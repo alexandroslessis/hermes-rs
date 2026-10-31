@@ -91,6 +91,7 @@ fn guidance_parts(input: &SystemPromptInput) -> Vec<Option<String>> {
     }
     parts.push(Some(text::TASK_COMPLETION_GUIDANCE.to_string()));
     parts.push(Some(text::PARALLEL_TOOL_CALL_GUIDANCE.to_string()));
+    parts.push(Some(text::STEER_CHANNEL_NOTE.to_string()));
     if model_matches(input.model, text::TOOL_USE_ENFORCEMENT_MODELS) {
         parts.push(Some(text::TOOL_USE_ENFORCEMENT_GUIDANCE.to_string()));
         if model_matches(input.model, &["gemini", "gemma"]) {

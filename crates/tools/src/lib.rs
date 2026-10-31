@@ -80,6 +80,11 @@ impl SessionTools {
         self.shell.cwd()
     }
 
+    /// Per-session scratch space (oversized tool results are spilled here).
+    pub fn scratch_dir(&self) -> &Path {
+        &self.scratch_dir
+    }
+
     pub fn todos(&self) -> Vec<TodoItem> {
         self.todos.items()
     }

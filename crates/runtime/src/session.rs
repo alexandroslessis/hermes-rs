@@ -17,15 +17,20 @@ use hermes_tools::SessionTools;
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::ops::TurnState;
+
 pub enum HermesEffect {
     Conversation(ConversationEffect),
     RecordUsage(ProviderUsage),
+    /// Replaces a message by id (a repaired tool call, or a withdrawn one hidden from the model).
+    UpdateMessage(Message),
 }
 
 impl MachineEffect for HermesEffect {
     fn ensure_message_ids(&mut self) {
-        if let HermesEffect::Conversation(effect) = self {
-            effect.ensure_message_ids();
+        match self {
+            HermesEffect::Conversation(effect) => effect.ensure_message_ids(),
+            HermesEffect::UpdateMessage(_) | HermesEffect::RecordUsage(_) => {}
         }
     }
 }
@@ -53,6 +58,8 @@ pub struct TurnSession {
     pub id: String,
     pub system_prompt: String,
     pub conversation: Conversation,
+    /// One-shot output cap for the next request (see `TurnState::max_tokens`).
+    pub max_tokens: Option<i32>,
 }
 
 impl MachineSession for TurnSession {
@@ -63,6 +70,10 @@ impl MachineSession for TurnSession {
     fn conversation(&self) -> Option<&Conversation> {
         Some(&self.conversation)
     }
+
+    fn max_tokens_override(&self) -> Option<i32> {
+        self.max_tokens
+    }
 }
 
 pub struct OpenSession {
@@ -70,6 +81,8 @@ pub struct OpenSession {
     pub conversation: Mutex<Conversation>,
     pub tools: Arc<SessionTools>,
     pub running: Mutex<Option<CancellationToken>>,
+    /// The running turn's loop state (where `/steer` text waits for delivery).
+    pub turn_state: Mutex<Option<Arc<Mutex<TurnState>>>>,
 }
 
 impl OpenSession {
@@ -79,6 +92,7 @@ impl OpenSession {
             id: record.id.clone(),
             system_prompt: record.system_prompt.clone(),
             conversation: self.conversation.lock().clone(),
+            max_tokens: None,
         }
     }
 }
@@ -87,6 +101,7 @@ impl OpenSession {
 pub struct TurnRuntime {
     pub session: Arc<OpenSession>,
     pub store: Arc<Store>,
+    pub state: Arc<Mutex<TurnState>>,
 }
 
 impl TurnRuntime {
@@ -156,7 +171,9 @@ impl TurnRuntime {
 #[async_trait]
 impl SessionLoader<TurnSession> for TurnRuntime {
     async fn load(&self, _session_id: &str) -> Result<TurnSession> {
-        Ok(self.session.snapshot())
+        let mut session = self.session.snapshot();
+        session.max_tokens = self.state.lock().max_tokens.take();
+        Ok(session)
     }
 }
 
@@ -241,6 +258,13 @@ impl EffectHandler<TurnSession, HermesEffect> for TurnRuntime {
                         message.metadata.user_visible = user_visible;
                         message.metadata.agent_visible = agent_visible;
                     })?;
+                }
+                HermesEffect::UpdateMessage(message) => {
+                    let id = message.id.clone().context("updated message has no id")?;
+                    let message = message.clone();
+                    self.update_message(&id, |stored| *stored = message)?;
+                    let conversation = self.session.conversation.lock().clone();
+                    emit.emit(AgentEvent::HistoryReplaced(conversation));
                 }
                 HermesEffect::RecordUsage(usage) => {
                     let session_id = self.session.record.lock().id.clone();

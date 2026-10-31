@@ -69,6 +69,10 @@ pub struct ChatView {
     /// The code-block languages `markdown` was built with.
     languages: Arc<markdown::language::LanguageRegistry>,
     clarify: Option<ClarifyForm>,
+    /// `/steer` text waiting for the agent's next tool call to finish.
+    steering: Option<String>,
+    /// A steer the turn ended before delivering: Hermes sends it as the next message.
+    next_message: Option<String>,
     pub usage: TurnUsage,
     error: Option<String>,
     focus_handle: FocusHandle,
@@ -91,12 +95,7 @@ impl ChatView {
             .store()
             .usage_totals(&session_id)
             .unwrap_or_default();
-        let composer = cx.new(|cx| {
-            TextArea::new(
-                "Message Hermes… (Enter to send, Shift+Enter for a new line)",
-                cx,
-            )
-        });
+        let composer = cx.new(|cx| TextArea::new(COMPOSER_PLACEHOLDER, cx));
         let subscription = cx.subscribe_in(
             &composer,
             window,
@@ -120,6 +119,8 @@ impl ChatView {
             expanded: HashSet::new(),
             markdown: HashMap::new(),
             clarify: None,
+            steering: None,
+            next_message: None,
             usage: TurnUsage {
                 last_input_tokens: 0,
                 total_input_tokens: totals.input_tokens,
@@ -185,7 +186,20 @@ impl ChatView {
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).text().trim().to_string();
-        if text.is_empty() || self.running.is_some() {
+        if text.is_empty() {
+            return;
+        }
+        // Mid-turn, Enter steers the running turn (Hermes's `/steer`).
+        if self.running.is_some() {
+            if backend(cx).runtime.steer(&self.session_id, &text) {
+                self.composer
+                    .update(cx, |composer, cx| composer.set_text("", cx));
+                self.steering = Some(match self.steering.take() {
+                    Some(earlier) => format!("{earlier} / {text}"),
+                    None => text,
+                });
+                cx.notify();
+            }
             return;
         }
         self.composer
@@ -244,6 +258,9 @@ impl ChatView {
         };
         self.error = None;
         self.running = Some(turn.cancel.clone());
+        self.composer.update(cx, |composer, cx| {
+            composer.set_placeholder(STEER_PLACEHOLDER, cx)
+        });
         self.list_state.scroll_to_end();
         self.turn_task = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = turn.events.recv().await {
@@ -302,6 +319,10 @@ impl ChatView {
     fn handle_event(&mut self, event: RuntimeEvent, cx: &mut Context<Self>) {
         match event {
             RuntimeEvent::Agent(AgentEvent::Message(message)) => {
+                // The chat's copy of a delivered steer: shown to the user, not sent to the model.
+                if message.role == Role::User && !message.is_agent_visible() {
+                    self.steering = None;
+                }
                 self.conversation.push(message);
                 self.entries_changed(cx);
             }
@@ -319,8 +340,21 @@ impl ChatView {
                 cx.notify();
             }
             RuntimeEvent::Agent(_) => {}
+            RuntimeEvent::SteerUndelivered(text) => {
+                self.steering = None;
+                self.next_message = Some(text);
+            }
             RuntimeEvent::TurnFinished(status) => {
                 self.running = None;
+                self.composer.update(cx, |composer, cx| {
+                    composer.set_placeholder(COMPOSER_PLACEHOLDER, cx)
+                });
+                if let Some(text) = self.next_message.take() {
+                    cx.spawn(async move |this, cx| {
+                        this.update(cx, |this, cx| this.begin(Some(text), cx)).ok();
+                    })
+                    .detach();
+                }
                 if let TurnStatus::Failed(error) = status {
                     self.error = Some(error);
                 }
@@ -445,10 +479,7 @@ impl ChatView {
                     return None;
                 };
                 let (text, is_error) = match &response.tool_result {
-                    Ok(result) => (
-                        content.as_tool_response_text().unwrap_or_default(),
-                        result.is_error.unwrap_or(false),
-                    ),
+                    Ok(result) => (tool_output(content), result.is_error.unwrap_or(false)),
                     Err(error) => (error.message.to_string(), true),
                 };
                 Some((response.id.as_str(), (text, is_error)))
@@ -996,7 +1027,7 @@ impl ChatView {
                 let response = content.as_tool_response()?;
                 todo_calls
                     .contains(response.id.as_str())
-                    .then(|| content.as_tool_response_text())?
+                    .then(|| Some(tool_output(content)))?
             })
             .find_map(|text| {
                 let value: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -1118,6 +1149,23 @@ impl ChatView {
             .border_1()
             .border_color(colors.border)
             .bg(colors.editor_background)
+            .when_some(self.steering.clone(), |this, steering| {
+                this.child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Icon::new(IconName::ArrowRight)
+                                .size(IconSize::XSmall)
+                                .color(Color::Accent),
+                        )
+                        .child(
+                            Label::new(format!("Steering: {steering}"))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
+                )
+            })
             .child(self.composer.clone())
             .child(
                 h_flex()
@@ -1144,6 +1192,10 @@ impl ChatView {
             )
     }
 }
+
+const COMPOSER_PLACEHOLDER: &str = "Message Hermes… (Enter to send, Shift+Enter for a new line)";
+const STEER_PLACEHOLDER: &str =
+    "Steer the agent… (delivered after its current tool call; Stop ends the turn)";
 
 /// Effort levels shown in the pill: label and the value sent to the provider.
 const EFFORTS: &[(&str, &str)] = &[
@@ -1332,5 +1384,17 @@ impl Render for ChatView {
             .children(self.render_clarify(cx))
             .children(self.render_todos(cx))
             .child(self.render_composer(cx))
+    }
+}
+
+/// What a tool returned, before the runtime's loop guardrails added notes for the model.
+fn tool_output(content: &MessageContent) -> String {
+    let structured = content
+        .as_tool_response()
+        .and_then(|response| response.tool_result.as_ref().ok())
+        .and_then(|result| result.structured_content.as_ref());
+    match structured {
+        Some(value) => value.to_string(),
+        None => content.as_tool_response_text().unwrap_or_default(),
     }
 }

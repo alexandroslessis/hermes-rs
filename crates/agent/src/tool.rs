@@ -336,8 +336,11 @@ where
             .iter()
             .flat_map(Message::get_tool_response_ids)
             .collect();
+        // hermes-rs: a message hidden from the model was withdrawn (a retried malformed or
+        // truncated tool call); its calls must never run.
         let pending = turn
             .iter()
+            .filter(|message| message.is_agent_visible())
             .flat_map(|message| message.content.iter())
             .filter_map(MessageContent::as_tool_request)
             .filter(|request| {

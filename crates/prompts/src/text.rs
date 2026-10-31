@@ -20,6 +20,11 @@ pub const TASK_COMPLETION_GUIDANCE: &str =
     hermes!("agent.prompt_builder", "TASK_COMPLETION_GUIDANCE");
 pub const PARALLEL_TOOL_CALL_GUIDANCE: &str =
     hermes!("agent.prompt_builder", "PARALLEL_TOOL_CALL_GUIDANCE");
+/// Explains the `/steer` marker; steering lands after tool results, so only sessions with tools
+/// get it.
+pub const STEER_CHANNEL_NOTE: &str = hermes!("agent.prompt_builder", "STEER_CHANNEL_NOTE");
+pub const STEER_MARKER_OPEN: &str = hermes!("agent.prompt_builder", "STEER_MARKER_OPEN");
+pub const STEER_MARKER_CLOSE: &str = "[/OUT-OF-BAND USER MESSAGE]";
 pub const TOOL_USE_ENFORCEMENT_GUIDANCE: &str =
     hermes!("agent.prompt_builder", "TOOL_USE_ENFORCEMENT_GUIDANCE");
 pub const GOOGLE_MODEL_OPERATIONAL_GUIDANCE: &str =

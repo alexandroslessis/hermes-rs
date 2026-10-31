@@ -467,6 +467,10 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
             .thinking_effort()
             .map(|effort| self.model_config.clone().with_thinking_effort(effort))
             .unwrap_or_else(|| self.model_config.clone());
+        let model_config = match session.max_tokens_override() {
+            Some(tokens) => model_config.with_max_tokens(Some(tokens)),
+            None => model_config,
+        };
         let span = inference_span(self.provider.as_ref(), &model_config);
 
         async {

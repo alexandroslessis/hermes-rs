@@ -22,6 +22,11 @@ pub trait MachineSession: MaybeSend + MaybeSync {
     fn thinking_effort(&self) -> Option<ThinkingEffort> {
         None
     }
+    /// hermes-rs: a one-shot output cap for the next request (Hermes boosts `max_tokens` when
+    /// retrying a tool call the output limit cut off).
+    fn max_tokens_override(&self) -> Option<i32> {
+        None
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]

@@ -251,6 +251,29 @@ Hermes behaviors to port into operations (sources in `../hermes-agent/agent/`):
    the tool-call turn before any side effect.
 8. `/steer` and interrupt-and-redirect (`STEER_*` prompt blocks already extracted).
 
+M2.5 status (2026-10-31): ported, as operations in `crates/runtime/src/ops.rs` sharing a per-turn
+`TurnState`, with the pure logic in `crates/runtime/src/guards.rs`; each behavior has a
+mock-provider test in `crates/runtime/tests/turns.rs`.
+- Done: 1 (duplicate call ids made unique, name repair, 3-strike exit, malformed-JSON retry ×2 then
+  error results, truncated arguments refused); 2 (Hermes's warn-only guardrails for attended
+  surfaces: exact/same-tool failure warnings, read-only no-progress warnings, identical-call and
+  batch-cycle notices, byte-identical result stubs); 3 (text continuation ×4 with the ceiling
+  collapse, repetition-dominated fragments discarded, truncated tool calls retried ×4 with a boosted
+  `max_tokens`); 4 (housekeeping reuse, one post-tool nudge, thinking-only nudge ×2, visible
+  terminal; empty retries stay in the inference step); 5 (500 calls per turn, then one toolless
+  summary call with Hermes's request text and fallback copy); 7 (per-result spillover to the
+  session scratch dir with Hermes's `<persisted-output>` preview, limit scaled to the context
+  window, `read_file` exempt); 8 (`/steer`: Enter while a turn runs queues a steer, delivered after
+  the next tool batch in the out-of-band marker; `STEER_CHANNEL_NOTE` added to the prompt; an
+  undelivered steer becomes the next message). Verified live: steering.
+- Adapted: thinking-only replies get Hermes's reasoning-only nudge instead of an assistant prefill
+  (chat-completions endpoints can't continue an assistant row); reasoning isn't switched off for
+  thinking-only truncation.
+- Not ported: 6 (stop gates: Hermes ships them off by default and they need LSP verdicts,
+  plugins or kanban); the per-turn aggregate result budget (spillover layer 3); empty-response
+  backoff, cost-aware budgets and fallback providers; interrupt-and-redirect (Stop already ends the
+  turn cleanly).
+
 **M3: Memory and recall.** Memory store with Hermes semantics, frozen snapshot, threat scan,
 pending-write approvals, session search, memory editor screen.
 

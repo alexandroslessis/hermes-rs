@@ -46,10 +46,19 @@ impl Respond for Script {
     }
 }
 
+/// One streamed response. Like a real provider, every response gets its own id.
 fn sse(chunks: Vec<Value>) -> String {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = format!(
+        "resp_{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let mut body: String = chunks
-        .iter()
-        .map(|chunk| format!("data: {chunk}\n\n"))
+        .into_iter()
+        .map(|mut chunk| {
+            chunk["id"] = json!(id);
+            format!("data: {chunk}\n\n")
+        })
         .collect();
     body.push_str("data: [DONE]\n\n");
     body
@@ -133,7 +142,7 @@ fn runtime_in(data_dir: &Path) -> Runtime {
         RuntimeConfig {
             data_dir: data_dir.to_path_buf(),
             shell: detect_shell(),
-            max_turns: 20,
+            max_iterations: 20,
         },
         Arc::new(Bridge),
     )
@@ -513,4 +522,422 @@ fn openrouter_gets_its_unified_reasoning_field() {
     assert_eq!(params["reasoning"], json!({"effort": "low"}));
     let params = hermes_runtime::effort_request_params("http://localhost:1234/v1", "low");
     assert_eq!(params["reasoning_effort"], "low");
+}
+
+// ---- Hermes turn-loop behaviors ---------------------------------------------------------------
+
+fn raw_tool_reply(name: &str, arguments: &str, finish: &str) -> String {
+    sse(vec![
+        delta(
+            json!({"role": "assistant", "tool_calls": [{"index": 0, "id": "call_raw", "type": "function",
+                   "function": {"name": name, "arguments": arguments}}]}),
+            Some(finish),
+        ),
+        usage(),
+    ])
+}
+
+fn finished_text_reply(text: &str, finish: &str) -> String {
+    sse(vec![
+        delta(json!({"role": "assistant", "content": text}), Some(finish)),
+        usage(),
+    ])
+}
+
+fn session_in(h: &Harness) -> String {
+    h.runtime
+        .create_session(&h.provider, "test-model", None, h.work.path())
+        .unwrap()
+        .id
+}
+
+fn last_text(h: &Harness, session: &str) -> String {
+    h.runtime
+        .messages(session)
+        .unwrap()
+        .last()
+        .unwrap()
+        .as_concat_text()
+}
+
+fn sent_messages(request: &Value) -> Vec<Value> {
+    request["messages"].as_array().unwrap().clone()
+}
+
+#[tokio::test]
+async fn misspelled_tool_names_are_repaired() {
+    let h = harness(vec![
+        tool_reply(&[(
+            "call_1",
+            "Write-File",
+            json!({"path": "a.txt", "content": "x"}),
+        )]),
+        text_reply("ok"),
+    ])
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "write it").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!(
+        std::fs::read_to_string(h.work.path().join("a.txt")).unwrap(),
+        "x"
+    );
+    let second = sent_messages(&h.requests.lock()[1]);
+    let call = second.iter().find(|m| m["role"] == "assistant").unwrap();
+    assert_eq!(call["tool_calls"][0]["function"]["name"], "write_file");
+}
+
+#[tokio::test]
+async fn three_batches_of_invented_tools_end_the_turn() {
+    let invented = || tool_reply(&[("call_x", "browser_navigate", json!({"url": "x"}))]);
+    let h = harness(vec![
+        invented(),
+        invented(),
+        invented(),
+        text_reply("never sent"),
+    ])
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "browse").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!(h.requests.lock().len(), 3);
+    assert_eq!(
+        last_text(&h, &session),
+        "Model generated invalid tool call: browser_navigate"
+    );
+    // The first two strikes were answered with the tool list.
+    let third = sent_messages(&h.requests.lock()[2]);
+    let answer = third.iter().rev().find(|m| m["role"] == "tool").unwrap();
+    assert!(
+        answer["content"]
+            .as_str()
+            .unwrap()
+            .contains("does not exist. Available tools:")
+    );
+}
+
+#[tokio::test]
+async fn malformed_arguments_are_retried_without_a_trace() {
+    let h = harness(vec![
+        raw_tool_reply("read_file", r#"{"path" "a.txt"}"#, "tool_calls"),
+        raw_tool_reply("read_file", r#"{"path" "a.txt"}"#, "tool_calls"),
+        text_reply("fine"),
+    ])
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "read").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 3);
+    // The withdrawn responses never reach the model.
+    assert!(
+        sent_messages(&requests[2])
+            .iter()
+            .all(|m| m["role"] != "assistant" && m["role"] != "tool")
+    );
+    assert_eq!(last_text(&h, &session), "fine");
+}
+
+#[tokio::test]
+async fn the_third_malformed_response_gets_an_error_result() {
+    let bad = || raw_tool_reply("read_file", r#"{"path" "a.txt"}"#, "tool_calls");
+    let h = harness(vec![bad(), bad(), bad(), text_reply("recovered")]).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "read").await;
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 4);
+    let answer = sent_messages(&requests[3])
+        .into_iter()
+        .rfind(|m| m["role"] == "tool")
+        .unwrap();
+    assert!(
+        answer["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Error: Invalid JSON arguments.")
+    );
+}
+
+#[tokio::test]
+async fn truncated_text_is_continued() {
+    let h = harness(vec![
+        finished_text_reply("The first half of the answer", "length"),
+        text_reply(" and the second half."),
+    ])
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "explain").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 2);
+    let last_sent = sent_messages(&requests[1]).pop().unwrap();
+    assert_eq!(last_sent["role"], "user");
+    assert!(
+        last_sent["content"]
+            .as_str()
+            .unwrap()
+            .contains("truncated by the output length limit")
+    );
+    // The user sees both fragments and not the nudge.
+    let visible: Vec<String> = h
+        .runtime
+        .messages(&session)
+        .unwrap()
+        .iter()
+        .filter(|m| m.is_user_visible())
+        .map(|m| m.as_concat_text())
+        .collect();
+    assert_eq!(
+        visible,
+        vec![
+            "explain",
+            "The first half of the answer",
+            " and the second half."
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_truncated_repetition_loop_is_not_continued() {
+    let looped = "I will now repeat this sentence because I am stuck in a loop.\n".repeat(30);
+    let h = harness(vec![
+        finished_text_reply(&looped, "length"),
+        text_reply("never"),
+    ])
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "go").await;
+    assert_eq!(h.requests.lock().len(), 1);
+    assert!(last_text(&h, &session).contains("Repetition Detected"));
+    let stored = h.runtime.messages(&session).unwrap();
+    assert!(
+        stored
+            .iter()
+            .filter(|m| m.is_user_visible())
+            .all(|m| !m.as_concat_text().contains("stuck in a loop"))
+    );
+}
+
+#[tokio::test]
+async fn a_tool_call_cut_off_by_the_output_limit_is_retried_with_a_bigger_cap() {
+    let h = harness(vec![
+        raw_tool_reply(
+            "write_file",
+            r#"{"path": "big.txt", "content": "abc"#,
+            "length",
+        ),
+        tool_reply(&[(
+            "call_2",
+            "write_file",
+            json!({"path": "big.txt", "content": "abc"}),
+        )]),
+        text_reply("written"),
+    ])
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "write a big file").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 3);
+    let cap = |r: &Value| {
+        r.get("max_tokens")
+            .or_else(|| r.get("max_completion_tokens"))
+            .cloned()
+    };
+    assert_eq!(cap(&requests[0]), None);
+    assert_eq!(cap(&requests[1]), Some(json!(8192)));
+    assert_eq!(cap(&requests[2]), None);
+    assert_eq!(
+        std::fs::read_to_string(h.work.path().join("big.txt")).unwrap(),
+        "abc"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_reply_after_tools_gets_one_nudge() {
+    let h = harness(vec![
+        tool_reply(&[(
+            "call_1",
+            "write_file",
+            json!({"path": "n.txt", "content": "1"}),
+        )]),
+        finished_text_reply("", "stop"),
+        text_reply("All done."),
+    ])
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "do it").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 3);
+    let sent = sent_messages(&requests[2]);
+    assert_eq!(sent[sent.len() - 2]["content"], "(empty)");
+    assert!(
+        sent[sent.len() - 1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("returned an empty response")
+    );
+    assert_eq!(last_text(&h, &session), "All done.");
+}
+
+#[tokio::test]
+async fn a_thinking_only_reply_is_asked_for_its_answer() {
+    let h = harness(vec![
+        sse(vec![
+            delta(
+                json!({"role": "assistant", "reasoning_content": "Let me think about it."}),
+                Some("stop"),
+            ),
+            usage(),
+        ]),
+        text_reply("Here is the answer."),
+    ])
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "question").await;
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 2);
+    let nudge = sent_messages(&requests[1]).pop().unwrap();
+    assert!(
+        nudge["content"]
+            .as_str()
+            .unwrap()
+            .contains("contained only internal reasoning")
+    );
+    assert_eq!(last_text(&h, &session), "Here is the answer.");
+}
+
+#[tokio::test]
+async fn an_exhausted_budget_ends_with_a_toolless_summary() {
+    // The harness allows 20 model calls per turn.
+    let mut replies: Vec<String> = (0..20)
+        .map(|i| {
+            tool_reply(&[(
+                &format!("call_{i}"),
+                "write_file",
+                json!({"path": format!("f{i}.txt"), "content": "x"}),
+            )])
+        })
+        .collect();
+    replies.push(text_reply("Summary: wrote twenty files."));
+    let h = harness(replies).await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "write many files").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 21);
+    assert!(
+        requests[19]["tools"]
+            .as_array()
+            .is_some_and(|t| !t.is_empty())
+    );
+    assert!(
+        requests[20]
+            .get("tools")
+            .is_none_or(|t| t.as_array().is_none_or(Vec::is_empty))
+    );
+    let ask = sent_messages(&requests[20]).pop().unwrap();
+    assert_eq!(ask["content"], hermes_runtime::SUMMARY_REQUEST);
+    assert_eq!(last_text(&h, &session), "Summary: wrote twenty files.");
+}
+
+#[tokio::test]
+async fn repeated_identical_calls_get_a_loop_notice() {
+    let search = |id: &str| {
+        tool_reply(&[(
+            id,
+            "search_files",
+            json!({"pattern": "nothing-matches-this", "target": "content"}),
+        )])
+    };
+    let h = harness(vec![
+        search("c1"),
+        search("c2"),
+        search("c3"),
+        text_reply("giving up"),
+    ])
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "search").await;
+    let requests = h.requests.lock().clone();
+    let results: Vec<String> = sent_messages(&requests[3])
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["content"].as_str().unwrap().to_string())
+        .collect();
+    assert!(results[1].contains("idempotent_no_progress_warning"));
+    assert!(results[2].contains("3rd consecutive identical call to search_files"));
+}
+
+async fn collect(mut turn: hermes_runtime::Turn) -> Vec<RuntimeEvent> {
+    let mut events = Vec::new();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(60), turn.events.recv())
+        .await
+        .unwrap()
+    {
+        let finished = matches!(event, RuntimeEvent::TurnFinished(_));
+        events.push(event);
+        if finished {
+            break;
+        }
+    }
+    events
+}
+
+#[tokio::test]
+async fn a_steer_is_delivered_after_the_running_tool_batch() {
+    let h = harness(vec![
+        tool_reply(&[("call_1", "terminal", json!({"command": "sleep 2"}))]),
+        text_reply("Switching to python."),
+    ])
+    .await;
+    let session = session_in(&h);
+    let turn = h
+        .runtime
+        .start_turn(&session, &h.provider, TurnOptions::default(), "count files")
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(h.runtime.steer(&session, "use python instead"));
+    let events = collect(turn).await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 2);
+    let sent = sent_messages(&requests[1]);
+    assert_eq!(sent[sent.len() - 2]["role"], "tool");
+    let steer = sent.last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(steer.starts_with("[OUT-OF-BAND USER MESSAGE"));
+    assert!(steer.contains("\nuse python instead\n[/OUT-OF-BAND USER MESSAGE]"));
+    // The chat shows the user's own words.
+    let shown: Vec<String> = h
+        .runtime
+        .messages(&session)
+        .unwrap()
+        .iter()
+        .filter(|m| m.is_user_visible() && m.role == rmcp::model::Role::User)
+        .map(|m| m.as_concat_text())
+        .filter(|t| !t.is_empty())
+        .collect();
+    assert_eq!(shown, vec!["count files", "use python instead"]);
+}
+
+#[tokio::test]
+async fn a_steer_without_a_tool_batch_comes_back_for_the_next_message() {
+    let h = harness(vec![text_reply("Hello!")]).await;
+    let session = session_in(&h);
+    let turn = h
+        .runtime
+        .start_turn(&session, &h.provider, TurnOptions::default(), "hi")
+        .unwrap();
+    assert!(h.runtime.steer(&session, "and in French"));
+    let events = collect(turn).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::SteerUndelivered(t) if t == "and in French"))
+    );
+    assert!(!h.runtime.steer(&session, "too late"));
 }

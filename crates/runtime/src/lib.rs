@@ -1,6 +1,7 @@
 //! The agent runtime the desktop app talks to: create and open sessions, start a turn and
 //! receive its events, cancel it, list a provider's models.
 
+mod guards;
 mod ops;
 mod session;
 
@@ -31,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 pub use hermes_tools::{
     ClarifyAnswer, ClarifyOutcome, ClarifyQuestion, ClarifyRequest, ClarifyResponse, ProcessNotice,
 };
-pub use ops::MAX_TURNS_MESSAGE;
+pub use ops::{EMPTY_TERMINAL_MESSAGE, SUMMARY_REQUEST, TRUNCATED_MESSAGE};
 use session::{HermesEffect, OpenSession, TurnRuntime, TurnSession};
 
 /// An OpenAI-compatible endpoint, e.g. OpenRouter at `https://openrouter.ai/api/v1`.
@@ -94,8 +95,9 @@ pub struct RuntimeConfig {
     /// `%APPDATA%\hermes-rs`: sessions.db, SOUL.md, scratch/.
     pub data_dir: PathBuf,
     pub shell: ShellKind,
-    /// Model calls allowed per user message before the agent stops and asks to continue.
-    pub max_turns: u32,
+    /// Model calls allowed per user message (Hermes's iteration budget); when they run out the
+    /// model gets one more call, without tools, to summarize.
+    pub max_iterations: u32,
 }
 
 impl RuntimeConfig {
@@ -106,7 +108,7 @@ impl RuntimeConfig {
         Ok(Self {
             data_dir,
             shell: hermes_tools::detect_shell(),
-            max_turns: 150,
+            max_iterations: 500,
         })
     }
 }
@@ -114,6 +116,8 @@ impl RuntimeConfig {
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
     Agent(AgentEvent),
+    /// A `/steer` message the turn ended before delivering; Hermes sends it as the next message.
+    SteerUndelivered(String),
     TurnFinished(TurnStatus),
 }
 
@@ -258,6 +262,7 @@ impl Runtime {
             conversation: Mutex::new(conversation),
             tools: Arc::new(tools),
             running: Mutex::new(None),
+            turn_state: Mutex::new(None),
         });
         Ok(self
             .sessions
@@ -337,9 +342,12 @@ impl Runtime {
                 return Err(error);
             }
         };
+        let state: ops::SharedTurnState = Arc::default();
+        *open.turn_state.lock() = Some(state.clone());
         let runtime = TurnRuntime {
             session: open.clone(),
             store: self.store.clone(),
+            state: state.clone(),
         };
         let first_event = match text {
             Some(text) => {
@@ -365,7 +373,7 @@ impl Runtime {
 
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let _ = events_tx.send(RuntimeEvent::Agent(first_event));
-        let max_turns = self.config.max_turns;
+        let max_iterations = self.config.max_iterations;
         let session_id = session_id.to_string();
         let turn_cancel = cancel.clone();
         tokio::spawn(async move {
@@ -377,22 +385,41 @@ impl Runtime {
                 }
             });
             let emit = Emitter::new(agent_tx, turn_cancel.clone());
-            let tool_names = SessionTools::tool_names()
+            let tool_names: Vec<String> = SessionTools::tool_names()
                 .into_iter()
                 .map(str::to_string)
                 .collect();
-            let tools: Arc<dyn ToolProvider<TurnSession>> = runtime.session.tools.clone();
+            let tools: Arc<dyn ToolProvider<TurnSession>> = Arc::new(ops::GuardedTools {
+                inner: runtime.session.tools.clone(),
+                state: state.clone(),
+                result_limit: ops::result_size_limit(context_length),
+            });
             let mut model_config = ModelConfig::new(&model).with_context_limit(context_length);
             if let Some(params) = effort_params {
                 model_config = model_config.with_merged_request_params(params);
             }
             let steps: Vec<Step<'_, TurnSession, HermesEffect>> = vec![
                 Step::Operation(Arc::new(ops::FrozenPrompt)),
+                Step::Operation(Arc::new(ops::IterationBudget {
+                    state: state.clone(),
+                    max_iterations,
+                })),
+                Step::Operation(Arc::new(ops::ValidateToolCalls {
+                    state: state.clone(),
+                    tool_names: tool_names.clone(),
+                })),
                 Step::Operation(Arc::new(ToolOperation::new().with_provider(tools))),
                 Step::Operation(Arc::new(ops::UnhandledToolCalls { tool_names })),
-                Step::Operation(Arc::new(ops::EmptyResponse)),
+                Step::Operation(Arc::new(ops::DeliverSteer {
+                    state: state.clone(),
+                })),
+                Step::Operation(Arc::new(ops::LengthContinuation {
+                    state: state.clone(),
+                })),
+                Step::Operation(Arc::new(ops::EmptyResponseRecovery {
+                    state: state.clone(),
+                })),
                 Step::Operation(Arc::new(ops::ExitOnError)),
-                Step::Operation(Arc::new(ops::MaxTurns { max_turns })),
                 Step::Inference(Arc::new(InferenceRunner::new(llm, model_config))),
             ];
             let machine = StateMachine::new(steps, turn_cancel.clone());
@@ -401,6 +428,10 @@ impl Runtime {
             drop(emit);
             let _ = forward.await;
             *runtime.session.running.lock() = None;
+            *runtime.session.turn_state.lock() = None;
+            if let Some(text) = state.lock().pending_steer.take() {
+                let _ = events_tx.send(RuntimeEvent::SteerUndelivered(text));
+            }
             let status = match result {
                 Ok(_) if turn_cancel.is_cancelled() => TurnStatus::Cancelled,
                 Ok(_) => TurnStatus::Completed,
@@ -415,6 +446,25 @@ impl Runtime {
             events: events_rx,
             cancel,
         })
+    }
+
+    /// Hermes's `/steer`: a message for the running turn, delivered to the model right after its
+    /// next tool results. `false` when no turn is running (send it as a normal message instead).
+    pub fn steer(&self, session_id: &str, text: &str) -> bool {
+        let state = self
+            .sessions
+            .lock()
+            .get(session_id)
+            .and_then(|open| open.turn_state.lock().clone());
+        let Some(state) = state else {
+            return false;
+        };
+        let mut state = state.lock();
+        state.pending_steer = Some(match state.pending_steer.take() {
+            Some(earlier) => format!("{earlier}\n\n{text}"),
+            None => text.to_string(),
+        });
+        true
     }
 
     pub fn cancel(&self, session_id: &str) {

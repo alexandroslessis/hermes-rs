@@ -193,6 +193,15 @@ impl TextArea {
         cx.notify();
     }
 
+    pub fn set_placeholder(
+        &mut self,
+        placeholder: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.placeholder = placeholder.into();
+        cx.notify();
+    }
+
     /// A one-line field: Enter submits, long text scrolls instead of growing.
     pub fn single_line(mut self) -> Self {
         self.max_lines = 1;
