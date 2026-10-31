@@ -166,7 +166,7 @@ def prune_manifest(path: Path, keep: set[str], zed_ws_deps: dict) -> set[str]:
             kept = [e for e in entries if e.split("/")[0].removeprefix("dep:").rstrip("?") in remaining]
             entries.clear()
             entries.extend(kept)
-    path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+    path.write_text(tomlkit.dumps(doc), encoding="utf-8", newline="\n")
     return used
 
 
@@ -194,7 +194,7 @@ def main() -> None:
         used |= prune_manifest(dst / "Cargo.toml", set(crates), zed_ws_deps)
 
     cargo_toml = ROOT / "Cargo.toml"
-    text = cargo_toml.read_text(encoding="utf-8")
+    text = cargo_toml.read_text(encoding="utf-8", newline="\n")
     before, rest = text.split(BEGIN, 1)
     _, after = rest.split(END, 1)
     declared_outside = set(tomlkit.parse(before + after)["workspace"]["dependencies"].keys())
@@ -206,7 +206,7 @@ def main() -> None:
             lines.append(f'{key} = {{ path = "vendor/zed/{key}" }}')
         elif key in zed_ws_deps:
             lines.append(f"{key} = {inline(zed_ws_deps[key].unwrap()).as_string().strip()}")
-    cargo_toml.write_text(f"{before}{BEGIN}\n" + "\n".join(lines) + f"\n{END}{after}", encoding="utf-8")
+    cargo_toml.write_text(f"{before}{BEGIN}\n" + "\n".join(lines) + f"\n{END}{after}", encoding="utf-8", newline="\n")
 
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=zed, capture_output=True, text=True,
                             check=True).stdout.strip()
@@ -218,7 +218,7 @@ def main() -> None:
              + ", ".join(f"`{c}`" for c in crates)
              + "\n\nAssets: `assets/fonts`, `assets/icons`, `assets/themes` copied from Zed's `assets/`."
              + "\n<!-- END zed -->\n")
-    sources.write_text(body.lstrip() + "\n", encoding="utf-8")
+    sources.write_text(body.lstrip() + "\n", encoding="utf-8", newline="\n")
     print(f"vendored {len(crates)} crates, {len(lines)} workspace dependency entries")
 
 

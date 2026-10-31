@@ -22,6 +22,8 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use ui::{Callout, CommonAnimationExt, Disclosure, Divider, PopoverMenu, Tooltip, prelude::*};
 
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownOptions, MarkdownStyle};
+
 use crate::backend::backend;
 use crate::model_picker::ModelPicker;
 use crate::state::AppState;
@@ -60,6 +62,8 @@ pub struct ChatView {
     running: Option<CancellationToken>,
     turn_task: Option<Task<()>>,
     expanded: HashSet<String>,
+    /// Rendered markdown per assistant text block, keyed by (message index, block index).
+    markdown: HashMap<(usize, usize), Entity<Markdown>>,
     clarify: Option<ClarifyForm>,
     pub usage: TurnUsage,
     error: Option<String>,
@@ -110,6 +114,7 @@ impl ChatView {
             running: None,
             turn_task: None,
             expanded: HashSet::new(),
+            markdown: HashMap::new(),
             clarify: None,
             usage: TurnUsage {
                 last_input_tokens: 0,
@@ -412,14 +417,21 @@ impl ChatView {
             .collect()
     }
 
-    fn render_entry(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_entry(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(&message_index) = self.entries.get(index) else {
             return div().into_any_element();
         };
         let message = self.conversation.messages()[message_index].clone();
         let content = match message.role {
             Role::User => self.render_user_message(&message, cx),
-            Role::Assistant => self.render_assistant_message(&message, index, cx),
+            Role::Assistant => {
+                self.render_assistant_message(&message, message_index, index, window, cx)
+            }
         };
         div()
             .w_full()
@@ -450,10 +462,37 @@ impl ChatView {
             .into_any_element()
     }
 
+    /// The markdown entity for one text block, created or updated to `text` as it streams.
+    fn markdown_for(
+        &mut self,
+        key: (usize, usize),
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<Markdown> {
+        if let Some(markdown) = self.markdown.get(&key) {
+            let markdown = markdown.clone();
+            if markdown.read(cx).source() != text {
+                let text = text.to_string();
+                markdown.update(cx, |markdown, cx| markdown.replace(text, cx));
+            }
+            return markdown;
+        }
+        let options = MarkdownOptions {
+            render_mermaid_diagrams: true,
+            ..Default::default()
+        };
+        let markdown = cx
+            .new(|cx| Markdown::new_with_options(text.to_string().into(), None, None, options, cx));
+        self.markdown.insert(key, markdown.clone());
+        markdown
+    }
+
     fn render_assistant_message(
         &mut self,
         message: &Message,
+        message_index: usize,
         entry: usize,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let responses = self.tool_responses();
@@ -468,10 +507,12 @@ impl ChatView {
         for (chunk, content) in message.content.iter().enumerate() {
             match content {
                 MessageContent::Text(text) if !text.text.trim().is_empty() => {
+                    let markdown = self.markdown_for((message_index, chunk), &text.text, cx);
+                    let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
                     blocks.push(
                         div()
                             .w_full()
-                            .child(text.text.trim().to_string())
+                            .child(MarkdownElement::new(markdown, style))
                             .into_any_element(),
                     );
                 }
@@ -988,7 +1029,9 @@ impl Render for ChatView {
             } else {
                 list(
                     self.list_state.clone(),
-                    cx.processor(|this, index: usize, _window, cx| this.render_entry(index, cx)),
+                    cx.processor(|this, index: usize, window, cx| {
+                        this.render_entry(index, window, cx)
+                    }),
                 )
                 .flex_1()
                 .size_full()

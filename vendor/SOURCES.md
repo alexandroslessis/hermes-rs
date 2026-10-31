@@ -35,7 +35,8 @@ Commit `c419cf7c864ac0ee511dbd9f7091a8bba0b567ee` from https://github.com/NousRe
 
 Commit `ba63a022c9a22ca66d68ef2a8f0bb9b5b0a9984d` from https://github.com/zed-industries/zed, copied by `scripts/vendor_zed.py`.
 
-Crates (23): `bench_metrics`, `collections`, `component`, `derive_refineable`, `gpui`, `gpui_macros`, `gpui_platform`, `gpui_shared_string`, `gpui_util`, `gpui_windows`, `http_client`, `icons`, `menu`, `refineable`, `scheduler`, `sum_tree`, `syntax_theme`, `theme`, `ui`, `ui_macros`, `zlog`, `ztracing`, `ztracing_macro`
+Crates (24): `bench_metrics`, `collections`, `component`, `derive_refineable`, `gpui`, `gpui_macros`, `gpui_platform`, `gpui_shared_string`, `gpui_util`, `gpui_windows`, `http_client`, `icons`, `menu`, `mermaid_render`, `refineable`, `scheduler`, `sum_tree`, `syntax_theme`, `theme`, `ui`, `ui_macros`, `zlog`, `ztracing`, `ztracing_macro`
 
 Assets: `assets/fonts`, `assets/icons`, `assets/themes` copied from Zed's `assets/`.
 <!-- END zed -->
+

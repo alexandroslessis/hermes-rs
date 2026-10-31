@@ -49,6 +49,14 @@ pub struct Language {
     highlighter: Option<Arc<dyn Highlighter>>,
 }
 
+impl std::fmt::Debug for Language {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Language")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
 impl Language {
     pub fn new(name: impl Into<LanguageName>, highlighter: Option<Arc<dyn Highlighter>>) -> Self {
         Self {
@@ -139,22 +147,63 @@ impl From<&String> for Rope {
 }
 
 impl Rope {
-    /// Rounds a UTF-16 offset to a character boundary and returns it as a UTF-8 byte offset
-    /// wrapped in `OffsetUtf16` units (callers convert with `.0`).
-    pub fn clip_offset_utf16(&self, offset: OffsetUtf16, bias: Bias) -> usize {
+    /// Moves a UTF-16 offset that falls inside a surrogate pair to the pair's start (`Left`) or
+    /// end (`Right`), and clamps it to the text.
+    pub fn clip_offset_utf16(&self, offset: OffsetUtf16, bias: Bias) -> OffsetUtf16 {
         let mut utf16 = 0;
-        for (byte, ch) in self.0.char_indices() {
+        for ch in self.0.chars() {
             let next = utf16 + ch.len_utf16();
             if offset.0 < next {
-                return match bias {
-                    Bias::Left => byte,
-                    Bias::Right if offset.0 == utf16 => byte,
-                    Bias::Right => byte + ch.len_utf8(),
-                };
+                return OffsetUtf16(match bias {
+                    _ if offset.0 == utf16 => utf16,
+                    Bias::Left => utf16,
+                    Bias::Right => next,
+                });
             }
             utf16 = next;
         }
+        OffsetUtf16(utf16)
+    }
+
+    /// The UTF-8 byte offset of a (clipped) UTF-16 offset.
+    pub fn offset_utf16_to_offset(&self, offset: OffsetUtf16) -> usize {
+        let mut utf16 = 0;
+        for (byte, ch) in self.0.char_indices() {
+            if utf16 >= offset.0 {
+                return byte;
+            }
+            utf16 += ch.len_utf16();
+        }
         self.0.len()
+    }
+
+    pub fn chunks_in_range(&self, range: Range<usize>) -> impl Iterator<Item = &str> {
+        std::iter::once(&self.0[range])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf16_offsets_clip_to_whole_characters() {
+        // "a😀b": the emoji is one char, two UTF-16 units, four UTF-8 bytes.
+        let rope = Rope::from("a😀b");
+        assert_eq!(
+            rope.clip_offset_utf16(OffsetUtf16(2), Bias::Left),
+            OffsetUtf16(1)
+        );
+        assert_eq!(
+            rope.clip_offset_utf16(OffsetUtf16(2), Bias::Right),
+            OffsetUtf16(3)
+        );
+        assert_eq!(
+            rope.clip_offset_utf16(OffsetUtf16(9), Bias::Left),
+            OffsetUtf16(4)
+        );
+        assert_eq!(rope.offset_utf16_to_offset(OffsetUtf16(3)), 5);
+        assert_eq!(rope.chunks_in_range(1..5).collect::<String>(), "😀");
     }
 }
 

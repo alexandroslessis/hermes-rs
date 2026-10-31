@@ -6,9 +6,24 @@ use pulldown_cmark::{
     Alignment, CowStr, HeadingLevel, LinkType, MetadataBlockKind, Options, Parser,
 };
 use std::{ops::Range, sync::Arc};
-use util::markdown::generate_heading_slug;
 
 use crate::{html, path_range::PathWithRange};
+
+/// A URL-friendly slug from heading text ("Hello World" -> "hello-world"); from Zed's `util`.
+pub fn generate_heading_slug(text: &str) -> String {
+    text.trim()
+        .chars()
+        .filter_map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                Some(c.to_lowercase().next().unwrap_or(c))
+            } else if c == ' ' {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect()
+}
 
 pub const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_FOOTNOTES)

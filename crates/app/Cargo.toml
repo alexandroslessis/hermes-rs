@@ -23,6 +23,7 @@ hermes_llm.workspace = true
 hermes_runtime.workspace = true
 hermes_store.workspace = true
 hermes_tools.workspace = true
+markdown.workspace = true
 keyring = { version = "3.6.3", features = ["windows-native"] }
 rmcp.workspace = true
 rust-embed.workspace = true

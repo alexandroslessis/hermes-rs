@@ -277,7 +277,7 @@ fn rebalance_delimiters(source: &str, spans: &[InlineSpan], selection: &Range<us
 mod tests {
     use super::*;
     use crate::parser::parse_markdown_with_options;
-    use util::test::marked_text_ranges;
+    use crate::test_util::marked_text_ranges;
 
     fn markdown_for(source: &str, selection: Range<usize>) -> String {
         let parsed = parse_markdown_with_options(source, false, false, false);

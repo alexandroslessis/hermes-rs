@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 license = "GPL-3.0-or-later"
-description = "Zed's markdown renderer (crates/markdown), adapted: no Mermaid, pluggable code highlighting"
+description = "Zed's markdown renderer (crates/markdown), adapted: local language shim, pluggable code highlighting"
 
 [lints]
 workspace = true
@@ -17,6 +17,8 @@ anyhow.workspace = true
 base64.workspace = true
 collections.workspace = true
 gpui.workspace = true
+gpui_util.workspace = true
+mermaid_render.workspace = true
 html5ever = "0.39"
 linkify = "0.10.0"
 log.workspace = true
@@ -28,3 +30,6 @@ sum_tree.workspace = true
 syntax_theme.workspace = true
 theme.workspace = true
 ui.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

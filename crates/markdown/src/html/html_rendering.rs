@@ -550,14 +550,7 @@ mod tests {
     };
 
     fn ensure_theme_initialized(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            if !cx.has_global::<settings::SettingsStore>() {
-                settings::init(cx);
-            }
-            if !cx.has_global::<theme::GlobalTheme>() {
-                theme_settings::init(theme::LoadThemes::JustBase, cx);
-            }
-        });
+        cx.update(crate::font_settings::init_test);
     }
 
     use crate::WrapButtonVisibility;

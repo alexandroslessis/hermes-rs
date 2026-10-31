@@ -1,8 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*", "vendor/zed/*"]
-# crates/markdown: Zed markdown port in progress (M2), not yet compiling.
-exclude = ["vendor/async-task", "crates/markdown"]
+exclude = ["vendor/async-task"]
 # `cargo build`/`cargo test` without -p only touch our own crates; vendored Zed crates are
 # still compiled as dependencies, but their own test suites are not run.
 default-members = ["crates/*"]
@@ -91,6 +90,8 @@ inventory = "0.3.19"
 itertools = "0.14.0"
 log = {version = "0.4", default-features = false, features = ["std"]}
 menu = { path = "vendor/zed/menu" }
+mermaid_render = { path = "vendor/zed/mermaid_render" }
+merman = {version = "=0.8.0-alpha.5", default-features = false}
 palette = {version = "0.7.5", default-features = false, features = ["std"]}
 parking_lot = "0.12.1"
 pollster = "0.4.0"
@@ -98,6 +99,7 @@ postage = {version = "0.5", default-features = false}
 proc-macro2 = "1.0.93"
 profiling = "1"
 proptest = {version = "1.12.0", features = ["attr-macro"]}
+quick-xml = "0.41"
 quote = "1.0.9"
 rand = {version = "0.9", default-features = false, features = ["std", "std_rng", "os_rng"]}
 raw-window-handle = "0.6"

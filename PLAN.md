@@ -209,6 +209,45 @@ composer (multiline, history, slash and skill autocomplete), sessions sidebar, t
 clarify cards, todo panel, status bar, onboarding + settings (provider, keys, models). After M2 the
 app is usable day to day.
 
+M2 status (2026-10-31): done, tested in the running app against OpenRouter: themed title bar
+(working buttons), settings with provider/API key (Credential Manager) and the model picker,
+project-grouped sessions sidebar (Hermes-style grouping, Zed's `ThreadItem` rows), chat view
+with Zed's markdown renderer (tables, code blocks, Mermaid diagrams), thinking blocks with a
+pulsing label, tool cards with colored diffs, clarify form, composer with Zed-style model
+selector, status bar. Remaining for M2: syntax highlighting in code blocks (a tree-sitter
+`Highlighter` behind `crates/markdown/src/language.rs`), Zed's JSON themes + theme picker, the
+todo panel above the composer, a Retry action on provider errors.
+
+**M2.5: Hermes turn-loop parity.** Direction (2026-10-31): match Hermes's behavior wherever a
+kept feature is involved; use Goose only as plumbing.
+
+Where things come from today:
+
+| Layer | Source | Plan |
+|---|---|---|
+| Tool definitions, descriptions, result shapes | Hermes | keep |
+| Tool implementations (terminal, files, patch, search, todo, clarify, processes) | written in Rust from Hermes's behavior | extend toward Hermes (lint after write, document reading, PTY, `notify` patterns) |
+| System prompt | Hermes | keep |
+| Message model, OpenAI wire format, streaming, provider retries | Goose | keep: it's the reliable plumbing |
+| Turn loop *mechanism* (state machine, cancellation, effects) | Goose `goose-agent` | keep as the skeleton |
+| Turn loop *behavior* | mostly Goose defaults today | **port Hermes's, one operation per behavior** |
+
+Hermes behaviors to port into operations (sources in `../hermes-agent/agent/`):
+1. `turn_tool_validation.py`: unknown tool names get auto-repair (closest real name) and a 3-strike
+   exit; malformed JSON arguments get one retry with the parse error. Today we only answer
+   "tool does not exist".
+2. `tool_guardrails.py` + `repetition_guard.py`: detect the agent repeating the same tool call or
+   text in a loop and intervene.
+3. `turn_truncation.py`: `finish_reason == "length"` recovery (continue, or stop on repetition).
+4. `turn_empty_response.py` + `empty_response_guard.py`: the thinking-only / empty answer
+   recovery ladder (Goose has a simpler version).
+5. `iteration_budget.py`: a 500-call budget shared with subagents, plus the one "grace call" that
+   asks for a summary when it runs out (instead of Goose's canned max-turns message).
+6. `turn_stop_gates.py`: the gates that keep a text answer from ending a task too early.
+7. `tool_executor.py`: per-tool result size caps, which tools may run concurrently, persisting
+   the tool-call turn before any side effect.
+8. `/steer` and interrupt-and-redirect (`STEER_*` prompt blocks already extracted).
+
 **M3: Memory and recall.** Memory store with Hermes semantics, frozen snapshot, threat scan,
 pending-write approvals, session search, memory editor screen.
 
