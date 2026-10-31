@@ -142,6 +142,47 @@ impl Runtime {
         context_length: Option<usize>,
         cwd: &Path,
     ) -> Result<SessionRecord> {
+        let prompt = self.system_prompt(&provider.id, model, context_length, cwd)?;
+        self.store.create_session(NewSession {
+            cwd: cwd.display().to_string().replace('\\', "/"),
+            provider: provider.id.clone(),
+            model: model.to_string(),
+            system_prompt: prompt,
+        })
+    }
+
+    /// Switches a session to another model. Like Hermes, this rebuilds the frozen system
+    /// prompt (model-family guidance differs), so the next request misses the prompt cache.
+    pub fn set_session_model(
+        &self,
+        session_id: &str,
+        model: &str,
+        context_length: Option<usize>,
+    ) -> Result<()> {
+        let open = self.open(session_id)?;
+        anyhow::ensure!(
+            open.running.lock().is_none(),
+            "the model can't change while a turn is running"
+        );
+        let (provider, cwd) = {
+            let record = open.record.lock();
+            (record.provider.clone(), PathBuf::from(&record.cwd))
+        };
+        let prompt = self.system_prompt(&provider, model, context_length, &cwd)?;
+        self.store.set_model(session_id, model, &prompt)?;
+        let mut record = open.record.lock();
+        record.model = model.to_string();
+        record.system_prompt = prompt;
+        Ok(())
+    }
+
+    fn system_prompt(
+        &self,
+        provider: &str,
+        model: &str,
+        context_length: Option<usize>,
+        cwd: &Path,
+    ) -> Result<String> {
         let home = dirs::home_dir().context("no home directory")?;
         let soul = std::fs::read_to_string(self.config.data_dir.join("SOUL.md")).ok();
         let tool_names = SessionTools::tool_names();
@@ -150,7 +191,7 @@ impl Runtime {
         let scratch_root = self.config.data_dir.join("scratch");
         let prompt = build_system_prompt(&SystemPromptInput {
             model,
-            provider: &provider.id,
+            provider,
             cwd,
             home: &home,
             scratch_dir: &scratch_root,
@@ -166,12 +207,7 @@ impl Runtime {
             context_length,
             now: chrono::Local::now(),
         });
-        self.store.create_session(NewSession {
-            cwd: cwd.display().to_string().replace('\\', "/"),
-            provider: provider.id.clone(),
-            model: model.to_string(),
-            system_prompt: prompt.full(),
-        })
+        Ok(prompt.full())
     }
 
     fn open(&self, session_id: &str) -> Result<Arc<OpenSession>> {

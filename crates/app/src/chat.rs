@@ -3,9 +3,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use std::time::Duration;
+
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, FollowMode, ListAlignment, ListState,
-    SharedString, Subscription, Task, Window, list, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, Context, Entity, FocusHandle, Focusable,
+    FollowMode, ListAlignment, ListState, SharedString, Subscription, Task, Window, list,
+    prelude::*, pulsating_between, px,
 };
 use hermes_agent::events::AgentEvent;
 use hermes_llm::conversation::Conversation;
@@ -17,9 +20,10 @@ use hermes_runtime::{
 use rmcp::model::Role;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use ui::{Callout, CommonAnimationExt, Disclosure, Divider, Tooltip, prelude::*};
+use ui::{Callout, CommonAnimationExt, Disclosure, Divider, PopoverMenu, Tooltip, prelude::*};
 
 use crate::backend::backend;
+use crate::model_picker::ModelPicker;
 use crate::state::AppState;
 use crate::text_area::{TextArea, TextAreaEvent};
 
@@ -66,16 +70,34 @@ pub struct ChatView {
 impl gpui::EventEmitter<ChatEvent> for ChatView {}
 
 impl ChatView {
-    pub fn new(session_id: String, model: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        session_id: String,
+        model: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let backend = backend(cx);
         let messages = backend.runtime.messages(&session_id).unwrap_or_default();
-        let totals = backend.runtime.store().usage_totals(&session_id).unwrap_or_default();
-        let composer = cx.new(|cx| TextArea::new("Message Hermes… (Enter to send, Shift+Enter for a new line)", cx));
-        let subscription = cx.subscribe_in(&composer, window, |this: &mut Self, _, event, window, cx| {
-            if let TextAreaEvent::Submit = event {
-                this.submit(window, cx);
-            }
+        let totals = backend
+            .runtime
+            .store()
+            .usage_totals(&session_id)
+            .unwrap_or_default();
+        let composer = cx.new(|cx| {
+            TextArea::new(
+                "Message Hermes… (Enter to send, Shift+Enter for a new line)",
+                cx,
+            )
         });
+        let subscription = cx.subscribe_in(
+            &composer,
+            window,
+            |this: &mut Self, _, event, window, cx| {
+                if let TextAreaEvent::Submit = event {
+                    this.submit(window, cx);
+                }
+            },
+        );
         let list_state = ListState::new(0, ListAlignment::Top, px(2000.));
         list_state.set_follow_mode(FollowMode::Tail);
         let mut this = Self {
@@ -145,7 +167,8 @@ impl ChatView {
         if text.is_empty() || self.running.is_some() {
             return;
         }
-        self.composer.update(cx, |composer, cx| composer.set_text("", cx));
+        self.composer
+            .update(cx, |composer, cx| composer.set_text("", cx));
         self.start_turn(text, window, cx);
     }
 
@@ -163,7 +186,9 @@ impl ChatView {
         let backend = backend(cx);
         let turn = {
             let _guard = backend.tokio.enter();
-            backend.runtime.start_turn(&self.session_id, &provider, context_length, &text)
+            backend
+                .runtime
+                .start_turn(&self.session_id, &provider, context_length, &text)
         };
         let mut turn = match turn {
             Ok(turn) => turn,
@@ -179,11 +204,41 @@ impl ChatView {
         self.turn_task = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = turn.events.recv().await {
                 let finished = matches!(event, RuntimeEvent::TurnFinished(_));
-                if this.update(cx, |this, cx| this.handle_event(event, cx)).is_err() || finished {
+                if this
+                    .update(cx, |this, cx| this.handle_event(event, cx))
+                    .is_err()
+                    || finished
+                {
                     break;
                 }
             }
         }));
+        cx.emit(ChatEvent::Updated);
+        cx.notify();
+    }
+
+    /// Switches this chat's model; it also becomes the default for new chats (Hermes's
+    /// composer picker is sticky the same way).
+    fn switch_model(&mut self, model: String, cx: &mut Context<Self>) {
+        let state = AppState::global(cx);
+        let context_length = state.read(cx).context_length(&model);
+        state.update(cx, |state, cx| {
+            state.config.model = Some(model.clone());
+            state.save(cx);
+        });
+        if model == self.model {
+            return;
+        }
+        match backend(cx)
+            .runtime
+            .set_session_model(&self.session_id, &model, context_length)
+        {
+            Ok(()) => {
+                self.model = model;
+                self.error = None;
+            }
+            Err(error) => self.error = Some(format!("{error:#}")),
+        }
         cx.emit(ChatEvent::Updated);
         cx.notify();
     }
@@ -236,17 +291,30 @@ impl ChatView {
         }
     }
 
-    pub fn show_clarify(&mut self, request: ClarifyRequest, reply: oneshot::Sender<ClarifyOutcome>, cx: &mut Context<Self>) {
+    pub fn show_clarify(
+        &mut self,
+        request: ClarifyRequest,
+        reply: oneshot::Sender<ClarifyOutcome>,
+        cx: &mut Context<Self>,
+    ) {
         let other = request
             .questions
             .iter()
             .map(|question| {
-                let placeholder = if question.choices.is_empty() { "Your answer" } else { "Other…" };
+                let placeholder = if question.choices.is_empty() {
+                    "Your answer"
+                } else {
+                    "Other…"
+                };
                 cx.new(|cx| TextArea::new(placeholder, cx))
             })
             .collect();
         self.clarify = Some(ClarifyForm {
-            selected: request.questions.iter().map(|q| vec![false; q.choices.len()]).collect(),
+            selected: request
+                .questions
+                .iter()
+                .map(|q| vec![false; q.choices.len()])
+                .collect(),
             questions: request.questions,
             other,
             reply: Some(reply),
@@ -255,8 +323,12 @@ impl ChatView {
     }
 
     fn answer_clarify(&mut self, submit: bool, cx: &mut Context<Self>) {
-        let Some(mut form) = self.clarify.take() else { return };
-        let Some(reply) = form.reply.take() else { return };
+        let Some(mut form) = self.clarify.take() else {
+            return;
+        };
+        let Some(reply) = form.reply.take() else {
+            return;
+        };
         if !submit {
             let _ = reply.send(ClarifyOutcome::Cancelled);
             cx.notify();
@@ -285,7 +357,9 @@ impl ChatView {
                         }
                         ClarifyResponse::Answered(ClarifyAnswer::Choices(all))
                     }
-                    (false, _, false) => ClarifyResponse::Answered(ClarifyAnswer::Text(picked[0].clone())),
+                    (false, _, false) => {
+                        ClarifyResponse::Answered(ClarifyAnswer::Text(picked[0].clone()))
+                    }
                 }
             })
             .collect();
@@ -294,11 +368,19 @@ impl ChatView {
     }
 
     /// A background process the agent started with notify=true finished: tell the agent.
-    pub fn process_finished(&mut self, notice: ProcessNotice, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn process_finished(
+        &mut self,
+        notice: ProcessNotice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let text = format!(
             "[Background process {} finished with exit code {}]\nCommand: {}\nLast output:\n{}",
             notice.process_id,
-            notice.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into()),
+            notice
+                .exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "unknown".into()),
             notice.command,
             notice.tail
         );
@@ -315,7 +397,9 @@ impl ChatView {
             .iter()
             .flat_map(|message| &message.content)
             .filter_map(|content| {
-                let MessageContent::ToolResponse(response) = content else { return None };
+                let MessageContent::ToolResponse(response) = content else {
+                    return None;
+                };
                 let (text, is_error) = match &response.tool_result {
                     Ok(result) => (
                         content.as_tool_response_text().unwrap_or_default(),
@@ -337,7 +421,12 @@ impl ChatView {
             Role::User => self.render_user_message(&message, cx),
             Role::Assistant => self.render_assistant_message(&message, index, cx),
         };
-        div().w_full().px_4().py_2().child(content).into_any_element()
+        div()
+            .w_full()
+            .px_4()
+            .py_2()
+            .child(content)
+            .into_any_element()
     }
 
     fn render_user_message(&self, message: &Message, cx: &Context<Self>) -> AnyElement {
@@ -361,18 +450,34 @@ impl ChatView {
             .into_any_element()
     }
 
-    fn render_assistant_message(&mut self, message: &Message, entry: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_assistant_message(
+        &mut self,
+        message: &Message,
+        entry: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let responses = self.tool_responses();
-        let responses: HashMap<String, (String, bool)> =
-            responses.into_iter().map(|(id, value)| (id.to_string(), value)).collect();
+        let responses: HashMap<String, (String, bool)> = responses
+            .into_iter()
+            .map(|(id, value)| (id.to_string(), value))
+            .collect();
         let mut blocks: Vec<AnyElement> = Vec::new();
+        // The block being streamed right now: last content of the last entry while running.
+        let streaming_chunk = (self.running.is_some() && entry + 1 == self.entries.len())
+            .then(|| message.content.len().saturating_sub(1));
         for (chunk, content) in message.content.iter().enumerate() {
             match content {
                 MessageContent::Text(text) if !text.text.trim().is_empty() => {
-                    blocks.push(div().w_full().child(text.text.trim().to_string()).into_any_element());
+                    blocks.push(
+                        div()
+                            .w_full()
+                            .child(text.text.trim().to_string())
+                            .into_any_element(),
+                    );
                 }
                 MessageContent::Thinking(thinking) if !thinking.thinking.trim().is_empty() => {
-                    blocks.push(self.render_thinking(entry, chunk, &thinking.thinking, cx));
+                    let active = streaming_chunk == Some(chunk);
+                    blocks.push(self.render_thinking(entry, chunk, &thinking.thinking, active, cx));
                 }
                 MessageContent::ToolRequest(request) => {
                     let response = responses.get(&request.id).cloned();
@@ -391,7 +496,11 @@ impl ChatView {
                 _ => {}
             }
         }
-        v_flex().w_full().gap_2().children(blocks).into_any_element()
+        v_flex()
+            .w_full()
+            .gap_2()
+            .children(blocks)
+            .into_any_element()
     }
 
     fn toggle(&mut self, key: String, cx: &mut Context<Self>) {
@@ -403,7 +512,14 @@ impl ChatView {
         cx.notify();
     }
 
-    fn render_thinking(&self, entry: usize, chunk: usize, text: &str, cx: &Context<Self>) -> AnyElement {
+    fn render_thinking(
+        &self,
+        entry: usize,
+        chunk: usize,
+        text: &str,
+        active: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let key = format!("thinking-{entry}-{chunk}");
         let open = self.expanded.contains(&key);
         let colors = cx.theme().colors();
@@ -415,10 +531,36 @@ impl ChatView {
                     .id(SharedString::from(format!("{key}-header")))
                     .gap_1p5()
                     .cursor_pointer()
-                    .child(Icon::new(IconName::ToolThink).size(IconSize::Small).color(Color::Muted))
-                    .child(Label::new("Thinking").size(LabelSize::Small).color(Color::Muted))
-                    .child(Disclosure::new(SharedString::from(format!("{key}-disclosure")), open))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle(toggle_key.clone(), cx))),
+                    .child(
+                        Icon::new(IconName::ToolThink)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(if active {
+                        Label::new("Thinking")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .with_animation(
+                                SharedString::from(format!("{key}-pulse")),
+                                Animation::new(Duration::from_secs(2))
+                                    .repeat()
+                                    .with_easing(pulsating_between(0.3, 1.0)),
+                                |label, delta| label.alpha(delta),
+                            )
+                            .into_any_element()
+                    } else {
+                        Label::new("Thinking")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .into_any_element()
+                    })
+                    .child(Disclosure::new(
+                        SharedString::from(format!("{key}-disclosure")),
+                        open,
+                    ))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.toggle(toggle_key.clone(), cx)),
+                    ),
             )
             .when(open, |this| {
                 this.child(
@@ -445,22 +587,37 @@ impl ChatView {
         let (name, args) = match &request.tool_call {
             Ok(call) => (
                 call.name.to_string(),
-                call.arguments.clone().map(serde_json::Value::Object).unwrap_or_default(),
+                call.arguments
+                    .clone()
+                    .map(serde_json::Value::Object)
+                    .unwrap_or_default(),
             ),
-            Err(error) => ("invalid tool call".to_string(), serde_json::json!({"error": error.message})),
+            Err(error) => (
+                "invalid tool call".to_string(),
+                serde_json::json!({"error": error.message}),
+            ),
         };
         let key = format!("tool-{}", request.id);
         let open = self.expanded.contains(&key);
         let toggle_key = key.clone();
         let status: AnyElement = match (&response, self.running.is_some()) {
-            (Some((_, true)), _) => Icon::new(IconName::XCircle).size(IconSize::Small).color(Color::Error).into_any_element(),
-            (Some(_), _) => Icon::new(IconName::Check).size(IconSize::Small).color(Color::Success).into_any_element(),
+            (Some((_, true)), _) => Icon::new(IconName::XCircle)
+                .size(IconSize::Small)
+                .color(Color::Error)
+                .into_any_element(),
+            (Some(_), _) => Icon::new(IconName::Check)
+                .size(IconSize::Small)
+                .color(Color::Success)
+                .into_any_element(),
             (None, true) => Icon::new(IconName::LoadCircle)
                 .size(IconSize::Small)
                 .color(Color::Accent)
                 .with_keyed_rotate_animation(SharedString::from(format!("{key}-spin")), 2)
                 .into_any_element(),
-            (None, false) => Icon::new(IconName::Stop).size(IconSize::Small).color(Color::Muted).into_any_element(),
+            (None, false) => Icon::new(IconName::Stop)
+                .size(IconSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
         };
         let summary = tool_summary(&name, &args);
         let mono = theme::theme_settings(cx).buffer_font(cx).clone();
@@ -481,8 +638,16 @@ impl ChatView {
                     .gap_2()
                     .cursor_pointer()
                     .hover(|style| style.bg(colors.ghost_element_hover))
-                    .child(Icon::new(tool_icon(&name)).size(IconSize::Small).color(Color::Muted))
-                    .child(Label::new(name.clone()).size(LabelSize::Small).color(Color::Default))
+                    .child(
+                        Icon::new(tool_icon(&name))
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(name.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Default),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -496,8 +661,13 @@ impl ChatView {
                             .child(summary),
                     )
                     .child(status)
-                    .child(Disclosure::new(SharedString::from(format!("{key}-disclosure")), open))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle(toggle_key.clone(), cx))),
+                    .child(Disclosure::new(
+                        SharedString::from(format!("{key}-disclosure")),
+                        open,
+                    ))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.toggle(toggle_key.clone(), cx)),
+                    ),
             )
             .when(open, |this| {
                 let args_text = serde_json::to_string_pretty(&args).unwrap_or_default();
@@ -511,9 +681,17 @@ impl ChatView {
                         .gap_2()
                         .font(mono)
                         .text_xs()
-                        .child(Label::new("Arguments").size(LabelSize::XSmall).color(Color::Muted))
+                        .child(
+                            Label::new("Arguments")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
                         .child(div().text_color(colors.text).child(clip(&args_text)))
-                        .child(Label::new("Result").size(LabelSize::XSmall).color(Color::Muted))
+                        .child(
+                            Label::new("Result")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
                         .child(div().text_color(colors.text).child(result)),
                 )
             })
@@ -526,7 +704,11 @@ impl ChatView {
         let questions = form.questions.iter().enumerate().map(|(q, question)| {
             let choices = question.choices.iter().enumerate().map(|(c, choice)| {
                 let selected = form.selected[q][c];
-                let label = if c == 0 { format!("{choice} (Recommended)") } else { choice.clone() };
+                let label = if c == 0 {
+                    format!("{choice} (Recommended)")
+                } else {
+                    choice.clone()
+                };
                 Button::new(SharedString::from(format!("clarify-{q}-{c}")), label)
                     .style(ButtonStyle::Outlined)
                     .toggle_state(selected)
@@ -577,15 +759,57 @@ impl ChatView {
                     h_flex()
                         .justify_end()
                         .gap_2()
-                        .child(Button::new("clarify-skip", "Skip").on_click(cx.listener(|this, _, _, cx| this.answer_clarify(false, cx))))
+                        .child(
+                            Button::new("clarify-skip", "Skip").on_click(
+                                cx.listener(|this, _, _, cx| this.answer_clarify(false, cx)),
+                            ),
+                        )
                         .child(
                             Button::new("clarify-submit", "Submit")
                                 .style(ButtonStyle::Filled)
-                                .on_click(cx.listener(|this, _, _, cx| this.answer_clarify(true, cx))),
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.answer_clarify(true, cx)),
+                                ),
                         ),
                 )
                 .into_any_element(),
         )
+    }
+
+    fn render_model_button(&self, cx: &Context<Self>) -> impl IntoElement {
+        let chat = cx.entity().downgrade();
+        let selected = self.model.clone();
+        let short = self
+            .model
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.model)
+            .to_string();
+        let running = self.running.is_some();
+        PopoverMenu::new("model-selector")
+            .menu(move |window, cx| {
+                let chat = chat.clone();
+                let on_select: crate::model_picker::OnSelect =
+                    std::rc::Rc::new(move |id, _, cx| {
+                        chat.update(cx, |chat, cx| chat.switch_model(id, cx)).ok();
+                    });
+                let selected = selected.clone();
+                Some(cx.new(|cx| {
+                    ModelPicker::new(Some(selected), px(320.), on_select, window, cx).in_popover()
+                }))
+            })
+            .trigger(
+                Button::new("model-button", short)
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .disabled(running)
+                    .end_icon(
+                        Icon::new(IconName::ChevronDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .anchor(gpui::Anchor::BottomLeft)
     }
 
     fn render_composer(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -604,7 +828,7 @@ impl ChatView {
             .child(
                 h_flex()
                     .justify_between()
-                    .child(Label::new(self.model.clone()).size(LabelSize::XSmall).color(Color::Muted))
+                    .child(self.render_model_button(cx))
                     .child(if running {
                         IconButton::new("stop", IconName::Stop)
                             .icon_color(Color::Error)
@@ -640,7 +864,8 @@ fn tool_summary(name: &str, args: &serde_json::Value) -> String {
     let summary = match name {
         "terminal" => field("command"),
         "read_file" | "write_file" | "patch" => field("path"),
-        "search_files" => field("pattern").map(|p| format!("{p}  in {}", field("path").unwrap_or_else(|| ".".into()))),
+        "search_files" => field("pattern")
+            .map(|p| format!("{p}  in {}", field("path").unwrap_or_else(|| ".".into()))),
         "process_manage" => Some(format!(
             "{} {}",
             field("action").unwrap_or_default(),
@@ -672,7 +897,12 @@ fn render_result(text: &str, cx: &App) -> AnyElement {
     for (key, value) in &map {
         match value {
             serde_json::Value::String(diff) if key == "diff" => {
-                lines.push(div().text_color(colors.text_muted).child("diff:").into_any_element());
+                lines.push(
+                    div()
+                        .text_color(colors.text_muted)
+                        .child("diff:")
+                        .into_any_element(),
+                );
                 for line in clip(diff).lines() {
                     let color = if line.starts_with('+') && !line.starts_with("+++") {
                         Some(colors.version_control_added)
@@ -681,7 +911,11 @@ fn render_result(text: &str, cx: &App) -> AnyElement {
                     } else {
                         None
                     };
-                    let row = div().child(if line.is_empty() { " ".to_string() } else { line.to_string() });
+                    let row = div().child(if line.is_empty() {
+                        " ".to_string()
+                    } else {
+                        line.to_string()
+                    });
                     lines.push(match color {
                         Some(color) => row.bg(color.opacity(0.2)).into_any_element(),
                         None => row.into_any_element(),
@@ -689,7 +923,12 @@ fn render_result(text: &str, cx: &App) -> AnyElement {
                 }
             }
             serde_json::Value::String(text) if text.contains('\n') => {
-                lines.push(div().text_color(colors.text_muted).child(format!("{key}:")).into_any_element());
+                lines.push(
+                    div()
+                        .text_color(colors.text_muted)
+                        .child(format!("{key}:"))
+                        .into_any_element(),
+                );
                 lines.push(div().child(clip(text)).into_any_element());
             }
             other => {
@@ -697,7 +936,11 @@ fn render_result(text: &str, cx: &App) -> AnyElement {
                     serde_json::Value::String(text) => text.clone(),
                     other => other.to_string(),
                 };
-                lines.push(div().child(format!("{key}: {}", clip(&shown))).into_any_element());
+                lines.push(
+                    div()
+                        .child(format!("{key}: {}", clip(&shown)))
+                        .into_any_element(),
+                );
             }
         }
     }
@@ -706,7 +949,11 @@ fn render_result(text: &str, cx: &App) -> AnyElement {
 
 fn clip(text: &str) -> String {
     if text.chars().count() > MAX_RESULT_CHARS {
-        format!("{}\n… ({} more characters)", text.chars().take(MAX_RESULT_CHARS).collect::<String>(), text.chars().count() - MAX_RESULT_CHARS)
+        format!(
+            "{}\n… ({} more characters)",
+            text.chars().take(MAX_RESULT_CHARS).collect::<String>(),
+            text.chars().count() - MAX_RESULT_CHARS
+        )
     } else {
         text.to_string()
     }
@@ -731,14 +978,21 @@ impl Render for ChatView {
                     .items_center()
                     .justify_center()
                     .gap_2()
-                    .child(Icon::new(IconName::Sparkle).size(IconSize::XLarge).color(Color::Accent))
+                    .child(
+                        Icon::new(IconName::Sparkle)
+                            .size(IconSize::XLarge)
+                            .color(Color::Accent),
+                    )
                     .child(Headline::new("What should we work on?").size(HeadlineSize::Small))
                     .into_any_element()
             } else {
-                list(self.list_state.clone(), cx.processor(|this, index: usize, _window, cx| this.render_entry(index, cx)))
-                    .flex_1()
-                    .size_full()
-                    .into_any_element()
+                list(
+                    self.list_state.clone(),
+                    cx.processor(|this, index: usize, _window, cx| this.render_entry(index, cx)),
+                )
+                .flex_1()
+                .size_full()
+                .into_any_element()
             })
             .when_some(self.error.clone(), |this, error| {
                 this.child(
@@ -755,4 +1009,3 @@ impl Render for ChatView {
             .child(self.render_composer(cx))
     }
 }
-

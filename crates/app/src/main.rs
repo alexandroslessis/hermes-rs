@@ -6,7 +6,9 @@ mod assets;
 mod backend;
 mod chat;
 mod config;
+mod model_picker;
 mod settings;
+mod sidebar;
 mod state;
 mod text_area;
 mod title_bar;
@@ -14,7 +16,10 @@ mod workspace;
 
 use std::sync::Arc;
 
-use gpui::{App, AppContext as _, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
+use gpui::{
+    App, AppContext as _, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, point,
+    px, size,
+};
 
 use crate::appearance::Appearance;
 use crate::assets::Assets;
@@ -24,7 +29,9 @@ use crate::workspace::{NewSession, OpenSettings, ToggleSidebar, Workspace};
 
 fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+        )
         .init();
     let (backend, requests) = match Backend::start() {
         Ok(started) => started,

@@ -108,14 +108,17 @@ pub fn store_api_key(provider_id: &str, key: &str) -> Result<()> {
 /// Reads a user environment variable from the registry too, so a variable set after the app
 /// started still works.
 fn env_var(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.is_empty()).or_else(|| {
-        windows_registry::CURRENT_USER
-            .open("Environment")
-            .ok()?
-            .get_string(name)
-            .ok()
-            .filter(|v| !v.is_empty())
-    })
+    std::env::var(name)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            windows_registry::CURRENT_USER
+                .open("Environment")
+                .ok()?
+                .get_string(name)
+                .ok()
+                .filter(|v| !v.is_empty())
+        })
 }
 
 pub fn api_key(provider: &ProviderSettings) -> Option<String> {

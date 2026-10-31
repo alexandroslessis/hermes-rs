@@ -398,3 +398,21 @@ async fn sessions_reopen_from_disk_with_their_todos() {
             .system_prompt
     );
 }
+
+#[tokio::test]
+async fn switching_models_rebuilds_the_frozen_prompt() {
+    let h = harness(vec![]).await;
+    let session = h
+        .runtime
+        .create_session(&h.provider, "anthropic/claude-x", None, h.work.path())
+        .unwrap();
+    assert!(!session.system_prompt.contains("# Tool-use enforcement"));
+
+    h.runtime
+        .set_session_model(&session.id, "openai/gpt-5", None)
+        .unwrap();
+    let record = h.runtime.store().session(&session.id).unwrap().unwrap();
+    assert_eq!(record.model, "openai/gpt-5");
+    assert!(record.system_prompt.contains("Model: openai/gpt-5"));
+    assert!(record.system_prompt.contains("# Tool-use enforcement"));
+}

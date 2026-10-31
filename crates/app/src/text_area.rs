@@ -12,8 +12,8 @@ use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ScrollEvent, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
-    WrappedLine, actions, div, fill, point, prelude::*, px, relative, size,
+    ScrollEvent, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine,
+    actions, div, fill, point, prelude::*, px, relative, size,
 };
 use theme::ActiveTheme;
 use unicode_segmentation::UnicodeSegmentation;
@@ -103,10 +103,7 @@ struct TextLayout {
 
 impl TextLayout {
     fn line_for_index(&self, index: usize) -> Option<&LayoutLine> {
-        self.lines
-            .iter()
-            .rev()
-            .find(|line| line.start <= index)
+        self.lines.iter().rev().find(|line| line.start <= index)
     }
 
     /// Top-left of the caret for `index`, in content coordinates.
@@ -135,7 +132,10 @@ impl TextLayout {
             position.x.max(px(0.)),
             (position.y - line.top).clamp(px(0.), line.height - px(1.)),
         );
-        let index = match line.wrapped.closest_index_for_position(local, self.line_height) {
+        let index = match line
+            .wrapped
+            .closest_index_for_position(local, self.line_height)
+        {
             Ok(index) | Err(index) => index,
         };
         line.start + index.min(line.wrapped.len())
@@ -240,7 +240,13 @@ impl TextArea {
         cx.notify();
     }
 
-    fn replace(&mut self, range: Range<usize>, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn replace(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let range = self.clamp(range.start)..self.clamp(range.end.max(range.start));
         self.content.replace_range(range.clone(), text);
         let end = range.start + text.len();
@@ -285,11 +291,17 @@ impl TextArea {
     }
 
     fn line_start(&self, offset: usize) -> usize {
-        self.content[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0)
+        self.content[..offset]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0)
     }
 
     fn line_end(&self, offset: usize) -> usize {
-        self.content[offset..].find('\n').map(|i| offset + i).unwrap_or(self.content.len())
+        self.content[offset..]
+            .find('\n')
+            .map(|i| offset + i)
+            .unwrap_or(self.content.len())
     }
 
     /// The offset one visual row above or below the cursor.
@@ -365,11 +377,21 @@ impl TextArea {
         self.select_to(target, window, cx);
     }
 
-    fn select_word_left(&mut self, _: &SelectWordLeft, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_word_left(
+        &mut self,
+        _: &SelectWordLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.select_to(self.previous_word(self.cursor_offset()), window, cx);
     }
 
-    fn select_word_right(&mut self, _: &SelectWordRight, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_word_right(
+        &mut self,
+        _: &SelectWordRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.select_to(self.next_word(self.cursor_offset()), window, cx);
     }
 
@@ -406,7 +428,12 @@ impl TextArea {
         self.replace(self.selected_range.clone(), "", window, cx);
     }
 
-    fn delete_word_left(&mut self, _: &DeleteWordLeft, window: &mut Window, cx: &mut Context<Self>) {
+    fn delete_word_left(
+        &mut self,
+        _: &DeleteWordLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.selected_range.is_empty() {
             let start = self.previous_word(self.cursor_offset());
             self.selected_range = start..self.cursor_offset();
@@ -458,11 +485,19 @@ impl TextArea {
         let Some(bounds) = self.last_bounds else {
             return 0;
         };
-        let local = point(position.x - bounds.left(), position.y - bounds.top() + self.scroll_top);
+        let local = point(
+            position.x - bounds.left(),
+            position.y - bounds.top() + self.scroll_top,
+        );
         self.clamp(self.layout.borrow().index_for_position(local))
     }
 
-    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.is_selecting = true;
         self.goal_x = None;
         let index = self.index_for_mouse_position(event.position);
@@ -482,7 +517,12 @@ impl TextArea {
         self.is_selecting = false;
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_selecting {
             self.select_to(self.index_for_mouse_position(event.position), window, cx);
         }
@@ -513,7 +553,9 @@ impl TextArea {
     }
 
     fn offset_to_utf16(&self, offset: usize) -> usize {
-        self.content[..offset.min(self.content.len())].encode_utf16().count()
+        self.content[..offset.min(self.content.len())]
+            .encode_utf16()
+            .count()
     }
 
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
@@ -538,14 +580,24 @@ impl EntityInputHandler for TextArea {
         Some(self.content[range].to_string())
     }
 
-    fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<UTF16Selection> {
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
             range: self.range_to_utf16(&self.selected_range),
             reversed: self.selection_reversed,
         })
     }
 
-    fn set_selected_text_range(&mut self, range_utf16: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+    fn set_selected_text_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.selected_range = self.range_from_utf16(&range_utf16);
         self.selection_reversed = false;
         window.notify_text_selection_changed(&self.focus_handle);
@@ -557,7 +609,9 @@ impl EntityInputHandler for TextArea {
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked_range.as_ref().map(|range| self.range_to_utf16(range))
+        self.marked_range
+            .as_ref()
+            .map(|range| self.range_to_utf16(range))
     }
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -597,13 +651,15 @@ impl EntityInputHandler for TextArea {
             .unwrap_or(self.selected_range.clone());
         let range = self.clamp(range.start)..self.clamp(range.end.max(range.start));
         self.content.replace_range(range.clone(), new_text);
-        self.marked_range = (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
+        self.marked_range =
+            (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
         let start_utf16 = self.offset_to_utf16(range.start);
         let inserted_utf16 = new_text.encode_utf16().count();
         self.selected_range = new_selected_range_utf16
             .map(|selected| {
                 self.range_from_utf16(
-                    &(start_utf16 + selected.start.min(inserted_utf16)..start_utf16 + selected.end.min(inserted_utf16)),
+                    &(start_utf16 + selected.start.min(inserted_utf16)
+                        ..start_utf16 + selected.end.min(inserted_utf16)),
                 )
             })
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
@@ -631,7 +687,12 @@ impl EntityInputHandler for TextArea {
         ))
     }
 
-    fn character_index_for_point(&mut self, point: Point<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
         let index = self.index_for_mouse_position(point);
         Some(self.offset_to_utf16(index))
     }
@@ -657,7 +718,10 @@ impl IntoElement for TextAreaElement {
 fn runs_for(text_len: usize, marked: Option<&Range<usize>>, run: TextRun) -> Vec<TextRun> {
     match marked {
         Some(marked) => [
-            TextRun { len: marked.start, ..run.clone() },
+            TextRun {
+                len: marked.start,
+                ..run.clone()
+            },
             TextRun {
                 len: marked.end - marked.start,
                 underline: Some(UnderlineStyle {
@@ -667,7 +731,10 @@ fn runs_for(text_len: usize, marked: Option<&Range<usize>>, run: TextRun) -> Vec
                 }),
                 ..run.clone()
             },
-            TextRun { len: text_len - marked.end, ..run },
+            TextRun {
+                len: text_len - marked.end,
+                ..run
+            },
         ]
         .into_iter()
         .filter(|run| run.len > 0)
@@ -700,7 +767,10 @@ impl Element for TextAreaElement {
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
         let (text, color): (SharedString, _) = if input.content.is_empty() {
-            (input.placeholder.clone(), cx.theme().colors().text_placeholder)
+            (
+                input.placeholder.clone(),
+                cx.theme().colors().text_placeholder,
+            )
         } else {
             (input.content.clone().into(), style.color)
         };
@@ -722,34 +792,40 @@ impl Element for TextAreaElement {
         let mut layout_style = Style::default();
         layout_style.size.width = relative(1.).into();
 
-        let layout_id = window.request_measured_layout(layout_style, move |known, available, window, _cx| {
-            let width = known.width.or(match available.width {
-                gpui::AvailableSpace::Definite(width) => Some(width),
-                _ => None,
+        let layout_id =
+            window.request_measured_layout(layout_style, move |known, available, window, _cx| {
+                let width = known.width.or(match available.width {
+                    gpui::AvailableSpace::Definite(width) => Some(width),
+                    _ => None,
+                });
+                let lines = window
+                    .text_system()
+                    .shape_text(text.clone(), font_size, &runs, width, None)
+                    .unwrap_or_default();
+                let mut layout = TextLayout {
+                    lines: Vec::new(),
+                    line_height,
+                    content_height: px(0.),
+                };
+                let mut start = 0;
+                let mut top = px(0.);
+                for wrapped in lines {
+                    let height = wrapped.size(line_height).height.max(line_height);
+                    let len = wrapped.len();
+                    layout.lines.push(LayoutLine {
+                        wrapped,
+                        start,
+                        top,
+                        height,
+                    });
+                    start += len + 1;
+                    top += height;
+                }
+                layout.content_height = top.max(line_height);
+                let height = layout.content_height.min(max_height);
+                *shared.borrow_mut() = layout;
+                size(width.unwrap_or(px(0.)), height)
             });
-            let lines = window
-                .text_system()
-                .shape_text(text.clone(), font_size, &runs, width, None)
-                .unwrap_or_default();
-            let mut layout = TextLayout {
-                lines: Vec::new(),
-                line_height,
-                content_height: px(0.),
-            };
-            let mut start = 0;
-            let mut top = px(0.);
-            for wrapped in lines {
-                let height = wrapped.size(line_height).height.max(line_height);
-                let len = wrapped.len();
-                layout.lines.push(LayoutLine { wrapped, start, top, height });
-                start += len + 1;
-                top += height;
-            }
-            layout.content_height = top.max(line_height);
-            let height = layout.content_height.min(max_height);
-            *shared.borrow_mut() = layout;
-            size(width.unwrap_or(px(0.)), height)
-        });
         (layout_id, ())
     }
 
@@ -777,7 +853,12 @@ impl Element for TextAreaElement {
             let max_scroll = (layout.borrow().content_height - visible).max(px(0.));
             input.scroll_top = input.scroll_top.clamp(px(0.), max_scroll);
             input.last_bounds = Some(bounds);
-            (input.cursor_offset(), input.selected_range.clone(), layout, input.scroll_top)
+            (
+                input.cursor_offset(),
+                input.selected_range.clone(),
+                layout,
+                input.scroll_top,
+            )
         });
         let layout = layout.borrow();
         let origin = point(bounds.left(), bounds.top() - scroll_top);
@@ -790,7 +871,11 @@ impl Element for TextAreaElement {
             let mut row_top = start.y;
             while row_top <= end.y {
                 let left = if row_top == start.y { start.x } else { px(0.) };
-                let right = if row_top == end.y { end.x } else { bounds.size.width };
+                let right = if row_top == end.y {
+                    end.x
+                } else {
+                    bounds.size.width
+                };
                 if right > left {
                     selections.push(fill(
                         Bounds::from_corners(
@@ -828,7 +913,11 @@ impl Element for TextAreaElement {
         let focus_handle = input.focus_handle.clone();
         let layout = input.layout.clone();
         let scroll_top = input.scroll_top;
-        window.handle_input(&focus_handle, ElementInputHandler::new(bounds, self.input.clone()), cx);
+        window.handle_input(
+            &focus_handle,
+            ElementInputHandler::new(bounds, self.input.clone()),
+            cx,
+        );
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for selection in prepaint.selections.drain(..) {
                 window.paint_quad(selection);
@@ -836,7 +925,14 @@ impl Element for TextAreaElement {
             let layout = layout.borrow();
             for line in &layout.lines {
                 let origin = point(bounds.left(), bounds.top() - scroll_top + line.top);
-                let _ = line.wrapped.paint(origin, layout.line_height, gpui::TextAlign::Left, None, window, cx);
+                let _ = line.wrapped.paint(
+                    origin,
+                    layout.line_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
             }
             if focus_handle.is_focused(window) {
                 if let Some(cursor) = prepaint.cursor.take() {
@@ -894,4 +990,3 @@ impl Focusable for TextArea {
         self.focus_handle.clone()
     }
 }
-

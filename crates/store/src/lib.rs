@@ -191,6 +191,15 @@ impl Store {
         Ok(())
     }
 
+    /// Switching models rebuilds the frozen prompt too; see `Runtime::set_session_model`.
+    pub fn set_model(&self, id: &str, model: &str, system_prompt: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE sessions SET model = ?2, system_prompt = ?3, updated_at = ?4 WHERE id = ?1",
+            params![id, model, system_prompt, now_ms()],
+        )?;
+        Ok(())
+    }
+
     /// Only compaction may rewrite the frozen system prompt (the prompt-cache invariant).
     pub fn set_system_prompt(&self, id: &str, system_prompt: &str) -> Result<()> {
         self.conn.lock().execute(

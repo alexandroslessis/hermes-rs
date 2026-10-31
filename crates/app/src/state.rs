@@ -60,7 +60,8 @@ impl AppState {
     }
 
     pub fn context_length(&self, model: &str) -> Option<usize> {
-        self.model_info(model).and_then(|model| model.context_length)
+        self.model_info(model)
+            .and_then(|model| model.context_length)
     }
 
     pub fn save(&mut self, cx: &mut Context<Self>) {

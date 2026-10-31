@@ -34,12 +34,16 @@ impl TitleBar {
     }
 
     pub fn left(mut self, element: impl IntoElement) -> Self {
-        self.left.push(element.into_any_element());
+        // occlude: without it the drag area below swallows the click (Windows treats it as caption).
+        self.left
+            .push(div().occlude().child(element).into_any_element());
         self
     }
 
     pub fn right(mut self, element: impl IntoElement) -> Self {
-        self.right.push(element.into_any_element());
+        // occlude: without it the drag area below swallows the click (Windows treats it as caption).
+        self.right
+            .push(div().occlude().child(element).into_any_element());
         self
     }
 }
@@ -143,7 +147,12 @@ impl RenderOnce for CaptionButton {
                     a: 1.0,
                 }
                 .into();
-                (color, gpui::white(), color.opacity(0.8), gpui::white().opacity(0.8))
+                (
+                    color,
+                    gpui::white(),
+                    color.opacity(0.8),
+                    gpui::white().opacity(0.8),
+                )
             }
             _ => (
                 cx.theme().colors().ghost_element_hover,
