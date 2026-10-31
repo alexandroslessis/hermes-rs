@@ -1,0 +1,61 @@
+[package]
+name = "gpui_platform"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/gpui_platform.rs"
+doctest = false
+
+[features]
+default = ["multithreaded"]
+# Threads in the browser: needs a nightly toolchain and a cross-origin-isolated
+# page. Off, gpui_web builds on stable.
+multithreaded = []
+bench-support = ["gpui/bench-support"]
+font-kit = []
+inspector = ["gpui/inspector"]
+test-support = ["gpui/test-support", "gpui_windows/test-support"]
+screen-capture = ["gpui/screen-capture", "gpui_windows/screen-capture"]
+runtime_shaders = []
+wayland = []
+x11 = []
+
+[[bench]]
+name = "atlas_upload"
+harness = false
+required-features = ["bench-support"]
+
+[[bench]]
+name = "focus_cleanup"
+path = "../gpui/benches/focus_cleanup.rs"
+harness = false
+required-features = ["bench-support"]
+
+[[bench]]
+name = "inspector_render"
+harness = false
+required-features = ["bench-support"]
+
+[[bench]]
+name = "randomized_element_tree"
+harness = false
+required-features = ["bench-support"]
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+
+[dev-dependencies]
+bench_metrics.workspace = true
+criterion.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_windows.workspace = true
+gpui = { workspace = true, features = ["windows-manifest"] }
+

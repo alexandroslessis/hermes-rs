@@ -1,0 +1,1 @@
+- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml.

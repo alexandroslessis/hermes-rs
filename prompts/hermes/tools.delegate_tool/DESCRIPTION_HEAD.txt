@@ -1,0 +1,15 @@
+Spawn isolated subagents for parallel or context-heavy work. Each gets its own conversation, terminal session, and toolset, and only its final summary returns to you. Pass every task in `tasks` — one entry spawns one subagent, several run in parallel (limit in the tasks description).
+
+Sessions without a later-result consumer (including one-shot CLI and cron) join parallel children and return results in this tool call. Otherwise runs in the background: dispatch returns live transcript paths and results re-enter as a new message when subagents finish ({delivery}). Background results are delivered only BETWEEN your turns: finish whatever does not depend on them, then give a one-line status and END YOUR TURN. Never wait or poll on transcripts, artifact files, or CI for a child. While children run, `action` (list/steer/stop) controls them live.
+
+USE FOR: reasoning-heavy subtasks, work that would flood your context, or independent parallel workstreams.
+DO NOT USE FOR (use these instead):
+- Mechanical multi-step work with no reasoning needed -> execute_code
+- A single tool call -> call the tool directly
+- Tasks needing user interaction -> subagents cannot ask questions
+- Durable work that must survive this session -> cronjob or terminal(background=True, notify=True); /stop, /new, or process exit halts running subagents (whole tree); each returns an 'interrupted' completion with partial output.
+
+RULES:
+- Children know nothing of this conversation: pass everything needed via 'context', including any required output language, tone, or style (e.g. "respond in Chinese").
+- Child summaries are SELF-REPORTS, not verified facts: a child claiming "uploaded successfully" or "file written" may be wrong. For external side effects (uploads, remote writes, publishing), require a verifiable handle (URL, ID, absolute path) and verify it yourself before telling the user the operation succeeded.
+- Children cannot close tracked work: a child asked to close it returns findings instead; the parent applies the transition.

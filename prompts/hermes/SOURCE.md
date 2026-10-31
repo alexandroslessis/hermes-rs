@@ -1,0 +1,84 @@
+Extracted by `scripts/extract_hermes_prompts.py` from https://github.com/NousResearch/hermes-agent at commit `c419cf7c864ac0ee511dbd9f7091a8bba0b567ee`. MIT License, (c) 2025 Nous Research (see `licenses/MIT-hermes-agent.txt`).
+
+Skipped constants (not statically evaluable):
+
+- `agent/prompt_builder.py:_EXECUTION_GUIDANCE_LINE_TOOLS (Set)`
+- `agent/prompt_builder.py:_REMOTE_TERMINAL_BACKENDS (Call)`
+- `agent/prompt_builder.py:_BACKEND_IMAGE_KEYS (DictComp)`
+- `agent/prompt_builder.py:_SKILLS_PROMPT_CACHE (Call)`
+- `agent/prompt_builder.py:_SKILLS_PROMPT_CACHE_LOCK (Call)`
+- `agent/prompt_builder.py:_CONTEXT_FILE_CANDIDATES (unknown name _hermes_md_candidates)`
+- `agent/background_review.py:_PROMPT_NAME_BY_SCOPE (TypeError("cannot use 'list' as a dict key (unhashable type: 'list')"))`
+- `agent/curator.py:_REPORT_SECTIONS (unknown name _consolidated_lines)`
+- `agent/context_compressor.py:_SUMMARY_ROUTE_PIN (Call)`
+- `agent/context_compressor.py:_SUMMARY_REFUSAL_PREFIX_RE (Call)`
+- `agent/context_compressor.py:_SKILL_PRUNED_MARKER_RE (Call)`
+- `agent/context_compressor.py:_ANCHOR_PATTERNS (Call)`
+- `agent/context_compressor.py:_ANCHOR_NOISE (Call)`
+- `agent/context_compressor.py:_PATH_MENTION_RE (Call)`
+- `agent/context_compressor.py:_MEDIA_DIRECTIVE_RE (Call)`
+- `agent/context_compressor.py:_HISTORICAL_TASK_SECTION_RE (Call)`
+- `agent/context_compressor.py:_GATEWAY_REPLY_POINTER_RE (Call)`
+- `agent/context_compressor.py:_IMAGE_PART_TYPES (Call)`
+- `agent/context_compressor.py:_CLARIFY_HEADLESS_NOTICE (Call)`
+- `agent/context_compressor.py:_TOOL_RESULT_SUMMARIZERS (unknown name _sum_terminal)`
+- `agent/title_generator.py:_UPGRADE_THREADS (Call)`
+- `agent/title_generator.py:_ATTACHMENT_REF_RE (Call)`
+- `agent/title_generator.py:_CONTEXT_FOOTER_RE (Call)`
+- `agent/title_generator.py:_EXAMPLE_ECHO_REJECT (BinOp)`
+- `agent/title_generator.py:_TITLE_PROMPT_TEMPLATE (GeneratorExp)`
+- `agent/title_generator.py:_CONTROL_WRAPPERS (Call)`
+- `agent/title_generator.py:_CONTEXT_REFERENCE_TOKEN_RE (Call)`
+- `tools/memory_tool.py:_STORE_ACTIONS (Lambda)`
+- `tools/memory_tool.py:_SINGLE_TARGET_TEXT (TypeError("cannot use 'list' as a dict key (unhashable type: 'list')"))`
+- `tools/memory_tool_store.py:FAILURE_CLASS (Call)`
+- `tools/memory_tool_store.py:_MATCH_FOLD (Call)`
+- `tools/skill_manager_tool.py:HERMES_HOME (Call)`
+- `tools/skill_manager_tool.py:SKILLS_DIR (BinOp)`
+- `tools/skill_manager_tool.py:_SKILLS_DIR_AT_IMPORT (unknown name SKILLS_DIR)`
+- `tools/skill_manager_tool.py:VALID_NAME_RE (Call)`
+- `tools/skill_manager_tool.py:ALLOWED_SUBDIRS (Set)`
+- `tools/skill_manager_tool.py:_FRONTMATTER_END_RE (Call)`
+- `tools/skill_manager_tool.py:_ACTION_HANDLERS (Lambda)`
+- `tools/skills_tool.py:HERMES_HOME (Call)`
+- `tools/skills_tool.py:SKILLS_DIR (BinOp)`
+- `tools/skills_tool.py:_SKILLS_DIR_AT_IMPORT (unknown name SKILLS_DIR)`
+- `tools/session_search_tool.py:_RELATIVE_BOUND_RE (Call)`
+- `tools/session_search_tool.py:_FRESH_RESET_END_REASONS (unknown name _BOUNDARY_END_REASONS)`
+- `tools/todo_tool.py:VALID_STATUSES (Set)`
+- `tools/todo_tool.py:_ACTIVE_STATUSES (Set)`
+- `tools/todo_tool.py:TODO_TOOL_NAMES (Call)`
+- `tools/process_registry.py:_IS_WINDOWS (Call)`
+- `tools/process_registry.py:_IS_LINUX (Call)`
+- `tools/process_registry.py:CHECKPOINT_PATH (BinOp)`
+- `tools/process_registry.py:_CHECKPOINT_PATH_AT_IMPORT (unknown name CHECKPOINT_PATH)`
+- `tools/process_registry.py:_FINAL_DRAIN_MAX_CHARS (BinOp)`
+- `tools/process_registry.py:_SYSTEMD_SCOPE_PROBE_LOCK (Call)`
+- `tools/process_registry.py:_MIN_WORKER_MEMORY_MAX_BYTES (BinOp)`
+- `tools/process_registry.py:_DEFAULT_WORKER_MEMORY_MAX_BYTES (BinOp)`
+- `tools/process_registry.py:_WORKER_MEMORY_MAX_CAP_BYTES (BinOp)`
+- `tools/process_registry.py:_CHECKPOINT_FIELDS (GeneratorExp)`
+- `tools/process_registry.py:_CHECKPOINT_DEFAULTS (DictComp)`
+- `tools/process_registry.py:_SESSION_ACTIONS (Lambda)`
+- `tools/file_tools.py:_EXPECTED_WRITE_ERRNOS (Set)`
+- `tools/file_tools.py:_BLOCKED_DEVICE_PATHS (Call)`
+- `tools/file_tools.py:_V4A_SINGLE_HEADER_RE (Call)`
+- `tools/file_tools.py:_V4A_MOVE_HEADER_RE (Call)`
+- `tools/file_tools.py:_SPECIAL_FILE_KINDS (Attribute)`
+- `tools/web_tools.py:_BUILTIN_AVAILABILITY (Lambda)`
+- `tools/web_tools.py:_LEGACY_WEB_BACKENDS (Call)`
+- `tools/web_tools.py:_WEB_CHECK_SKIP (Call)`
+- `tools/vision_tools.py:_VISION_DOWNLOAD_TIMEOUT (unknown name float)`
+- `tools/vision_tools.py:_VISION_MAX_DOWNLOAD_BYTES (BinOp)`
+- `tools/vision_tools.py:_VISION_CPU_WORKERS (unknown name int)`
+- `tools/vision_tools.py:_MAX_BASE64_BYTES (BinOp)`
+- `tools/vision_tools.py:_RESIZE_TARGET_BYTES (BinOp)`
+- `tools/vision_tools.py:_TOOL_RESULT_MEDIA_PROVIDERS (Call)`
+- `tools/vision_tools.py:_GEMINI_PROVIDERS (Call)`
+- `tools/vision_tools.py:_VIDEO_ERROR_RULES (Subscript)`
+- `tools/vision_tools.py:_ANALYSIS_KINDS (unknown name _VIDEO_ERROR_RULES)`
+- `tools/vision_tools.py:_MAX_VIDEO_BASE64_BYTES (BinOp)`
+- `tools/vision_tools.py:_VIDEO_SIZE_WARN_BYTES (BinOp)`
+- `tools/delegate_tool.py:_ROLES (Call)`
+- `tools/delegate_tool.py:_LIVE_CONTROL_PARAMS (Call)`
+- `tools/delegate_tool.py:_MODEL_HIDDEN_TASK_FIELDS (Set)`

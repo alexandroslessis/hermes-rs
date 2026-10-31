@@ -1,0 +1,1 @@
+cron children are dispatched as direct external subprocesses without restart-safe cgroup isolation (killed if the gateway restarts mid-job). Set cron.require_restart_safe_scope=true in config.yaml to fail closed instead.

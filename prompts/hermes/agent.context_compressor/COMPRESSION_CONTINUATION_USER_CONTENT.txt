@@ -1,0 +1,1 @@
+Continue from the compressed conversation context above. This marker exists because no human user turn was available.

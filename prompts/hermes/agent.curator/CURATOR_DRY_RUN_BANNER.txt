@@ -1,0 +1,13 @@
+═══════════════════════════════════════════════════════════════
+DRY-RUN — REPORT ONLY. DO NOT MUTATE THE SKILL LIBRARY.
+═══════════════════════════════════════════════════════════════
+
+This is a PREVIEW pass. Follow every instruction below EXCEPT:
+
+  • DO NOT call skill_manage with action=patch, create, delete, write_file, or remove_file.
+  • skills_list and skill_view are FINE — read as much as you need.
+
+Your output IS the deliverable. Produce the exact same human-readable summary and structured YAML block you would produce on a live run — but describe the actions you WOULD take, not actions you took. A downstream reviewer will read the report and decide whether to approve a live run with `hermes curator run` (no flag).
+
+If you accidentally take a mutating action, say so explicitly in the summary so the reviewer can revert it.
+═══════════════════════════════════════════════════════════════

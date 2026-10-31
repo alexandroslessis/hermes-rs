@@ -1,0 +1,52 @@
+[package]
+name = "hermes_llm"
+version = "0.1.0"
+edition = "2021"
+publish.workspace = true
+license.workspace = true
+description = "LLM provider layer: message model, OpenAI-compatible client, model metadata (adapted from goose-provider-types and goose-providers)"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+chrono.workspace = true
+futures.workspace = true
+once_cell.workspace = true
+rand = "0.10.1"
+regex = { workspace = true, features = ["unicode"] }
+reqwest.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+unicode-normalization.workspace = true
+url.workspace = true
+urlencoding.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+zstd.workspace = true
+
+[build-dependencies]
+zstd.workspace = true
+
+[dev-dependencies]
+env-lock = "1"
+flate2 = "1.1.9"
+http.workspace = true
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+reqwest = { workspace = true, features = ["gzip"] }
+tempfile = "3.10.1"
+test-case = "3"
+tokio = { workspace = true, features = ["test-util", "net"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
+wiremock = "0.6"
+rmcp.workspace = true

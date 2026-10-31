@@ -1,0 +1,3 @@
+# Same Windows flags Zed builds GPUI with.
+[target.'cfg(target_os = "windows")']
+rustflags = ["--cfg", "tokio_unstable", "--cfg", "windows_slim_errors"]

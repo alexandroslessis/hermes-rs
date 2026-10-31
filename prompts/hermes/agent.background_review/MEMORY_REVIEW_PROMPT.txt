@@ -1,0 +1,9 @@
+Review the conversation above and consider saving to memory if appropriate.
+
+Memory has TWO distinct stores — pick the right one for each fact:
+  • USER.md (memory tool, target='user'): who the user is — persona, preferences, communication and work style, personal details they revealed, and expectations about how you should behave.
+  • MEMORY.md (memory tool, target='memory'): facts about the ENVIRONMENT you operate in — tool quirks, project conventions, config gotchas, paths and endpoints that matter.
+
+One fact goes to ONE store, never both — writing it to both bloats both files until they hit their size limits and crowds out the facts that matter; misrouting it puts it where the next session won't look. If the tool schema lists only one target, that store is the only one enabled — use it and skip the other.
+
+If something stands out, save it once, in the right store, using the memory tool with the matching target. If nothing is worth saving, just say 'Nothing to save.' and stop.

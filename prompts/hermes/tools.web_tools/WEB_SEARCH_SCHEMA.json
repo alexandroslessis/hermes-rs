@@ -1,0 +1,23 @@
+{
+  "name": "web_search",
+  "description": "Search the web: returns titles, URLs and snippets (5 by default). Read pages with web_extract. The query is passed through to the configured backend, so operators such as site:domain, filetype:pdf, intitle:word, -term, and \"exact phrase\" may work when the backend supports them.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "The search query to look up on the web. You may include backend-supported operators such as site:example.com, filetype:pdf, intitle:word, -term, or \"exact phrase\"."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of results to return. Defaults to 5.",
+        "minimum": 1,
+        "maximum": 100,
+        "default": 5
+      }
+    },
+    "required": [
+      "query"
+    ]
+  }
+}

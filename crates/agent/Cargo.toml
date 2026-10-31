@@ -1,0 +1,32 @@
+[package]
+name = "hermes_agent"
+version = "0.1.0"
+edition = "2021"
+publish.workspace = true
+license.workspace = true
+description = "Agent state machine, operations, skills discovery and compaction (adapted from goose-agent and goose-context-management)"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+hermes_llm.workspace = true
+include_dir.workspace = true
+minijinja.workspace = true
+regex = { workspace = true, features = ["unicode-perl"] }
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml = "0.9.32"
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-futures.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+schemars.workspace = true
+tempfile = "3.10.1"

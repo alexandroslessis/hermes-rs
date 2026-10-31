@@ -1,0 +1,1 @@
+To drop text inside an entry, patch a longer span that contains it; 'remove' deletes the whole entry.

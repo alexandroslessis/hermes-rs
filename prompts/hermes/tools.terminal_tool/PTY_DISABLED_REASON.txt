@@ -1,0 +1,1 @@
+PTY disabled for this command because it expects piped stdin/EOF (for example gh auth login --with-token). For local background processes, call process(action='close') after writing so it receives EOF.

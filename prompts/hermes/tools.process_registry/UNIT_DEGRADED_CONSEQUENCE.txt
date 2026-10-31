@@ -1,0 +1,1 @@
+workers are spawned unmanaged inside this systemd unit's cgroup and will be KILLED when the unit exits (Type=oneshot dispatch timers lose every worker within a second). Give the unit's user a session bus (`loginctl enable-linger <user>`) so workers get their own scope, or set KillMode=process on the unit.

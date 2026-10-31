@@ -1,0 +1,64 @@
+{
+  "name": "delegate_task",
+  "description": "Spawn one or more subagents in isolated contexts. Description is rebuilt at every get_definitions() call to reflect the user's current delegation limits.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "tasks": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "properties": {
+            "goal": {
+              "type": "string",
+              "description": "What this subagent should accomplish. Be specific and self-contained — it knows nothing about your conversation history."
+            },
+            "context": {
+              "type": "string",
+              "description": "Background THIS child needs: file paths, error messages, constraints. Each child sees only its own context — repeat shared background in every task that needs it."
+            },
+            "output_schema": {
+              "type": "object",
+              "description": "Optional JSON Schema this child's final answer must validate against (told to the child up front; parent validates with one bounded correction retry; result gains schema_valid, plus schema_errors on failure — the child's raw text is still returned as summary, never discarded). Keep it forgiving — require only fields you will read."
+            },
+            "images": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Optional images this child must SEE (max 8): local file paths or http(s) URLs — e.g. a screenshot the user sent, a design mock, a chart. Vision-capable children receive the pixels on their first turn; non-vision children get path hints for vision_analyze. Text files do NOT belong here — put paths in 'context' instead."
+            },
+            "group": {
+              "type": "string",
+              "description": "Optional result-delivery bucket within this call (only when delegation.independent_completions is enabled; otherwise the whole call returns as one message). Tasks sharing a group return together in ONE message; ungrouped tasks return individually as each finishes. This does not order execution; if B needs A's output, dispatch B after A returns."
+            }
+          },
+          "required": [
+            "goal"
+          ]
+        },
+        "description": "(rebuilt at get_definitions() time)"
+      },
+      "action": {
+        "type": "string",
+        "enum": [
+          "spawn",
+          "list",
+          "steer",
+          "stop"
+        ],
+        "description": "Default 'spawn'. Live control of running children: 'list' = ids/goals/status/transcripts; 'steer' = queue course-correction text into one child (subagent_id + message) without stopping it; 'stop' = end one child early (subagent_id; partial result still returns). Control actions return immediately; goal/tasks are ignored unless spawning."
+      },
+      "subagent_id": {
+        "type": "string",
+        "description": "Target for action='steer'/'stop' (ids from the spawn response or action='list')."
+      },
+      "message": {
+        "type": "string",
+        "description": "For action='steer': the course correction, appended to the child's next tool result mid-run. Be directive and specific."
+      }
+    },
+    "required": []
+  }
+}

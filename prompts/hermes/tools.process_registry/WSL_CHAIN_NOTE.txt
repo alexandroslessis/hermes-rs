@@ -1,0 +1,1 @@
+Spawned via a wsl[.exe] launcher: the recorded host PID is the short-lived launcher, not the Linux-side workers. Inspect them with `wsl -e ps` / `wsl --list --running` from the host.

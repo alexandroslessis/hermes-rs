@@ -1,0 +1,1 @@
+Requested foreground timeout {requested}s exceeds the {cap}s cap, so this command was started as a tracked background process instead of being refused. Do NOT re-run it. This session cannot receive completion notifications, so poll it with process(action="poll", session_id=...) until it exits.

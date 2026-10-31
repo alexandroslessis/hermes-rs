@@ -1,0 +1,6 @@
+# Keep every text file LF on all platforms: several embedded templates and prompts are
+# compared byte-for-byte, and Windows CRLF checkouts would change them.
+* text=auto eol=lf
+*.png binary
+*.ttf binary
+*.ico binary
