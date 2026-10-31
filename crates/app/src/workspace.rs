@@ -456,24 +456,25 @@ impl Workspace {
                 v_flex()
                     .py_1()
                     .child(
-                        Button::new("new-session", "New session")
-                            .style(ButtonStyle::Subtle)
-                            .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
-                            .full_width()
+                        sidebar_action("new-session", cx)
+                            .child(Icon::new(IconName::Plus).size(IconSize::Small))
+                            .child(Label::new("New session"))
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.new_session(window, cx)),
                             ),
                     )
                     .child(
-                        Button::new("choose-folder", format!("in {folder}"))
-                            .start_icon(
+                        sidebar_action("choose-folder", cx)
+                            .child(
                                 Icon::new(IconName::Folder)
                                     .size(IconSize::Small)
                                     .color(Color::Muted),
                             )
-                            .label_size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .full_width()
+                            .child(
+                                Label::new(format!("in {folder}"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
                             .tooltip(Tooltip::text(format!(
                                 "{}\nClick to start a session in another folder",
                                 cwd.display()
@@ -688,4 +689,17 @@ impl Render for Workspace {
             )
             .child(self.render_status_bar(cx))
     }
+}
+
+/// A full-width sidebar action shaped like the session rows: square edges, row hover color.
+fn sidebar_action(id: &'static str, cx: &App) -> gpui::Stateful<Div> {
+    h_flex()
+        .id(id)
+        .w_full()
+        .h(px(28.))
+        .px_1p5()
+        .gap_1p5()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
 }
