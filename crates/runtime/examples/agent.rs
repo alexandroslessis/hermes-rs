@@ -161,6 +161,9 @@ async fn main() -> Result<()> {
                         MessageContent::Thinking(thinking) => {
                             print!("\x1b[2m{}\x1b[0m", thinking.thinking)
                         }
+                        MessageContent::Error(error) => {
+                            println!("\n\x1b[31m[error] {}\x1b[0m", error.message)
+                        }
                         MessageContent::ToolRequest(request) => {
                             if let Ok(call) = &request.tool_call {
                                 let args =

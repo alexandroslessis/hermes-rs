@@ -164,8 +164,12 @@ Goose's `detect_image_path` doesn't recognize Windows paths.
   `supported_parameters` → tools/reasoning, `architecture.input_modalities` → vision), fall back
   to the bundled canonical catalog, and cache the list per provider with a refresh action.
 
-**M1: Agent backend, headless.** ✅ (2026-10-31, apart from the live compatibility run, which
-needs an API key) Session store, frozen tiered prompt, core operations, tools
+**M1: Agent backend, headless.** ✅ (2026-10-31) Live check on OpenRouter free models:
+`nvidia/nemotron-3-ultra-550b-a55b:free` (multi-step turn using todo, write, patch, search,
+terminal and read, with streamed reasoning, plus continuing the session from disk) and
+`cohere/north-mini-code:free` (three parallel tool calls in one response) both work.
+`google/gemma-4-31b-it:free` was rate-limited upstream; the error is surfaced cleanly. Session
+store, frozen tiered prompt, core operations, tools
 (terminal, process, files, patch, search, todo, clarify), event stream. Tests run against a mock
 OpenAI server, plus a compatibility run against LM Studio/Ollama/OpenRouter.
 
