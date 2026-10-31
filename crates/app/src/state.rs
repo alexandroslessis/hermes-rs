@@ -11,6 +11,8 @@ use crate::config::{self, AppConfig, ProviderSettings};
 
 pub struct AppState {
     pub config: AppConfig,
+    /// Code-block languages, colored with the active theme's syntax colors.
+    pub languages: std::sync::Arc<markdown::language::LanguageRegistry>,
     pub data_dir: PathBuf,
     pub models: Vec<DiscoveredModel>,
     pub models_loading: bool,
@@ -24,9 +26,20 @@ impl Global for AppStateGlobal {}
 impl AppState {
     pub fn init(data_dir: PathBuf, cx: &mut App) -> Entity<Self> {
         let config = AppConfig::load(&data_dir);
+        let registry = theme::ThemeRegistry::global(cx);
+        hermes_themes::load_bundled_themes(&registry);
+        let name = config.theme.as_deref().unwrap_or(theme::DEFAULT_DARK_THEME);
+        if let Ok(theme) = registry
+            .get(name)
+            .or_else(|_| registry.get(theme::DEFAULT_DARK_THEME))
+        {
+            theme::GlobalTheme::update_theme(cx, theme);
+        }
+        let languages = hermes_highlight::language_registry(theme::ActiveTheme::theme(cx).syntax());
         let state = cx.new(|cx| {
             let mut state = Self {
                 config,
+                languages,
                 data_dir,
                 models: Vec::new(),
                 models_loading: false,
@@ -69,6 +82,18 @@ impl AppState {
             tracing::error!("saving settings: {error:#}");
         }
         cx.notify();
+    }
+
+    /// Switches to the named theme, recolors code blocks to match, and remembers the choice.
+    pub fn set_theme(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Ok(theme) = theme::ThemeRegistry::global(cx).get(name) else {
+            return;
+        };
+        self.languages = hermes_highlight::language_registry(theme.syntax());
+        theme::GlobalTheme::update_theme(cx, theme);
+        self.config.theme = Some(name.to_string());
+        self.save(cx);
+        cx.refresh_windows();
     }
 
     /// Re-lists the active provider's models in the background.

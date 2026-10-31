@@ -14,6 +14,8 @@ license = "GPL-3.0-or-later"
 [workspace.dependencies]
 # Our own crates.
 hermes_agent = { path = "crates/agent" }
+hermes_highlight = { path = "crates/highlight" }
+hermes_themes = { path = "crates/themes" }
 hermes_llm = { path = "crates/llm" }
 hermes_prompts = { path = "crates/prompts" }
 hermes_runtime = { path = "crates/runtime" }

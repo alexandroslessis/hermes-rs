@@ -144,7 +144,15 @@ async fn main() -> Result<()> {
     };
     println!("session {session_id}");
 
-    let mut turn = runtime.start_turn(&session_id, &provider, context_length, &prompt)?;
+    let mut turn = runtime.start_turn(
+        &session_id,
+        &provider,
+        hermes_runtime::TurnOptions {
+            context_length,
+            effort: std::env::var("HERMES_EFFORT").ok(),
+        },
+        &prompt,
+    )?;
     let cancel = turn.cancel.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;

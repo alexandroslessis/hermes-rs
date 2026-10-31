@@ -30,6 +30,9 @@ pub struct AppConfig {
     pub last_cwd: Option<PathBuf>,
     #[serde(default)]
     pub theme: Option<String>,
+    /// Reasoning effort per model (Hermes keeps a preset per model the same way).
+    #[serde(default)]
+    pub efforts: std::collections::HashMap<String, String>,
 }
 
 impl Default for AppConfig {
@@ -45,6 +48,7 @@ impl Default for AppConfig {
             model: None,
             last_cwd: None,
             theme: None,
+            efforts: Default::default(),
         }
     }
 }

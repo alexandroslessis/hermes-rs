@@ -65,6 +65,31 @@ impl ProviderConfig {
     }
 }
 
+/// Per-turn request settings.
+#[derive(Debug, Clone, Default)]
+pub struct TurnOptions {
+    /// The model's context window, when known (sizes context-file caps and compaction).
+    pub context_length: Option<usize>,
+    /// Reasoning effort for thinking models: `none`, `minimal`, `low`, `medium`, `high` or
+    /// `xhigh`. `None` sends nothing and leaves the provider's default (Hermes: unset stays unset).
+    pub effort: Option<String>,
+}
+
+/// The request field that carries reasoning effort: OpenRouter normalizes it as
+/// `reasoning: {effort}`; other OpenAI-compatible servers (vLLM, DeepSeek, LM Studio) take
+/// `reasoning_effort`.
+pub fn effort_request_params(base_url: &str, effort: &str) -> HashMap<String, serde_json::Value> {
+    let openrouter = hermes_llm::discovery::catalog_provider_for(base_url) == "openrouter";
+    if openrouter {
+        HashMap::from([(
+            "reasoning".to_string(),
+            serde_json::json!({ "effort": effort }),
+        )])
+    } else {
+        HashMap::from([("reasoning_effort".to_string(), serde_json::json!(effort))])
+    }
+}
+
 pub struct RuntimeConfig {
     /// `%APPDATA%\hermes-rs`: sessions.db, SOUL.md, scratch/.
     pub data_dir: PathBuf,
@@ -263,9 +288,37 @@ impl Runtime {
         &self,
         session_id: &str,
         provider: &ProviderConfig,
-        context_length: Option<usize>,
+        options: TurnOptions,
         text: &str,
     ) -> Result<Turn> {
+        self.begin_turn(session_id, provider, options, Some(text))
+    }
+
+    /// Hermes's `/retry`: drops the provider error that ended the last turn and runs the agent
+    /// again from where it stopped, without a new user message.
+    pub fn retry_turn(
+        &self,
+        session_id: &str,
+        provider: &ProviderConfig,
+        options: TurnOptions,
+    ) -> Result<Turn> {
+        self.begin_turn(session_id, provider, options, None)
+    }
+
+    fn begin_turn(
+        &self,
+        session_id: &str,
+        provider: &ProviderConfig,
+        options: TurnOptions,
+        text: Option<&str>,
+    ) -> Result<Turn> {
+        let TurnOptions {
+            context_length,
+            effort,
+        } = options;
+        let effort_params = effort
+            .as_deref()
+            .map(|effort| effort_request_params(&provider.base_url, effort));
         let open = self.open(session_id)?;
         let cancel = CancellationToken::new();
         {
@@ -288,16 +341,30 @@ impl Runtime {
             session: open.clone(),
             store: self.store.clone(),
         };
-        let user = Message::user()
-            .with_text(text)
-            .with_generated_id_if_missing();
-        if let Err(error) = runtime.append(user.clone()) {
-            *open.running.lock() = None;
-            return Err(error);
-        }
+        let first_event = match text {
+            Some(text) => {
+                let user = Message::user()
+                    .with_text(text)
+                    .with_generated_id_if_missing();
+                runtime
+                    .append(user.clone())
+                    .map(|()| AgentEvent::Message(user))
+            }
+            None => runtime
+                .drop_trailing_errors()
+                .and_then(|conversation| conversation.context("there is no failed turn to retry"))
+                .map(AgentEvent::HistoryReplaced),
+        };
+        let first_event = match first_event {
+            Ok(event) => event,
+            Err(error) => {
+                *open.running.lock() = None;
+                return Err(error);
+            }
+        };
 
         let (events_tx, events_rx) = mpsc::unbounded_channel();
-        let _ = events_tx.send(RuntimeEvent::Agent(AgentEvent::Message(user)));
+        let _ = events_tx.send(RuntimeEvent::Agent(first_event));
         let max_turns = self.config.max_turns;
         let session_id = session_id.to_string();
         let turn_cancel = cancel.clone();
@@ -315,7 +382,10 @@ impl Runtime {
                 .map(str::to_string)
                 .collect();
             let tools: Arc<dyn ToolProvider<TurnSession>> = runtime.session.tools.clone();
-            let model_config = ModelConfig::new(&model).with_context_limit(context_length);
+            let mut model_config = ModelConfig::new(&model).with_context_limit(context_length);
+            if let Some(params) = effort_params {
+                model_config = model_config.with_merged_request_params(params);
+            }
             let steps: Vec<Step<'_, TurnSession, HermesEffect>> = vec![
                 Step::Operation(Arc::new(ops::FrozenPrompt)),
                 Step::Operation(Arc::new(ToolOperation::new().with_provider(tools))),

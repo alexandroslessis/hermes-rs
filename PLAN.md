@@ -214,9 +214,12 @@ M2 status (2026-10-31): done, tested in the running app against OpenRouter: them
 project-grouped sessions sidebar (Hermes-style grouping, Zed's `ThreadItem` rows), chat view
 with Zed's markdown renderer (tables, code blocks, Mermaid diagrams), thinking blocks with a
 pulsing label, tool cards with colored diffs, clarify form, composer with Zed-style model
-selector, status bar. Remaining for M2: syntax highlighting in code blocks (a tree-sitter
-`Highlighter` behind `crates/markdown/src/language.rs`), Zed's JSON themes + theme picker, the
-todo panel above the composer, a Retry action on provider errors.
+selector, status bar. Polish (2026-10-31): tree-sitter syntax highlighting in code blocks
+(`crates/highlight`, 16 languages, colored by the theme), Zed's bundled JSON themes (One, Ayu,
+Gruvbox; `crates/themes`, copied from Zed's `theme_settings`) with a picker in Settings, the
+Hermes-style Tasks strip above the composer, Retry on provider errors, and a per-model reasoning
+effort picker (Auto/Off/Minimal/Low/Medium/High/Max; OpenRouter gets `reasoning.effort`, other
+servers `reasoning_effort`, Auto sends nothing).
 
 **M2.5: Hermes turn-loop parity.** Direction (2026-10-31): match Hermes's behavior wherever a
 kept feature is involved; use Goose only as plumbing.

@@ -1,0 +1,19 @@
+[package]
+name = "hermes_themes"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+indexmap.workspace = true
+log.workspace = true
+palette.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+theme.workspace = true
+uuid.workspace = true

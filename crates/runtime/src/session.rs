@@ -113,6 +113,30 @@ impl TurnRuntime {
         self.store.upsert_message(&session_id, index, &stored)
     }
 
+    /// Removes the error messages that ended the last turn; `None` when the conversation
+    /// doesn't end with one.
+    pub fn drop_trailing_errors(&self) -> Result<Option<Conversation>> {
+        let session_id = self.session.record.lock().id.clone();
+        let conversation = {
+            let mut conversation = self.session.conversation.lock();
+            let messages = conversation.messages_mut();
+            let before = messages.len();
+            while messages
+                .last()
+                .is_some_and(|message| message.error_kind().is_some())
+            {
+                messages.pop();
+            }
+            if messages.len() == before {
+                return Ok(None);
+            }
+            conversation.clone()
+        };
+        self.store
+            .replace_messages(&session_id, conversation.messages())?;
+        Ok(Some(conversation))
+    }
+
     fn update_message(&self, message_id: &str, change: impl FnOnce(&mut Message)) -> Result<()> {
         let session_id = self.session.record.lock().id.clone();
         let (index, stored) = {

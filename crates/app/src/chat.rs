@@ -2,7 +2,7 @@
 //! Layout and card styling follow Zed's `agent_ui` thread view (GPL-3.0-or-later).
 
 use std::collections::{HashMap, HashSet};
-
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
@@ -23,6 +23,8 @@ use tokio_util::sync::CancellationToken;
 use ui::{Callout, CommonAnimationExt, Disclosure, Divider, PopoverMenu, Tooltip, prelude::*};
 
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownOptions, MarkdownStyle};
+
+use hermes_tools::{TodoItem, TodoStatus};
 
 use crate::backend::backend;
 use crate::model_picker::ModelPicker;
@@ -64,6 +66,8 @@ pub struct ChatView {
     expanded: HashSet<String>,
     /// Rendered markdown per assistant text block, keyed by (message index, block index).
     markdown: HashMap<(usize, usize), Entity<Markdown>>,
+    /// The code-block languages `markdown` was built with.
+    languages: Arc<markdown::language::LanguageRegistry>,
     clarify: Option<ClarifyForm>,
     pub usage: TurnUsage,
     error: Option<String>,
@@ -124,7 +128,19 @@ impl ChatView {
             },
             error: None,
             focus_handle: cx.focus_handle(),
-            _subscriptions: vec![subscription],
+            _subscriptions: vec![
+                subscription,
+                // A theme change recolors code blocks, so cached markdown is rebuilt.
+                cx.observe(&AppState::global(cx), |this: &mut Self, state, cx| {
+                    let languages = &state.read(cx).languages;
+                    if !Arc::ptr_eq(languages, &this.languages) {
+                        this.languages = languages.clone();
+                        this.markdown.clear();
+                        cx.notify();
+                    }
+                }),
+            ],
+            languages: AppState::global(cx).read(cx).languages.clone(),
         };
         this.rebuild_entries();
         this.list_state.reset(this.entries.len());
@@ -178,10 +194,26 @@ impl ChatView {
     }
 
     pub fn start_turn(&mut self, text: String, _window: &mut Window, cx: &mut Context<Self>) {
+        self.begin(Some(text), cx);
+    }
+
+    /// Hermes's `/retry`: run the failed turn again.
+    fn retry(&mut self, cx: &mut Context<Self>) {
+        self.begin(None, cx);
+    }
+
+    /// Starts a turn with a new message, or retries the failed one (`text` is `None`).
+    fn begin(&mut self, text: Option<String>, cx: &mut Context<Self>) {
         let state = AppState::global(cx);
-        let (provider, context_length) = {
+        let (provider, options) = {
             let state = state.read(cx);
-            (state.runtime_provider(), state.context_length(&self.model))
+            (
+                state.runtime_provider(),
+                hermes_runtime::TurnOptions {
+                    context_length: state.context_length(&self.model),
+                    effort: state.config.efforts.get(&self.model).cloned(),
+                },
+            )
         };
         let Some(provider) = provider else {
             self.error = Some("No provider is configured. Open Settings to add one.".into());
@@ -191,9 +223,16 @@ impl ChatView {
         let backend = backend(cx);
         let turn = {
             let _guard = backend.tokio.enter();
-            backend
-                .runtime
-                .start_turn(&self.session_id, &provider, context_length, &text)
+            match &text {
+                Some(text) => {
+                    backend
+                        .runtime
+                        .start_turn(&self.session_id, &provider, options, text)
+                }
+                None => backend
+                    .runtime
+                    .retry_turn(&self.session_id, &provider, options),
+            }
         };
         let mut turn = match turn {
             Ok(turn) => turn,
@@ -477,12 +516,14 @@ impl ChatView {
             }
             return markdown;
         }
+        let languages = AppState::global(cx).read(cx).languages.clone();
         let options = MarkdownOptions {
             render_mermaid_diagrams: true,
             ..Default::default()
         };
-        let markdown = cx
-            .new(|cx| Markdown::new_with_options(text.to_string().into(), None, None, options, cx));
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(text.to_string().into(), Some(languages), None, options, cx)
+        });
         self.markdown.insert(key, markdown.clone());
         markdown
     }
@@ -525,12 +566,24 @@ impl ChatView {
                     blocks.push(self.render_tool_call(request, response, cx));
                 }
                 MessageContent::Error(error) => {
+                    let can_retry = self.running.is_none() && entry + 1 == self.entries.len();
                     blocks.push(
                         Callout::new()
                             .severity(Severity::Error)
                             .icon(IconName::XCircle)
                             .title("The provider returned an error")
                             .description(error.message.clone())
+                            .when(can_retry, |callout| {
+                                callout.actions_slot(
+                                    Button::new(
+                                        SharedString::from(format!("retry-{entry}")),
+                                        "Retry",
+                                    )
+                                    .style(ButtonStyle::Filled)
+                                    .start_icon(Icon::new(IconName::Rerun).size(IconSize::Small))
+                                    .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
+                                )
+                            })
                             .into_any_element(),
                     );
                 }
@@ -817,6 +870,71 @@ impl ChatView {
         )
     }
 
+    /// Hermes's reasoning pill: shows the model's effort and opens the levels. Only for
+    /// models whose provider reports reasoning support.
+    fn render_effort_pill(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let state = AppState::global(cx).read(cx);
+        let supports = state
+            .model_info(&self.model)
+            .and_then(|model| model.supports_reasoning);
+        if supports != Some(true) {
+            return None;
+        }
+        let current = state.config.efforts.get(&self.model).cloned();
+        let label = EFFORTS
+            .iter()
+            .find(|(_, wire)| current.as_deref() == Some(*wire))
+            .map(|(label, _)| *label)
+            .unwrap_or("Auto");
+        let model = self.model.clone();
+        Some(
+            PopoverMenu::new("effort-selector")
+                .menu(move |window, cx| {
+                    let model = model.clone();
+                    let current = current.clone();
+                    Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        menu = menu.header("Reasoning effort");
+                        let auto_model = model.clone();
+                        menu = menu.toggleable_entry(
+                            "Auto (provider default)",
+                            current.is_none(),
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                set_effort(&auto_model, None, cx);
+                            },
+                        );
+                        for (label, wire) in EFFORTS {
+                            let model = model.clone();
+                            menu = menu.toggleable_entry(
+                                *label,
+                                current.as_deref() == Some(*wire),
+                                IconPosition::Start,
+                                None,
+                                move |_, cx| {
+                                    set_effort(&model, Some(wire), cx);
+                                },
+                            );
+                        }
+                        menu
+                    }))
+                })
+                .trigger(
+                    Button::new("effort-button", label)
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .disabled(self.running.is_some())
+                        .start_icon(
+                            Icon::new(IconName::ToolThink)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+                .anchor(gpui::Anchor::BottomLeft)
+                .into_any_element(),
+        )
+    }
+
     fn render_model_button(&self, cx: &Context<Self>) -> impl IntoElement {
         let chat = cx.entity().downgrade();
         let selected = self.model.clone();
@@ -853,6 +971,141 @@ impl ChatView {
             .anchor(gpui::Anchor::BottomLeft)
     }
 
+    /// The agent's task list: the latest successful `todo_list` result in the conversation.
+    fn current_todos(&self) -> Vec<TodoItem> {
+        let todo_calls: HashSet<&str> = self
+            .conversation
+            .messages()
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(MessageContent::as_tool_request)
+            .filter(|request| {
+                request
+                    .tool_call
+                    .as_ref()
+                    .is_ok_and(|call| call.name == "todo_list")
+            })
+            .map(|request| request.id.as_str())
+            .collect();
+        self.conversation
+            .messages()
+            .iter()
+            .rev()
+            .flat_map(|message| message.content.iter().rev())
+            .filter_map(|content| {
+                let response = content.as_tool_response()?;
+                todo_calls
+                    .contains(response.id.as_str())
+                    .then(|| content.as_tool_response_text())?
+            })
+            .find_map(|text| {
+                let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+                serde_json::from_value(value.get("todos")?.clone()).ok()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Hermes's "Tasks" strip above the composer: progress, expandable to every item.
+    fn render_todos(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let todos = self.current_todos();
+        let done = todos
+            .iter()
+            .filter(|t| t.status == TodoStatus::Completed)
+            .count();
+        let open = todos
+            .iter()
+            .filter(|t| matches!(t.status, TodoStatus::Pending | TodoStatus::InProgress))
+            .count();
+        if todos.is_empty() || (open == 0 && self.running.is_none()) {
+            return None;
+        }
+        let colors = cx.theme().colors();
+        let expanded = self.expanded.contains("todos");
+        let active = todos
+            .iter()
+            .find(|t| t.status == TodoStatus::InProgress)
+            .map(|t| t.content.clone());
+        Some(
+            v_flex()
+                .mx_4()
+                .mb_1()
+                .px_2()
+                .py_1()
+                .gap_1()
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border_variant)
+                .bg(colors.editor_background)
+                .child(
+                    h_flex()
+                        .id("todos-header")
+                        .gap_2()
+                        .cursor_pointer()
+                        .child(
+                            Icon::new(IconName::ListTodo)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(format!("Tasks {done}/{}", todos.len()))
+                                .size(LabelSize::Small),
+                        )
+                        .when_some(active.filter(|_| !expanded), |this, active| {
+                            this.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_sm()
+                                    .text_color(colors.text_muted)
+                                    .child(active),
+                            )
+                        })
+                        .child(div().flex_1())
+                        .child(Disclosure::new("todos-disclosure", expanded))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle("todos".into(), cx))),
+                )
+                .when(expanded, |this| {
+                    this.child(
+                        v_flex()
+                            .id("todo-items")
+                            .max_h(px(220.))
+                            .overflow_y_scroll()
+                            .children(todos.iter().map(|todo| {
+                                let (icon, color) = match todo.status {
+                                    TodoStatus::Completed => {
+                                        (IconName::TodoComplete, Color::Success)
+                                    }
+                                    TodoStatus::InProgress => {
+                                        (IconName::TodoProgress, Color::Accent)
+                                    }
+                                    TodoStatus::Pending => (IconName::TodoPending, Color::Muted),
+                                    TodoStatus::Cancelled => (IconName::XCircle, Color::Disabled),
+                                };
+                                h_flex()
+                                    .gap_2()
+                                    .py_0p5()
+                                    .when(todo.parent.is_some(), |row| row.pl_5())
+                                    .child(Icon::new(icon).size(IconSize::Small).color(color))
+                                    .child(
+                                        Label::new(todo.content.clone())
+                                            .size(LabelSize::Small)
+                                            .when(todo.status == TodoStatus::Cancelled, |l| {
+                                                l.strikethrough()
+                                            })
+                                            .when(todo.status == TodoStatus::Completed, |l| {
+                                                l.color(Color::Muted)
+                                            }),
+                                    )
+                            })),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_composer(&self, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let running = self.running.is_some();
@@ -869,7 +1122,12 @@ impl ChatView {
             .child(
                 h_flex()
                     .justify_between()
-                    .child(self.render_model_button(cx))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(self.render_model_button(cx))
+                            .children(self.render_effort_pill(cx)),
+                    )
                     .child(if running {
                         IconButton::new("stop", IconName::Stop)
                             .icon_color(Color::Error)
@@ -885,6 +1143,29 @@ impl ChatView {
                     }),
             )
     }
+}
+
+/// Effort levels shown in the pill: label and the value sent to the provider.
+const EFFORTS: &[(&str, &str)] = &[
+    ("Off", "none"),
+    ("Minimal", "minimal"),
+    ("Low", "low"),
+    ("Medium", "medium"),
+    ("High", "high"),
+    ("Max", "xhigh"),
+];
+
+fn set_effort(model: &str, effort: Option<&str>, cx: &mut App) {
+    AppState::global(cx).update(cx, |state, cx| {
+        match effort {
+            Some(effort) => state
+                .config
+                .efforts
+                .insert(model.to_string(), effort.to_string()),
+            None => state.config.efforts.remove(model),
+        };
+        state.save(cx);
+    });
 }
 
 fn tool_icon(name: &str) -> IconName {
@@ -1049,6 +1330,7 @@ impl Render for ChatView {
                 )
             })
             .children(self.render_clarify(cx))
+            .children(self.render_todos(cx))
             .child(self.render_composer(cx))
     }
 }

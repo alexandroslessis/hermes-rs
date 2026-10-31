@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Subscription, Window, prelude::*};
-use ui::{Callout, Divider, Tooltip, prelude::*};
+use ui::{Callout, ContextMenu, Divider, DropdownMenu, Tooltip, prelude::*};
 
 use crate::config::{self, ProviderSettings};
 use crate::model_picker::ModelPicker;
@@ -173,8 +173,51 @@ impl Focusable for SettingsView {
     }
 }
 
+impl SettingsView {
+    /// Zed's bundled themes, light and dark, in a dropdown.
+    fn theme_picker(window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = cx.theme().name.clone();
+        let mut themes = theme::ThemeRegistry::global(cx).list();
+        themes.sort_by(|a, b| {
+            a.appearance
+                .is_light()
+                .cmp(&b.appearance.is_light())
+                .then(a.name.cmp(&b.name))
+        });
+        let selected = current.clone();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            let mut light = None;
+            for meta in themes {
+                if light != Some(meta.appearance.is_light()) {
+                    light = Some(meta.appearance.is_light());
+                    menu = menu.header(if meta.appearance.is_light() {
+                        "Light"
+                    } else {
+                        "Dark"
+                    });
+                }
+                let name = meta.name.clone();
+                menu = menu.toggleable_entry(
+                    meta.name.clone(),
+                    meta.name == selected,
+                    IconPosition::Start,
+                    None,
+                    move |_, cx| {
+                        AppState::global(cx).update(cx, |state, cx| state.set_theme(&name, cx));
+                    },
+                );
+            }
+            menu
+        });
+        h_flex()
+            .gap_2()
+            .child(Label::new("Theme").color(Color::Muted))
+            .child(DropdownMenu::new("theme-picker", current, menu))
+    }
+}
+
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let state = AppState::global(cx);
         let (has_key, key_source, selected, error) = {
@@ -206,6 +249,9 @@ impl Render for SettingsView {
             .bg(colors.panel_background)
             .overflow_y_scroll()
             .child(Headline::new("Settings").size(HeadlineSize::Large))
+            .child(Label::new("Appearance").size(LabelSize::Large))
+            .child(Self::theme_picker(window, cx))
+            .child(Divider::horizontal())
             .child(Label::new("Provider").size(LabelSize::Large))
             .child(Label::new("Any OpenAI-compatible endpoint: OpenRouter, OpenAI, LM Studio, Ollama, vLLM…").color(Color::Muted))
             .child(Self::field("Name", &self.name, cx))

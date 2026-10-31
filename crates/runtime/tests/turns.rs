@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use hermes_agent::events::AgentEvent;
 use hermes_runtime::{
     ClarifyOutcome, ClarifyRequest, ProcessNotice, ProviderConfig, Runtime, RuntimeConfig,
-    RuntimeEvent, TurnStatus,
+    RuntimeEvent, TurnOptions, TurnStatus,
 };
 use hermes_tools::{UserBridge, detect_shell};
 use parking_lot::Mutex;
@@ -144,7 +144,7 @@ fn runtime_in(data_dir: &Path) -> Runtime {
 async fn run_turn(h: &Harness, session_id: &str, text: &str) -> Vec<RuntimeEvent> {
     let mut turn = h
         .runtime
-        .start_turn(session_id, &h.provider, None, text)
+        .start_turn(session_id, &h.provider, TurnOptions::default(), text)
         .unwrap();
     let mut events = Vec::new();
     while let Some(event) = tokio::time::timeout(Duration::from_secs(60), turn.events.recv())
@@ -321,6 +321,65 @@ async fn provider_errors_end_the_turn_with_an_error_message() {
 }
 
 #[tokio::test]
+async fn retry_drops_the_error_and_answers_the_same_message() {
+    // The first request fails (empty script → 500); the retry gets the scripted reply.
+    let h = harness(vec![]).await;
+    let session = h
+        .runtime
+        .create_session(&h.provider, "test-model", None, h.work.path())
+        .unwrap();
+    run_turn(&h, &session.id, "hello").await;
+    assert!(
+        h.runtime
+            .messages(&session.id)
+            .unwrap()
+            .last()
+            .unwrap()
+            .error_kind()
+            .is_some()
+    );
+    let first_turn_requests = h.requests.lock().len();
+    let mut turn = h
+        .runtime
+        .retry_turn(&session.id, &h.provider, TurnOptions::default())
+        .unwrap();
+    let mut first = None;
+    while let Some(event) = turn.events.recv().await {
+        first.get_or_insert_with(|| {
+            matches!(event, RuntimeEvent::Agent(AgentEvent::HistoryReplaced(_)))
+        });
+        if matches!(event, RuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    assert_eq!(first, Some(true), "the UI is told the error was removed");
+    // The retry fails again (the mock has no replies left): still exactly one error, after "hello".
+    let messages = h.runtime.messages(&session.id).unwrap();
+    assert_eq!(
+        messages.iter().filter(|m| m.error_kind().is_some()).count(),
+        1
+    );
+    assert_eq!(messages.len(), 2);
+    // The provider layer retries failed HTTP calls, so a failing turn makes several requests.
+    assert_eq!(h.requests.lock().len(), 2 * first_turn_requests);
+}
+
+#[tokio::test]
+async fn retry_without_a_failed_turn_is_refused() {
+    let h = harness(vec![text_reply("hi")]).await;
+    let session = h
+        .runtime
+        .create_session(&h.provider, "test-model", None, h.work.path())
+        .unwrap();
+    run_turn(&h, &session.id, "hello").await;
+    let refused = h
+        .runtime
+        .retry_turn(&session.id, &h.provider, TurnOptions::default());
+    assert!(refused.is_err());
+    assert!(!h.runtime.is_running(&session.id));
+}
+
+#[tokio::test]
 async fn cancelling_stops_a_running_command_and_answers_its_call() {
     if !matches!(detect_shell(), hermes_tools::ShellKind::GitBash(_)) {
         return;
@@ -337,7 +396,12 @@ async fn cancelling_stops_a_running_command_and_answers_its_call() {
         .unwrap();
     let mut turn = h
         .runtime
-        .start_turn(&session.id, &h.provider, None, "wait a minute")
+        .start_turn(
+            &session.id,
+            &h.provider,
+            TurnOptions::default(),
+            "wait a minute",
+        )
         .unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
     h.runtime.cancel(&session.id);
@@ -415,4 +479,38 @@ async fn switching_models_rebuilds_the_frozen_prompt() {
     assert_eq!(record.model, "openai/gpt-5");
     assert!(record.system_prompt.contains("Model: openai/gpt-5"));
     assert!(record.system_prompt.contains("# Tool-use enforcement"));
+}
+
+#[tokio::test]
+async fn effort_is_sent_only_when_set() {
+    let h = harness(vec![text_reply("a"), text_reply("b")]).await;
+    let session = h
+        .runtime
+        .create_session(&h.provider, "test-model", None, h.work.path())
+        .unwrap();
+    run_turn(&h, &session.id, "first").await;
+    let options = TurnOptions {
+        context_length: None,
+        effort: Some("high".into()),
+    };
+    let mut turn = h
+        .runtime
+        .start_turn(&session.id, &h.provider, options, "second")
+        .unwrap();
+    while let Some(event) = turn.events.recv().await {
+        if matches!(event, RuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    let requests = h.requests.lock().clone();
+    assert!(requests[0].get("reasoning_effort").is_none());
+    assert_eq!(requests[1]["reasoning_effort"], "high");
+}
+
+#[test]
+fn openrouter_gets_its_unified_reasoning_field() {
+    let params = hermes_runtime::effort_request_params("https://openrouter.ai/api/v1", "low");
+    assert_eq!(params["reasoning"], json!({"effort": "low"}));
+    let params = hermes_runtime::effort_request_params("http://localhost:1234/v1", "low");
+    assert_eq!(params["reasoning_effort"], "low");
 }
