@@ -92,6 +92,18 @@ impl SessionTools {
         paths::resolve(path, &self.cwd(), &self.home)
     }
 
+    /// How a path appears in results: relative to the working directory when inside it.
+    fn shown(&self, path: &Path) -> String {
+        let cwd = self.cwd();
+        let lower = |p: &Path| display_path(p).to_lowercase();
+        let (full, base) = (display_path(path), lower(&cwd));
+        if lower(path).starts_with(&format!("{}/", base.trim_end_matches('/'))) {
+            full[base.trim_end_matches('/').len() + 1..].to_string()
+        } else {
+            full
+        }
+    }
+
     /// Kills the shell and every background process. Called when the session is closed.
     pub async fn shutdown(&self) {
         self.shell.shutdown().await;

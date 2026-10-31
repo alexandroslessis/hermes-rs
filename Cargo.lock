@@ -2123,11 +2123,29 @@ name = "hermes-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "dirs",
  "gpui",
  "gpui_platform",
+ "hermes_agent",
+ "hermes_llm",
+ "hermes_runtime",
+ "hermes_store",
+ "hermes_tools",
+ "keyring",
+ "rmcp",
  "rust-embed",
+ "serde",
+ "serde_json",
  "theme",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
  "ui",
+ "unicode-segmentation",
+ "windows",
+ "windows-registry",
 ]
 
 [[package]]
@@ -2839,6 +2857,18 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "keyring"
+version = "3.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eebcc3aff044e5944a8fbaf69eb277d11986064cba30c468730e8b9909fb551c"
+dependencies = [
+ "byteorder",
+ "log",
+ "windows-sys 0.60.2",
+ "zeroize",
 ]
 
 [[package]]

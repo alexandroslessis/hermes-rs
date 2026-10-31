@@ -14,8 +14,26 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+dirs.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
+hermes_agent.workspace = true
+hermes_llm.workspace = true
+hermes_runtime.workspace = true
+hermes_store.workspace = true
+hermes_tools.workspace = true
+keyring = { version = "3.6.3", features = ["windows-native"] }
+rmcp.workspace = true
 rust-embed.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 theme.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 ui.workspace = true
+unicode-segmentation.workspace = true
+windows = { workspace = true, features = ["Wdk_System_SystemServices", "Win32_System_SystemInformation"] }
+windows-registry.workspace = true

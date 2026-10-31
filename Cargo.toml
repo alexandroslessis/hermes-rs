@@ -1,7 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/*", "vendor/zed/*"]
-exclude = ["vendor/async-task"]
+# crates/markdown: Zed markdown port in progress (M2), not yet compiling.
+exclude = ["vendor/async-task", "crates/markdown"]
 # `cargo build`/`cargo test` without -p only touch our own crates; vendored Zed crates are
 # still compiled as dependencies, but their own test suites are not run.
 default-members = ["crates/*"]
@@ -19,6 +20,7 @@ hermes_prompts = { path = "crates/prompts" }
 hermes_runtime = { path = "crates/runtime" }
 hermes_store = { path = "crates/store" }
 hermes_tools = { path = "crates/tools" }
+markdown = { path = "crates/markdown" }
 
 # Our own choices (anything Zed also uses comes from the generated block below).
 # Versions for the Goose-derived crates follow Goose's root Cargo.toml.

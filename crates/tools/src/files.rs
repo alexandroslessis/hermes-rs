@@ -265,7 +265,7 @@ pub async fn write_file(tools: &SessionTools, args: Value) -> ToolOutput {
         .map(|()| {
             let mut result = json!({
                 "success": true,
-                "path": display_path(&path),
+                "path": tools.shown(&path),
                 "bytes_written": args.content.len(),
                 "verified": true,
             });
@@ -540,7 +540,7 @@ pub async fn patch(tools: &SessionTools, args: Value) -> ToolOutput {
     if let Err(error) = write_verified(tools, &path, updated.as_bytes()).await {
         return ToolOutput::error(error);
     }
-    let shown = display_path(&path);
+    let shown = tools.shown(&path);
     let diff = similar::TextDiff::from_lines(&content, &updated)
         .unified_diff()
         .context_radius(3)

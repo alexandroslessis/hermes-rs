@@ -1,0 +1,97 @@
+//! App-wide state shared by every view: settings and the active provider's discovered models.
+
+use std::path::PathBuf;
+
+use gpui::{App, AppContext as _, Context, Entity, Global};
+use hermes_llm::discovery::DiscoveredModel;
+use hermes_runtime::ProviderConfig;
+
+use crate::backend::backend;
+use crate::config::{self, AppConfig, ProviderSettings};
+
+pub struct AppState {
+    pub config: AppConfig,
+    pub data_dir: PathBuf,
+    pub models: Vec<DiscoveredModel>,
+    pub models_loading: bool,
+    pub models_error: Option<String>,
+}
+
+struct AppStateGlobal(Entity<AppState>);
+
+impl Global for AppStateGlobal {}
+
+impl AppState {
+    pub fn init(data_dir: PathBuf, cx: &mut App) -> Entity<Self> {
+        let config = AppConfig::load(&data_dir);
+        let state = cx.new(|cx| {
+            let mut state = Self {
+                config,
+                data_dir,
+                models: Vec::new(),
+                models_loading: false,
+                models_error: None,
+            };
+            state.refresh_models(cx);
+            state
+        });
+        cx.set_global(AppStateGlobal(state.clone()));
+        state
+    }
+
+    pub fn global(cx: &App) -> Entity<Self> {
+        cx.global::<AppStateGlobal>().0.clone()
+    }
+
+    pub fn provider(&self) -> Option<&ProviderSettings> {
+        self.config.active_provider()
+    }
+
+    pub fn runtime_provider(&self) -> Option<ProviderConfig> {
+        self.provider().map(config::runtime_provider)
+    }
+
+    pub fn has_api_key(&self) -> bool {
+        self.provider().and_then(config::api_key).is_some()
+    }
+
+    pub fn model_info(&self, id: &str) -> Option<&DiscoveredModel> {
+        self.models.iter().find(|model| model.id == id)
+    }
+
+    pub fn context_length(&self, model: &str) -> Option<usize> {
+        self.model_info(model).and_then(|model| model.context_length)
+    }
+
+    pub fn save(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.config.save(&self.data_dir) {
+            tracing::error!("saving settings: {error:#}");
+        }
+        cx.notify();
+    }
+
+    /// Re-lists the active provider's models in the background.
+    pub fn refresh_models(&mut self, cx: &mut Context<Self>) {
+        let Some(provider) = self.runtime_provider() else {
+            return;
+        };
+        self.models_loading = true;
+        self.models_error = None;
+        let task = backend(cx).spawn(async move { provider.list_models().await });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.models_loading = false;
+                match result {
+                    Ok(Ok(models)) => this.models = models,
+                    Ok(Err(error)) => this.models_error = Some(format!("{error:#}")),
+                    Err(error) => this.models_error = Some(error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+}
