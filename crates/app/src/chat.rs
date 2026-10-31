@@ -8,7 +8,7 @@ use std::time::Duration;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Context, Entity, FocusHandle, Focusable,
     FollowMode, ListAlignment, ListState, SharedString, Subscription, Task, Window, list,
-    prelude::*, pulsating_between, px,
+    prelude::*, px,
 };
 use hermes_agent::events::AgentEvent;
 use hermes_llm::conversation::Conversation;
@@ -662,17 +662,7 @@ impl ChatView {
                             .color(Color::Muted),
                     )
                     .child(if active {
-                        Label::new("Thinking")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .with_animation(
-                                SharedString::from(format!("{key}-pulse")),
-                                Animation::new(Duration::from_secs(2))
-                                    .repeat()
-                                    .with_easing(pulsating_between(0.3, 1.0)),
-                                |label, delta| label.alpha(delta),
-                            )
-                            .into_any_element()
+                        shimmer(SharedString::from(format!("{key}-shimmer")), "Thinking", cx)
                     } else {
                         Label::new("Thinking")
                             .size(LabelSize::Small)
@@ -1397,4 +1387,42 @@ fn tool_output(content: &MessageContent) -> String {
         Some(value) => value.to_string(),
         None => content.as_tool_response_text().unwrap_or_default(),
     }
+}
+
+/// A label with a bright band sweeping across it, left to right: the "working" shimmer.
+fn shimmer(id: SharedString, text: &'static str, cx: &App) -> AnyElement {
+    let base = Color::Muted.color(cx);
+    let bright = cx.theme().colors().text;
+    let size = ui::TextSize::Small.rems(cx);
+    let chars = text.chars().count() as f32;
+    // Half-width of the band, in characters; it starts and ends fully off the text.
+    const BAND: f32 = 3.0;
+    div()
+        .text_size(size)
+        .text_color(base)
+        .child(text)
+        .with_animation(
+            id,
+            Animation::new(Duration::from_millis(1800)).repeat(),
+            move |_, delta| {
+                let center = -BAND + delta * (chars + 2. * BAND);
+                let runs = text.char_indices().enumerate().map(|(n, (i, c))| {
+                    let distance = (n as f32 + 0.5 - center).abs();
+                    let strength = (1. - distance / BAND).clamp(0., 1.);
+                    let color = base.blend(bright.opacity(strength * strength));
+                    (
+                        i..i + c.len_utf8(),
+                        gpui::HighlightStyle {
+                            color: Some(color),
+                            ..Default::default()
+                        },
+                    )
+                });
+                div()
+                    .text_size(size)
+                    .text_color(base)
+                    .child(gpui::StyledText::new(text).with_highlights(runs))
+            },
+        )
+        .into_any_element()
 }

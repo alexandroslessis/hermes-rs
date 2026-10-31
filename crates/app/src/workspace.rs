@@ -454,11 +454,10 @@ impl Workspace {
             .border_color(colors.border)
             .child(
                 v_flex()
-                    .p_2()
-                    .gap_1()
+                    .py_1()
                     .child(
                         Button::new("new-session", "New session")
-                            .style(ButtonStyle::Filled)
+                            .style(ButtonStyle::Subtle)
                             .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
                             .full_width()
                             .on_click(
