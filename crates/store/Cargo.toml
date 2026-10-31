@@ -1,0 +1,24 @@
+[package]
+name = "hermes_store"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "SQLite persistence for sessions, messages and usage"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+hermes_llm.workspace = true
+parking_lot.workspace = true
+rmcp.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+tempfile.workspace = true

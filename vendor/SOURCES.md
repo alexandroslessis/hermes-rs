@@ -13,7 +13,9 @@ Commit `b23d21cabd9b4de0c045dcdd731821a3a15c2bfc` from https://github.com/aaif-g
 | `crates/goose-provider-types/src/` | `crates/llm/src/` | Kept only the OpenAI chat-completions format (removed anthropic, databricks, google, ollama, openai_responses, snowflake). Restored the thinking-signature retry check inline in `retry.rs`. 7 image-path tests ignored on Windows (`/`-rooted paths only). |
 | `crates/goose-provider-types/build.rs` | `crates/llm/build.rs` | none |
 | `crates/goose-providers/src/{api_client,http_status,openai_compatible}.rs` | `crates/llm/src/` | Removed the Responses API streaming path. |
-| `crates/goose-agent/src/` | `crates/agent/src/` | `goose_provider_types` → `hermes_llm`; `SourceEntry`/`SourceType` copied from `goose-sdk-types` into `skills/source.rs` (skill variants only). |
+| `crates/goose-agent/src/` | `crates/agent/src/` | `goose_provider_types` → `hermes_llm`; `SourceEntry`/`SourceType` copied from `goose-sdk-types` into `skills/source.rs` (skill variants only). `ToolOperation::run` executes a response's tool calls concurrently (`join_all`) instead of one by one. |
+| `crates/goose/src/agents/state_machine/ops_{empty_response,exit_on_error,maxturns,remaining_tool_calls}.rs` | `crates/runtime/src/ops.rs` | Adapted to our session/effect types; max turns doesn't fire on a finished answer; unanswered calls name the available tools. |
+| — | `crates/llm/src/discovery.rs` | New (hermes-rs): model discovery from `/models` with catalog fallback. |
 | `crates/goose-context-management/src/` | `crates/agent/src/compaction/` | Became a module: `lib.rs` → `compaction.rs`, `crate::` paths → `crate::compaction::`. |
 
 ## async-task (Zed fork)

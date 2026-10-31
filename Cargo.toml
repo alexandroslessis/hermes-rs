@@ -15,19 +15,27 @@ license = "GPL-3.0-or-later"
 # Our own crates.
 hermes_agent = { path = "crates/agent" }
 hermes_llm = { path = "crates/llm" }
+hermes_prompts = { path = "crates/prompts" }
+hermes_runtime = { path = "crates/runtime" }
+hermes_store = { path = "crates/store" }
+hermes_tools = { path = "crates/tools" }
 
 # Our own choices (anything Zed also uses comes from the generated block below).
 # Versions for the Goose-derived crates follow Goose's root Cargo.toml.
 async-stream = "0.3.6"
 async-trait = "0.1.89"
 base64 = "0.23.0"
+dirs = "7"
+ignore = "0.4.34"
 include_dir = "0.7"
 minijinja = { version = "2.18", default-features = false, features = ["loader", "multi_template", "serde"] }
 once_cell = "1.21.3"
 reqwest = { version = "0.13.2", default-features = false, features = ["json", "stream", "multipart", "form", "rustls"] }
 rmcp = { version = "3.4.1", default-features = false, features = ["schemars", "server", "macros"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 rust-embed = { version = "8.11", features = ["include-exclude"] }
-tokio = { version = "1.48", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "process", "io-util", "fs"] }
+similar = "3"
+tokio ={ version = "1.48", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "process", "io-util", "fs"] }
 tokio-stream = { version = "0.1.16", features = ["io-util"] }
 tokio-util = { version = "0.7.12", features = ["compat", "io", "codec"] }
 tracing-futures = { version = "0.2.4", features = ["futures-03"] }

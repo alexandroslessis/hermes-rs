@@ -4,6 +4,7 @@ pub mod cache_semantics;
 pub mod canonical;
 pub mod context_limit;
 pub mod conversation;
+pub mod discovery;
 pub mod documents;
 pub mod errors;
 pub mod formats;

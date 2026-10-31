@@ -152,9 +152,53 @@ Each milestone ends with something you can run and tests that pass.
 Known gaps carried forward: Zed's JSON themes aren't loaded yet (built-in One Dark is used), and
 Goose's `detect_image_path` doesn't recognize Windows paths.
 
-**M1: Agent backend, headless.** Session store, frozen tiered prompt, core operations, tools
+### Notes from review (2026-10-31)
+
+- **Themed title bar (M2).** The window still uses the native Windows title bar (black bar with
+  system buttons). Do what Zed does: `TitlebarOptions { appears_transparent: true }` and draw our
+  own title bar with themed caption buttons, porting Zed's `platform_title_bar` crate
+  (`platforms/platform_windows.rs`) as a Tier 2 copy.
+- **Automatic model discovery (M1 backend, M2 UI).** Adding a provider lists all of its models
+  automatically, like Hermes. Nothing is configured per model. Use `GET {base_url}/models`, read
+  the rich fields when the endpoint returns them (OpenRouter: `context_length`, `pricing`,
+  `supported_parameters` → tools/reasoning, `architecture.input_modalities` → vision), fall back
+  to the bundled canonical catalog, and cache the list per provider with a refresh action.
+
+**M1: Agent backend, headless.** ✅ (2026-10-31, apart from the live compatibility run, which
+needs an API key) Session store, frozen tiered prompt, core operations, tools
 (terminal, process, files, patch, search, todo, clarify), event stream. Tests run against a mock
 OpenAI server, plus a compatibility run against LM Studio/Ollama/OpenRouter.
+
+M1 design:
+
+| Crate | Contents |
+|---|---|
+| `hermes_store` | SQLite via `rusqlite` (bundled, WAL). Tables `sessions` (id, title, cwd, provider, model, frozen system prompt, timestamps), `messages` (session, seq, id, JSON), `usage`. The live `Conversation` is kept in memory per open session; each effect is applied with `Conversation::push` (which merges streamed chunks sharing an id) and the merged message is upserted by id. |
+| `hermes_prompts` | Embeds `prompts/`. Builds the stable → context → volatile system prompt once per session: identity (SOUL.md or Hermes default), model-family guidance, context files (`AGENTS.md`, `.hermes.md`, `CLAUDE.md`, `.cursorrules` from git root to cwd, size-capped), environment (shell hint, cwd, OS, date). Memory and skills slots stay empty until M3/M4. Our tool schemas live in `prompts/tools/`: Hermes's, edited so every description matches what our tools actually do. |
+| `hermes_tools` | One `ToolProvider` (goose-agent trait) serving `terminal`, `process_manage`, `read_file`, `write_file`, `patch`, `search_files`, `todo_list`, `clarify`. Terminal = persistent Git Bash session per agent session (cwd and exports survive between calls, sentinel-delimited output, timeout kills and restarts the shell), PowerShell fallback. Background processes with a rolling output buffer. Read-before-write guard on `write_file`. `patch` = exact, then whitespace/indentation-tolerant matching, returns a unified diff. `search_files` = `ignore` walker (gitignore-aware) + `regex`. `clarify` awaits the UI through a `UserBridge` trait. |
+| `hermes_llm` | + `discovery`: `GET /models` with rich-field parsing (OpenRouter) and canonical-catalog fallback. |
+| `hermes_agent` | + `runtime`: assembles the state machine (prompt, tools, unhandled tool calls, empty response, max turns, exit on error, inference), implements `SessionLoader`/`EffectHandler` over the store, and exposes `start_turn(session, text) -> events` plus `cancel`. Events = goose `AgentEvent`s + clarify requests + turn finished. |
+
+The Git Bash path is the default because Hermes uses it on Windows and models are far better at
+POSIX shell. The shell hint in the prompt says which shell is in use.
+
+What M1 delivered, beyond the table above:
+- `hermes_runtime` is its own crate (it depends on both `hermes_agent` and `hermes_tools`, and
+  tools implement a trait from `hermes_agent`).
+- Every shell and background process runs inside a Windows **Job Object**, so a timeout, Stop or
+  session close kills everything it started. `taskkill /T` alone misses programs started from Git
+  Bash, because MSYS's fork emulation breaks the Windows parent-child chain.
+- Stored messages are keyed by position, not message id: some providers reuse completion ids.
+- Tool calls from one response run concurrently (Hermes's prompt promises this).
+- Model discovery against the live OpenRouter API: 452 models with context, tools and pricing.
+- Tests: store 4, prompts 10, tools 29, runtime end-to-end 6 (tool loop with a byte-stable
+  system prompt across calls, streaming, invented tools, provider errors, cancel mid-command,
+  reopen from disk).
+
+Open for later milestones: session titles (needs Hermes's title prompt, copied by hand), the
+system prompt's threat scan of context files (F5, with memory in M3), background-process
+notifications starting a new turn automatically (M2, needs the UI), and the live compatibility
+run (OpenRouter, then local servers).
 
 **M2: Chat UI.** Markdown (Tier 2 port), streaming chat view, tool cards, thinking blocks,
 composer (multiline, history, slash and skill autocomplete), sessions sidebar, tabs, approval and

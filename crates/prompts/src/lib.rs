@@ -1,0 +1,7 @@
+//! Prompt text and tool schemas embedded from `prompts/`, and the system-prompt builder.
+
+pub mod system;
+pub mod text;
+pub mod tools;
+
+pub use system::{Shell, SystemPrompt, SystemPromptInput, build_system_prompt};

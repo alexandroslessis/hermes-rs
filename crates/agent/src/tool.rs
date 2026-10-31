@@ -359,7 +359,10 @@ where
             return not_applicable();
         }
 
-        for request in pending {
+        // hermes-rs: independent tool calls from one response run concurrently (the prompt tells
+        // the model they do); tools that share state, like the terminal's shell, serialize
+        // internally. Responses keep the order of the calls.
+        let calls = pending.iter().map(|request| {
             let provider = match request.tool_call.as_ref() {
                 Ok(call) => available
                     .iter()
@@ -368,14 +371,19 @@ where
                     .expect("pending requests were filtered by available tools"),
                 Err(_) => &self.registered as &dyn ToolProvider<S>,
             };
-            let tool_result = match request.tool_call.as_ref() {
-                Err(error) => Err(error.clone()),
-                Ok(call) => {
-                    provider
-                        .call(session, &request.id, call.clone(), emit)
-                        .await
+            async move {
+                match request.tool_call.as_ref() {
+                    Err(error) => Err(error.clone()),
+                    Ok(call) => {
+                        provider
+                            .call(session, &request.id, call.clone(), emit)
+                            .await
+                    }
                 }
-            };
+            }
+        });
+        let results = futures::future::join_all(calls).await;
+        for (request, tool_result) in pending.into_iter().zip(results) {
             let mut output = self.response.lock().unwrap();
             let message =
                 output.get_or_insert_with(|| Message::user().with_generated_id_if_missing());
