@@ -311,11 +311,9 @@ impl Workspace {
                     .cursor_pointer()
                     .h(px(28.))
                     .w_full()
-                    .pl_2()
-                    .pr_1()
+                    .px_1p5()
                     .mt_1()
                     .justify_between()
-                    .rounded_sm()
                     .hover(|s| s.bg(colors.ghost_element_hover))
                     .child(
                         h_flex()
@@ -491,7 +489,6 @@ impl Workspace {
                 v_flex()
                     .id("sessions")
                     .flex_1()
-                    .px_1()
                     .pb_2()
                     .overflow_y_scroll()
                     .children(rows),
