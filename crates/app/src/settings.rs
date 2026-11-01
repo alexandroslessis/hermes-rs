@@ -717,6 +717,8 @@ impl Render for SettingsView {
                             .border_color(border_variant)
                             .bg(editor_background)
                             .overflow_hidden()
+                            // The list scrolls on its own; the wheel shouldn't also scroll the page.
+                            .on_scroll(|_, _, cx| cx.stop_propagation())
                             .child(self.picker.clone()),
                     ),
             );

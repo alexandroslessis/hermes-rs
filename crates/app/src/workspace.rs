@@ -849,6 +849,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
+        let (button_hover, button_active) = (colors.element_background, colors.element_active);
         let id = session.id.clone();
         let delete_id = session.id.clone();
         let hover_id = session.id.clone();
@@ -883,6 +884,9 @@ impl Workspace {
                 )
                 .icon_size(IconSize::Small)
                 .icon_color(Color::Muted)
+                // The row behind it is already hovered: Zed's row buttons use these to stand out.
+                .hover_background(button_hover)
+                .active_background(button_active)
                 .tooltip(Tooltip::text("Delete session"))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
