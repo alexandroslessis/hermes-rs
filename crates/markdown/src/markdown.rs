@@ -2969,8 +2969,9 @@ impl Element for MarkdownElement {
                                 task_list_marker_for_item(&parsed_markdown.events, index)
                             {
                                 let source = &parsed_markdown.source()[range.clone()];
+                                // hermes-rs: identical items in one document must not share an id.
                                 let checkbox = Checkbox::new(
-                                    ElementId::Name(source.to_string().into()),
+                                    ElementId::Name(format!("{}:{source}", range.start).into()),
                                     ToggleState::from(checked),
                                 )
                                 .fill();

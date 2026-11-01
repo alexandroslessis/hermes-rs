@@ -412,10 +412,19 @@ impl A11yNodeBuilder {
         debug_assert!(!self.ids_stack.is_empty(), "node pushed before push_root");
 
         if !self.seen_ids.insert(id) {
-            debug_assert!(
-                false,
-                "Duplicate a11y node id: {id:?}. In a release build, this node would be silently discarded from the a11y tree."
-            );
+            // hermes-rs: Zed asserts here in debug builds, which crashed the app whenever a
+            // Windows UI Automation client (screen readers, clipboard and selection tools) was
+            // reading the window. Release builds drop the node; log the first holder of the id
+            // instead so the duplicate can be found.
+            #[cfg(debug_assertions)]
+            {
+                let first = self.node_info.get(&id).map(|info| {
+                    (info.view, info.element_id.clone(), info.synthetic, info.source_location)
+                });
+                log::error!(
+                    "duplicate a11y node id {id:?}; first node (view, element id, synthetic, created at): {first:?}"
+                );
+            }
             return false;
         }
 

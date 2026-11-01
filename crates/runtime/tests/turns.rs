@@ -1021,3 +1021,59 @@ async fn session_search_recalls_an_earlier_session() {
             .any(|m| m["content"].as_str().unwrap().contains("team vault"))
     );
 }
+
+#[tokio::test]
+async fn rewinding_drops_the_message_and_what_followed() {
+    let h = harness(vec![
+        tool_reply(&[(
+            "call_t",
+            "todo_list",
+            json!({"todos": [{"id": "1", "content": "later step", "status": "pending"}]}),
+        )]),
+        text_reply("Planned."),
+        text_reply("Second answer."),
+        text_reply("Answer again."),
+    ])
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "first").await;
+    run_turn(&h, &session, "second").await;
+    // Rewinding to the first message drops both turns.
+    let kept = h.runtime.rewind(&session, 0).unwrap();
+    assert!(kept.is_empty());
+    assert!(h.runtime.messages(&session).unwrap().is_empty());
+    // The store agrees after a reopen.
+    assert!(
+        h.runtime
+            .store()
+            .load_messages(&session)
+            .unwrap()
+            .is_empty()
+    );
+    run_turn(&h, &session, "first").await;
+    let texts: Vec<String> = h
+        .runtime
+        .messages(&session)
+        .unwrap()
+        .iter()
+        .map(|m| m.as_concat_text())
+        .collect();
+    assert_eq!(texts, vec!["first", "Answer again."]);
+}
+
+#[tokio::test]
+async fn rewinding_is_refused_while_a_turn_runs() {
+    let h = harness(vec![
+        tool_reply(&[("call_1", "terminal", json!({"command": "sleep 2"}))]),
+        text_reply("done"),
+    ])
+    .await;
+    let session = session_in(&h);
+    let turn = h
+        .runtime
+        .start_turn(&session, &h.provider, TurnOptions::default(), "wait")
+        .unwrap();
+    assert!(h.runtime.rewind(&session, 0).is_err());
+    collect(turn).await;
+    assert!(h.runtime.rewind(&session, 0).is_ok());
+}

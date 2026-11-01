@@ -57,6 +57,8 @@ fn main() {
                 KeyBinding::new("ctrl-b", ToggleSidebar, None),
                 KeyBinding::new("ctrl-,", OpenSettings, None),
                 KeyBinding::new("ctrl-shift-m", OpenMemory, None),
+                // Copy the text selected in a chat message.
+                KeyBinding::new("ctrl-c", markdown::Copy, Some("Markdown")),
             ]);
 
             let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);

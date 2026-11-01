@@ -105,9 +105,14 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     pub fn for_current_user() -> Result<Self> {
-        let data_dir = dirs::data_dir()
-            .context("no application data directory")?
-            .join("hermes-rs");
+        // HERMES_RS_HOME points a run at another data folder (testing without touching the
+        // real sessions and memory).
+        let data_dir = match std::env::var_os("HERMES_RS_HOME") {
+            Some(home) => PathBuf::from(home),
+            None => dirs::data_dir()
+                .context("no application data directory")?
+                .join("hermes-rs"),
+        };
         Ok(Self {
             data_dir,
             shell: hermes_tools::detect_shell(),
@@ -299,6 +304,25 @@ impl Runtime {
             .lock()
             .messages()
             .clone())
+    }
+
+    /// Hermes's edit-and-resend: drops message `keep` and everything after it, so the next
+    /// turn continues from the conversation as it was before that message. The todo list goes
+    /// back to what it was then. Refused while a turn runs.
+    pub fn rewind(&self, session_id: &str, keep: usize) -> Result<Vec<Message>> {
+        let open = self.open(session_id)?;
+        if open.running.lock().is_some() {
+            anyhow::bail!("a turn is running in this session");
+        }
+        let conversation = {
+            let mut conversation = open.conversation.lock();
+            conversation.messages_mut().truncate(keep);
+            conversation.clone()
+        };
+        self.store
+            .replace_messages(session_id, conversation.messages())?;
+        open.tools.reset_todos(restore_todos(&conversation));
+        Ok(conversation.messages().clone())
     }
 
     pub fn is_running(&self, session_id: &str) -> bool {

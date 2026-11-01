@@ -41,6 +41,12 @@ impl TodoList {
         self.items.lock().clone()
     }
 
+    /// Replaces the list (a rewound conversation restores the list it had then).
+    pub fn reset(&self, items: Vec<TodoItem>) {
+        *self.items.lock() = items;
+        *self.revision.lock() += 1;
+    }
+
     fn write(&self, todos: Vec<TodoItem>, merge: bool) -> Result<Vec<TodoItem>, String> {
         for item in &todos {
             if item.id.trim().is_empty() {

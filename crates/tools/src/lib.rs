@@ -106,6 +106,10 @@ impl SessionTools {
         self.todos.items()
     }
 
+    pub fn reset_todos(&self, items: Vec<TodoItem>) {
+        self.todos.reset(items);
+    }
+
     pub fn tool_names() -> Vec<&'static str> {
         hermes_prompts::tools::tool_names().collect()
     }

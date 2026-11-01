@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Context, Entity, FocusHandle, Focusable,
-    FollowMode, ListAlignment, ListState, SharedString, Subscription, Task, Window, list,
-    prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, Entity, FocusHandle,
+    Focusable, FollowMode, ListAlignment, ListState, SharedString, Subscription, Task, Window,
+    list, prelude::*, px,
 };
 use hermes_agent::events::AgentEvent;
 use hermes_llm::conversation::Conversation;
@@ -20,7 +20,10 @@ use hermes_runtime::{
 use rmcp::model::Role;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use ui::{Callout, CommonAnimationExt, Disclosure, Divider, PopoverMenu, Tooltip, prelude::*};
+use ui::{
+    Callout, CommonAnimationExt, ContextMenu, Disclosure, Divider, PopoverMenu, Tooltip,
+    prelude::*, right_click_menu,
+};
 
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownOptions, MarkdownStyle};
 
@@ -65,12 +68,14 @@ pub struct ChatView {
     turn_task: Option<Task<()>>,
     expanded: HashSet<String>,
     /// Rendered markdown per assistant text block, keyed by (message index, block index).
-    markdown: HashMap<(usize, usize), Entity<Markdown>>,
+    markdown: HashMap<MarkdownKey, Entity<Markdown>>,
     /// The code-block languages `markdown` was built with.
     languages: Arc<markdown::language::LanguageRegistry>,
     clarify: Option<ClarifyForm>,
     /// `/steer` text waiting for the agent's next tool call to finish.
     steering: Option<String>,
+    /// The user message being edited in the composer; sending rewinds the conversation there.
+    editing: Option<usize>,
     /// A steer the turn ended before delivering: Hermes sends it as the next message.
     next_message: Option<String>,
     pub usage: TurnUsage,
@@ -120,6 +125,7 @@ impl ChatView {
             markdown: HashMap::new(),
             clarify: None,
             steering: None,
+            editing: None,
             next_message: None,
             usage: TurnUsage {
                 last_input_tokens: 0,
@@ -189,6 +195,14 @@ impl ChatView {
         if text.is_empty() {
             return;
         }
+        if self.running.is_none() {
+            if let Some(index) = self.editing.take() {
+                self.composer
+                    .update(cx, |composer, cx| composer.set_text("", cx));
+                self.resend(index, Some(text), cx);
+                return;
+            }
+        }
         // Mid-turn, Enter steers the running turn (Hermes's `/steer`).
         if self.running.is_some() {
             if backend(cx).runtime.steer(&self.session_id, &text) {
@@ -209,6 +223,37 @@ impl ChatView {
 
     pub fn start_turn(&mut self, text: String, _window: &mut Window, cx: &mut Context<Self>) {
         self.begin(Some(text), cx);
+    }
+
+    /// Hermes's edit-and-resend: the conversation rewinds to just before user message
+    /// `message_index`, then that message (or `text`, its edited version) is sent again.
+    fn resend(&mut self, message_index: usize, text: Option<String>, cx: &mut Context<Self>) {
+        let text =
+            text.unwrap_or_else(|| self.conversation.messages()[message_index].as_concat_text());
+        match backend(cx).runtime.rewind(&self.session_id, message_index) {
+            Ok(messages) => {
+                self.conversation = Conversation::new_unvalidated(messages);
+                self.markdown.clear();
+                self.rebuild_entries();
+                self.list_state.reset(self.entries.len());
+            }
+            Err(error) => {
+                self.error = Some(format!("{error:#}"));
+                cx.notify();
+                return;
+            }
+        }
+        self.begin(Some(text), cx);
+    }
+
+    /// Puts a user message in the composer; sending it rewinds the conversation there.
+    fn edit_message(&mut self, message_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.conversation.messages()[message_index].as_concat_text();
+        self.composer
+            .update(cx, |composer, cx| composer.set_text(text, cx));
+        self.composer.focus_handle(cx).focus(window, cx);
+        self.editing = Some(message_index);
+        cx.notify();
     }
 
     /// Hermes's `/retry`: run the failed turn again.
@@ -498,25 +543,86 @@ impl ChatView {
         };
         let message = self.conversation.messages()[message_index].clone();
         let content = match message.role {
-            Role::User => self.render_user_message(&message, cx),
+            Role::User => self.render_user_message(&message, message_index, window, cx),
             Role::Assistant => {
                 self.render_assistant_message(&message, message_index, index, window, cx)
             }
         };
-        div()
-            .w_full()
-            .px_4()
-            .py_2()
-            .child(content)
+        let chat = cx.entity().downgrade();
+        let whole = message.as_concat_text();
+        right_click_menu(SharedString::from(format!("entry-menu-{message_index}")))
+            .trigger(move |_, _, _| div().w_full().px_4().py_2().child(content))
+            .menu(move |window, cx| {
+                // The markdown blocks of this message saw the right-click first and recorded
+                // what was selected in them.
+                let selected = chat.upgrade().and_then(|chat| {
+                    chat.read(cx)
+                        .markdown
+                        .iter()
+                        .filter(|(key, _)| key.0 == message_index)
+                        .find_map(|(_, markdown)| {
+                            let markdown = markdown.read(cx);
+                            Some((
+                                markdown.context_menu_selected_text()?.clone(),
+                                markdown.context_menu_selected_markdown().cloned(),
+                            ))
+                        })
+                });
+                let whole = whole.clone();
+                ContextMenu::build(window, cx, move |menu, _, _| {
+                    let menu = match selected.clone() {
+                        Some((text, markdown)) => {
+                            let menu = menu.entry("Copy", None, move |_, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()))
+                            });
+                            match markdown {
+                                Some(markdown) => {
+                                    menu.entry("Copy as Markdown", None, move |_, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            markdown.to_string(),
+                                        ))
+                                    })
+                                }
+                                None => menu,
+                            }
+                            .separator()
+                        }
+                        None => menu,
+                    };
+                    let whole = whole.clone();
+                    menu.entry("Copy message", None, move |_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(whole.clone()))
+                    })
+                })
+            })
             .into_any_element()
     }
 
-    fn render_user_message(&self, message: &Message, cx: &Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors();
+    fn render_user_message(
+        &mut self,
+        message: &Message,
+        message_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let text = message.as_concat_text();
-        h_flex()
+        let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let body = self.markdown_block((message_index, 0, MarkdownKind::User), &text, style, cx);
+        let colors = cx.theme().colors();
+        let running = self.running.is_some();
+        let group = SharedString::from(format!("user-message-{message_index}"));
+        let action = |id: &str, icon: IconName, tooltip: &'static str| {
+            IconButton::new(SharedString::from(format!("{id}-{message_index}")), icon)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text(tooltip))
+        };
+        let copy_text = text.clone();
+        v_flex()
             .w_full()
-            .justify_end()
+            .items_end()
+            .gap_0p5()
+            .group(group.clone())
             .child(
                 div()
                     .max_w(relative(0.85))
@@ -527,7 +633,31 @@ impl ChatView {
                     .border_1()
                     .border_color(colors.border)
                     .text_color(colors.text)
-                    .child(text),
+                    .child(body),
+            )
+            .child(
+                h_flex()
+                    .gap_0p5()
+                    .visible_on_hover(group)
+                    .child(action("copy-message", IconName::Copy, "Copy").on_click(
+                        move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()))
+                        },
+                    ))
+                    .child(
+                        action("edit-message", IconName::Pencil, "Edit and resend")
+                            .disabled(running)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.edit_message(message_index, window, cx)
+                            })),
+                    )
+                    .child(
+                        action("resend-message", IconName::Rerun, "Re-send from here")
+                            .disabled(running)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.resend(message_index, None, cx)
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -535,7 +665,7 @@ impl ChatView {
     /// The markdown entity for one text block, created or updated to `text` as it streams.
     fn markdown_for(
         &mut self,
-        key: (usize, usize),
+        key: MarkdownKey,
         text: &str,
         cx: &mut Context<Self>,
     ) -> Entity<Markdown> {
@@ -552,11 +682,40 @@ impl ChatView {
             render_mermaid_diagrams: true,
             ..Default::default()
         };
-        let markdown = cx.new(|cx| {
-            Markdown::new_with_options(text.to_string().into(), Some(languages), None, options, cx)
+        let markdown = cx.new(|cx| match key.2 {
+            // What the user typed is shown as written, not as markdown.
+            MarkdownKind::User => Markdown::new_text(text.to_string().into(), cx),
+            _ => Markdown::new_with_options(
+                text.to_string().into(),
+                Some(languages),
+                None,
+                options,
+                cx,
+            ),
         });
         self.markdown.insert(key, markdown.clone());
         markdown
+    }
+
+    /// Selectable text (drag to select, Ctrl+C or right-click to copy). Each block gets its own
+    /// element id: the markdown renderer keys code blocks, tables and checkboxes by offset or
+    /// text, which repeat across messages, and duplicate ids crash the accessibility tree.
+    fn markdown_block(
+        &mut self,
+        key: MarkdownKey,
+        text: &str,
+        style: MarkdownStyle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let markdown = self.markdown_for(key, text, cx);
+        div()
+            .id(SharedString::from(format!(
+                "markdown-{}-{}-{:?}",
+                key.0, key.1, key.2
+            )))
+            .w_full()
+            .child(MarkdownElement::new(markdown, style))
+            .into_any_element()
     }
 
     fn render_assistant_message(
@@ -579,18 +738,25 @@ impl ChatView {
         for (chunk, content) in message.content.iter().enumerate() {
             match content {
                 MessageContent::Text(text) if !text.text.trim().is_empty() => {
-                    let markdown = self.markdown_for((message_index, chunk), &text.text, cx);
                     let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-                    blocks.push(
-                        div()
-                            .w_full()
-                            .child(MarkdownElement::new(markdown, style))
-                            .into_any_element(),
-                    );
+                    blocks.push(self.markdown_block(
+                        (message_index, chunk, MarkdownKind::Text),
+                        &text.text,
+                        style,
+                        cx,
+                    ));
                 }
                 MessageContent::Thinking(thinking) if !thinking.thinking.trim().is_empty() => {
                     let active = streaming_chunk == Some(chunk);
-                    blocks.push(self.render_thinking(entry, chunk, &thinking.thinking, active, cx));
+                    blocks.push(self.render_thinking(
+                        message_index,
+                        entry,
+                        chunk,
+                        &thinking.thinking,
+                        active,
+                        window,
+                        cx,
+                    ));
                 }
                 MessageContent::ToolRequest(request) => {
                     let response = responses.get(&request.id).cloned();
@@ -637,16 +803,30 @@ impl ChatView {
         cx.notify();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_thinking(
-        &self,
+        &mut self,
+        message_index: usize,
         entry: usize,
         chunk: usize,
         text: &str,
         active: bool,
-        cx: &Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let key = format!("thinking-{entry}-{chunk}");
         let open = self.expanded.contains(&key);
+        let body = open.then(|| {
+            let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+            style.base_text_style.color = cx.theme().colors().text_muted;
+            style.base_text_style.font_size = TextSize::Small.rems(cx).into();
+            self.markdown_block(
+                (message_index, chunk, MarkdownKind::Thinking),
+                text.trim(),
+                style,
+                cx,
+            )
+        });
         let colors = cx.theme().colors();
         let toggle_key = key.clone();
         v_flex()
@@ -684,9 +864,7 @@ impl ChatView {
                         .pl_3p5()
                         .border_l_1()
                         .border_color(colors.border_variant)
-                        .text_color(colors.text_muted)
-                        .text_sm()
-                        .child(text.trim().to_string()),
+                        .children(body),
                 )
             })
             .into_any_element()
@@ -1139,6 +1317,34 @@ impl ChatView {
             .border_1()
             .border_color(colors.border)
             .bg(colors.editor_background)
+            .when(self.editing.is_some(), |this| {
+                this.child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Icon::new(IconName::Pencil)
+                                .size(IconSize::XSmall)
+                                .color(Color::Accent),
+                        )
+                        .child(
+                            Label::new(
+                                "Editing a message: sending replaces it and everything after it",
+                            )
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            Button::new("cancel-edit", "Cancel")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.editing = None;
+                                    this.composer.update(cx, |c, cx| c.set_text("", cx));
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .when_some(self.steering.clone(), |this, steering| {
                 this.child(
                     h_flex()
@@ -1450,3 +1656,13 @@ fn shimmer(id: SharedString, text: &'static str, cx: &App) -> AnyElement {
         )
         .into_any_element()
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum MarkdownKind {
+    Text,
+    Thinking,
+    User,
+}
+
+/// (message index, content block, kind) of a rendered markdown block.
+type MarkdownKey = (usize, usize, MarkdownKind);
