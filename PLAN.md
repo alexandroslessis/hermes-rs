@@ -446,7 +446,7 @@ M5 part 5 status (2026-11-01): web search and extract, done.
   their Settings, the managed Nous gateway, the result memo cache, website policy rules,
   connect-time DNS-rebinding checks, binary-payload detection.
 
-M5 part 6 status (2026-11-01): vision and image paste, done (live check pending, see below).
+M5 part 6 status (2026-11-01): vision and image paste, done.
 - `crates/tools/src/vision.rs`: images from a path, an http(s) URL (public addresses only) or a
   `data:` URL; an optional `region` crop at full resolution; then Hermes's embed caps (long edge
   1568 px; 256 KB base64 for `vision_analyze`, 1 MB for attachments) by re-encoding as JPEG with
@@ -461,9 +461,9 @@ M5 part 6 status (2026-11-01): vision and image paste, done (live check pending,
   model without vision gets the paths and a placeholder). Sent messages show their images.
 - `TurnOptions::supports_vision` comes from discovery (OpenRouter input modalities, Ollama
   capabilities). Compaction counts ~1,600 tokens per image.
-- Live check: blocked today (the OpenRouter account's free-model daily quota ran out; the local
-  Ollama model has no vision). `live_vision_sees_attached_and_loaded_images` is ready for
-  `google/gemma-4-31b-it:free` or a local vision model.
+- Live-checked with Ollama `qwen3.5:9b` (`live_vision_sees_attached_and_loaded_images`, any
+  endpoint via `HERMES_LIVE_BASE_URL`): an attached red image answered "Red", a blue file loaded
+  through `vision_analyze` answered "Blue". The user confirmed paste and attach in the app.
 - Not ported: the auxiliary vision model and `image_input_mode`, video, SVG/HEIC conversion,
   per-turn duplicate/repeat caps, detecting image paths in typed text (the provider layer does
   that for vision models).

@@ -2063,21 +2063,27 @@ fn solid_png(rgb: [u8; 3]) -> Vec<u8> {
     out.into_inner()
 }
 
-/// A real vision model on OpenRouter (key in `hermes_rs_or_api_key`):
+/// A real vision model, on OpenRouter (key in `hermes_rs_or_api_key`) or `HERMES_LIVE_BASE_URL`:
 /// `HERMES_LIVE_VISION_MODEL=google/gemma-4-31b-it:free cargo test -p hermes_runtime --test turns live_vision -- --ignored --nocapture`
 #[tokio::test]
 #[ignore]
 async fn live_vision_sees_attached_and_loaded_images() {
     let model = std::env::var("HERMES_LIVE_VISION_MODEL").expect("set HERMES_LIVE_VISION_MODEL");
-    let key = std::env::var("hermes_rs_or_api_key").expect("set hermes_rs_or_api_key");
+    // OpenRouter with its key by default; `HERMES_LIVE_BASE_URL` points at another endpoint
+    // (Ollama: http://localhost:11434/v1, no key).
+    let base_url = std::env::var("HERMES_LIVE_BASE_URL")
+        .unwrap_or_else(|_| "https://openrouter.ai/api/v1".into());
+    let key = base_url
+        .contains("openrouter.ai")
+        .then(|| std::env::var("hermes_rs_or_api_key").expect("set hermes_rs_or_api_key"));
     let data = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
     std::fs::write(work.path().join("swatch.png"), solid_png([0, 0, 255])).unwrap();
     let runtime = runtime_in(data.path());
     let provider = ProviderConfig {
-        id: "openrouter".into(),
-        base_url: "https://openrouter.ai/api/v1".into(),
-        api_key: Some(key),
+        id: "live".into(),
+        base_url,
+        api_key: key,
     };
     let options = TurnOptions {
         context_length: Some(128_000),
