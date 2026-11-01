@@ -80,6 +80,10 @@ pub struct TokenUsageTooltip {
     pub used: SharedString,
     pub max: SharedString,
     pub cost: Option<SharedString>,
+    /// Estimated tokens per part of the request: (part, "12.3k").
+    pub breakdown: Vec<(SharedString, SharedString)>,
+    /// When automatic compression starts, e.g. "150k".
+    pub compress_at: Option<SharedString>,
 }
 
 impl Render for TokenUsageTooltip {
@@ -91,6 +95,7 @@ impl Render for TokenUsageTooltip {
             self.max.clone(),
             self.cost.clone(),
         );
+        let (breakdown, compress_at) = (self.breakdown.clone(), self.compress_at.clone());
         ui::tooltip_container(cx, move |container, cx| {
             container
                 .min_w_40()
@@ -108,6 +113,39 @@ impl Render for TokenUsageTooltip {
                         .child(Label::new("/").color(separator_color))
                         .child(Label::new(max).color(Color::Muted)),
                 )
+                .when(!breakdown.is_empty(), |this| {
+                    this.child(
+                        v_flex()
+                            .mt_1p5()
+                            .pt_1p5()
+                            .gap_0p5()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(
+                                Label::new("Estimated breakdown")
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            )
+                            .children(breakdown.into_iter().map(|(part, tokens)| {
+                                h_flex()
+                                    .gap_4()
+                                    .justify_between()
+                                    .child(Label::new(part).size(LabelSize::Small))
+                                    .child(
+                                        Label::new(tokens)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                            }))
+                            .when_some(compress_at, |this, at| {
+                                this.child(
+                                    Label::new(format!("Compresses automatically at {at}"))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                            }),
+                    )
+                })
                 .when_some(cost, |this, cost| {
                     this.child(
                         v_flex()

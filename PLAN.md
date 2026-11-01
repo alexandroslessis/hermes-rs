@@ -365,6 +365,36 @@ M5 part 1 status (2026-11-01): safety, done.
 - Not ported: smart (aux-model) approvals (F3, later), the user deny list, the sudo-password
   guard, execute_code gating (no execute_code tool).
 
+M5 part 2 status (2026-11-01): compression and the context breakdown, done.
+- `crates/prompts/src/compress.rs`: Hermes's handoff prefix and end marker, the summarizer
+  prompt (fresh and iterative-update forms, the no-user-turn variant, temporal anchoring, the
+  `/compress <focus>` paragraph).
+- `crates/runtime/src/compress.rs`: Hermes's lean-mode compressor. Budgets (75% trigger under
+  512k windows, else 50%; lean tail budget and 1.5× soft ceiling; summary budget 20% clamped
+  2k–10k), the head (`protect_first_n` = 3, decays to 0 after the first compaction), the
+  token-walked tail aligned to tool groups and anchored on the latest user message (except the
+  oversized-turn split), Hermes's one-line tool-result stubs, demotion of tail results older than
+  six rounds, the summarizer input format and bounds, iterative updates of the previous summary,
+  redaction of input and output. The `AutoCompress` step runs before each model call (last
+  request's usage plus an estimate of what was added); a failed summary leaves the context alone
+  for the rest of the turn. The frozen prompt is rebuilt at the compaction (Hermes's one
+  exception to the frozen-prompt rule).
+- A compaction that would grow the request is refused (Hermes). Editing a message from before
+  the handoff undoes the compaction: the summarized turns are the model's again (Hermes rewinds
+  its archived rows similarly).
+- Live-checked with nemotron-3-nano (16k window): auto-compression at 15.7k → 12.5k kept the
+  repo rule verbatim and the model answered from the summary.
+- Unlike Hermes nothing the user sees is rewritten: compacted messages are hidden from the model
+  only, stubs are agent-only copies next to the originals, the handoff is agent-only, and a
+  user-only notice ("Context compacted · N messages summarized · before → after") opens into the
+  summary. It goes above the message that started the turn (auto) or at the end (`/compress`).
+- `/compress [focus]` in the chat; "Compressing context" in the generating row; the context
+  ring's tooltip shows the estimated breakdown (system prompt, tool definitions, skills, memory,
+  conversation) and where auto-compression starts.
+- Not ported: the separate/aux summary model, the deterministic fallback summary and failure
+  cooldown timers, micro-compaction, anti-thrash counters beyond "not twice without growth",
+  the session-log/anchor-index sections, skill-prune markers, memory-provider context.
+
 **M6: Polish.** Command palette (Tier 2 `picker`), find in transcript, themes and fonts, diff
 review pane, import from `~/.hermes`, installer (MSI), auto-update.
 

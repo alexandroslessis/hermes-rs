@@ -24,13 +24,21 @@ pub enum HermesEffect {
     RecordUsage(ProviderUsage),
     /// Replaces a message by id (a repaired tool call, or a withdrawn one hidden from the model).
     UpdateMessage(Message),
+    /// Context compression's result: the rebuilt conversation and the refreshed frozen prompt.
+    Compacted {
+        conversation: Conversation,
+        system_prompt: Option<String>,
+        notice: crate::compress::CompactionNotice,
+    },
 }
 
 impl MachineEffect for HermesEffect {
     fn ensure_message_ids(&mut self) {
         match self {
             HermesEffect::Conversation(effect) => effect.ensure_message_ids(),
-            HermesEffect::UpdateMessage(_) | HermesEffect::RecordUsage(_) => {}
+            HermesEffect::UpdateMessage(_)
+            | HermesEffect::RecordUsage(_)
+            | HermesEffect::Compacted { .. } => {}
         }
     }
 }
@@ -60,6 +68,22 @@ pub struct TurnSession {
     pub conversation: Conversation,
     /// One-shot output cap for the next request (see `TurnState::max_tokens`).
     pub max_tokens: Option<i32>,
+    /// The last request's tokens (input + output) and the conversation length then.
+    pub context: Option<(usize, usize)>,
+}
+
+impl TurnSession {
+    /// Tokens the next request would take: the last one's plus what was added since, or an
+    /// estimate of everything (`fixed`: system prompt and tools) when there was none.
+    pub fn context_tokens(&self, conversation: &Conversation, fixed: usize) -> usize {
+        let messages = conversation.messages();
+        match self.context {
+            Some((tokens, len)) if len <= messages.len() => {
+                tokens + crate::compress::estimate_messages(&messages[len..])
+            }
+            _ => fixed + crate::compress::estimate_messages(messages),
+        }
+    }
 }
 
 impl MachineSession for TurnSession {
@@ -87,9 +111,30 @@ pub struct OpenSession {
     pub review: Mutex<Option<CancellationToken>>,
     /// Hermes's nudge counters, which decide when a turn is followed by a review.
     pub nudges: Mutex<crate::review::Nudges>,
+    /// The last request's tokens and the conversation length then (see [`TurnSession`]).
+    pub context: Mutex<Option<(usize, usize)>>,
 }
 
 impl OpenSession {
+    /// Stores a compacted conversation and, when rebuilt, the new frozen prompt (compaction is
+    /// the one place it may change, as in Hermes). The next request is measured afresh.
+    pub fn apply_compaction(
+        &self,
+        store: &Store,
+        conversation: Conversation,
+        system_prompt: Option<String>,
+    ) -> Result<()> {
+        let session_id = self.record.lock().id.clone();
+        if let Some(prompt) = system_prompt {
+            store.set_system_prompt(&session_id, &prompt)?;
+            self.record.lock().system_prompt = prompt;
+        }
+        store.replace_messages(&session_id, conversation.messages())?;
+        *self.conversation.lock() = conversation;
+        *self.context.lock() = None;
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> TurnSession {
         let record = self.record.lock();
         TurnSession {
@@ -97,6 +142,7 @@ impl OpenSession {
             system_prompt: record.system_prompt.clone(),
             conversation: self.conversation.lock().clone(),
             max_tokens: None,
+            context: *self.context.lock(),
         }
     }
 }
@@ -276,6 +322,21 @@ impl EffectHandler<TurnSession, HermesEffect> for TurnRuntime {
                         message.metadata.agent_visible = agent_visible;
                     })?;
                 }
+                HermesEffect::Compacted {
+                    conversation,
+                    system_prompt,
+                    notice,
+                } => {
+                    self.session.apply_compaction(
+                        &self.store,
+                        conversation.clone(),
+                        system_prompt.take(),
+                    )?;
+                    emit.emit(AgentEvent::HistoryReplaced(conversation.clone()));
+                    emit.emit(AgentEvent::Compacted {
+                        tokens: notice.tokens_after,
+                    });
+                }
                 HermesEffect::UpdateMessage(message) => {
                     let id = message.id.clone().context("updated message has no id")?;
                     let message = message.clone();
@@ -284,6 +345,12 @@ impl EffectHandler<TurnSession, HermesEffect> for TurnRuntime {
                     emit.emit(AgentEvent::HistoryReplaced(conversation));
                 }
                 HermesEffect::RecordUsage(usage) => {
+                    let tokens = usage.usage.input_tokens.unwrap_or(0).max(0) as usize
+                        + usage.usage.output_tokens.unwrap_or(0).max(0) as usize;
+                    if self.persist && tokens > 0 {
+                        let len = self.session.conversation.lock().len();
+                        *self.session.context.lock() = Some((tokens, len));
+                    }
                     if self.record_usage {
                         let session_id = self.session.record.lock().id.clone();
                         self.store.record_usage(&session_id, usage)?;

@@ -15,4 +15,12 @@ pub enum AgentEvent {
     },
     McpNotification((String, ServerNotification)),
     HistoryReplaced(Conversation),
+    /// Context compression started (the summary request is running).
+    Compacting,
+    /// Context compression finished; the request is now about `tokens` tokens.
+    Compacted {
+        tokens: usize,
+    },
+    /// Context compression was skipped (`None`: nothing to summarize) or failed.
+    CompactionFailed(Option<String>),
 }

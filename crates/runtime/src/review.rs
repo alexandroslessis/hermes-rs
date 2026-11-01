@@ -165,6 +165,7 @@ async fn review(job: ReviewJob) -> Result<Vec<String>> {
         turn_state: Mutex::new(None),
         review: Mutex::new(None),
         nudges: Mutex::new(Nudges::default()),
+        context: Mutex::new(None),
     });
     let session_id = fork.record.lock().id.clone();
     let state: ops::SharedTurnState = Arc::default();

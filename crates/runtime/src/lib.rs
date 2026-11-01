@@ -1,6 +1,7 @@
 //! The agent runtime the desktop app talks to: create and open sessions, start a turn and
 //! receive its events, cancel it, list a provider's models.
 
+pub mod compress;
 mod curator;
 mod guards;
 mod ops;
@@ -158,6 +159,22 @@ pub enum TurnStatus {
     Failed(String),
 }
 
+/// Estimated tokens per part of the request (characters / 4, like Hermes's breakdown).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContextBreakdown {
+    pub system_prompt: usize,
+    pub tool_definitions: usize,
+    pub skills: usize,
+    pub memory: usize,
+    pub conversation: usize,
+}
+
+impl ContextBreakdown {
+    pub fn total(&self) -> usize {
+        self.system_prompt + self.tool_definitions + self.skills + self.memory + self.conversation
+    }
+}
+
 pub struct Turn {
     pub events: mpsc::UnboundedReceiver<RuntimeEvent>,
     pub cancel: CancellationToken,
@@ -303,43 +320,37 @@ impl Runtime {
         cwd: &Path,
         with_memory: bool,
     ) -> Result<String> {
-        let home = dirs::home_dir().context("no home directory")?;
-        let soul = std::fs::read_to_string(self.config.data_dir.join("SOUL.md")).ok();
-        let tool_names = SessionTools::tool_names();
-        let skills_index = self.skills.index_prompt();
-        // Memory as it is now; writes during the session don't change this prompt.
-        let snapshot = self.memory.snapshot();
-        let memory = [snapshot.memory, snapshot.user]
-            .into_iter()
-            .flatten()
-            .reduce(|a, b| format!("{a}\n\n{b}"))
-            .filter(|_| with_memory);
-        // The scratch dir is per session but the prompt must name it before the id exists, so
-        // sessions share the scratch root in the prompt and get their own subdirectory below.
-        let scratch_root = self.config.data_dir.join("scratch");
-        // The project this folder belongs to, so the agent knows its other folders.
-        let projects = self.store.list_projects().unwrap_or_default();
-        let project = hermes_store::project_for_path(&projects, &cwd.display().to_string());
-        let prompt = build_system_prompt(&SystemPromptInput {
-            model,
-            provider,
-            cwd,
-            home: &home,
-            scratch_dir: &scratch_root,
-            shell: match self.config.shell {
-                ShellKind::GitBash(_) => Shell::GitBash,
-                ShellKind::PowerShell => Shell::PowerShell,
-            },
-            windows_version: &self.windows_version,
-            tool_names: &tool_names,
-            soul: soul.as_deref(),
-            memory: memory.as_deref(),
-            skills_index: skills_index.as_deref(),
-            project: project.map(|p| (p.name.as_str(), p.folders.as_slice())),
-            context_length,
-            now: chrono::Local::now(),
-        });
-        Ok(prompt.full())
+        self.prompt_source()
+            .build(provider, model, context_length, cwd, with_memory)
+    }
+
+    fn prompt_source(&self) -> PromptSource {
+        PromptSource {
+            data_dir: self.config.data_dir.clone(),
+            shell: self.config.shell.clone(),
+            windows_version: self.windows_version.clone(),
+            store: self.store.clone(),
+            memory: self.memory.clone(),
+            skills: self.skills.clone(),
+        }
+    }
+
+    /// Rebuilds a session's frozen prompt as it would be built now (after a compaction).
+    fn prompt_rebuild(
+        &self,
+        open: &OpenSession,
+        context_length: Option<usize>,
+    ) -> compress::PromptRebuild {
+        let source = self.prompt_source();
+        let (provider, model, cwd) = {
+            let record = open.record.lock();
+            (
+                record.provider.clone(),
+                record.model.clone(),
+                PathBuf::from(&record.cwd),
+            )
+        };
+        Arc::new(move || source.build(&provider, &model, context_length, &cwd, true))
     }
 
     fn open(&self, session_id: &str) -> Result<Arc<OpenSession>> {
@@ -382,6 +393,7 @@ impl Runtime {
             turn_state: Mutex::new(None),
             review: Mutex::new(None),
             nudges: Mutex::new(review::Nudges::resumed(user_turns)),
+            context: Mutex::new(None),
         });
         Ok(self
             .sessions
@@ -411,8 +423,11 @@ impl Runtime {
         let conversation = {
             let mut conversation = open.conversation.lock();
             conversation.messages_mut().truncate(keep);
+            // Rewound past a compaction's handoff: the turns it summarized come back.
+            compress::undo(&mut conversation);
             conversation.clone()
         };
+        *open.context.lock() = None;
         self.store
             .replace_messages(session_id, conversation.messages())?;
         open.tools.reset_todos(restore_todos(&conversation));
@@ -527,6 +542,8 @@ impl Runtime {
             }
         };
         let turn_start = open.conversation.lock().messages().len();
+        let rebuild_prompt = self.prompt_rebuild(&open, context_length);
+        let summarizer_llm = llm.clone();
         *self.last_activity.lock() = std::time::Instant::now();
         let last_activity = self.last_activity.clone();
 
@@ -580,6 +597,15 @@ impl Runtime {
                     state: state.clone(),
                 })),
                 Step::Operation(Arc::new(ops::ExitOnError)),
+                Step::Operation(Arc::new(compress::AutoCompress {
+                    state: state.clone(),
+                    summarizer: compress::Summarizer {
+                        llm: summarizer_llm,
+                        model: model.clone(),
+                        context_length,
+                    },
+                    rebuild_prompt,
+                })),
                 Step::Inference(Arc::new(InferenceRunner::new(llm, model_config))),
             ];
             let machine = StateMachine::new(steps, turn_cancel.clone());
@@ -646,6 +672,113 @@ impl Runtime {
         Ok(())
     }
 
+    /// Hermes's `/compress [focus]`: summarizes the conversation now, between turns. Runs like a
+    /// turn (it can be cancelled, and no turn starts meanwhile); the events end with
+    /// `TurnFinished`, failed with "Nothing to compress yet." when there's nothing to summarize.
+    pub fn compress(
+        &self,
+        session_id: &str,
+        provider: &ProviderConfig,
+        options: TurnOptions,
+        focus: Option<String>,
+    ) -> Result<Turn> {
+        let open = self.open(session_id)?;
+        let cancel = CancellationToken::new();
+        {
+            let mut running = open.running.lock();
+            anyhow::ensure!(
+                running.is_none(),
+                "a turn is running in this session; compress it when it ends"
+            );
+            *running = Some(cancel.clone());
+        }
+        let llm = match provider.provider() {
+            Ok(llm) => llm,
+            Err(error) => {
+                *open.running.lock() = None;
+                return Err(error);
+            }
+        };
+        let rebuild_prompt = self.prompt_rebuild(&open, options.context_length);
+        let summarizer = compress::Summarizer {
+            llm,
+            model: open.record.lock().model.clone(),
+            context_length: options.context_length,
+        };
+        let store = self.store.clone();
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let turn_cancel = cancel.clone();
+        tokio::spawn(async move {
+            let _ = events_tx.send(RuntimeEvent::Agent(AgentEvent::Compacting));
+            let conversation = open.conversation.lock().clone();
+            let fixed = compress::estimate_text(&open.record.lock().system_prompt)
+                + compress::tool_definition_tokens();
+            let result = tokio::select! {
+                result = compress::compact(&conversation, fixed, &summarizer, focus.as_deref(), None) => Some(result),
+                _ = turn_cancel.cancelled() => None,
+            };
+            let status = match result {
+                None => TurnStatus::Cancelled,
+                Some(Ok(None)) => TurnStatus::Failed("Nothing to compress yet.".into()),
+                Some(Err(error)) => TurnStatus::Failed(format!("{error:#}")),
+                Some(Ok(Some(compacted))) => {
+                    let prompt = rebuild_prompt().ok();
+                    let conversation = compacted.conversation;
+                    match open.apply_compaction(&store, conversation.clone(), prompt) {
+                        Ok(()) => {
+                            let _ = events_tx.send(RuntimeEvent::Agent(
+                                AgentEvent::HistoryReplaced(conversation),
+                            ));
+                            let _ = events_tx.send(RuntimeEvent::Agent(AgentEvent::Compacted {
+                                tokens: compacted.notice.tokens_after,
+                            }));
+                            TurnStatus::Completed
+                        }
+                        Err(error) => TurnStatus::Failed(format!("{error:#}")),
+                    }
+                }
+            };
+            *open.running.lock() = None;
+            let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
+        });
+        Ok(Turn {
+            events: events_rx,
+            cancel,
+        })
+    }
+
+    /// What fills the context window, estimated (Hermes's `/context` breakdown): the frozen
+    /// prompt split into its skills index, memory and the rest, the tool definitions, and the
+    /// conversation the model sees.
+    pub fn context_breakdown(&self, session_id: &str) -> Result<ContextBreakdown> {
+        let open = self.open(session_id)?;
+        let prompt = open.record.lock().system_prompt.clone();
+        let skills = match (
+            prompt.find("<available_skills>"),
+            prompt.find("</available_skills>"),
+        ) {
+            (Some(start), Some(end)) if end > start => {
+                compress::estimate_text(&prompt[start..end + "</available_skills>".len()])
+            }
+            _ => 0,
+        };
+        let snapshot = self.memory.snapshot();
+        let memory = [snapshot.memory, snapshot.user]
+            .into_iter()
+            .flatten()
+            .filter(|block| prompt.contains(block.as_str()))
+            .map(|block| compress::estimate_text(&block))
+            .sum::<usize>();
+        let total = compress::estimate_text(&prompt);
+        Ok(ContextBreakdown {
+            system_prompt: total.saturating_sub(skills + memory),
+            tool_definitions: compress::tool_definition_tokens(),
+            skills,
+            memory,
+            conversation: compress::estimate_messages(open.conversation.lock().messages()),
+        })
+    }
+
     /// Hermes's `/steer`: a message for the running turn, delivered to the model right after its
     /// next tool results. `false` when no turn is running (send it as a normal message instead).
     pub fn steer(&self, session_id: &str, text: &str) -> bool {
@@ -689,6 +822,66 @@ impl Runtime {
         self.store.delete_session(session_id)?;
         let _ = std::fs::remove_dir_all(self.scratch_dir(session_id));
         Ok(())
+    }
+}
+
+/// What the frozen system prompt is built from; cloned into a compaction so it can rebuild it.
+#[derive(Clone)]
+struct PromptSource {
+    data_dir: PathBuf,
+    shell: ShellKind,
+    windows_version: String,
+    store: Arc<Store>,
+    memory: Arc<MemoryStore>,
+    skills: Arc<SkillStore>,
+}
+
+impl PromptSource {
+    fn build(
+        &self,
+        provider: &str,
+        model: &str,
+        context_length: Option<usize>,
+        cwd: &Path,
+        with_memory: bool,
+    ) -> Result<String> {
+        let home = dirs::home_dir().context("no home directory")?;
+        let soul = std::fs::read_to_string(self.data_dir.join("SOUL.md")).ok();
+        let tool_names = SessionTools::tool_names();
+        let skills_index = self.skills.index_prompt();
+        // Memory as it is now; writes during the session don't change this prompt.
+        let snapshot = self.memory.snapshot();
+        let memory = [snapshot.memory, snapshot.user]
+            .into_iter()
+            .flatten()
+            .reduce(|a, b| format!("{a}\n\n{b}"))
+            .filter(|_| with_memory);
+        // The scratch dir is per session but the prompt must name it before the id exists, so
+        // sessions share the scratch root in the prompt and get their own subdirectory below.
+        let scratch_root = self.data_dir.join("scratch");
+        // The project this folder belongs to, so the agent knows its other folders.
+        let projects = self.store.list_projects().unwrap_or_default();
+        let project = hermes_store::project_for_path(&projects, &cwd.display().to_string());
+        let prompt = build_system_prompt(&SystemPromptInput {
+            model,
+            provider,
+            cwd,
+            home: &home,
+            scratch_dir: &scratch_root,
+            shell: match self.shell {
+                ShellKind::GitBash(_) => Shell::GitBash,
+                ShellKind::PowerShell => Shell::PowerShell,
+            },
+            windows_version: &self.windows_version,
+            tool_names: &tool_names,
+            soul: soul.as_deref(),
+            memory: memory.as_deref(),
+            skills_index: skills_index.as_deref(),
+            project: project.map(|p| (p.name.as_str(), p.folders.as_slice())),
+            context_length,
+            now: chrono::Local::now(),
+        });
+        Ok(prompt.full())
     }
 }
 

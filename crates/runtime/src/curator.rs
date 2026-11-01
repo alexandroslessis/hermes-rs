@@ -169,6 +169,7 @@ impl Runtime {
             turn_state: Mutex::new(None),
             review: Mutex::new(None),
             nudges: Mutex::new(Default::default()),
+            context: Mutex::new(None),
         });
         let state: ops::SharedTurnState = Arc::default();
         let runtime = TurnRuntime {

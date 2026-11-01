@@ -99,6 +99,10 @@ pub struct ChatView {
     )>,
     /// Background-review notes shown under the thread until the next turn (Hermes prints them).
     notices: Vec<String>,
+    /// A context compaction is running (the generating row says so).
+    compacting: bool,
+    /// The running "turn" is a `/compress`, which ends without the turn-finished notification.
+    manual_compress: bool,
     effort_menu: PopoverMenuHandle<ContextMenu>,
     model_menu: PopoverMenuHandle<ModelPicker>,
     pub usage: TurnUsage,
@@ -163,6 +167,8 @@ impl ChatView {
             slash_matches: Vec::new(),
             next_message: None,
             notices: Vec::new(),
+            compacting: false,
+            manual_compress: false,
             approval: None,
             effort_menu: PopoverMenuHandle::default(),
             model_menu: PopoverMenuHandle::default(),
@@ -405,7 +411,13 @@ impl ChatView {
             }
             return;
         }
+        // Hermes's `/compress [focus]` summarizes the conversation now instead of starting a turn.
+        let compress = text
+            .as_deref()
+            .and_then(|t| command_arg(t, "compress"))
+            .map(|focus| (!focus.is_empty()).then(|| focus.to_string()));
         let text = match text {
+            _ if compress.is_some() => None,
             Some(text) if command_arg(&text, "learn").is_some() => {
                 let request = command_arg(&text, "learn").unwrap_or_default();
                 Some(hermes_prompts::review::learn_message(request))
@@ -431,6 +443,12 @@ impl ChatView {
         let turn = {
             let _guard = backend.tokio.enter();
             match &text {
+                _ if compress.is_some() => backend.runtime.compress(
+                    &self.session_id,
+                    &provider,
+                    options,
+                    compress.clone().flatten(),
+                ),
                 Some(text) => {
                     backend
                         .runtime
@@ -452,6 +470,7 @@ impl ChatView {
         self.error = None;
         self.notices.clear();
         self.running = Some(turn.cancel.clone());
+        self.manual_compress = compress.is_some();
         self.composer.update(cx, |composer, cx| {
             composer.set_placeholder(STEER_PLACEHOLDER, cx)
         });
@@ -630,6 +649,23 @@ impl ChatView {
                 self.usage.cost += usage.cost.unwrap_or(0.);
                 cx.notify();
             }
+            RuntimeEvent::Agent(AgentEvent::Compacting) => {
+                self.compacting = true;
+                cx.notify();
+            }
+            RuntimeEvent::Agent(AgentEvent::Compacted { tokens }) => {
+                self.compacting = false;
+                self.usage.last_input_tokens = i32::try_from(tokens).unwrap_or(i32::MAX);
+                cx.notify();
+            }
+            RuntimeEvent::Agent(AgentEvent::CompactionFailed(error)) => {
+                self.compacting = false;
+                if let Some(error) = error {
+                    self.notices
+                        .push(format!("Context compression failed: {error}"));
+                }
+                cx.notify();
+            }
             RuntimeEvent::Agent(_) => {}
             RuntimeEvent::SteerUndelivered(text) => {
                 self.steering = None;
@@ -637,6 +673,8 @@ impl ChatView {
             }
             RuntimeEvent::TurnFinished(status) => {
                 self.running = None;
+                self.compacting = false;
+                let manual_compress = std::mem::take(&mut self.manual_compress);
                 self.composer.update(cx, |composer, cx| {
                     composer.set_placeholder(COMPOSER_PLACEHOLDER, cx)
                 });
@@ -657,7 +695,7 @@ impl ChatView {
                     self.entries_changed(cx);
                 }
                 cx.emit(ChatEvent::Updated);
-                if !continues && !cancelled {
+                if !continues && !cancelled && !manual_compress {
                     cx.emit(ChatEvent::TurnFinished {
                         failed: self.error.is_some(),
                         used_tools: self.used_tools_since_last_user_message(),
@@ -824,6 +862,8 @@ impl ChatView {
         self.conversation
             .messages()
             .iter()
+            // A compaction stub is an agent-only copy; the chat shows the original output.
+            .filter(|message| message.is_user_visible())
             .flat_map(|message| &message.content)
             .filter_map(|content| {
                 let MessageContent::ToolResponse(response) = content else {
@@ -902,9 +942,17 @@ impl ChatView {
         };
         let message = self.conversation.messages()[message_index].clone();
         let is_last = index + 1 == self.entries.len();
-        let content = match message.role {
-            Role::User => self.render_user_message(&message, message_index, window, cx),
-            Role::Assistant => {
+        let compaction = hermes_runtime::compress::notice(&message);
+        let content = match (&compaction, &message.role) {
+            (Some(notice), _) => v_flex()
+                .px_5()
+                .py_1p5()
+                .w_full()
+                .text_ui(cx)
+                .child(self.render_compaction(notice, &message, message_index, window, cx))
+                .into_any_element(),
+            (None, Role::User) => self.render_user_message(&message, message_index, window, cx),
+            (None, Role::Assistant) => {
                 let body =
                     self.render_assistant_message(&message, message_index, index, window, cx);
                 v_flex()
@@ -919,11 +967,13 @@ impl ChatView {
         };
         // Zed's thread controls close every finished turn: the last agent message before the
         // next user message (or the end).
+        // A compaction notice is neither: it closes the turn before it like a user message.
         let turn_end = message.role == Role::Assistant
-            && self
-                .entries
-                .get(index + 1)
-                .is_none_or(|&next| self.conversation.messages()[next].role == Role::User)
+            && compaction.is_none()
+            && self.entries.get(index + 1).is_none_or(|&next| {
+                let next = &self.conversation.messages()[next];
+                next.role == Role::User || hermes_runtime::compress::notice(next).is_some()
+            })
             && !(is_last && self.running.is_some());
         let content = if turn_end {
             v_flex()
@@ -1237,6 +1287,103 @@ impl ChatView {
     /// Zed's thinking block in its default "auto" display: a plain "Thinking" header (the
     /// chevron shows on hover), opened while the thought streams and closed when it ends,
     /// unless the user opened or closed it by hand.
+    /// Where the context was compacted: a muted row like Thinking's ("Context compacted · …"),
+    /// opening into the summary the model now reads in place of the earlier messages.
+    fn render_compaction(
+        &mut self,
+        notice: &hermes_runtime::compress::CompactionNotice,
+        message: &Message,
+        message_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = format!("compaction-{message_index}");
+        let open = self.expanded.contains(&key);
+        let body = open.then(|| {
+            let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+            self.markdown_block(
+                (message_index, 0, MarkdownKind::Text),
+                message.as_concat_text().trim(),
+                style,
+                cx,
+            )
+        });
+        let tokens = |n: usize| chat_ui::humanize_token_count(n as u64);
+        let mut label = format!(
+            "Context compacted · {} message{} summarized · {} → {} tokens",
+            notice.summarized,
+            if notice.summarized == 1 { "" } else { "s" },
+            tokens(notice.tokens_before),
+            tokens(notice.tokens_after),
+        );
+        if let Some(focus) = &notice.focus {
+            label.push_str(&format!(" · focus: {focus}"));
+        }
+        let colors = cx.theme().colors();
+        let header_group = SharedString::from(format!("{key}-header"));
+        let toggle = {
+            let key = key.clone();
+            move |this: &mut Self, cx: &mut Context<Self>| {
+                if open {
+                    this.expanded.remove(&key);
+                } else {
+                    this.expanded.insert(key.clone());
+                }
+                this.list_state.remeasure_items(0..this.list_len());
+                cx.notify();
+            }
+        };
+        let header_toggle = toggle.clone();
+        v_flex()
+            .id(SharedString::from(format!("{key}-block")))
+            .gap_1()
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("{key}-row")))
+                    .group(header_group.clone())
+                    .w_full()
+                    .pr_1()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .h(window.line_height() - px(2.))
+                            .gap_1p5()
+                            .overflow_hidden()
+                            .child(
+                                Icon::new(IconName::FoldVertical)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                div()
+                                    .text_size(rems_from_px(13_f32))
+                                    .text_color(colors.text_muted)
+                                    .child(label),
+                            ),
+                    )
+                    .child(
+                        Disclosure::new(SharedString::from(format!("{key}-expand")), open)
+                            .opened_icon(IconName::ChevronUp)
+                            .closed_icon(IconName::ChevronDown)
+                            .visible_on_hover(header_group)
+                            .on_click(cx.listener(move |this, _, _, cx| toggle(this, cx))),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| header_toggle(this, cx))),
+            )
+            .when_some(body, |this, body| {
+                this.child(
+                    div()
+                        .ml_1p5()
+                        .pl_3p5()
+                        .border_l_1()
+                        .border_color(tool_card_border_color(cx))
+                        .overflow_hidden()
+                        .child(body),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_thinking(
         &mut self,
         message_index: usize,
@@ -1797,6 +1944,16 @@ impl ChatView {
                             .justify_center()
                             .child(chat_ui::GeneratingSpinnerElement::new(SpinnerVariant::Dots)),
                     )
+                    .when(self.compacting, |this| {
+                        this.child(
+                            div().min_w(rems(8.)).child(
+                                LoadingLabel::new("Compressing context")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .single_line(),
+                            ),
+                        )
+                    })
                 }
             })
     }
@@ -2225,10 +2382,21 @@ impl ChatView {
     /// 85%), with the numbers and the session's cost on hover.
     fn render_token_usage(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
         let max = AppState::global(cx).read(cx).context_length(&self.model)? as u64;
-        let used = self.usage.last_input_tokens.max(0) as u64;
         if max == 0 {
             return None;
         }
+        let runtime = backend(cx).runtime.clone();
+        let session_id = self.session_id.clone();
+        // No request measured yet (a reopened or just-compacted session): the estimate.
+        let used = match self.usage.last_input_tokens {
+            n if n > 0 => n as u64,
+            _ => runtime
+                .context_breakdown(&session_id)
+                .map_or(0, |b| b.total() as u64),
+        };
+        let compress_at = SharedString::from(chat_ui::humanize_token_count(
+            hermes_runtime::compress::Budget::new(Some(max as usize)).threshold as u64,
+        ));
         let ratio = used as f32 / max as f32;
         // Zed turns the ring to the warning color at 85%; past 95% it's about to overflow.
         let progress_color = if ratio >= 0.95 {
@@ -2262,11 +2430,37 @@ impl ChatView {
                         max_label.clone(),
                         cost.clone(),
                     );
+                    // Estimated on hover: it walks the whole conversation.
+                    let breakdown = runtime
+                        .context_breakdown(&session_id)
+                        .map(|b| {
+                            [
+                                ("System prompt", b.system_prompt),
+                                ("Tool definitions", b.tool_definitions),
+                                ("Skills", b.skills),
+                                ("Memory", b.memory),
+                                ("Conversation", b.conversation),
+                            ]
+                            .into_iter()
+                            .filter(|&(part, tokens)| tokens > 0 || part == "Conversation")
+                            .map(|(part, tokens)| {
+                                (
+                                    SharedString::from(part),
+                                    SharedString::from(chat_ui::humanize_token_count(
+                                        tokens as u64,
+                                    )),
+                                )
+                            })
+                            .collect()
+                        })
+                        .unwrap_or_default();
                     cx.new(|_| chat_ui::TokenUsageTooltip {
                         percentage,
                         used,
                         max,
                         cost,
+                        breakdown,
+                        compress_at: Some(compress_at.clone()),
                     })
                     .into()
                 }),
@@ -2826,6 +3020,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     (
         "learn",
         "Learn a reusable skill from anything you describe (dirs, URLs, this chat, notes)",
+    ),
+    (
+        "compress",
+        "Compress the conversation context now (optional focus topic)",
     ),
 ];
 

@@ -83,6 +83,10 @@ pub struct TurnState {
     pub max_tokens: Option<i32>,
     /// `/steer` text waiting for the next tool batch to finish.
     pub pending_steer: Option<String>,
+    /// A summary request failed this turn: the context stays as it is (Hermes's cooldown).
+    pub compression_failed: bool,
+    /// The conversation length right after the last compaction: no second one until it grows.
+    pub compacted_at: Option<usize>,
 }
 
 pub type SharedTurnState = Arc<Mutex<TurnState>>;

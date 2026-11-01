@@ -1486,3 +1486,290 @@ async fn hardline_commands_never_reach_the_user() {
         "{result}"
     );
 }
+
+fn text_reply_with_prompt_tokens(text: &str, prompt_tokens: u64) -> String {
+    sse(vec![
+        delta(json!({"role": "assistant", "content": text}), Some("stop")),
+        json!({"id": "c", "object": "chat.completion.chunk", "model": "test-model", "choices": [],
+               "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 10,
+                         "total_tokens": prompt_tokens + 10}}),
+    ])
+}
+
+fn is_handoff(message: &hermes_llm::conversation::message::Message) -> bool {
+    hermes_runtime::compress::is_handoff(message)
+}
+
+#[tokio::test]
+async fn compress_summarizes_the_middle_and_keeps_the_chat() {
+    let h = harness(vec![
+        text_reply("one"),
+        text_reply(&long_two()),
+        text_reply("three"),
+        text_reply("four"),
+        text_reply("## Goal\nthe summary"),
+        text_reply("five"),
+    ])
+    .await;
+    let session = session_in(&h);
+    for text in ["first", "second", "third", "fourth"] {
+        run_turn(&h, &session, text).await;
+    }
+    let events = collect(
+        h.runtime
+            .compress(
+                &session,
+                &h.provider,
+                TurnOptions::default(),
+                Some("the parser".into()),
+            )
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::Agent(AgentEvent::Compacted { .. })))
+    );
+    // The summary request: one user message, no tools, the middle as labeled turns.
+    let summary_request = h.requests.lock()[4].clone();
+    let sent = sent_messages(&summary_request);
+    let prompt = sent.last().unwrap()["content"].to_string();
+    assert!(prompt.contains("[ASSISTANT]: two"), "{prompt}");
+    assert!(prompt.contains("FOCUS TOPIC: \\\"the parser\\\""));
+    assert!(
+        summary_request
+            .get("tools")
+            .is_none_or(|tools| tools.as_array().is_none_or(Vec::is_empty))
+    );
+
+    let messages = h.runtime.messages(&session).unwrap();
+    // Nothing the user saw is gone; the summarized reply is hidden from the model only.
+    let two = messages
+        .iter()
+        .find(|m| m.as_concat_text().starts_with("two"))
+        .unwrap();
+    assert!(two.is_user_visible() && !two.is_agent_visible());
+    let handoff = messages.iter().find(|m| is_handoff(m)).unwrap();
+    assert!(!handoff.is_user_visible());
+    assert!(handoff.as_concat_text().contains("## Goal\nthe summary"));
+    let notice = messages.last().unwrap();
+    assert!(hermes_runtime::compress::notice(notice).is_some());
+    assert!(!notice.is_agent_visible());
+
+    // The next request carries the handoff instead of the summarized turns.
+    run_turn(&h, &session, "fifth").await;
+    let next = h.requests.lock()[5].to_string();
+    assert!(next.contains("CONTEXT COMPACTION"));
+    assert!(!next.contains("two xxxx"));
+    assert!(next.contains("four"));
+    assert_eq!(last_text(&h, &session), "five");
+}
+
+#[tokio::test]
+async fn compress_with_nothing_to_summarize_says_so() {
+    let h = harness(vec![text_reply("one")]).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "first").await;
+    let events = collect(
+        h.runtime
+            .compress(&session, &h.provider, TurnOptions::default(), None)
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        finished_status(&events),
+        TurnStatus::Failed("Nothing to compress yet.".into())
+    );
+    assert_eq!(h.requests.lock().len(), 1);
+}
+
+#[tokio::test]
+async fn a_request_past_the_threshold_is_compressed_before_the_next_call() {
+    let options = TurnOptions {
+        context_length: Some(40_000),
+        effort: None,
+    };
+    let h = harness(vec![
+        text_reply("one"),
+        text_reply(&long_two()),
+        text_reply("three"),
+        // 35k tokens: past 75% of the 40k window.
+        text_reply_with_prompt_tokens("four", 35_000),
+        text_reply("## Goal\nauto summary"),
+        text_reply("five"),
+    ])
+    .await;
+    let session = session_in(&h);
+    let run = |text: &'static str| {
+        let turn = h
+            .runtime
+            .start_turn(&session, &h.provider, options.clone(), text)
+            .unwrap();
+        collect(turn)
+    };
+    for text in ["first", "second", "third", "fourth"] {
+        run(text).await;
+    }
+    let events = run("fifth").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::Agent(AgentEvent::Compacting)))
+    );
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 6);
+    assert!(requests[4].to_string().contains("TURNS TO SUMMARIZE"));
+    assert!(requests[5].to_string().contains("auto summary"));
+    assert_eq!(last_text(&h, &session), "five");
+    // The notice sits above the message that started the turn.
+    let messages = h.runtime.messages(&session).unwrap();
+    let at = messages
+        .iter()
+        .position(|m| hermes_runtime::compress::notice(m).is_some())
+        .unwrap();
+    assert_eq!(messages[at + 1].as_concat_text(), "fifth");
+}
+
+/// `/compress` against a real model: the summary keeps a fact from the summarized turns.
+/// `HERMES_LIVE_BASE_URL=http://localhost:11434/v1 HERMES_LIVE_MODEL=<model> cargo test -p hermes_runtime --test turns live_compress -- --ignored --nocapture`
+#[tokio::test]
+#[ignore]
+async fn live_compress_keeps_what_matters() {
+    // A local thinking model can take minutes over the summary.
+    async fn collect(mut turn: hermes_runtime::Turn) -> Vec<RuntimeEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(900), turn.events.recv())
+            .await
+            .unwrap()
+        {
+            let finished = matches!(event, RuntimeEvent::TurnFinished(_));
+            events.push(event);
+            if finished {
+                break;
+            }
+        }
+        events
+    }
+    let (Ok(base_url), Ok(model)) = (
+        std::env::var("HERMES_LIVE_BASE_URL"),
+        std::env::var("HERMES_LIVE_MODEL"),
+    ) else {
+        panic!("set HERMES_LIVE_BASE_URL and HERMES_LIVE_MODEL");
+    };
+    let data = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let runtime = runtime_in(data.path());
+    let provider = ProviderConfig {
+        id: "live".into(),
+        base_url,
+        api_key: None,
+    };
+    let options = TurnOptions {
+        context_length: Some(16384),
+        effort: None,
+    };
+    let session = runtime
+        .create_session(&provider, &model, Some(16384), work.path())
+        .unwrap();
+    // Two long pastes push the rule out of the kept tail, so only the summary carries it.
+    let filler = format!(
+        "Here is a build log; just acknowledge it in one sentence, no tools.
+{}",
+        "compiling crate ok
+"
+        .repeat(800)
+    );
+    for text in [
+        "I'm working on a parser in parser.rs. Just acknowledge in one sentence, no tools.",
+        "The bug is an off-by-one in tokenize(). Just acknowledge in one sentence, no tools.",
+        "Rule for this repo: never use unwrap(), always propagate errors with `?`. Just acknowledge in one sentence, no tools.",
+        &filler,
+        &filler,
+        "What is 2+2? One word, no tools.",
+    ] {
+        let turn = runtime
+            .start_turn(&session.id, &provider, options.clone(), text.as_ref())
+            .unwrap();
+        println!("turn: {:?}", finished_status(&collect(turn).await));
+    }
+    let events = collect(
+        runtime
+            .compress(&session.id, &provider, options.clone(), None)
+            .unwrap(),
+    )
+    .await;
+    println!("compress: {:?}", finished_status(&events));
+    let messages = runtime.messages(&session.id).unwrap();
+    let notice = messages
+        .iter()
+        .find(|m| hermes_runtime::compress::notice(m).is_some())
+        .expect("no compaction notice");
+    println!(
+        "{:?}\n--- summary ---\n{}",
+        hermes_runtime::compress::notice(notice),
+        notice.as_concat_text()
+    );
+    let turn = runtime
+        .start_turn(
+            &session.id,
+            &provider,
+            options,
+            "What is the coding rule for this repo? One sentence, no tools.",
+        )
+        .unwrap();
+    println!("turn: {:?}", finished_status(&collect(turn).await));
+    let answer = runtime
+        .messages(&session.id)
+        .unwrap()
+        .last()
+        .unwrap()
+        .as_concat_text();
+    println!("--- answer ---\n{answer}");
+    assert!(answer.to_lowercase().contains("unwrap"), "{answer}");
+}
+
+#[tokio::test]
+async fn rewinding_past_a_compaction_brings_the_summarized_turns_back() {
+    let h = harness(vec![
+        text_reply("one"),
+        text_reply(&long_two()),
+        text_reply("three"),
+        text_reply("four"),
+        text_reply("## Goal\nthe summary"),
+    ])
+    .await;
+    let session = session_in(&h);
+    for text in ["first", "second", "third", "fourth"] {
+        run_turn(&h, &session, text).await;
+    }
+    collect(
+        h.runtime
+            .compress(&session, &h.provider, TurnOptions::default(), None)
+            .unwrap(),
+    )
+    .await;
+    let messages = h.runtime.messages(&session).unwrap();
+    let handoff = messages.iter().position(is_handoff).unwrap();
+    // Editing a message before the handoff cuts it off.
+    let messages = h.runtime.rewind(&session, handoff).unwrap();
+    assert!(messages.iter().all(|m| !is_handoff(m)));
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.as_concat_text().starts_with("two"))
+    );
+    assert!(messages.iter().all(|m| m.is_agent_visible()));
+    assert!(
+        messages
+            .iter()
+            .all(|m| hermes_runtime::compress::notice(m).is_none())
+    );
+}
+
+/// A reply long enough that summarizing it shrinks the request.
+fn long_two() -> String {
+    format!("two {}", "x".repeat(8_000))
+}
