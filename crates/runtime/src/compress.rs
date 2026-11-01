@@ -735,10 +735,14 @@ fn plan(messages: &[Message], budget: &Budget) -> Option<Plan> {
 
 // ---- compaction ---------------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct Summarizer {
     pub llm: Arc<dyn Provider>,
     pub model: String,
     pub context_length: Option<usize>,
+    /// The session model's window, which decides when to compress (`context_length` is the
+    /// summarizing model's own).
+    pub window: Option<usize>,
 }
 
 pub struct Compacted {
@@ -755,7 +759,7 @@ pub async fn compact(
     focus: Option<&str>,
     notice_at: Option<usize>,
 ) -> Result<Option<Compacted>> {
-    let budget = Budget::new(summarizer.context_length);
+    let budget = Budget::new(summarizer.window);
     let messages = conversation.messages();
     let Some(plan) = plan(messages, &budget) else {
         return Ok(None);
@@ -994,7 +998,7 @@ impl Operation<TurnSession, HermesEffect> for AutoCompress {
                 return not_applicable();
             }
         }
-        let budget = Budget::new(self.summarizer.context_length);
+        let budget = Budget::new(self.summarizer.window);
         let fixed = estimate_text(&session.system_prompt) + tool_definition_tokens();
         let tokens = session.context_tokens(conversation, fixed);
         if tokens < budget.threshold {

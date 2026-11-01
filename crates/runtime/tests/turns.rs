@@ -512,6 +512,7 @@ async fn effort_is_sent_only_when_set() {
         context_length: None,
         effort: Some("high".into()),
         supports_vision: false,
+        aux: Default::default(),
     };
     let mut turn = h
         .runtime
@@ -1356,6 +1357,7 @@ async fn live_refine_saves_something() {
         context_length: Some(32768),
         effort: None,
         supports_vision: false,
+        aux: Default::default(),
     };
     let session = runtime
         .create_session(&provider, &model, Some(32768), work.path())
@@ -1593,6 +1595,7 @@ async fn a_request_past_the_threshold_is_compressed_before_the_next_call() {
         context_length: Some(40_000),
         effort: None,
         supports_vision: false,
+        aux: Default::default(),
     };
     let h = harness(vec![
         text_reply("one"),
@@ -1674,6 +1677,7 @@ async fn live_compress_keeps_what_matters() {
         context_length: Some(16384),
         effort: None,
         supports_vision: false,
+        aux: Default::default(),
     };
     let session = runtime
         .create_session(&provider, &model, Some(16384), work.path())
@@ -1804,6 +1808,7 @@ async fn too_much_attached_context_refuses_the_message() {
         context_length: Some(2_000),
         effort: None,
         supports_vision: false,
+        aux: Default::default(),
     };
     // Each file fits on its own (under half of 2k tokens), together they don't.
     let error = h
@@ -1966,6 +1971,7 @@ fn vision(supports_vision: bool) -> TurnOptions {
         context_length: None,
         effort: None,
         supports_vision,
+        aux: Default::default(),
     }
 }
 
@@ -2089,6 +2095,7 @@ async fn live_vision_sees_attached_and_loaded_images() {
         context_length: Some(128_000),
         effort: None,
         supports_vision: true,
+        aux: Default::default(),
     };
     let session = runtime
         .create_session(&provider, &model, Some(128_000), work.path())
@@ -2243,6 +2250,7 @@ async fn live_delegate_task_counts_files_in_a_subagent() {
         context_length: Some(32_768),
         effort: None,
         supports_vision: false,
+        aux: Default::default(),
     };
     let session = runtime
         .create_session(&provider, &model, Some(32_768), work.path())
@@ -2407,6 +2415,7 @@ async fn live_mcp_stdio_server_is_used_by_a_real_model() {
         context_length: Some(32_768),
         effort: None,
         supports_vision: false,
+        aux: Default::default(),
     };
     let session = runtime
         .create_session(&provider, &model, Some(32_768), work.path())
@@ -2458,4 +2467,41 @@ async fn live_mcp_stdio_server_is_used_by_a_real_model() {
         });
     let answer = messages.last().unwrap().as_concat_text();
     assert!(called && answer.contains("5555.75"), "{answer}");
+}
+
+#[tokio::test]
+async fn compression_uses_the_auxiliary_model_when_one_is_set() {
+    let h = harness(vec![
+        text_reply("one"),
+        text_reply(&long_two()),
+        text_reply("three"),
+        text_reply("four"),
+        text_reply("## Goal\nthe summary"),
+    ])
+    .await;
+    let session = session_in(&h);
+    for text in ["first", "second", "third", "fourth"] {
+        run_turn(&h, &session, text).await;
+    }
+    let options = TurnOptions {
+        aux: hermes_runtime::AuxModels {
+            compression: Some(hermes_runtime::AuxModel {
+                provider: h.provider.clone(),
+                model: "summary-model".into(),
+                context_length: Some(32_000),
+            }),
+            review: None,
+        },
+        ..TurnOptions::default()
+    };
+    let events = collect(
+        h.runtime
+            .compress(&session, &h.provider, options, None)
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests[3]["model"], "test-model");
+    assert_eq!(requests[4]["model"], "summary-model");
 }

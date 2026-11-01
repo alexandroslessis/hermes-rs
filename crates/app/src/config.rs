@@ -67,6 +67,12 @@ pub struct AppConfig {
     /// off by default).
     #[serde(default)]
     pub checkpoints: bool,
+    /// What Enter does while a turn runs (Hermes's `busy_input_mode`).
+    #[serde(default)]
+    pub busy_input_mode: BusyInput,
+    /// Models for side jobs (Hermes's `auxiliary.*`).
+    #[serde(default)]
+    pub aux_models: AuxModelSettings,
     /// Hermes's `mcp_servers`: the MCP servers whose tools the agent gets.
     #[serde(default)]
     pub mcp_servers: std::collections::BTreeMap<String, hermes_runtime::mcp::McpServerConfig>,
@@ -113,6 +119,8 @@ impl Default for AppConfig {
             curator_consolidate: false,
             ask_dangerous_commands: true,
             checkpoints: false,
+            busy_input_mode: BusyInput::default(),
+            aux_models: AuxModelSettings::default(),
             mcp_servers: Default::default(),
             sidebar_width: None,
         }
@@ -225,4 +233,36 @@ mod tests {
 
 fn default_true() -> bool {
     true
+}
+
+/// Hermes's `display.busy_input_mode`: a message sent while a turn runs steers it (delivered after
+/// its current tool call), waits in the queue for it to end, or stops it and goes instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BusyInput {
+    #[default]
+    Steer,
+    Queue,
+    Interrupt,
+}
+
+/// A model on a particular provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelChoice {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Hermes's `auxiliary.*` for the side jobs hermes-rs runs; `None` uses the chat's model.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AuxModelSettings {
+    /// Writes compaction summaries (`auxiliary.compression`).
+    #[serde(default)]
+    pub compression: Option<ModelChoice>,
+    /// Reviews turns for memory and skills (`auxiliary.background_review`).
+    #[serde(default)]
+    pub review: Option<ModelChoice>,
+    /// Consolidates skills (`auxiliary.curator`).
+    #[serde(default)]
+    pub curator: Option<ModelChoice>,
 }

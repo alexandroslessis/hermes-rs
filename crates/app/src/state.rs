@@ -206,20 +206,64 @@ pub fn provider_ready(provider: &ProviderSettings) -> bool {
 }
 
 impl AppState {
+    /// A side job's model on its provider, when one is chosen and the provider still exists.
+    pub fn aux_model(
+        &self,
+        choice: &Option<config::ModelChoice>,
+    ) -> Option<hermes_runtime::AuxModel> {
+        let choice = choice.as_ref()?;
+        let provider = self
+            .config
+            .providers
+            .iter()
+            .find(|p| p.id == choice.provider)?;
+        Some(hermes_runtime::AuxModel {
+            provider: config::runtime_provider(provider),
+            model: choice.model.clone(),
+            context_length: self
+                .provider_models
+                .get(&provider.id)
+                .and_then(|list| list.models.iter().find(|m| m.id == choice.model))
+                .and_then(|m| m.context_length),
+        })
+    }
+
+    /// The turn's side-job models (compression and background review).
+    pub fn aux_models(&self) -> hermes_runtime::AuxModels {
+        hermes_runtime::AuxModels {
+            compression: self.aux_model(&self.config.aux_models.compression),
+            review: self.aux_model(&self.config.aux_models.review),
+        }
+    }
+
     /// The model the curator's consolidation pass runs on: the default model, when consolidation
     /// is on and a provider serves it.
     pub fn curator_model(&self) -> Option<hermes_runtime::CuratorModel> {
         if !self.config.curator_consolidate {
             return None;
         }
-        let model = self.config.model.clone()?;
-        let provider = self.provider_for_model(&model)?;
+        // The auxiliary curator model, else the default model.
+        let (model, provider) = match &self.config.aux_models.curator {
+            Some(choice) => (
+                choice.model.clone(),
+                self.config
+                    .providers
+                    .iter()
+                    .find(|p| p.id == choice.provider)?,
+            ),
+            None => {
+                let model = self.config.model.clone()?;
+                let provider = self.provider_for_model(&model)?;
+                (model, provider)
+            }
+        };
         Some(hermes_runtime::CuratorModel {
             provider: config::runtime_provider(provider),
             options: hermes_runtime::TurnOptions {
                 context_length: self.context_length(&model),
                 effort: self.config.efforts.get(&model).cloned(),
                 supports_vision: self.supports_vision(&model),
+                aux: Default::default(),
             },
             model,
         })

@@ -101,6 +101,48 @@ pub struct TurnOptions {
     /// The model accepts images (its discovered input modalities): attached images and
     /// `vision_analyze` results are sent to it.
     pub supports_vision: bool,
+    /// Models for side jobs (Hermes's `auxiliary.*`); each falls back to the turn's model.
+    pub aux: AuxModels,
+}
+
+/// A model for a side job, on its own provider.
+#[derive(Debug, Clone)]
+pub struct AuxModel {
+    pub provider: ProviderConfig,
+    pub model: String,
+    pub context_length: Option<usize>,
+}
+
+/// Hermes's `auxiliary.compression` and `auxiliary.background_review` (the curator's model is
+/// chosen with [`CuratorModel`]).
+#[derive(Debug, Clone, Default)]
+pub struct AuxModels {
+    pub compression: Option<AuxModel>,
+    pub review: Option<AuxModel>,
+}
+
+/// Who writes compaction summaries: the auxiliary compression model, else the session's.
+/// `window` stays the session model's (it decides when to compress).
+fn summarizer_for(
+    aux: &AuxModels,
+    llm: &Arc<dyn Provider>,
+    model: &str,
+    context_length: Option<usize>,
+) -> Result<compress::Summarizer> {
+    Ok(match &aux.compression {
+        Some(aux) => compress::Summarizer {
+            llm: aux.provider.provider()?,
+            model: aux.model.clone(),
+            context_length: aux.context_length,
+            window: context_length,
+        },
+        None => compress::Summarizer {
+            llm: llm.clone(),
+            model: model.to_string(),
+            context_length,
+            window: context_length,
+        },
+    })
 }
 
 /// The request field that carries reasoning effort: OpenRouter normalizes it as
@@ -560,6 +602,7 @@ impl Runtime {
             context_length,
             effort,
             supports_vision,
+            aux,
         } = options;
         let effort_params = effort
             .as_deref()
@@ -575,8 +618,26 @@ impl Runtime {
             *running = Some(cancel.clone());
         }
         let model = open.record.lock().model.clone();
-        let llm = match provider.provider() {
-            Ok(llm) => llm,
+        let models = provider.provider().and_then(|llm| {
+            let summarizer = summarizer_for(&aux, &llm, &model, context_length)?;
+            let review = match &aux.review {
+                Some(aux) => (
+                    aux.provider.provider()?,
+                    aux.model.clone(),
+                    aux.context_length,
+                    None,
+                ),
+                None => (
+                    llm.clone(),
+                    model.clone(),
+                    context_length,
+                    effort_params.clone(),
+                ),
+            };
+            Ok((llm, summarizer, review))
+        });
+        let (llm, summarizer, review_model) = match models {
+            Ok(models) => models,
             Err(error) => {
                 *open.running.lock() = None;
                 return Err(error);
@@ -599,13 +660,15 @@ impl Runtime {
             review.cancel();
         }
         let review_memory = text.is_some() && open.nudges.lock().tick_memory();
+        // The background review runs on the auxiliary review model when one is set.
+        let (review_llm, review_name, review_context, review_effort) = review_model;
         let review_setup = ReviewSetup {
             store: self.store.clone(),
             bridge: self.bridge.clone(),
-            llm: llm.clone(),
-            model: model.clone(),
-            context_length,
-            effort_params: effort_params.clone(),
+            llm: review_llm,
+            model: review_name,
+            context_length: review_context,
+            effort_params: review_effort,
             enabled: self.background_review.clone(),
         };
         // A message with `@url:` references or images is added once its pages are fetched and
@@ -646,9 +709,9 @@ impl Runtime {
             supports_vision,
             base_prompt: self.child_base_prompt(&open, context_length),
             child_tools: self.child_tools(),
+            summarizer: summarizer.clone(),
             mcp: self.mcp.clone(),
         });
-        let summarizer_llm = llm.clone();
         let self_mcp = self.mcp.clone();
         *self.last_activity.lock() = std::time::Instant::now();
         let last_activity = self.last_activity.clone();
@@ -755,11 +818,7 @@ impl Runtime {
                 Step::Operation(Arc::new(ops::ExitOnError)),
                 Step::Operation(Arc::new(compress::AutoCompress {
                     state: state.clone(),
-                    summarizer: compress::Summarizer {
-                        llm: summarizer_llm,
-                        model: model.clone(),
-                        context_length,
-                    },
+                    summarizer: summarizer.clone(),
                     rebuild_prompt,
                 })),
                 Step::Inference(Arc::new(InferenceRunner::new(llm, model_config))),
@@ -811,16 +870,30 @@ impl Runtime {
             !open.conversation.lock().messages().is_empty(),
             "Nothing to refine yet — send a message first."
         );
+        let (llm, model, context_length, effort_params) = match &options.aux.review {
+            Some(aux) => (
+                aux.provider.provider()?,
+                aux.model.clone(),
+                aux.context_length,
+                None,
+            ),
+            None => (
+                provider.provider()?,
+                open.record.lock().model.clone(),
+                options.context_length,
+                options
+                    .effort
+                    .as_deref()
+                    .map(|effort| effort_request_params(&provider.base_url, effort)),
+            ),
+        };
         let setup = ReviewSetup {
             store: self.store.clone(),
             bridge: self.bridge.clone(),
-            llm: provider.provider()?,
-            model: open.record.lock().model.clone(),
-            context_length: options.context_length,
-            effort_params: options
-                .effort
-                .as_deref()
-                .map(|effort| effort_request_params(&provider.base_url, effort)),
+            llm,
+            model,
+            context_length,
+            effort_params,
             enabled: self.background_review.clone(),
         };
         let skills = SessionTools::tool_names().contains(&"skill_manage");
@@ -856,10 +929,13 @@ impl Runtime {
             }
         };
         let rebuild_prompt = self.prompt_rebuild(&open, options.context_length);
-        let summarizer = compress::Summarizer {
-            llm,
-            model: open.record.lock().model.clone(),
-            context_length: options.context_length,
+        let model = open.record.lock().model.clone();
+        let summarizer = match summarizer_for(&options.aux, &llm, &model, options.context_length) {
+            Ok(summarizer) => summarizer,
+            Err(error) => {
+                *open.running.lock() = None;
+                return Err(error);
+            }
         };
         let store = self.store.clone();
         let (events_tx, events_rx) = mpsc::unbounded_channel();

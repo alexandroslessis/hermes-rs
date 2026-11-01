@@ -78,6 +78,8 @@ pub struct Delegator {
     pub supports_vision: bool,
     pub base_prompt: BasePrompt,
     pub child_tools: ChildTools,
+    /// Who writes children's compaction summaries (the parent's summarizer).
+    pub summarizer: compress::Summarizer,
     /// MCP servers' tools, offered to the parent and (as in Hermes) inherited by children.
     pub mcp: Arc<crate::mcp::McpManager>,
 }
@@ -415,11 +417,7 @@ impl Delegator {
             Step::Operation(Arc::new(ops::ExitOnError)),
             Step::Operation(Arc::new(compress::AutoCompress {
                 state: state.clone(),
-                summarizer: compress::Summarizer {
-                    llm: self.llm.clone(),
-                    model: self.model.clone(),
-                    context_length: self.context_length,
-                },
+                summarizer: self.summarizer.clone(),
                 rebuild_prompt: Arc::new(move || Ok(child_prompt.clone())),
             })),
             Step::Inference(Arc::new(InferenceRunner::new(

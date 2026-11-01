@@ -90,6 +90,8 @@ pub struct ChatView {
     editing: Option<usize>,
     /// Skills matching a `/command` being typed: (name, short description).
     slash_matches: Vec<Suggestion>,
+    /// Prompts waiting for the running turn to end (Hermes's `/queue`).
+    queued: Vec<String>,
     /// Images waiting to go with the next message (pasted, dropped or picked).
     attachments: Vec<Arc<gpui::Image>>,
     /// Each running `delegate_task` call'"'"'s subagents and what they last started, by tool call id.
@@ -177,6 +179,7 @@ impl ChatView {
             slash_matches: Vec::new(),
             file_index: None,
             attachments: Vec::new(),
+            queued: Vec::new(),
             message_images: HashMap::new(),
             subagent_progress: HashMap::new(),
             next_message: None,
@@ -275,8 +278,36 @@ impl ChatView {
                 return;
             }
         }
-        // Mid-turn, Enter steers the running turn (Hermes's `/steer`).
+        // Mid-turn, Enter steers the running turn (Hermes's `/steer`), queues the message for after
+        // it, or stops it and sends this instead (Settings, Hermes's `busy_input_mode`).
+        // `/steer <text>` steers whatever the setting says; with nothing running it's a message.
+        let (text, force_steer) = match command_arg(&text, "steer") {
+            Some(steer) if !steer.is_empty() => (steer.to_string(), true),
+            _ => (text, false),
+        };
         if self.running.is_some() {
+            let mode = if force_steer {
+                config::BusyInput::Steer
+            } else {
+                AppState::global(cx).read(cx).config.busy_input_mode
+            };
+            match mode {
+                config::BusyInput::Queue => {
+                    self.composer
+                        .update(cx, |composer, cx| composer.set_text("", cx));
+                    self.queued.push(text);
+                    cx.notify();
+                    return;
+                }
+                config::BusyInput::Interrupt => {
+                    self.composer
+                        .update(cx, |composer, cx| composer.set_text("", cx));
+                    self.next_message = Some(text);
+                    self.stop(cx);
+                    return;
+                }
+                config::BusyInput::Steer => {}
+            }
             if backend(cx).runtime.steer(&self.session_id, &text) {
                 self.composer
                     .update(cx, |composer, cx| composer.set_text("", cx));
@@ -291,6 +322,141 @@ impl ChatView {
         self.composer
             .update(cx, |composer, cx| composer.set_text("", cx));
         self.start_turn(text, window, cx);
+    }
+
+    /// Hermes's `/queue`: `<prompt>` queues it for after the running turn (runs it now when
+    /// nothing runs); `list`, `edit N <prompt>`, `rm N`, `move FROM TO` and `clear` manage the queue.
+    /// Returns what to tell the user, or the prompt to send now.
+    fn queue_command(&mut self, args: &str) -> Result<String, String> {
+        let preview = |text: &str| {
+            let line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if line.chars().count() > 60 {
+                format!("{}…", line.chars().take(60).collect::<String>())
+            } else {
+                line
+            }
+        };
+        let (sub, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+        let rest = rest.trim();
+        let index = |n: &str, size: usize| -> Result<usize, String> {
+            n.parse::<usize>()
+                .ok()
+                .filter(|&i| (1..=size).contains(&i))
+                .map(|i| i - 1)
+                .ok_or_else(|| format!("Queue item {n} not found. Current size: {size}"))
+        };
+        Ok(match sub {
+            "" => QUEUE_USAGE.into(),
+            "list" | "ls" => {
+                if self.queued.is_empty() {
+                    "Queue is empty.".into()
+                } else {
+                    let mut lines = vec![format!("Queue ({} pending):", self.queued.len())];
+                    lines.extend(
+                        self.queued
+                            .iter()
+                            .enumerate()
+                            .map(|(i, text)| format!("{}. {}", i + 1, preview(text))),
+                    );
+                    lines.join("\n")
+                }
+            }
+            "clear" => {
+                let count = std::mem::take(&mut self.queued).len();
+                format!(
+                    "Cleared {count} queued prompt{}.",
+                    if count == 1 { "" } else { "s" }
+                )
+            }
+            "rm" | "remove" => match index(rest, self.queued.len()) {
+                Ok(i) => {
+                    let removed = self.queued.remove(i);
+                    format!("Removed queue item {}: {}", i + 1, preview(&removed))
+                }
+                Err(error) => error,
+            },
+            "edit" => {
+                let (n, prompt) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                if prompt.trim().is_empty() {
+                    return Ok("Usage: /queue edit <number> <new prompt>".into());
+                }
+                match index(n, self.queued.len()) {
+                    Ok(i) => {
+                        self.queued[i] = prompt.trim().to_string();
+                        format!("Edited queue item {}: {}", i + 1, preview(prompt))
+                    }
+                    Err(error) => error,
+                }
+            }
+            "move" | "mv" => {
+                let mut numbers = rest.split_whitespace();
+                let size = self.queued.len();
+                match (
+                    numbers.next().map(|n| index(n, size)),
+                    numbers.next().map(|n| index(n, size)),
+                ) {
+                    (Some(Ok(from)), Some(Ok(to))) => {
+                        let item = self.queued.remove(from);
+                        self.queued.insert(to, item);
+                        format!("Moved queue item {} to {}.", from + 1, to + 1)
+                    }
+                    (Some(Err(error)), _) | (_, Some(Err(error))) => error,
+                    _ => QUEUE_USAGE.into(),
+                }
+            }
+            _ => {
+                let prompt = args.trim().to_string();
+                if self.running.is_none() {
+                    return Err(prompt);
+                }
+                let shown = preview(&prompt);
+                self.queued.push(prompt);
+                format!("Queued: {shown}")
+            }
+        })
+    }
+
+    /// The queued prompts over the composer, each removable.
+    fn render_queue(&self, cx: &Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        v_flex()
+            .gap_0p5()
+            .children(self.queued.iter().enumerate().map(|(index, text)| {
+                let line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                h_flex()
+                    .gap_2()
+                    .px_1()
+                    .rounded_sm()
+                    .bg(colors.element_background)
+                    .child(
+                        Icon::new(IconName::QueueMessage)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(format!("Queued {}: {line}", index + 1))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
+                    )
+                    .child(
+                        IconButton::new(
+                            SharedString::from(format!("unqueue-{index}")),
+                            IconName::Close,
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Remove from Queue"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if index < this.queued.len() {
+                                this.queued.remove(index);
+                            }
+                            cx.notify();
+                        })),
+                    )
+            }))
     }
 
     pub fn start_turn(&mut self, text: String, _window: &mut Window, cx: &mut Context<Self>) {
@@ -528,6 +694,7 @@ impl ChatView {
                     context_length: state.context_length(&self.model),
                     effort: state.config.efforts.get(&self.model).cloned(),
                     supports_vision: state.supports_vision(&self.model),
+                    aux: state.aux_models(),
                 },
             )
         };
@@ -539,6 +706,18 @@ impl ChatView {
         let backend = backend(cx);
         // Hermes's `/refine [focus]` reviews the conversation in the background instead of
         // starting a turn; `/learn <request>` starts one with the learn prompt.
+        // Hermes's `/queue` manages prompts waiting for the running turn.
+        let text = match text.as_deref().and_then(|t| command_arg(t, "queue")) {
+            Some(args) => match self.queue_command(args) {
+                Ok(notice) => {
+                    self.notices.push(notice);
+                    self.trailer_changed(cx);
+                    return;
+                }
+                Err(prompt) => Some(prompt),
+            },
+            None => text,
+        };
         // Hermes's `/rollback` and `/diff` report in the chat instead of starting a turn.
         let local = text.as_deref().and_then(|t| {
             command_arg(t, "rollback")
@@ -877,6 +1056,14 @@ impl ChatView {
                 self.composer.update(cx, |composer, cx| {
                     composer.set_placeholder(COMPOSER_PLACEHOLDER, cx)
                 });
+                // A finished turn hands over to the first queued prompt (not after a stop or an error).
+                let queued = (self.next_message.is_none()
+                    && status == TurnStatus::Completed
+                    && !self.queued.is_empty())
+                .then(|| self.queued.remove(0));
+                if queued.is_some() {
+                    self.next_message = queued;
+                }
                 let continues = self.next_message.is_some();
                 let cancelled = matches!(status, TurnStatus::Cancelled);
                 if let Some(text) = self.next_message.take() {
@@ -2998,6 +3185,9 @@ impl ChatView {
                     .min_w_0()
                     .px_2()
                     .gap_2()
+                    .when(!self.queued.is_empty(), |this| {
+                        this.child(self.render_queue(cx))
+                    })
                     .when(!self.attachments.is_empty(), |this| {
                         this.child(self.render_attachments(cx))
                     })
@@ -3372,6 +3562,14 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
         "Compress the conversation context now (optional focus topic)",
     ),
     (
+        "steer",
+        "Send guidance to the running turn, delivered after its current tool call",
+    ),
+    (
+        "queue",
+        "Queue a prompt for after the running turn, or list/edit/rm/move/clear queued prompts",
+    ),
+    (
         "rollback",
         "List file checkpoints; /rollback N restores one, /rollback diff N previews",
     ),
@@ -3411,6 +3609,9 @@ struct Suggestion {
     description: String,
     text: String,
 }
+
+/// `queue.usage`.
+const QUEUE_USAGE: &str = "Usage: /queue <prompt> | /queue list | /queue edit N <prompt> | /queue rm N | /queue move FROM TO | /queue clear";
 
 /// Hermes's built-in `@` reference kinds, offered as an `@` mention is typed.
 const MENTION_KINDS: &[(&str, &str)] = &[

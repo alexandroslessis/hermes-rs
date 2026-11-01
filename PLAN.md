@@ -505,6 +505,20 @@ M5 part 8 status (2026-11-01): MCP, done.
   trust gates and cost policies for untrusted servers, the OSV malware preflight, health checks
   and automatic reconnect, the schema cache, server-sent tool-list updates.
 
+M5 part 9 status (2026-11-01): queue and auxiliary model routing, done. M5 complete.
+- Queue: Hermes's `/queue <prompt>` (runs now when idle) and `/queue list | edit N | rm N | move
+  FROM TO | clear`; queued prompts show over the composer with remove buttons and run one by one
+  as turns complete (not after a stop or an error). `/steer <text>` steers whatever the setting.
+  Settings → While a Turn Runs: Enter steers (default, as before), queues, or interrupts
+  (Hermes's `busy_input_mode`; its default is interrupt).
+- Auxiliary models: Settings → Auxiliary Models picks a model (on any provider) for compression
+  summaries, the background review and `/refine`, and the curator; each falls back to the chat's
+  model. Compression keeps deciding by the chat model's window. Children of `delegate_task` use
+  the parent's summarizer.
+- Not ported: Hermes's other auxiliary tasks (approval classifier, title generation, vision,
+  MCP, skills hub, …), the auto chain (`free_only`, OpenRouter fallback), per-task timeouts and
+  extra_body, the compact-digest replay for a non-main review model.
+
 **M6: Polish.** Command palette (Tier 2 `picker`), find in transcript, themes and fonts, diff
 review pane, import from `~/.hermes`, installer (MSI), auto-update.
 

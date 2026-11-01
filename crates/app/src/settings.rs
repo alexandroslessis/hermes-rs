@@ -7,7 +7,8 @@ use gpui::{
     App, Context, Entity, FocusHandle, Focusable, KeyDownEvent, Subscription, Window, prelude::*,
 };
 use ui::{
-    Chip, ContextMenu, Divider, DropdownMenu, Switch, TintColor, ToggleState, Tooltip, prelude::*,
+    Chip, ContextMenu, Divider, DropdownMenu, PopoverMenu, Switch, TintColor, ToggleState, Tooltip,
+    prelude::*,
 };
 
 use crate::backend::backend;
@@ -291,6 +292,162 @@ impl SettingsView {
     }
 
     /// Hermes's self-improvement switch: background reviews after turns.
+    /// Hermes's `busy_input_mode`: what a message sent during a turn does.
+    fn render_busy_input(cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::config::BusyInput;
+        let current = AppState::global(cx).read(cx).config.busy_input_mode;
+        let choice = |mode: BusyInput, label: &'static str, tip: &'static str| {
+            Button::new(SharedString::from(format!("busy-{label}")), label)
+                .style(if mode == current {
+                    ButtonStyle::Filled
+                } else {
+                    ButtonStyle::Subtle
+                })
+                .tooltip(Tooltip::text(tip))
+                .on_click(move |_, _, cx| {
+                    AppState::global(cx).update(cx, |state, cx| {
+                        state.config.busy_input_mode = mode;
+                        state.save(cx);
+                    });
+                })
+        };
+        h_flex()
+            .justify_between()
+            .items_start()
+            .gap_4()
+            .child(Self::section(
+                "While a Turn Runs",
+                Some("What sending a message does while the agent is working. /queue and /steer work either way."),
+            ))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .flex_none()
+                    .child(choice(BusyInput::Steer, "Steer", "Delivered to the agent after its current tool call"))
+                    .child(choice(BusyInput::Queue, "Queue", "Sent when the running turn ends"))
+                    .child(choice(BusyInput::Interrupt, "Interrupt", "Stops the running turn and sends this instead")),
+            )
+    }
+
+    /// Hermes's `auxiliary.*`: the models side jobs run on, each defaulting to the chat's model.
+    fn render_aux(cx: &mut Context<Self>) -> impl IntoElement {
+        let aux = AppState::global(cx).read(cx).config.aux_models.clone();
+        let row = |id: &'static str,
+                   title: &'static str,
+                   description: &'static str,
+                   choice: Option<config::ModelChoice>,
+                   set: fn(&mut config::AuxModelSettings, Option<config::ModelChoice>),
+                   cx: &mut Context<Self>| {
+            let name = choice
+                .as_ref()
+                .map(|choice| {
+                    AppState::global(cx)
+                        .read(cx)
+                        .model_info(&choice.model)
+                        .and_then(|m| m.name.clone())
+                        .unwrap_or_else(|| choice.model.clone())
+                })
+                .unwrap_or_else(|| "Chat model".into());
+            let selected = choice.clone().map(|c| (c.provider, c.model));
+            let chosen = choice.is_some();
+            h_flex()
+                .justify_between()
+                .gap_4()
+                .child(
+                    v_flex().min_w_0().child(Label::new(title)).child(
+                        Label::new(description)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .flex_none()
+                        .child(
+                            PopoverMenu::new(SharedString::from(format!("aux-{id}")))
+                                .menu(move |window, cx| {
+                                    let on_select: crate::model_picker::OnSelect =
+                                        Rc::new(move |provider, model, _, cx| {
+                                            AppState::global(cx).update(cx, |state, cx| {
+                                                set(
+                                                    &mut state.config.aux_models,
+                                                    Some(config::ModelChoice { provider, model }),
+                                                );
+                                                state.save(cx);
+                                            });
+                                        });
+                                    let selected = selected.clone();
+                                    Some(cx.new(|cx| {
+                                        ModelPicker::new(selected, on_select, window, cx)
+                                    }))
+                                })
+                                .trigger(
+                                    Button::new(
+                                        SharedString::from(format!("aux-button-{id}")),
+                                        name,
+                                    )
+                                    .style(ButtonStyle::Outlined)
+                                    .label_size(LabelSize::Small)
+                                    .end_icon(
+                                        Icon::new(IconName::ChevronDown)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                                )
+                                .anchor(gpui::Anchor::TopRight),
+                        )
+                        .when(chosen, |this| {
+                            this.child(
+                                IconButton::new(
+                                    SharedString::from(format!("aux-reset-{id}")),
+                                    IconName::Close,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Use the Chat Model"))
+                                .on_click(move |_, _, cx| {
+                                    AppState::global(cx).update(cx, |state, cx| {
+                                        set(&mut state.config.aux_models, None);
+                                        state.save(cx);
+                                    });
+                                }),
+                            )
+                        }),
+                )
+        };
+        v_flex()
+            .gap_3()
+            .child(Self::section(
+                "Auxiliary Models",
+                Some("Side jobs can run on a cheaper or faster model; each uses the chat's model unless one is chosen here."),
+            ))
+            .child(row(
+                "compression",
+                "Compression",
+                "Writes the summary when the context is compacted.",
+                aux.compression,
+                |aux, choice| aux.compression = choice,
+                cx,
+            ))
+            .child(row(
+                "review",
+                "Background review",
+                "Reviews finished turns for memory and skills (and /refine).",
+                aux.review,
+                |aux, choice| aux.review = choice,
+                cx,
+            ))
+            .child(row(
+                "curator",
+                "Curator",
+                "Consolidates overlapping skills when the curator runs.",
+                aux.curator,
+                |aux, choice| aux.curator = choice,
+                cx,
+            ))
+    }
+
     fn render_learning(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (enabled, consolidate) = {
             let config = &AppState::global(cx).read(cx).config;
@@ -990,7 +1147,11 @@ impl Render for SettingsView {
                     .child(Self::theme_picker(window, cx)),
             )
             .child(Divider::horizontal())
+            .child(Self::render_busy_input(cx))
+            .child(Divider::horizontal())
             .child(self.render_learning(cx))
+            .child(Divider::horizontal())
+            .child(Self::render_aux(cx))
             .child(Divider::horizontal())
             .child(self.render_safety(cx))
             .child(Divider::horizontal())
