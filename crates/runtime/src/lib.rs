@@ -145,6 +145,42 @@ fn summarizer_for(
     })
 }
 
+/// Hermes's `generate_title`: a 3–7 word name for a session from its opening message, written by
+/// `model` (reasoning turned off). `None` when the model gave nothing usable.
+pub async fn generate_title(
+    provider: &ProviderConfig,
+    model: &str,
+    opening: &str,
+) -> Result<Option<String>> {
+    use hermes_prompts::titles;
+    let llm = provider.provider()?;
+    let snippet: String = opening
+        .chars()
+        .take(titles::MAX_TITLE_INPUT_CHARS)
+        .collect();
+    let config = ModelConfig::new(model)
+        .with_max_tokens(Some(titles::TITLE_MAX_TOKENS))
+        .with_merged_request_params(effort_request_params(&provider.base_url, "none"));
+    let (reply, _) = llm
+        .complete(
+            &config,
+            titles::TITLE_PROMPT,
+            &[Message::user().with_text(snippet)],
+            &[],
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("title request failed: {error}"))?;
+    let text: String = reply
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            MessageContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    Ok(titles::parse_title(&text))
+}
+
 /// The request field that carries reasoning effort: OpenRouter normalizes it as
 /// `reasoning: {effort}`; other OpenAI-compatible servers (vLLM, DeepSeek, LM Studio) take
 /// `reasoning_effort`.

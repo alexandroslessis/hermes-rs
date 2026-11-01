@@ -575,13 +575,76 @@ impl Workspace {
                 })
             {
                 // A skill command or expanded references: title it with what was typed.
-                let title = title_from(&crate::chat::shown_user_text(&first));
+                let typed = crate::chat::shown_user_text(&first);
+                let title = title_from(&typed);
                 if !title.is_empty() {
                     let _ = backend.runtime.store().set_title(&session_id, &title);
+                    // Hermes's titler then names it properly (the instant title is a placeholder).
+                    self.generate_title(session_id.clone(), title, typed, cx);
                 }
             }
         }
         self.reload_sessions(cx);
+    }
+
+    /// Asks the titles model (else the session's) for a title, and keeps it unless the session
+    /// was renamed in the meantime.
+    fn generate_title(
+        &mut self,
+        session_id: String,
+        placeholder: String,
+        opening: String,
+        cx: &mut Context<Self>,
+    ) {
+        let (provider, model) = {
+            let state = AppState::global(cx).read(cx);
+            let chosen = state.aux_model(&state.config.aux_models.titles);
+            match chosen {
+                Some(aux) => (aux.provider, aux.model),
+                None => {
+                    let Some(model) = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == session_id)
+                        .map(|s| s.model.clone())
+                    else {
+                        return;
+                    };
+                    let Some(provider) = state.provider_for_model(&model) else {
+                        return;
+                    };
+                    (crate::config::runtime_provider(provider), model)
+                }
+            }
+        };
+        let request = backend(cx).tokio.spawn(async move {
+            hermes_runtime::generate_title(&provider, &model, &opening).await
+        });
+        cx.spawn(async move |this, cx| {
+            let title = match request.await {
+                Ok(Ok(Some(title))) => title,
+                Ok(Err(error)) => {
+                    tracing::debug!("title generation failed: {error:#}");
+                    return;
+                }
+                _ => return,
+            };
+            this.update(cx, |this, cx| {
+                let backend = backend(cx);
+                let store = backend.runtime.store();
+                let unchanged = store
+                    .session(&session_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| s.title.as_deref() == Some(placeholder.as_str()));
+                if unchanged {
+                    let _ = store.set_title(&session_id, &title);
+                    this.reload_sessions(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The folder for sessions outside any group: the last one used, else home.

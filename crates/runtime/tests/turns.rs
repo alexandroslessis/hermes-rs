@@ -2552,3 +2552,53 @@ async fn undo_usage_and_insights_report_in_the_chat() {
     let (messages, typed) = h.runtime.undo(&session, "").unwrap();
     assert!(typed.is_none() && messages.last().unwrap().as_concat_text() == "Nothing to undo.");
 }
+
+#[tokio::test]
+async fn titles_come_from_the_model_with_hermes_prompt() {
+    let h = harness(vec![text_reply(
+        r#"{"title": "Fix parser crash in tokenize"}"#,
+    )])
+    .await;
+    let title = hermes_runtime::generate_title(
+        &h.provider,
+        "title-model",
+        "the parser crashes in tokenize() on empty input, can you fix it?",
+    )
+    .await
+    .unwrap();
+    assert_eq!(title.as_deref(), Some("Fix parser crash in tokenize"));
+    let request = h.requests.lock()[0].clone();
+    assert_eq!(request["model"], "title-model");
+    assert!(
+        sent_messages(&request)[0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("You name chat sessions.")
+    );
+}
+
+/// `HERMES_LIVE_BASE_URL=http://localhost:11434/v1 HERMES_LIVE_MODEL=<model> cargo test -p hermes_runtime --test turns live_title -- --ignored --nocapture`
+#[tokio::test]
+#[ignore]
+async fn live_title_names_a_session() {
+    let (Ok(base_url), Ok(model)) = (
+        std::env::var("HERMES_LIVE_BASE_URL"),
+        std::env::var("HERMES_LIVE_MODEL"),
+    ) else {
+        panic!("set HERMES_LIVE_BASE_URL and HERMES_LIVE_MODEL");
+    };
+    let provider = ProviderConfig {
+        id: "live".into(),
+        base_url,
+        api_key: None,
+    };
+    let title = hermes_runtime::generate_title(
+        &provider,
+        &model,
+        "my cargo build fails with error E0502 cannot borrow `self.items` as mutable in src/cart.rs",
+    )
+    .await
+    .unwrap();
+    println!("title: {title:?}");
+    assert!(title.is_some());
+}

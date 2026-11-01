@@ -265,4 +265,7 @@ pub struct AuxModelSettings {
     /// Consolidates skills (`auxiliary.curator`).
     #[serde(default)]
     pub curator: Option<ModelChoice>,
+    /// Names sessions from their opening message (`auxiliary.title_generation`).
+    #[serde(default)]
+    pub titles: Option<ModelChoice>,
 }

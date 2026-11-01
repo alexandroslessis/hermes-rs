@@ -446,6 +446,14 @@ impl SettingsView {
                 |aux, choice| aux.curator = choice,
                 cx,
             ))
+            .child(row(
+                "titles",
+                "Session titles",
+                "Names a session from its first message.",
+                aux.titles,
+                |aux, choice| aux.titles = choice,
+                cx,
+            ))
     }
 
     fn render_learning(&self, cx: &mut Context<Self>) -> impl IntoElement {
