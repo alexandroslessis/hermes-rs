@@ -13,7 +13,12 @@ use parking_lot::Mutex;
 use rmcp::model::Role;
 use rusqlite::{Connection, OptionalExtension, params};
 
-const SCHEMA_VERSION: i32 = 1;
+mod search;
+
+pub use search::{SearchHit, SearchQuery, SearchRow, SearchSort};
+
+/// v2 added the session-search index.
+const SCHEMA_VERSION: i32 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE sessions (
@@ -106,6 +111,10 @@ impl Store {
         let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version == 0 {
             conn.execute_batch(SCHEMA)?;
+            conn.execute_batch(search::SEARCH_SCHEMA)?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        } else if version == 1 {
+            search::migrate(&conn)?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if version != SCHEMA_VERSION {
             anyhow::bail!(
@@ -238,6 +247,7 @@ impl Store {
              ON CONFLICT(session_id, seq) DO UPDATE SET id = excluded.id, role = excluded.role, json = excluded.json",
             params![session_id, id, seq as i64, role_name(message), json],
         )?;
+        search::index_message(&conn, session_id, seq, message)?;
         conn.execute(
             "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
             params![session_id, now_ms()],
@@ -250,6 +260,10 @@ impl Store {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM messages WHERE session_id = ?1", [session_id])?;
+        tx.execute(
+            "DELETE FROM search_rows WHERE session_id = ?1",
+            [session_id],
+        )?;
         for (seq, message) in messages.iter().enumerate() {
             let id = message
                 .id
@@ -259,6 +273,7 @@ impl Store {
                 "INSERT INTO messages (session_id, id, seq, role, json) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![session_id, id, seq as i64, role_name(message), serde_json::to_string(message)?],
             )?;
+            search::index_message(&tx, session_id, seq, message)?;
         }
         tx.execute(
             "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",

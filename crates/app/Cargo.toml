@@ -20,6 +20,7 @@ gpui.workspace = true
 gpui_platform.workspace = true
 hermes_agent.workspace = true
 hermes_llm.workspace = true
+hermes_memory.workspace = true
 hermes_runtime.workspace = true
 hermes_store.workspace = true
 hermes_tools.workspace = true

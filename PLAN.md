@@ -277,6 +277,23 @@ mock-provider test in `crates/runtime/tests/turns.rs`.
 **M3: Memory and recall.** Memory store with Hermes semantics, frozen snapshot, threat scan,
 pending-write approvals, session search, memory editor screen.
 
+M3 status (2026-11-01): done, verified live with a free model (save → new session knows it →
+`session_search` recalls an older session → approval staged and approved in the Memory screen).
+- `crates/memory`: `MEMORY.md` / `USER.md` under `%APPDATA%\hermes-rs\memories` with Hermes's
+  budgets (2,200 / 1,375 chars), atomic batches checked on the final result, patch/remove with
+  typography-tolerant matching, the would-empty and drift guards, the per-turn consolidation cap,
+  the threat-pattern library (`threats.rs`, also for skills/context files later) and staged writes
+  pinned to the entries they were reviewed against.
+- The frozen snapshot rides in the volatile prompt tier; the memory and session-search guidance in
+  the tool-guidance block.
+- `session_search` over a new FTS5 index (store schema v2, migrated in place): discover (title
+  match, one result per session, adaptive hydration with bookends), read, scroll, browse.
+  Hermes's profiles/lineage/links are dropped (one profile, no compression lineage yet).
+- Memory screen (title bar, Ctrl+Shift+M): entries with edit/delete/add, pending approvals, the
+  "ask before saving" switch (`memory_write_approval` in config), open folder, import from
+  `~/.hermes/memories`.
+- Not yet: external memory providers (B26, dropped), per-store enable switches and limits in the UI.
+
 **M4: Self-improvement.** Skills (`skills_list`/`skill_view`/`skill_manage`), git-backed rollback,
 skill slash commands, background review, `/refine`, `/learn`, curator, skills browser screen.
 Behavior tuning starts here and continues with real use.

@@ -16,15 +16,21 @@ use ui::{
 
 use crate::backend::{UiRequest, backend};
 use crate::chat::{ChatEvent, ChatView};
+use crate::memory_view::MemoryView;
 use crate::settings::SettingsView;
 use crate::state::AppState;
 use crate::title_bar::TitleBar;
 
-actions!(workspace, [NewSession, ToggleSidebar, OpenSettings]);
+actions!(
+    workspace,
+    [NewSession, ToggleSidebar, OpenSettings, OpenMemory]
+);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Main {
     Chat,
     Settings,
+    Memory,
 }
 
 pub struct Workspace {
@@ -33,6 +39,7 @@ pub struct Workspace {
     active: Option<String>,
     main: Main,
     settings: Entity<SettingsView>,
+    memory: Entity<MemoryView>,
     sidebar_open: bool,
     collapsed: HashSet<String>,
     hovered_session: Option<String>,
@@ -63,6 +70,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let settings = cx.new(|cx| SettingsView::new(window, cx));
+        let memory = cx.new(|cx| MemoryView::new(window, cx));
         let state = AppState::global(cx);
         let requests_task = cx.spawn_in(window, async move |this, cx| {
             while let Some(request) = requests.recv().await {
@@ -82,6 +90,7 @@ impl Workspace {
             active: None,
             main: Main::Chat,
             settings,
+            memory,
             sidebar_open: true,
             collapsed: HashSet::new(),
             hovered_session: None,
@@ -103,6 +112,26 @@ impl Workspace {
             this.main = Main::Settings;
         }
         this
+    }
+
+    /// Shows `screen`, or goes back to the chat when it is already showing.
+    fn toggle_main(&mut self, screen: Main, window: &mut Window, cx: &mut Context<Self>) {
+        self.main = if self.main == screen {
+            Main::Chat
+        } else {
+            screen
+        };
+        match self.main {
+            Main::Memory => self.memory.update(cx, |memory, cx| memory.refresh(cx)),
+            Main::Chat => {
+                if let Some(chat) = self.active.as_ref().and_then(|id| self.chats.get(id)) {
+                    let composer = chat.read(cx).composer();
+                    composer.focus_handle(cx).focus(window, cx);
+                }
+            }
+            Main::Settings => {}
+        }
+        cx.notify();
     }
 
     fn reload_sessions(&mut self, cx: &mut Context<Self>) {
@@ -578,6 +607,7 @@ impl Render for Workspace {
         let colors = cx.theme().colors();
         let main: AnyElement = match self.main {
             Main::Settings => self.settings.clone().into_any_element(),
+            Main::Memory => self.memory.clone().into_any_element(),
             Main::Chat => match self.active.as_ref().and_then(|id| self.chats.get(id)) {
                 Some(chat) => chat.clone().into_any_element(),
                 None => v_flex()
@@ -603,6 +633,7 @@ impl Render for Workspace {
             },
         };
         let settings_open = matches!(self.main, Main::Settings);
+        let memory_open = matches!(self.main, Main::Memory);
         let _ = window;
         v_flex()
             .size_full()
@@ -616,6 +647,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
                 this.main = Main::Settings;
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &OpenMemory, window, cx| {
+                this.toggle_main(Main::Memory, window, cx)
             }))
             .font(theme::theme_settings(cx).ui_font(cx).clone())
             .text_color(colors.text)
@@ -644,6 +678,18 @@ impl Render for Workspace {
                             .color(Color::Muted),
                     )
                     .right(
+                        IconButton::new("open-memory", IconName::Notepad)
+                            .icon_color(if memory_open {
+                                Color::Accent
+                            } else {
+                                Color::Muted
+                            })
+                            .tooltip(Tooltip::text("Memory (Ctrl+Shift+M)"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_main(Main::Memory, window, cx)
+                            })),
+                    )
+                    .right(
                         IconButton::new("open-settings", IconName::Settings)
                             .icon_color(if settings_open {
                                 Color::Accent
@@ -652,18 +698,7 @@ impl Render for Workspace {
                             })
                             .tooltip(Tooltip::text("Settings (Ctrl+,)"))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.main = match this.main {
-                                    Main::Settings => Main::Chat,
-                                    Main::Chat => Main::Settings,
-                                };
-                                if let (Main::Chat, Some(chat)) = (
-                                    &this.main,
-                                    this.active.as_ref().and_then(|id| this.chats.get(id)),
-                                ) {
-                                    let composer = chat.read(cx).composer();
-                                    composer.focus_handle(cx).focus(window, cx);
-                                }
-                                cx.notify();
+                                this.toggle_main(Main::Settings, window, cx)
                             })),
                     ),
             )

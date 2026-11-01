@@ -1218,6 +1218,8 @@ fn tool_icon(name: &str) -> IconName {
         "search_files" => IconName::ToolSearch,
         "todo_list" => IconName::ListTodo,
         "clarify" => IconName::Info,
+        "memory" => IconName::Notepad,
+        "session_search" => IconName::HistoryRerun,
         _ => IconName::ToolHammer,
     }
 }
@@ -1239,6 +1241,28 @@ fn tool_summary(name: &str, args: &serde_json::Value) -> String {
             Some(todos) => format!("{} items", todos.len()),
             None => "read".into(),
         }),
+        "memory" => {
+            let ops = args.get("operations").and_then(|o| o.as_array());
+            let first = ops
+                .and_then(|ops| ops.first())
+                .or(Some(args))
+                .and_then(|op| op.get("content").or_else(|| op.get("old_text")))
+                .and_then(|c| c.as_str())
+                .unwrap_or_default();
+            let more = ops.map_or(0, |ops| ops.len().saturating_sub(1));
+            Some(format!(
+                "{}: {first}{}",
+                field("target").unwrap_or_else(|| "memory".into()),
+                if more > 0 {
+                    format!(" (+{more} more)")
+                } else {
+                    String::new()
+                }
+            ))
+        }
+        "session_search" => field("query")
+            .or_else(|| field("session_id"))
+            .or_else(|| Some("recent sessions".into())),
         "clarify" => args
             .get("questions")
             .and_then(|q| q.get(0))

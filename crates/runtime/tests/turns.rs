@@ -143,6 +143,7 @@ fn runtime_in(data_dir: &Path) -> Runtime {
             data_dir: data_dir.to_path_buf(),
             shell: detect_shell(),
             max_iterations: 20,
+            memory: Default::default(),
         },
         Arc::new(Bridge),
     )
@@ -940,4 +941,83 @@ async fn a_steer_without_a_tool_batch_comes_back_for_the_next_message() {
             .any(|e| matches!(e, RuntimeEvent::SteerUndelivered(t) if t == "and in French"))
     );
     assert!(!h.runtime.steer(&session, "too late"));
+}
+
+#[tokio::test]
+async fn memory_saved_in_one_session_reaches_the_next_sessions_prompt_only() {
+    let h = harness(vec![
+        tool_reply(&[(
+            "call_m",
+            "memory",
+            json!({"target": "user", "operations": [{"action": "add", "content": "User's name is Alex"}]}),
+        )]),
+        text_reply("Noted."),
+        text_reply("Hi Alex."),
+    ])
+    .await;
+    let first = session_in(&h);
+    let events = run_turn(&h, &first, "My name is Alex, remember it").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let saved = sent_messages(&h.requests.lock()[1])
+        .into_iter()
+        .rfind(|m| m["role"] == "tool")
+        .unwrap();
+    assert!(saved["content"].as_str().unwrap().contains("Write saved"));
+    assert_eq!(
+        std::fs::read_to_string(h.data.path().join("memories").join("USER.md")).unwrap(),
+        "User's name is Alex"
+    );
+    // The running session's prompt stays frozen; a new session sees the memory.
+    let prompt = |id: &str| {
+        h.runtime
+            .store()
+            .session(id)
+            .unwrap()
+            .unwrap()
+            .system_prompt
+    };
+    assert!(!prompt(&first).contains("User's name is Alex"));
+    let second = session_in(&h);
+    assert!(prompt(&second).contains("USER PROFILE (who the user is) ["));
+    assert!(prompt(&second).contains("User's name is Alex"));
+    assert!(prompt(&second).contains("You have persistent memory"));
+    run_turn(&h, &second, "hi").await;
+    let system = h.requests.lock()[2]["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(system.contains("User's name is Alex"));
+}
+
+#[tokio::test]
+async fn session_search_recalls_an_earlier_session() {
+    let h = harness(vec![
+        text_reply("Stored in the team vault under deploy/staging."),
+        tool_reply(&[("call_s", "session_search", json!({"query": "vault"}))]),
+        text_reply("It's in the team vault."),
+    ])
+    .await;
+    let earlier = session_in(&h);
+    run_turn(
+        &h,
+        &earlier,
+        "Where do the staging credentials live? The vault?",
+    )
+    .await;
+    let now = session_in(&h);
+    run_turn(&h, &now, "Where did we say the credentials are?").await;
+    let result = sent_messages(&h.requests.lock()[2])
+        .into_iter()
+        .rfind(|m| m["role"] == "tool")
+        .unwrap();
+    let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+    assert_eq!(result["mode"], "discover");
+    assert_eq!(result["count"], 1);
+    assert_eq!(result["results"][0]["session_id"], earlier.as_str());
+    let messages = result["results"][0]["messages"].as_array().unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m["content"].as_str().unwrap().contains("team vault"))
+    );
 }

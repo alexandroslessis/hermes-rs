@@ -26,6 +26,11 @@ impl Global for AppStateGlobal {}
 impl AppState {
     pub fn init(data_dir: PathBuf, cx: &mut App) -> Entity<Self> {
         let config = AppConfig::load(&data_dir);
+        let memory = backend(cx).runtime.memory();
+        memory.set_config(hermes_memory::MemoryConfig {
+            write_approval: config.memory_write_approval,
+            ..memory.config()
+        });
         let registry = theme::ThemeRegistry::global(cx);
         hermes_themes::load_bundled_themes(&registry);
         let name = config.theme.as_deref().unwrap_or(theme::DEFAULT_DARK_THEME);

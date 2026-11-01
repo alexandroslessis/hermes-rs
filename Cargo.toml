@@ -15,6 +15,7 @@ license = "GPL-3.0-or-later"
 # Our own crates.
 hermes_agent = { path = "crates/agent" }
 hermes_highlight = { path = "crates/highlight" }
+hermes_memory = { path = "crates/memory" }
 hermes_themes = { path = "crates/themes" }
 hermes_llm = { path = "crates/llm" }
 hermes_prompts = { path = "crates/prompts" }

@@ -22,6 +22,7 @@ use hermes_llm::conversation::message::{Message, MessageContent};
 use hermes_llm::discovery::DiscoveredModel;
 use hermes_llm::model::ModelConfig;
 use hermes_llm::openai_compatible::OpenAiCompatibleProvider;
+use hermes_memory::{MemoryConfig, MemoryStore};
 use hermes_prompts::{Shell, SystemPromptInput, build_system_prompt};
 use hermes_store::{NewSession, SessionRecord, Store};
 use hermes_tools::{SessionTools, SessionToolsConfig, ShellKind, TodoItem, UserBridge};
@@ -98,6 +99,8 @@ pub struct RuntimeConfig {
     /// Model calls allowed per user message (Hermes's iteration budget); when they run out the
     /// model gets one more call, without tools, to summarize.
     pub max_iterations: u32,
+    /// `MEMORY.md` / `USER.md` limits and the write-approval gate.
+    pub memory: MemoryConfig,
 }
 
 impl RuntimeConfig {
@@ -109,6 +112,7 @@ impl RuntimeConfig {
             data_dir,
             shell: hermes_tools::detect_shell(),
             max_iterations: 500,
+            memory: MemoryConfig::default(),
         })
     }
 }
@@ -137,6 +141,7 @@ pub struct Turn {
 
 pub struct Runtime {
     store: Arc<Store>,
+    memory: Arc<MemoryStore>,
     config: RuntimeConfig,
     bridge: Arc<dyn UserBridge>,
     windows_version: String,
@@ -146,8 +151,10 @@ pub struct Runtime {
 impl Runtime {
     pub fn new(config: RuntimeConfig, bridge: Arc<dyn UserBridge>) -> Result<Self> {
         let store = Store::open(&config.data_dir.join("sessions.db"))?;
+        let memory = MemoryStore::new(config.data_dir.join("memories"), config.memory.clone());
         Ok(Self {
             store: Arc::new(store),
+            memory: Arc::new(memory),
             windows_version: windows_version(),
             config,
             bridge,
@@ -157,6 +164,11 @@ impl Runtime {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// The memory store every session shares (the Memory screen edits it too).
+    pub fn memory(&self) -> Arc<MemoryStore> {
+        self.memory.clone()
     }
 
     fn scratch_dir(&self, session_id: &str) -> PathBuf {
@@ -215,6 +227,12 @@ impl Runtime {
         let home = dirs::home_dir().context("no home directory")?;
         let soul = std::fs::read_to_string(self.config.data_dir.join("SOUL.md")).ok();
         let tool_names = SessionTools::tool_names();
+        // Memory as it is now; writes during the session don't change this prompt.
+        let snapshot = self.memory.snapshot();
+        let memory = [snapshot.memory, snapshot.user]
+            .into_iter()
+            .flatten()
+            .reduce(|a, b| format!("{a}\n\n{b}"));
         // The scratch dir is per session but the prompt must name it before the id exists, so
         // sessions share the scratch root in the prompt and get their own subdirectory below.
         let scratch_root = self.config.data_dir.join("scratch");
@@ -231,7 +249,7 @@ impl Runtime {
             windows_version: &self.windows_version,
             tool_names: &tool_names,
             soul: soul.as_deref(),
-            memory: None,
+            memory: memory.as_deref(),
             skills_index: None,
             context_length,
             now: chrono::Local::now(),
@@ -256,6 +274,8 @@ impl Runtime {
             shell: self.config.shell.clone(),
             bridge: self.bridge.clone(),
             todos: restore_todos(&conversation),
+            memory: Some(self.memory.clone()),
+            history: Some(self.store.clone()),
         });
         let open = Arc::new(OpenSession {
             record: Mutex::new(record),
@@ -344,6 +364,7 @@ impl Runtime {
         };
         let state: ops::SharedTurnState = Arc::default();
         *open.turn_state.lock() = Some(state.clone());
+        open.tools.begin_turn();
         let runtime = TurnRuntime {
             session: open.clone(),
             store: self.store.clone(),

@@ -15,7 +15,10 @@ base64.workspace = true
 async-trait.workspace = true
 dirs.workspace = true
 futures.workspace = true
+chrono = { workspace = true, features = ["clock"] }
 hermes_agent.workspace = true
+hermes_memory.workspace = true
+hermes_store.workspace = true
 hermes_prompts.workspace = true
 ignore.workspace = true
 parking_lot.workspace = true

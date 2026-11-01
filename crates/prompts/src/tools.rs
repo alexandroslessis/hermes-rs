@@ -34,6 +34,11 @@ const SCHEMAS: &[(&str, &str)] = &[
         "clarify",
         include_str!("../../../prompts/tools/clarify.json"),
     ),
+    ("memory", include_str!("../../../prompts/tools/memory.json")),
+    (
+        "session_search",
+        include_str!("../../../prompts/tools/session_search.json"),
+    ),
 ];
 
 /// A tool definition as stored: name, description and JSON-schema parameters.

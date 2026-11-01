@@ -20,6 +20,7 @@ pub const TASK_COMPLETION_GUIDANCE: &str =
     hermes!("agent.prompt_builder", "TASK_COMPLETION_GUIDANCE");
 pub const PARALLEL_TOOL_CALL_GUIDANCE: &str =
     hermes!("agent.prompt_builder", "PARALLEL_TOOL_CALL_GUIDANCE");
+pub const SESSION_SEARCH_GUIDANCE: &str = "When the user references something from a past conversation or you suspect relevant cross-session context exists, use session_search to recall it before asking them to repeat themselves.";
 /// Explains the `/steer` marker; steering lands after tool results, so only sessions with tools
 /// get it.
 pub const STEER_CHANNEL_NOTE: &str = hermes!("agent.prompt_builder", "STEER_CHANNEL_NOTE");

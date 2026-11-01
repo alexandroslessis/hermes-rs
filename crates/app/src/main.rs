@@ -6,6 +6,7 @@ mod assets;
 mod backend;
 mod chat;
 mod config;
+mod memory_view;
 mod model_picker;
 mod settings;
 mod sidebar;
@@ -25,7 +26,7 @@ use crate::appearance::Appearance;
 use crate::assets::Assets;
 use crate::backend::{Backend, BackendGlobal};
 use crate::state::AppState;
-use crate::workspace::{NewSession, OpenSettings, ToggleSidebar, Workspace};
+use crate::workspace::{NewSession, OpenMemory, OpenSettings, ToggleSidebar, Workspace};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -55,6 +56,7 @@ fn main() {
                 KeyBinding::new("ctrl-n", NewSession, None),
                 KeyBinding::new("ctrl-b", ToggleSidebar, None),
                 KeyBinding::new("ctrl-,", OpenSettings, None),
+                KeyBinding::new("ctrl-shift-m", OpenMemory, None),
             ]);
 
             let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);

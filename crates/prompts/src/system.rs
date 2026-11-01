@@ -91,6 +91,7 @@ fn guidance_parts(input: &SystemPromptInput) -> Vec<Option<String>> {
     }
     parts.push(Some(text::TASK_COMPLETION_GUIDANCE.to_string()));
     parts.push(Some(text::PARALLEL_TOOL_CALL_GUIDANCE.to_string()));
+    parts.push(tool_guidance_block(input.tool_names));
     parts.push(Some(text::STEER_CHANNEL_NOTE.to_string()));
     if model_matches(input.model, text::TOOL_USE_ENFORCEMENT_MODELS) {
         parts.push(Some(text::TOOL_USE_ENFORCEMENT_GUIDANCE.to_string()));
@@ -102,6 +103,35 @@ fn guidance_parts(input: &SystemPromptInput) -> Vec<Option<String>> {
         parts.push(Some(execution_guidance(input.tool_names)));
     }
     parts
+}
+
+/// Hermes's `build_memory_guidance` (both stores enabled).
+fn memory_guidance(skill_manage_available: bool) -> String {
+    let frame = "You have persistent memory, carried across sessions and loaded into each new session's context; the memory tool's schema defines what belongs there. ";
+    let skill_routing = if skill_manage_available {
+        "Skills come first: when you learn something while doing a task — a procedure, a pitfall, and the user's preferences and corrections for that kind of work — record it in the skill you used or built for the task (skill_manage), where it loads only when relevant. "
+    } else {
+        "Task-specific knowledge — procedures, pitfalls, and the user's preferences and corrections for that kind of work — belongs in skills, not in memory, even when skill writing is unavailable. "
+    };
+    format!(
+        "{frame}{skill_routing}Memory is the narrow exception for facts that apply to EVERY session regardless of task (who the user is, environment facts, standing conventions with no task home); it has a hard character budget, so when it fills, replace or consolidate stale entries rather than skipping the save. Write entries as declarative facts, not instructions to yourself: 'User prefers concise responses' ✓ — 'Always respond concisely' ✗ (imperative phrasing gets re-read as a directive in later sessions and can override the user's current request). A fact stale within a week belongs in session history; procedures and workflows belong in skills."
+    )
+}
+
+/// Hermes's `_tool_guidance_block`: guidance for the memory and recall tools that are loaded.
+fn tool_guidance_block(tool_names: &[&str]) -> Option<String> {
+    let parts: Vec<String> = [
+        tool_names
+            .contains(&"memory")
+            .then(|| memory_guidance(tool_names.contains(&"skill_manage"))),
+        tool_names
+            .contains(&"session_search")
+            .then(|| text::SESSION_SEARCH_GUIDANCE.to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 pub fn build_system_prompt(input: &SystemPromptInput) -> SystemPrompt {

@@ -33,6 +33,9 @@ pub struct AppConfig {
     /// Reasoning effort per model (Hermes keeps a preset per model the same way).
     #[serde(default)]
     pub efforts: std::collections::HashMap<String, String>,
+    /// Stage the agent's memory writes for approval (Hermes's `memory.write_approval`).
+    #[serde(default)]
+    pub memory_write_approval: bool,
 }
 
 impl Default for AppConfig {
@@ -49,6 +52,7 @@ impl Default for AppConfig {
             last_cwd: None,
             theme: None,
             efforts: Default::default(),
+            memory_write_approval: false,
         }
     }
 }

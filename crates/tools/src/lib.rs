@@ -9,6 +9,7 @@ mod files;
 mod job;
 mod paths;
 mod process;
+mod recall;
 mod search;
 mod shell;
 mod todo;
@@ -49,6 +50,10 @@ pub struct SessionToolsConfig {
     pub bridge: Arc<dyn UserBridge>,
     /// Restored from the last `todo_list` result in the conversation when reopening a session.
     pub todos: Vec<TodoItem>,
+    /// `MEMORY.md` / `USER.md`, shared by every session (the `memory` tool).
+    pub memory: Option<Arc<hermes_memory::MemoryStore>>,
+    /// Past conversations (the `session_search` tool).
+    pub history: Option<Arc<hermes_store::Store>>,
 }
 
 pub struct SessionTools {
@@ -60,6 +65,10 @@ pub struct SessionTools {
     processes: process::ProcessRegistry,
     files: files::FileState,
     todos: todo::TodoList,
+    memory: Option<Arc<hermes_memory::MemoryStore>>,
+    /// Failed memory consolidations this turn (Hermes caps them per turn).
+    memory_failures: parking_lot::Mutex<hermes_memory::TurnFailures>,
+    history: Option<Arc<hermes_store::Store>>,
 }
 
 impl SessionTools {
@@ -73,7 +82,15 @@ impl SessionTools {
             home: config.home,
             scratch_dir: config.scratch_dir,
             bridge: config.bridge,
+            memory: config.memory,
+            memory_failures: Default::default(),
+            history: config.history,
         }
+    }
+
+    /// Called when a turn starts: per-turn tool state resets.
+    pub fn begin_turn(&self) {
+        *self.memory_failures.lock() = hermes_memory::TurnFailures::default();
     }
 
     pub fn cwd(&self) -> PathBuf {
@@ -124,8 +141,26 @@ impl SessionTools {
             "terminal" => shell::terminal(self, args).await,
             "process_manage" => process::process_manage(self, args).await,
             "todo_list" => todo::todo_list(self, args),
+            "memory" => self.memory_tool(&args),
+            "session_search" => self.session_search(&args),
             "clarify" => clarify::clarify(self, args).await,
             other => ToolOutput::error(format!("Unknown tool '{other}'.")),
+        }
+    }
+}
+
+impl SessionTools {
+    fn memory_tool(&self, args: &Value) -> ToolOutput {
+        let Some(memory) = &self.memory else {
+            return ToolOutput::error(
+                "Memory is not available. It may be disabled in config or this environment.",
+            );
+        };
+        let result = memory.tool(args, &mut self.memory_failures.lock());
+        let failed = result.get("success") == Some(&Value::Bool(false));
+        ToolOutput {
+            value: result,
+            is_error: failed,
         }
     }
 }
@@ -213,6 +248,8 @@ pub(crate) mod tests {
             shell: detect_shell(),
             bridge,
             todos: Vec::new(),
+            memory: None,
+            history: None,
         });
         (dir, tools)
     }
