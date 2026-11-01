@@ -13,7 +13,7 @@ use gpui::{
 use hermes_llm::discovery::DiscoveredModel;
 use ui::{
     Chip, CommonAnimationExt, Divider, ElevationIndex, ListItem, ListItemSpacing, Tooltip,
-    prelude::*,
+    WithScrollbar, prelude::*,
 };
 
 use crate::config::{FavoriteModel, ProviderSettings};
@@ -393,7 +393,7 @@ impl Focusable for ModelPicker {
 }
 
 impl Render for ModelPicker {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (loading, empty_label) = {
             let state = AppState::global(cx).read(cx);
             let loading = state.models_loading();
@@ -418,18 +418,27 @@ impl Render for ModelPicker {
                 .child(Label::new(empty_label).color(Color::Muted))
                 .into_any_element()
         } else {
-            list(
-                self.list.clone(),
-                cx.processor(|this, index, window, cx| this.render_entry(index, window, cx)),
-            )
-            .with_sizing_behavior(if self.in_popover {
-                ListSizingBehavior::Infer
-            } else {
-                ListSizingBehavior::Auto
-            })
-            .flex_1()
-            .py(DynamicSpacing::Base04.rems(cx))
-            .into_any_element()
+            let list_state = self.list.clone();
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    list(
+                        list_state.clone(),
+                        cx.processor(|this, index, window, cx| {
+                            this.render_entry(index, window, cx)
+                        }),
+                    )
+                    .with_sizing_behavior(if self.in_popover {
+                        ListSizingBehavior::Infer
+                    } else {
+                        ListSizingBehavior::Auto
+                    })
+                    .flex_1()
+                    .py(DynamicSpacing::Base04.rems(cx)),
+                )
+                .vertical_scrollbar_for(&list_state, window, cx)
+                .into_any_element()
         };
         v_flex()
             .key_context("ModelPicker")

@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use ui::{
     ButtonLike, Callout, CircularProgress, CommonAnimationExt, ContextMenu, ContextMenuEntry,
     CopyButton, Disclosure, Divider, LoadingLabel, PopoverMenu, PopoverMenuHandle, SpinnerVariant,
-    SplitButton, SplitButtonStyle, TintColor, Tooltip, prelude::*, right_click_menu,
+    SplitButton, SplitButtonStyle, TintColor, Tooltip, WithScrollbar, prelude::*, right_click_menu,
 };
 
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownOptions, MarkdownStyle};
@@ -41,6 +41,11 @@ const MAX_RESULT_CHARS: usize = 6000;
 pub enum ChatEvent {
     /// The session's stored state changed (new messages, title-worthy first message).
     Updated,
+    /// A turn ended on its own (not stopped by the user, and no steer is about to start the
+    /// next one): Zed notifies when this happens out of sight.
+    TurnFinished { failed: bool, used_tools: bool },
+    /// The agent asked a question and waits for the answer.
+    NeedsInput,
 }
 
 struct ClarifyForm {
@@ -86,7 +91,6 @@ pub struct ChatView {
     next_message: Option<String>,
     /// Thinking blocks the user opened or closed by hand (Zed's auto mode leaves the rest).
     thinking_toggled: HashSet<String>,
-    composer_expanded: bool,
     effort_menu: PopoverMenuHandle<ContextMenu>,
     model_menu: PopoverMenuHandle<ModelPicker>,
     pub usage: TurnUsage,
@@ -151,7 +155,6 @@ impl ChatView {
             slash_matches: Vec::new(),
             next_message: None,
             thinking_toggled: HashSet::new(),
-            composer_expanded: false,
             effort_menu: PopoverMenuHandle::default(),
             model_menu: PopoverMenuHandle::default(),
             usage: TurnUsage {
@@ -487,6 +490,8 @@ impl ChatView {
                 self.composer.update(cx, |composer, cx| {
                     composer.set_placeholder(COMPOSER_PLACEHOLDER, cx)
                 });
+                let continues = self.next_message.is_some();
+                let cancelled = matches!(status, TurnStatus::Cancelled);
                 if let Some(text) = self.next_message.take() {
                     cx.spawn(async move |this, cx| {
                         this.update(cx, |this, cx| this.begin(Some(text), cx)).ok();
@@ -502,6 +507,12 @@ impl ChatView {
                     self.entries_changed(cx);
                 }
                 cx.emit(ChatEvent::Updated);
+                if !continues && !cancelled {
+                    cx.emit(ChatEvent::TurnFinished {
+                        failed: self.error.is_some(),
+                        used_tools: self.used_tools_since_last_user_message(),
+                    });
+                }
                 cx.notify();
             }
         }
@@ -535,7 +546,41 @@ impl ChatView {
             other,
             reply: Some(reply),
         });
+        cx.emit(ChatEvent::NeedsInput);
         cx.notify();
+    }
+
+    /// Whether the agent waits on a question for the user (Zed's "waiting for confirmation").
+    pub fn needs_input(&self) -> bool {
+        self.clarify.is_some()
+    }
+
+    /// Whether the last turn failed (shown with Zed's error status in the sidebar).
+    pub fn has_error(&self) -> bool {
+        self.error.is_some() && self.running.is_none()
+    }
+
+    /// Whether the agent called tools since the last user message: Zed says "Finished running
+    /// tools" then, "New message" otherwise.
+    fn used_tools_since_last_user_message(&self) -> bool {
+        self.conversation
+            .messages()
+            .iter()
+            .rev()
+            // Tool results are user-role messages too; the user's own message has text.
+            .take_while(|message| {
+                message.role != Role::User
+                    || !message
+                        .content
+                        .iter()
+                        .any(|content| matches!(content, MessageContent::Text(_)))
+            })
+            .any(|message| {
+                message
+                    .content
+                    .iter()
+                    .any(|content| matches!(content, MessageContent::ToolRequest(_)))
+            })
     }
 
     fn answer_clarify(&mut self, submit: bool, cx: &mut Context<Self>) {
@@ -2206,11 +2251,6 @@ impl ChatView {
     /// usage, model and send on the right).
     fn render_composer(&self, has_messages: bool, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let (expand_icon, expand_tooltip) = if self.composer_expanded {
-            (IconName::Minimize, "Minimize Message Editor")
-        } else {
-            (IconName::Maximize, "Expand Message Editor")
-        };
         h_flex()
             .py_2()
             .bg(colors.editor_background)
@@ -2304,36 +2344,7 @@ impl ChatView {
                             .min_h_0()
                             .pt_1()
                             .pr_2p5()
-                            .child(self.composer.clone())
-                            .when(has_messages, |this| {
-                                this.child(
-                                    h_flex()
-                                        .absolute()
-                                        .top_0()
-                                        .right_0()
-                                        .opacity(0.5)
-                                        .hover(|s| s.opacity(1.0))
-                                        .child(
-                                            IconButton::new("toggle-height", expand_icon)
-                                                .icon_size(IconSize::Small)
-                                                .icon_color(Color::Muted)
-                                                .tooltip(Tooltip::text(expand_tooltip))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.composer_expanded =
-                                                        !this.composer_expanded;
-                                                    let lines = if this.composer_expanded {
-                                                        32
-                                                    } else {
-                                                        12
-                                                    };
-                                                    this.composer.update(cx, |c, cx| {
-                                                        c.set_max_lines(lines, cx)
-                                                    });
-                                                    cx.notify();
-                                                })),
-                                        ),
-                                )
-                            }),
+                            .child(self.composer.clone()),
                     )
                     .child(
                         h_flex()
@@ -2478,9 +2489,10 @@ impl Focusable for ChatView {
 }
 
 impl Render for ChatView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let empty = self.entries.is_empty();
+        let list_state = self.list_state.clone();
         v_flex()
             .size_full()
             .bg(colors.panel_background)
@@ -2498,15 +2510,22 @@ impl Render for ChatView {
                     .child(Headline::new("What should we work on?").size(HeadlineSize::Small))
                     .into_any_element()
             } else {
-                list(
-                    self.list_state.clone(),
-                    cx.processor(|this, index: usize, window, cx| {
-                        this.render_entry(index, window, cx)
-                    }),
-                )
-                .flex_1()
-                .size_full()
-                .into_any_element()
+                // Zed's thread: the list with its scrollbar along the right edge.
+                v_flex()
+                    .flex_1()
+                    .size_full()
+                    .child(
+                        list(
+                            list_state.clone(),
+                            cx.processor(|this, index: usize, window, cx| {
+                                this.render_entry(index, window, cx)
+                            }),
+                        )
+                        .flex_1()
+                        .size_full(),
+                    )
+                    .vertical_scrollbar_for(&list_state, window, cx)
+                    .into_any_element()
             })
             .when_some(self.error.clone(), |this, error| {
                 this.child(

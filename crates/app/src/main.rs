@@ -9,6 +9,8 @@ mod chat_ui;
 mod config;
 mod memory_view;
 mod model_picker;
+mod notification;
+mod project_dialog;
 mod settings;
 mod sidebar;
 mod skills_view;

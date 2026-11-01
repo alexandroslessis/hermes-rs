@@ -6,7 +6,7 @@ use std::rc::Rc;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, KeyDownEvent, Subscription, Window, prelude::*,
 };
-use ui::{Chip, ContextMenu, Divider, DropdownMenu, TintColor, Tooltip, prelude::*};
+use ui::{Chip, ContextMenu, Divider, DropdownMenu, TintColor, Tooltip, WithScrollbar, prelude::*};
 
 use crate::config::{self, ProviderSettings};
 use crate::model_picker::{ModelPicker, provider_icon};
@@ -28,6 +28,7 @@ struct ProviderForm {
 pub struct SettingsView {
     picker: Entity<ModelPicker>,
     form: Option<ProviderForm>,
+    scroll: gpui::ScrollHandle,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -58,6 +59,7 @@ impl SettingsView {
         Self {
             picker,
             form: None,
+            scroll: gpui::ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
@@ -591,7 +593,6 @@ impl Render for SettingsView {
             .size_full()
             .p_6()
             .gap_5()
-            .overflow_y_scroll()
             .child(Headline::new("Settings").size(HeadlineSize::Large))
             .child(Divider::horizontal())
             .child(
@@ -664,7 +665,8 @@ impl Render for SettingsView {
                             .overflow_hidden()
                             .child(self.picker.clone()),
                     ),
-            );
+            )
+            .vertical_scrollbar_for(&self.scroll, window, cx);
 
         div()
             .relative()

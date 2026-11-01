@@ -253,12 +253,6 @@ impl TextArea {
         cx.notify();
     }
 
-    /// How many lines the field grows to before it scrolls.
-    pub fn set_max_lines(&mut self, max_lines: usize, cx: &mut Context<Self>) {
-        self.max_lines = max_lines;
-        cx.notify();
-    }
-
     /// A one-line field: Enter submits, long text scrolls instead of growing.
     pub fn single_line(mut self) -> Self {
         self.max_lines = 1;

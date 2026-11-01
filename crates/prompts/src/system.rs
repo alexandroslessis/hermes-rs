@@ -37,6 +37,8 @@ pub struct SystemPromptInput<'a> {
     /// Rendered MEMORY.md / USER.md blocks (M3) and skills index (M4).
     pub memory: Option<&'a str>,
     pub skills_index: Option<&'a str>,
+    /// The project the working directory belongs to: its name and folders (primary first).
+    pub project: Option<(&'a str, &'a [String])>,
     pub context_length: Option<usize>,
     pub now: DateTime<Local>,
 }
@@ -187,6 +189,29 @@ fn environment_block(input: &SystemPromptInput) -> String {
             .to_string(),
     ]
     .join("\n");
+    let project = input
+        .project
+        .filter(|(_, folders)| !folders.is_empty())
+        .map(|(name, folders)| {
+            let list = folders
+                .iter()
+                .enumerate()
+                .map(|(i, folder)| {
+                    if i == 0 {
+                        format!("- {folder} (primary)")
+                    } else {
+                        format!("- {folder}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "\n\nProject: {name}. The user grouped these folders into it; they are all part \
+                 of the work, and you may read and change files in any of them:\n{list}"
+            )
+        })
+        .unwrap_or_default();
+    let host = format!("{host}{project}");
     let shell = match input.shell {
         Shell::GitBash => text::WINDOWS_BASH_SHELL_HINT,
         Shell::PowerShell => text::WINDOWS_POWERSHELL_SHELL_HINT,
@@ -376,6 +401,7 @@ mod tests {
             soul: None,
             memory: None,
             skills_index: None,
+            project: None,
             context_length: None,
             now: Local.with_ymd_and_hms(2026, 10, 31, 15, 0, 0).unwrap(),
         }

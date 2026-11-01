@@ -6,7 +6,7 @@ use std::sync::Arc;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Window, prelude::*};
 use hermes_tools::{PendingSkillWrite, SkillCommit, SkillEntry, SkillStore};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
-use ui::{Callout, Checkbox, Divider, ToggleState, Tooltip, prelude::*};
+use ui::{Callout, Checkbox, Divider, ToggleState, Tooltip, WithScrollbar, prelude::*};
 
 use crate::backend::backend;
 use crate::state::AppState;
@@ -20,6 +20,8 @@ pub struct SkillsView {
     document: Option<Entity<Markdown>>,
     show_history: bool,
     notice: Option<(Severity, String)>,
+    list_scroll: gpui::ScrollHandle,
+    detail_scroll: gpui::ScrollHandle,
     focus_handle: FocusHandle,
 }
 
@@ -33,6 +35,8 @@ impl SkillsView {
             document: None,
             show_history: false,
             notice: None,
+            list_scroll: gpui::ScrollHandle::new(),
+            detail_scroll: gpui::ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
         };
         view.refresh(cx);
@@ -115,7 +119,7 @@ impl SkillsView {
         cx.notify();
     }
 
-    fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_list(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut category: Option<Option<String>> = None;
@@ -163,7 +167,7 @@ impl SkillsView {
             .flex_none()
             .border_r_1()
             .border_color(colors.border)
-            .overflow_y_scroll()
+            .vertical_scrollbar_for(&self.list_scroll, window, cx)
             .children(rows)
     }
 
@@ -194,7 +198,7 @@ impl SkillsView {
             .size_full()
             .p_4()
             .gap_2()
-            .overflow_y_scroll()
+            .vertical_scrollbar_for(&self.detail_scroll, window, cx)
             .child(
                 h_flex()
                     .justify_between()
@@ -382,7 +386,7 @@ impl Render for SkillsView {
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_list(cx))
+                    .child(self.render_list(window, cx))
                     .child(
                         div()
                             .flex_1()

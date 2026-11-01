@@ -1,23 +1,28 @@
-//! The main window: title bar, session sidebar, the active chat or settings, and a status bar.
+//! The main window: title bar, session sidebar (grouped by project), the active chat or another
+//! screen, and a status bar.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, PathPromptOptions, SharedString, Subscription,
-    Task, Window, actions, prelude::*,
+    App, Context, Entity, FocusHandle, Focusable, ScrollHandle, SharedString, Subscription, Task,
+    Window, WindowHandle, actions, prelude::*,
 };
-use hermes_store::SessionRecord;
+use hermes_store::{Project, SessionRecord};
 use tokio::sync::mpsc;
 use ui::{
-    AgentThreadStatus, Callout, CommonAnimationExt, Divider, ThreadItem, Tooltip, prelude::*,
+    AgentThreadStatus, Callout, CommonAnimationExt, ContextMenu, Divider, PopoverMenu, ThreadItem,
+    TintColor, Tooltip, WithScrollbar, prelude::*,
 };
 
 use crate::backend::{UiRequest, backend};
 use crate::chat::{ChatEvent, ChatView};
 use crate::memory_view::MemoryView;
+use crate::notification::{AgentNotification, AgentNotificationEvent};
+use crate::project_dialog::{ProjectDialog, ProjectDialogEvent};
 use crate::settings::SettingsView;
+use crate::sidebar::{ProjectGroup, folder_name, group_sessions, project_root};
 use crate::skills_view::SkillsView;
 use crate::state::AppState;
 use crate::title_bar::TitleBar;
@@ -41,8 +46,16 @@ enum Main {
     Skills,
 }
 
+/// An open notification pop-up and the session it's about.
+struct Notification {
+    session_id: String,
+    window: WindowHandle<AgentNotification>,
+    _subscription: Subscription,
+}
+
 pub struct Workspace {
     sessions: Vec<SessionRecord>,
+    projects: Vec<Project>,
     chats: HashMap<String, Entity<ChatView>>,
     active: Option<String>,
     main: Main,
@@ -53,6 +66,11 @@ pub struct Workspace {
     collapsed: HashSet<String>,
     hovered_session: Option<String>,
     project_roots: RefCell<HashMap<String, PathBuf>>,
+    sidebar_scroll: ScrollHandle,
+    project_dialog: Option<(Entity<ProjectDialog>, Vec<Subscription>)>,
+    /// Sessions whose turn finished while you weren't looking (Zed's blue dot).
+    unseen: HashSet<String>,
+    notifications: Vec<Notification>,
     notice: Option<String>,
     focus_handle: FocusHandle,
     _requests: Task<()>,
@@ -96,6 +114,7 @@ impl Workspace {
         });
         let mut this = Self {
             sessions: Vec::new(),
+            projects: Vec::new(),
             chats: HashMap::new(),
             active: None,
             main: Main::Chat,
@@ -106,11 +125,24 @@ impl Workspace {
             collapsed: HashSet::new(),
             hovered_session: None,
             project_roots: RefCell::default(),
+            sidebar_scroll: ScrollHandle::new(),
+            project_dialog: None,
+            unseen: HashSet::new(),
+            notifications: Vec::new(),
             notice: None,
             focus_handle: cx.focus_handle(),
             _requests: requests_task,
-            _subscriptions: vec![cx.observe(&state, |_, _, cx| cx.notify())],
+            _subscriptions: vec![
+                cx.observe(&state, |_, _, cx| cx.notify()),
+                // Coming back to the window counts as seeing the session on screen.
+                cx.observe_window_activation(window, |this, window, cx| {
+                    if window.is_window_active() {
+                        this.mark_active_seen(cx);
+                    }
+                }),
+            ],
         };
+        this.reload_projects(cx);
         this.reload_sessions(cx);
         if let Some(first) = this.sessions.first().map(|s| s.id.clone()) {
             this.open_session(first, window, cx);
@@ -140,6 +172,7 @@ impl Workspace {
                     let composer = chat.read(cx).composer();
                     composer.focus_handle(cx).focus(window, cx);
                 }
+                self.mark_active_seen(cx);
             }
             Main::Settings => {}
         }
@@ -152,6 +185,59 @@ impl Workspace {
             .store()
             .list_sessions(200)
             .unwrap_or_default();
+        cx.notify();
+    }
+
+    fn reload_projects(&mut self, cx: &mut Context<Self>) {
+        self.projects = backend(cx)
+            .runtime
+            .store()
+            .list_projects()
+            .unwrap_or_default();
+        cx.notify();
+    }
+
+    fn groups(&self) -> Vec<ProjectGroup> {
+        group_sessions(
+            &self.sessions,
+            &self.projects,
+            &mut self.project_roots.borrow_mut(),
+        )
+    }
+
+    /// The sidebar group a folder belongs to: its project, else its automatic group.
+    fn group_key_for(&self, cwd: &str) -> String {
+        match hermes_store::project_for_path(&self.projects, cwd) {
+            Some(project) => project.id.clone(),
+            None => format!("auto:{}", project_root(Path::new(cwd)).display()),
+        }
+    }
+
+    /// The selected group: the one last picked, else the active session's, else the first.
+    fn selected_group<'a>(&self, groups: &'a [ProjectGroup], cx: &App) -> Option<&'a ProjectGroup> {
+        let picked = AppState::global(cx)
+            .read(cx)
+            .config
+            .selected_project
+            .clone();
+        let active = self
+            .active
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
+            .map(|session| self.group_key_for(&session.cwd));
+        picked
+            .and_then(|key| groups.iter().find(|g| g.key == key))
+            .or_else(|| active.and_then(|key| groups.iter().find(|g| g.key == key)))
+            .or_else(|| groups.first())
+    }
+
+    fn select_group(&mut self, key: String, cx: &mut Context<Self>) {
+        AppState::global(cx).update(cx, |state, cx| {
+            if state.config.selected_project.as_deref() != Some(key.as_str()) {
+                state.config.selected_project = Some(key);
+                state.save(cx);
+            }
+        });
         cx.notify();
     }
 
@@ -183,19 +269,143 @@ impl Workspace {
             let chat =
                 cx.new(|cx| ChatView::new(record.id.clone(), record.model.clone(), window, cx));
             let subscription =
-                cx.subscribe(&chat, |this: &mut Self, chat, event, cx| match event {
-                    ChatEvent::Updated => this.chat_updated(chat, cx),
+                cx.subscribe_in(&chat, window, |this: &mut Self, chat, event, window, cx| {
+                    match event {
+                        ChatEvent::Updated => this.chat_updated(chat.clone(), cx),
+                        // Zed's captions for a finished turn.
+                        ChatEvent::TurnFinished { failed, used_tools } => {
+                            let (caption, icon) = if *failed {
+                                ("Agent stopped because of an error", IconName::Warning)
+                            } else if *used_tools {
+                                ("Finished running tools", IconName::Sparkle)
+                            } else {
+                                ("New message", IconName::Sparkle)
+                            };
+                            let id = chat.read(cx).session_id.clone();
+                            this.session_needs_attention(id, caption, icon, window, cx);
+                        }
+                        ChatEvent::NeedsInput => {
+                            let id = chat.read(cx).session_id.clone();
+                            this.session_needs_attention(
+                                id,
+                                "Waiting for input",
+                                IconName::Info,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
                 });
             self._subscriptions.push(subscription);
             self.chats.insert(id.clone(), chat);
         }
         self.active = Some(id.clone());
         self.main = Main::Chat;
+        if let Some(record) = self.sessions.iter().find(|s| s.id == id) {
+            let key = self.group_key_for(&record.cwd);
+            self.select_group(key, cx);
+        }
+        self.mark_active_seen(cx);
         if let Some(chat) = self.chats.get(&id) {
             let composer = chat.read(cx).composer();
             composer.focus_handle(cx).focus(window, cx);
         }
         cx.notify();
+    }
+
+    /// The active session is on screen: drop its dot and its notifications.
+    fn mark_active_seen(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.active.clone() else {
+            return;
+        };
+        if self.main != Main::Chat {
+            return;
+        }
+        self.unseen.remove(&active);
+        self.dismiss_notifications(Some(&active), cx);
+        cx.notify();
+    }
+
+    /// Zed's `show_notification`: when the session isn't on screen (another session shows, or
+    /// the window is in the background), mark it unseen and pop up a notification.
+    fn session_needs_attention(
+        &mut self,
+        session_id: String,
+        caption: &'static str,
+        icon: IconName,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let visible = window.is_window_active()
+            && self.main == Main::Chat
+            && self.active.as_deref() == Some(session_id.as_str());
+        if visible {
+            return;
+        }
+        self.unseen.insert(session_id.clone());
+        cx.notify();
+        // One pop-up per session at a time; the newest event replaces it.
+        self.dismiss_notifications(Some(&session_id), cx);
+        window.request_attention();
+        let Some(screen) = cx.primary_display() else {
+            return;
+        };
+        let record = self.sessions.iter().find(|s| s.id == session_id);
+        let title = record
+            .and_then(|s| s.title.clone())
+            .unwrap_or_else(|| "New session".into());
+        let project = record.map(|s| {
+            let key = self.group_key_for(&s.cwd);
+            self.groups()
+                .into_iter()
+                .find(|g| g.key == key)
+                .map(|g| g.name)
+                .unwrap_or_else(|| folder_name(Path::new(&s.cwd)))
+        });
+        let options = AgentNotification::window_options(screen, cx);
+        let caption = SharedString::from(caption);
+        let Ok(handle) = cx.open_window(options, |_, cx| {
+            cx.new(|_| AgentNotification::new(title, Some(caption), icon, project))
+        }) else {
+            return;
+        };
+        let Ok(pop_up) = handle.entity(cx) else {
+            return;
+        };
+        let id = session_id.clone();
+        let subscription = cx.subscribe_in(
+            &pop_up,
+            window,
+            move |this: &mut Self, _, event, window, cx| match event {
+                AgentNotificationEvent::Accepted => {
+                    cx.activate(true);
+                    window.activate_window();
+                    this.open_session(id.clone(), window, cx);
+                    this.dismiss_notifications(Some(&id), cx);
+                }
+                AgentNotificationEvent::Dismissed => this.dismiss_notifications(Some(&id), cx),
+            },
+        );
+        self.notifications.push(Notification {
+            session_id,
+            window: handle,
+            _subscription: subscription,
+        });
+    }
+
+    /// Closes the pop-ups about `session` (all of them for `None`).
+    fn dismiss_notifications(&mut self, session: Option<&str>, cx: &mut Context<Self>) {
+        let (close, keep): (Vec<_>, Vec<_>) = self
+            .notifications
+            .drain(..)
+            .partition(|n| session.is_none_or(|id| n.session_id == id));
+        self.notifications = keep;
+        for notification in close {
+            notification
+                .window
+                .update(cx, |_, window, _| window.remove_window())
+                .ok();
+        }
     }
 
     /// Titles a session from its first message, then refreshes the sidebar order.
@@ -231,6 +441,7 @@ impl Workspace {
         self.reload_sessions(cx);
     }
 
+    /// The folder for sessions outside any group: the last one used, else home.
     fn cwd(&self, cx: &App) -> PathBuf {
         AppState::global(cx)
             .read(cx)
@@ -242,8 +453,14 @@ impl Workspace {
             .unwrap_or_else(|| PathBuf::from("C:/"))
     }
 
+    /// Hermes's new session: it starts in the selected project's primary folder.
     fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_session_in(None, window, cx);
+        let groups = self.groups();
+        let folder = self
+            .selected_group(&groups, cx)
+            .map(|group| group.root.clone())
+            .filter(|root| root.is_dir());
+        self.new_session_in(folder, window, cx);
     }
 
     /// Starts a session in `folder`, or in the folder chosen for new sessions.
@@ -256,7 +473,12 @@ impl Workspace {
         let state = AppState::global(cx);
         let (provider, model) = {
             let state = state.read(cx);
-            (state.runtime_provider(), state.config.model.clone())
+            let model = state.config.model.clone();
+            let provider = model
+                .as_deref()
+                .and_then(|model| state.provider_for_model(model))
+                .map(crate::config::runtime_provider);
+            (provider, model)
         };
         let (Some(provider), Some(model)) = (provider, model) else {
             self.notice = Some("Pick a provider and a model in Settings first.".into());
@@ -272,6 +494,10 @@ impl Workspace {
         {
             Ok(record) => {
                 self.notice = None;
+                AppState::global(cx).update(cx, |state, cx| {
+                    state.config.last_cwd = Some(cwd.clone());
+                    state.save(cx);
+                });
                 self.reload_sessions(cx);
                 self.open_session(record.id, window, cx);
             }
@@ -282,34 +508,41 @@ impl Workspace {
         }
     }
 
-    fn choose_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Choose the working folder for new sessions".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else {
-                return;
-            };
-            let Some(path) = paths.into_iter().next() else {
-                return;
-            };
-            this.update_in(cx, |this, window, cx| {
-                AppState::global(cx).update(cx, |state, cx| {
-                    state.config.last_cwd = Some(path);
-                    state.save(cx);
-                });
-                this.new_session(window, cx);
-            })
-            .ok();
-        })
-        .detach();
+    /// Opens the project dialog: for `project`, or a new one seeded with `name` and `folders`.
+    fn open_project_dialog(
+        &mut self,
+        project: Option<Project>,
+        name: String,
+        folders: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dialog = cx.new(|cx| ProjectDialog::new(project.as_ref(), name, folders, window, cx));
+        let subscriptions = vec![
+            cx.subscribe(&dialog, |this: &mut Self, _, event, cx| match event {
+                ProjectDialogEvent::Saved(id) => {
+                    this.reload_projects(cx);
+                    this.select_group(id.clone(), cx);
+                }
+            }),
+            cx.subscribe(&dialog, |this: &mut Self, _, _: &gpui::DismissEvent, cx| {
+                this.project_dialog = None;
+                cx.notify();
+            }),
+        ];
+        self.project_dialog = Some((dialog, subscriptions));
+        cx.notify();
+    }
+
+    fn delete_project(&mut self, id: String, cx: &mut Context<Self>) {
+        let _ = backend(cx).runtime.store().delete_project(&id);
+        self.reload_projects(cx);
     }
 
     fn delete_session(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.chats.remove(&id);
+        self.unseen.remove(&id);
+        self.dismiss_notifications(Some(&id), cx);
         let backend = backend(cx);
         let runtime = backend.runtime.clone();
         let task = backend.spawn(async move { runtime.delete_session(&id).await });
@@ -333,164 +566,333 @@ impl Workspace {
         .detach();
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A session row's status icon, as Zed's thread list shows it.
+    fn session_status(&self, id: &str, cx: &App) -> AgentThreadStatus {
+        match self.chats.get(id).map(|chat| chat.read(cx)) {
+            Some(chat) if chat.needs_input() => AgentThreadStatus::WaitingForConfirmation,
+            Some(chat) if chat.is_running() => AgentThreadStatus::Running,
+            Some(chat) if chat.has_error() => AgentThreadStatus::Error,
+            _ => AgentThreadStatus::Completed,
+        }
+    }
+
+    /// A project's header row: its name (highlighted when selected), and on hover a chevron,
+    /// new session, and its menu.
+    fn render_group_header(
+        &self,
+        group: &ProjectGroup,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = cx.theme().colors();
-        let now = chrono::Utc::now().timestamp_millis();
-        let groups =
-            crate::sidebar::group_sessions(&self.sessions, &mut self.project_roots.borrow_mut());
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for group in groups {
-            let key = group.root.display().to_string();
-            let collapsed = self.collapsed.contains(&key);
-            let running = group.sessions.iter().any(|s| {
-                self.chats
-                    .get(&s.id)
-                    .is_some_and(|chat| chat.read(cx).is_running())
-            });
-            let header_group = SharedString::from(format!("project-{key}"));
-            let toggle_key = key.clone();
-            let new_root = group.root.clone();
-            rows.push(
+        let key = group.key.clone();
+        let collapsed = self.collapsed.contains(&key);
+        let running = group.sessions.iter().any(|s| {
+            self.chats
+                .get(&s.id)
+                .is_some_and(|chat| chat.read(cx).is_running())
+        });
+        let unseen = group.sessions.iter().any(|s| self.unseen.contains(&s.id));
+        let header_group = SharedString::from(format!("project-{key}"));
+        let toggle_key = key.clone();
+        let select_key = key.clone();
+        let new_root = group.root.clone();
+        let tooltip = match &group.project {
+            Some(project) => project.folders.join("\n"),
+            None => group.root.display().to_string(),
+        };
+        let menu_project = group.project.clone();
+        let (menu_name, menu_root) = (group.name.clone(), group.root.display().to_string());
+        let workspace = cx.entity().downgrade();
+        h_flex()
+            .id(SharedString::from(format!("project-header-{key}")))
+            .group(header_group.clone())
+            .cursor_pointer()
+            .h(px(28.))
+            .w_full()
+            .px_1p5()
+            .justify_between()
+            .when(selected, |this| this.bg(colors.ghost_element_selected))
+            .hover(|s| s.bg(colors.ghost_element_hover))
+            .child(
                 h_flex()
-                    .id(SharedString::from(format!("project-header-{key}")))
-                    .group(header_group.clone())
-                    .cursor_pointer()
-                    .h(px(28.))
-                    .w_full()
-                    .px_1p5()
-                    .mt_1()
-                    .justify_between()
-                    .hover(|s| s.bg(colors.ghost_element_hover))
+                    .min_w_0()
+                    .gap_1p5()
                     .child(
-                        h_flex()
-                            .min_w_0()
-                            .gap_1()
-                            .child(
-                                Label::new(group.name.clone())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .truncate(),
-                            )
-                            .when(collapsed && running, |this| {
-                                this.child(
-                                    Icon::new(IconName::LoadCircle)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Muted)
-                                        .with_keyed_rotate_animation(
-                                            SharedString::from(format!("group-spin-{key}")),
-                                            2,
-                                        ),
-                                )
+                        Icon::new(if group.project.is_some() {
+                            IconName::FolderOpen
+                        } else {
+                            IconName::Folder
+                        })
+                        .size(IconSize::Small)
+                        .color(if selected {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        }),
+                    )
+                    .child(
+                        Label::new(group.name.clone())
+                            .size(LabelSize::Small)
+                            .color(if selected {
+                                Color::Default
+                            } else {
+                                Color::Muted
                             })
-                            .child(
-                                div().visible_on_hover(header_group.clone()).child(
-                                    Icon::new(if collapsed {
-                                        IconName::ChevronRight
-                                    } else {
-                                        IconName::ChevronDown
-                                    })
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
+                            .truncate(),
+                    )
+                    .when(collapsed && running, |this| {
+                        this.child(
+                            Icon::new(IconName::LoadCircle)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted)
+                                .with_keyed_rotate_animation(
+                                    SharedString::from(format!("group-spin-{key}")),
+                                    2,
                                 ),
-                            ),
-                    )
-                    .child(
-                        div().visible_on_hover(header_group.clone()).child(
-                            IconButton::new(
-                                SharedString::from(format!("new-in-{key}")),
-                                IconName::Plus,
-                            )
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text(format!(
-                                "New session in {}",
-                                group.root.display()
-                            )))
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.new_session_in(Some(new_root.clone()), window, cx)
-                                },
-                            )),
-                        ),
-                    )
-                    .tooltip(Tooltip::text(key.clone()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.collapsed.remove(&toggle_key) {
-                            this.collapsed.insert(toggle_key.clone());
-                        }
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            );
-            if collapsed {
-                continue;
-            }
-            for session in group.sessions {
-                let id = session.id.clone();
-                let delete_id = session.id.clone();
-                let hover_id = session.id.clone();
-                let running = self
-                    .chats
-                    .get(&session.id)
-                    .is_some_and(|chat| chat.read(cx).is_running());
-                let hovered = self.hovered_session.as_deref() == Some(session.id.as_str());
-                rows.push(
-                    ThreadItem::new(
-                        SharedString::from(session.id.clone()),
-                        session
-                            .title
-                            .clone()
-                            .unwrap_or_else(|| "New session".into()),
-                    )
-                    .base_bg(colors.panel_background)
-                    .icon(IconName::Chat)
-                    .status(if running {
-                        AgentThreadStatus::Running
-                    } else {
-                        AgentThreadStatus::Completed
-                    })
-                    .timestamp(crate::sidebar::relative_time(session.updated_at, now))
-                    .selected(self.active.as_deref() == Some(session.id.as_str()))
-                    .hovered(hovered)
-                    .on_hover(cx.listener(move |this, is_hovered: &bool, _, cx| {
-                        if *is_hovered {
-                            this.hovered_session = Some(hover_id.clone());
-                        } else if this.hovered_session.as_deref() == Some(hover_id.as_str()) {
-                            this.hovered_session = None;
-                        }
-                        cx.notify();
-                    }))
-                    .when(hovered, |this| {
-                        this.action_slot(
-                            IconButton::new(
-                                SharedString::from(format!("delete-{}", session.id)),
-                                IconName::Trash,
-                            )
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text("Delete session"))
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.delete_session(delete_id.clone(), window, cx)
-                                },
-                            )),
                         )
                     })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_session(id.clone(), window, cx)
-                    }))
-                    .into_any_element(),
+                    .when(collapsed && unseen && !running, |this| {
+                        this.child(
+                            Icon::new(IconName::Circle)
+                                .size(IconSize::XSmall)
+                                .color(Color::Accent),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_0p5()
+                    .visible_on_hover(header_group.clone())
+                    .child(
+                        IconButton::new(
+                            SharedString::from(format!("collapse-{key}")),
+                            if collapsed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            },
+                        )
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text(if collapsed { "Expand" } else { "Collapse" }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if !this.collapsed.remove(&toggle_key) {
+                                this.collapsed.insert(toggle_key.clone());
+                            }
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        IconButton::new(
+                            SharedString::from(format!("new-in-{key}")),
+                            IconName::Plus,
+                        )
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text(format!("New Session in {}", group.name)))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.new_session_in(Some(new_root.clone()), window, cx)
+                            },
+                        )),
+                    )
+                    .child(
+                        PopoverMenu::new(SharedString::from(format!("project-menu-{key}")))
+                            .trigger(
+                                IconButton::new(
+                                    SharedString::from(format!("project-menu-button-{key}")),
+                                    IconName::Ellipsis,
+                                )
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted),
+                            )
+                            .anchor(gpui::Anchor::TopRight)
+                            .menu(move |window, cx| {
+                                let workspace = workspace.clone();
+                                let project = menu_project.clone();
+                                let (name, root) = (menu_name.clone(), menu_root.clone());
+                                Some(ContextMenu::build(
+                                    window,
+                                    cx,
+                                    move |menu, _, _| match project.clone() {
+                                        Some(project) => {
+                                            let edit = workspace.clone();
+                                            let delete = workspace.clone();
+                                            let edited = project.clone();
+                                            let id = project.id.clone();
+                                            menu.entry(
+                                                "Edit Project…",
+                                                None,
+                                                move |window, cx| {
+                                                    edit.update(cx, |this, cx| {
+                                                        this.open_project_dialog(
+                                                            Some(edited.clone()),
+                                                            String::new(),
+                                                            Vec::new(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    })
+                                                    .ok();
+                                                },
+                                            )
+                                            .separator()
+                                            .entry(
+                                                "Delete Project",
+                                                None,
+                                                move |_, cx| {
+                                                    delete
+                                                        .update(cx, |this, cx| {
+                                                            this.delete_project(id.clone(), cx)
+                                                        })
+                                                        .ok();
+                                                },
+                                            )
+                                        }
+                                        None => {
+                                            let make = workspace.clone();
+                                            let (name, root) = (name.clone(), root.clone());
+                                            menu.entry(
+                                                "Make Project…",
+                                                None,
+                                                move |window, cx| {
+                                                    make.update(cx, |this, cx| {
+                                                        this.open_project_dialog(
+                                                            None,
+                                                            name.clone(),
+                                                            vec![root.clone()],
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    })
+                                                    .ok();
+                                                },
+                                            )
+                                        }
+                                    },
+                                ))
+                            }),
+                    ),
+            )
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // Clicking the selected project folds it; clicking another selects it.
+                let already = AppState::global(cx)
+                    .read(cx)
+                    .config
+                    .selected_project
+                    .as_deref()
+                    == Some(select_key.as_str());
+                if already {
+                    if !this.collapsed.remove(&select_key) {
+                        this.collapsed.insert(select_key.clone());
+                    }
+                    cx.notify();
+                } else {
+                    this.collapsed.remove(&select_key);
+                    this.select_group(select_key.clone(), cx);
+                }
+            }))
+            .into_any_element()
+    }
+
+    fn render_session_row(
+        &self,
+        session: &SessionRecord,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let id = session.id.clone();
+        let delete_id = session.id.clone();
+        let hover_id = session.id.clone();
+        let hovered = self.hovered_session.as_deref() == Some(session.id.as_str());
+        ThreadItem::new(
+            SharedString::from(session.id.clone()),
+            session
+                .title
+                .clone()
+                .unwrap_or_else(|| "New session".into()),
+        )
+        .base_bg(colors.panel_background)
+        .icon(IconName::Chat)
+        .status(self.session_status(&session.id, cx))
+        .notified(self.unseen.contains(&session.id))
+        .timestamp(crate::sidebar::relative_time(session.updated_at, now))
+        .selected(self.active.as_deref() == Some(session.id.as_str()))
+        .hovered(hovered)
+        .on_hover(cx.listener(move |this, is_hovered: &bool, _, cx| {
+            if *is_hovered {
+                this.hovered_session = Some(hover_id.clone());
+            } else if this.hovered_session.as_deref() == Some(hover_id.as_str()) {
+                this.hovered_session = None;
+            }
+            cx.notify();
+        }))
+        .when(hovered, |this| {
+            this.action_slot(
+                IconButton::new(
+                    SharedString::from(format!("delete-{}", session.id)),
+                    IconName::Trash,
+                )
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Delete session"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.delete_session(delete_id.clone(), window, cx)
+                })),
+            )
+        })
+        .on_click(cx.listener(move |this, _, window, cx| this.open_session(id.clone(), window, cx)))
+        .into_any_element()
+    }
+
+    fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = chrono::Utc::now().timestamp_millis();
+        let groups = self.groups();
+        let selected_key = self.selected_group(&groups, cx).map(|g| g.key.clone());
+        let selected_name = groups
+            .iter()
+            .find(|g| Some(&g.key) == selected_key.as_ref())
+            .map(|g| g.name.clone());
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (index, group) in groups.iter().enumerate() {
+            // A line between projects.
+            if index > 0 {
+                rows.push(div().py_1().child(Divider::horizontal()).into_any_element());
+            }
+            let selected = selected_key.as_deref() == Some(group.key.as_str());
+            rows.push(self.render_group_header(group, selected, cx));
+            if self.collapsed.contains(&group.key) {
+                continue;
+            }
+            if group.sessions.is_empty() {
+                rows.push(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .child(
+                            Label::new("No sessions yet")
+                                .size(LabelSize::Small)
+                                .color(Color::Disabled),
+                        )
+                        .into_any_element(),
                 );
+            }
+            for session in &group.sessions {
+                rows.push(self.render_session_row(session, now, cx));
             }
         }
 
-        let cwd = self.cwd(cx);
-        let folder = cwd
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| cwd.display().to_string());
+        let colors = cx.theme().colors();
+        let new_session_tooltip = match selected_name {
+            Some(name) => format!("New Session in {name} (Ctrl+N)"),
+            None => "New Session (Ctrl+N)".to_string(),
+        };
         v_flex()
             .w(px(280.))
             .h_full()
@@ -499,34 +901,33 @@ impl Workspace {
             .border_r_1()
             .border_color(colors.border)
             .child(
-                v_flex()
-                    .py_1()
+                h_flex()
+                    .p_2()
+                    .gap_2()
                     .child(
-                        sidebar_action("new-session", cx)
-                            .child(Icon::new(IconName::Plus).size(IconSize::Small))
-                            .child(Label::new("New session"))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.new_session(window, cx)),
-                            ),
+                        Button::new("new-project", "New Project")
+                            .style(ButtonStyle::Outlined)
+                            .full_width()
+                            .start_icon(Icon::new(IconName::FolderAdd).size(IconSize::Small))
+                            .tooltip(Tooltip::text("Group folders into a project"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_project_dialog(
+                                    None,
+                                    String::new(),
+                                    Vec::new(),
+                                    window,
+                                    cx,
+                                )
+                            })),
                     )
                     .child(
-                        sidebar_action("choose-folder", cx)
-                            .child(
-                                Icon::new(IconName::Folder)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                Label::new(format!("in {folder}"))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .tooltip(Tooltip::text(format!(
-                                "{}\nClick to start a session in another folder",
-                                cwd.display()
-                            )))
+                        Button::new("new-session", "New Session")
+                            .style(ButtonStyle::Tinted(TintColor::Accent))
+                            .full_width()
+                            .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
+                            .tooltip(Tooltip::text(new_session_tooltip))
                             .on_click(
-                                cx.listener(|this, _, window, cx| this.choose_folder(window, cx)),
+                                cx.listener(|this, _, window, cx| this.new_session(window, cx)),
                             ),
                     ),
             )
@@ -535,81 +936,64 @@ impl Workspace {
                 v_flex()
                     .id("sessions")
                     .flex_1()
+                    .pt_1()
                     .pb_2()
-                    .overflow_y_scroll()
-                    .children(rows),
+                    .children(rows)
+                    .vertical_scrollbar_for(&self.sidebar_scroll, window, cx),
             )
     }
 
+    /// The selected project and the active model.
     fn render_status_bar(&self, cx: &App) -> impl IntoElement {
         let colors = cx.theme().colors();
         let state = AppState::global(cx).read(cx);
-        let chat = self
+        let groups = self.groups();
+        let project = self.selected_group(&groups, cx).map(|g| g.name.clone());
+        let model = self
             .active
             .as_ref()
             .and_then(|id| self.chats.get(id))
-            .map(|chat| chat.read(cx));
-        let mut items: Vec<AnyElement> = Vec::new();
-        if let Some(chat) = chat {
-            let context = state.context_length(&chat.model);
-            items.push(
-                Label::new(chat.model.clone())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-                    .into_any_element(),
-            );
-            if let (Some(context), true) = (context, chat.usage.last_input_tokens > 0) {
-                let percent = chat.usage.last_input_tokens as f64 * 100. / context as f64;
-                items.push(
-                    Label::new(format!("context {percent:.1}% of {}K", context / 1000))
-                        .size(LabelSize::XSmall)
-                        .color(if percent > 80. {
-                            Color::Warning
-                        } else {
-                            Color::Muted
-                        })
-                        .into_any_element(),
-                );
-            }
-            items.push(
-                Label::new(format!(
-                    "{} in / {} out tokens",
-                    chat.usage.total_input_tokens, chat.usage.total_output_tokens
-                ))
-                .size(LabelSize::XSmall)
-                .color(Color::Muted)
-                .into_any_element(),
-            );
-            if chat.usage.cost > 0. {
-                items.push(
-                    Label::new(format!("${:.4}", chat.usage.cost))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .into_any_element(),
-                );
-            }
-        }
-        if let Some(record) = self
-            .active
-            .as_ref()
-            .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
-        {
-            items.push(
-                Label::new(record.cwd.clone())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-                    .into_any_element(),
-            );
-        }
+            .map(|chat| chat.read(cx).model.clone())
+            .or_else(|| state.config.model.clone())
+            .map(|id| {
+                state
+                    .model_info(&id)
+                    .and_then(|m| m.name.clone())
+                    .unwrap_or(id)
+            });
         h_flex()
             .h(px(24.))
             .px_2()
             .gap_4()
             .flex_none()
+            .justify_between()
             .bg(colors.status_bar_background)
             .border_t_1()
             .border_color(colors.border)
-            .children(items)
+            .child(h_flex().gap_1().when_some(project, |this, project| {
+                this.child(
+                    Icon::new(IconName::FolderOpen)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(project)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            }))
+            .child(h_flex().gap_1().when_some(model, |this, model| {
+                this.child(
+                    Icon::new(IconName::Sparkle)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(model)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            }))
     }
 }
 
@@ -641,8 +1025,8 @@ impl Render for Workspace {
                     )
                     .child(Headline::new("Hermes").size(HeadlineSize::Large))
                     .child(
-                        Button::new("empty-new-session", "Start a new session")
-                            .style(ButtonStyle::Filled)
+                        Button::new("empty-new-session", "Start a New Session")
+                            .style(ButtonStyle::Tinted(TintColor::Accent))
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.new_session(window, cx)),
                             ),
@@ -653,8 +1037,12 @@ impl Render for Workspace {
         let settings_open = matches!(self.main, Main::Settings);
         let memory_open = matches!(self.main, Main::Memory);
         let skills_open = matches!(self.main, Main::Skills);
-        let _ = window;
+        let dialog = self
+            .project_dialog
+            .as_ref()
+            .map(|(dialog, _)| dialog.clone());
         v_flex()
+            .relative()
             .size_full()
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
@@ -741,7 +1129,7 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .when(self.sidebar_open, |this| {
-                        this.child(self.render_sidebar(cx))
+                        this.child(self.render_sidebar(window, cx))
                     })
                     .child(
                         v_flex()
@@ -757,18 +1145,24 @@ impl Render for Workspace {
                     ),
             )
             .child(self.render_status_bar(cx))
+            // The project dialog over a dimmed window; clicking outside it cancels.
+            .when_some(dialog, |this, dialog| {
+                this.child(
+                    div()
+                        .id("project-dialog-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui::black().opacity(0.4))
+                        .occlude()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.project_dialog = None;
+                            cx.notify();
+                        }))
+                        .child(dialog),
+                )
+            })
     }
-}
-
-/// A full-width sidebar action shaped like the session rows: square edges, row hover color.
-fn sidebar_action(id: &'static str, cx: &App) -> gpui::Stateful<Div> {
-    h_flex()
-        .id(id)
-        .w_full()
-        .h(px(28.))
-        .px_1p5()
-        .gap_1p5()
-        .justify_center()
-        .cursor_pointer()
-        .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
 }

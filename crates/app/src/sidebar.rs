@@ -1,13 +1,18 @@
-//! Grouping sessions into projects for the sidebar, as Hermes's "Group by → Projects" does: a
-//! session belongs to the git repository containing its folder, or to the folder itself.
+//! Grouping sessions for the sidebar, as Hermes's projects do: a session belongs to the project
+//! with the longest folder containing its working directory. Sessions outside every project fall
+//! back to Hermes's automatic grouping: the git repository containing the folder, or the folder.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use hermes_store::SessionRecord;
+use hermes_store::{Project, SessionRecord, project_for_path};
 
 pub struct ProjectGroup {
-    /// The project's root folder, used as the group's identity.
+    /// The group's identity: the project id, or `auto:` and the folder for automatic groups.
+    pub key: String,
+    /// The named project, `None` for an automatic group.
+    pub project: Option<Project>,
+    /// Where new sessions in the group start: the project's primary folder, or the group's root.
     pub root: PathBuf,
     pub name: String,
     pub sessions: Vec<SessionRecord>,
@@ -20,31 +25,65 @@ pub fn project_root(cwd: &Path) -> PathBuf {
         .to_path_buf()
 }
 
-/// Groups sessions (already newest first) by project; groups are ordered by their newest session.
-/// `roots` caches folder → project root so the filesystem is probed once per folder.
+/// Groups sessions (already newest first). Projects come first, the most recently active on
+/// top and empty ones after; then the automatic groups, by their newest session. `roots` caches
+/// folder → git root so the filesystem is probed once per folder.
 pub fn group_sessions(
     sessions: &[SessionRecord],
+    projects: &[Project],
     roots: &mut HashMap<String, PathBuf>,
 ) -> Vec<ProjectGroup> {
-    let mut groups: Vec<ProjectGroup> = Vec::new();
+    let mut named: Vec<ProjectGroup> = Vec::new();
+    let mut auto: Vec<ProjectGroup> = Vec::new();
     for session in sessions {
+        if let Some(project) = project_for_path(projects, &session.cwd) {
+            match named.iter_mut().find(|group| group.key == project.id) {
+                Some(group) => group.sessions.push(session.clone()),
+                None => named.push(project_group(project, vec![session.clone()])),
+            }
+            continue;
+        }
         let root = roots
             .entry(session.cwd.clone())
             .or_insert_with(|| project_root(Path::new(&session.cwd)))
             .clone();
-        match groups.iter_mut().find(|group| group.root == root) {
+        let key = format!("auto:{}", root.display());
+        match auto.iter_mut().find(|group| group.key == key) {
             Some(group) => group.sessions.push(session.clone()),
-            None => groups.push(ProjectGroup {
-                name: root
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| root.display().to_string()),
+            None => auto.push(ProjectGroup {
+                key,
+                project: None,
+                name: folder_name(&root),
                 root,
                 sessions: vec![session.clone()],
             }),
         }
     }
-    groups
+    // Projects without sessions still show, so a new one can be started in them.
+    for project in projects {
+        if !named.iter().any(|group| group.key == project.id) {
+            named.push(project_group(project, Vec::new()));
+        }
+    }
+    named.extend(auto);
+    named
+}
+
+fn project_group(project: &Project, sessions: Vec<SessionRecord>) -> ProjectGroup {
+    ProjectGroup {
+        key: project.id.clone(),
+        root: PathBuf::from(project.primary_folder().unwrap_or_default()),
+        name: project.name.clone(),
+        project: Some(project.clone()),
+        sessions,
+    }
+}
+
+/// The last component of `path`, or all of it for a drive root.
+pub fn folder_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// "now", "5m", "3h", "2d", "4w", then the date.
@@ -92,7 +131,7 @@ mod tests {
             session("b", &other.display().to_string()),
             session("c", &repo.display().to_string()),
         ];
-        let groups = group_sessions(&sessions, &mut HashMap::new());
+        let groups = group_sessions(&sessions, &[], &mut HashMap::new());
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].name, "repo");
         assert_eq!(
@@ -104,6 +143,45 @@ mod tests {
             ["a", "c"]
         );
         assert_eq!(groups[1].name, "notes");
+    }
+
+    #[test]
+    fn projects_take_their_sessions_and_show_even_when_empty() {
+        let project = |id: &str, folders: &[&str]| Project {
+            id: id.into(),
+            name: id.to_uppercase(),
+            folders: folders.iter().map(|f| f.to_string()).collect(),
+            created_at: 0,
+        };
+        let projects = vec![
+            project("app", &["C:/nowhere/app", "C:/nowhere/lib"]),
+            project("empty", &["C:/nowhere/empty"]),
+        ];
+        let sessions = vec![
+            session("a", "C:/nowhere/lib/src"),
+            session("b", "C:/nowhere/scratch"),
+            session("c", "C:/nowhere/app"),
+        ];
+        let groups = group_sessions(&sessions, &projects, &mut HashMap::new());
+        let summary: Vec<(String, Vec<&str>)> = groups
+            .iter()
+            .map(|g| {
+                (
+                    g.key.clone(),
+                    g.sessions.iter().map(|s| s.id.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("app".to_string(), vec!["a", "c"]),
+                ("empty".to_string(), vec![]),
+                ("auto:C:/nowhere/scratch".to_string(), vec!["b"]),
+            ]
+        );
+        assert_eq!(groups[0].root, PathBuf::from("C:/nowhere/app"));
+        assert_eq!(groups[0].name, "APP");
     }
 
     #[test]

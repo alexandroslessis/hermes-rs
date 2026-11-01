@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Subscription, Window, prelude::*};
 use hermes_memory::{ENTRY_DELIMITER, MemoryStore, Operation, PendingWrite, Target, TurnFailures};
 use std::sync::Arc;
-use ui::{Callout, Checkbox, Divider, ToggleState, Tooltip, prelude::*};
+use ui::{Callout, Checkbox, Divider, ToggleState, Tooltip, WithScrollbar, prelude::*};
 
 use crate::backend::backend;
 use crate::state::AppState;
@@ -22,6 +22,7 @@ pub struct MemoryView {
     usage: [String; 2],
     pending: Vec<PendingWrite>,
     notice: Option<(Severity, String)>,
+    scroll: gpui::ScrollHandle,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -75,6 +76,7 @@ impl MemoryView {
             usage: Default::default(),
             pending: Vec::new(),
             notice: None,
+            scroll: gpui::ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         };
@@ -416,7 +418,7 @@ impl Focusable for MemoryView {
 }
 
 impl Render for MemoryView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let approval = AppState::global(cx).read(cx).config.memory_write_approval;
         let dir = Self::store(cx).dir().to_path_buf();
@@ -426,7 +428,7 @@ impl Render for MemoryView {
             .p_6()
             .gap_4()
             .bg(colors.panel_background)
-            .overflow_y_scroll()
+            .vertical_scrollbar_for(&self.scroll, window, cx)
             .child(Headline::new("Memory").size(HeadlineSize::Large))
             .child(
                 Label::new("What the agent remembers across sessions. New sessions start with these entries in their prompt; changes apply from the next session.")

@@ -65,7 +65,8 @@ impl ProviderConfig {
 
     /// Every model the endpoint serves, with context length, pricing and capabilities when known.
     pub async fn list_models(&self) -> Result<Vec<DiscoveredModel>> {
-        let mut models = hermes_llm::discovery::list_models(&self.client()?, &self.base_url).await?;
+        let mut models =
+            hermes_llm::discovery::list_models(&self.client()?, &self.base_url).await?;
         // Ollama lists bare ids; its native API, beside `/v1`, has the context windows.
         let base = self.base_url.trim_end_matches('/');
         if let Some(root) = base.strip_suffix("/v1")
@@ -273,6 +274,9 @@ impl Runtime {
         // The scratch dir is per session but the prompt must name it before the id exists, so
         // sessions share the scratch root in the prompt and get their own subdirectory below.
         let scratch_root = self.config.data_dir.join("scratch");
+        // The project this folder belongs to, so the agent knows its other folders.
+        let projects = self.store.list_projects().unwrap_or_default();
+        let project = hermes_store::project_for_path(&projects, &cwd.display().to_string());
         let prompt = build_system_prompt(&SystemPromptInput {
             model,
             provider,
@@ -288,6 +292,7 @@ impl Runtime {
             soul: soul.as_deref(),
             memory: memory.as_deref(),
             skills_index: skills_index.as_deref(),
+            project: project.map(|p| (p.name.as_str(), p.folders.as_slice())),
             context_length,
             now: chrono::Local::now(),
         });

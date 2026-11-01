@@ -13,12 +13,14 @@ use parking_lot::Mutex;
 use rmcp::model::Role;
 use rusqlite::{Connection, OptionalExtension, params};
 
+mod projects;
 mod search;
 
+pub use projects::{Project, is_under, project_for_path};
 pub use search::{SearchHit, SearchQuery, SearchRow, SearchSort};
 
-/// v2 added the session-search index.
-const SCHEMA_VERSION: i32 = 2;
+/// v2 added the session-search index, v3 projects.
+const SCHEMA_VERSION: i32 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE sessions (
@@ -114,9 +116,13 @@ impl Store {
         if version == 0 {
             conn.execute_batch(SCHEMA)?;
             conn.execute_batch(search::SEARCH_SCHEMA)?;
+            conn.execute_batch(projects::PROJECTS_SCHEMA)?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        } else if version == 1 {
-            search::migrate(&conn)?;
+        } else if version < SCHEMA_VERSION {
+            if version < 2 {
+                search::migrate(&conn)?;
+            }
+            projects::migrate(&conn)?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if version != SCHEMA_VERSION {
             anyhow::bail!(

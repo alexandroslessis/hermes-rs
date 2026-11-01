@@ -55,6 +55,9 @@ pub struct AppConfig {
     /// Stage the agent's skill writes for approval (Hermes's `skills.write_approval`).
     #[serde(default)]
     pub skill_write_approval: bool,
+    /// The sidebar group new sessions start in: a project id, or `auto:` and a folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_project: Option<String>,
     /// Models starred in the model selector (Zed's favorite models).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub favorite_models: Vec<FavoriteModel>,
@@ -83,6 +86,7 @@ impl Default for AppConfig {
             memory_write_approval: false,
             skill_write_approval: false,
             favorite_models: Vec::new(),
+            selected_project: None,
         }
     }
 }

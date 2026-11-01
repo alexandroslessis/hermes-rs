@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 use gpui::{App, AppContext as _, Context, Entity, Global};
 use hermes_llm::discovery::DiscoveredModel;
-use hermes_runtime::ProviderConfig;
 
 use crate::backend::backend;
 use crate::config::{self, AppConfig, ProviderSettings};
@@ -87,10 +86,6 @@ impl AppState {
             .filter(serves)
             .or_else(|| self.config.providers.iter().find(serves))
             .or_else(|| self.provider())
-    }
-
-    pub fn runtime_provider(&self) -> Option<ProviderConfig> {
-        self.provider().map(config::runtime_provider)
     }
 
     /// Whether the active provider can be called: it has a key, or it's local and needs none.
