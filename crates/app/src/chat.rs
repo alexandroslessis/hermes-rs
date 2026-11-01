@@ -3,7 +3,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Empty, Entity, FocusHandle, Focusable, FollowMode,
@@ -32,6 +31,7 @@ use hermes_tools::{TodoItem, TodoStatus};
 
 use crate::backend::backend;
 use crate::chat_ui;
+use crate::config;
 use crate::model_picker::ModelPicker;
 use crate::state::AppState;
 use crate::text_area::{TextArea, TextAreaEvent};
@@ -84,18 +84,11 @@ pub struct ChatView {
     slash_matches: Vec<(String, String)>,
     /// A steer the turn ended before delivering: Hermes sends it as the next message.
     next_message: Option<String>,
-    /// When the running turn started, and the output tokens it has produced so far.
-    turn_started: Option<Instant>,
-    turn_tokens: u64,
-    /// How long the last finished turn ran and the tokens it produced.
-    last_turn: Option<(Duration, u64)>,
     /// Thinking blocks the user opened or closed by hand (Zed's auto mode leaves the rest).
     thinking_toggled: HashSet<String>,
     composer_expanded: bool,
     effort_menu: PopoverMenuHandle<ContextMenu>,
     model_menu: PopoverMenuHandle<ModelPicker>,
-    /// Ticks the elapsed time shown under a running turn.
-    _turn_timer: Option<Task<()>>,
     pub usage: TurnUsage,
     error: Option<String>,
     focus_handle: FocusHandle,
@@ -157,16 +150,12 @@ impl ChatView {
             editing: None,
             slash_matches: Vec::new(),
             next_message: None,
-            turn_started: None,
-            turn_tokens: 0,
-            last_turn: None,
             thinking_toggled: HashSet::new(),
             composer_expanded: false,
             effort_menu: PopoverMenuHandle::default(),
             model_menu: PopoverMenuHandle::default(),
-            _turn_timer: None,
             usage: TurnUsage {
-                last_input_tokens: 0,
+                last_input_tokens: i32::try_from(totals.last_input_tokens).unwrap_or(i32::MAX),
                 total_input_tokens: totals.input_tokens,
                 total_output_tokens: totals.output_tokens,
                 cost: totals.cost.unwrap_or(0.),
@@ -348,7 +337,9 @@ impl ChatView {
         let (provider, options) = {
             let state = state.read(cx);
             (
-                state.runtime_provider(),
+                state
+                    .provider_for_model(&self.model)
+                    .map(config::runtime_provider),
                 hermes_runtime::TurnOptions {
                     context_length: state.context_length(&self.model),
                     effort: state.config.efforts.get(&self.model).cloned(),
@@ -406,20 +397,7 @@ impl ChatView {
         self.composer.update(cx, |composer, cx| {
             composer.set_placeholder(STEER_PLACEHOLDER, cx)
         });
-        self.turn_started = Some(Instant::now());
-        self.turn_tokens = 0;
         self.trailer_changed(cx);
-        self._turn_timer = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
-                if this
-                    .update(cx, |this, cx| this.trailer_changed(cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }));
         self.list_state.scroll_to_end();
         self.turn_task = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = turn.events.recv().await {
@@ -437,15 +415,16 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Switches this chat's model; it also becomes the default for new chats (Hermes's
+    /// Switches this chat's model (and the active provider to the one serving it); it becomes the default for new chats (Hermes's
     /// composer picker is sticky the same way).
-    fn switch_model(&mut self, model: String, cx: &mut Context<Self>) {
+    fn switch_model(&mut self, provider: String, model: String, cx: &mut Context<Self>) {
         let state = AppState::global(cx);
-        let context_length = state.read(cx).context_length(&model);
         state.update(cx, |state, cx| {
+            state.config.provider = Some(provider);
             state.config.model = Some(model.clone());
             state.save(cx);
         });
+        let context_length = state.read(cx).context_length(&model);
         if model == self.model {
             return;
         }
@@ -495,7 +474,6 @@ impl ChatView {
                 self.usage.last_input_tokens = usage.usage.input_tokens.unwrap_or(0);
                 self.usage.total_input_tokens += i64::from(usage.usage.input_tokens.unwrap_or(0));
                 self.usage.total_output_tokens += i64::from(usage.usage.output_tokens.unwrap_or(0));
-                self.turn_tokens += usage.usage.output_tokens.unwrap_or(0).max(0) as u64;
                 self.usage.cost += usage.cost.unwrap_or(0.);
                 cx.notify();
             }
@@ -506,10 +484,6 @@ impl ChatView {
             }
             RuntimeEvent::TurnFinished(status) => {
                 self.running = None;
-                self._turn_timer = None;
-                if let Some(started) = self.turn_started.take() {
-                    self.last_turn = Some((started.elapsed(), self.turn_tokens));
-                }
                 self.composer.update(cx, |composer, cx| {
                     composer.set_placeholder(COMPOSER_PLACEHOLDER, cx)
                 });
@@ -651,6 +625,52 @@ impl ChatView {
             .collect()
     }
 
+    /// The whole thread as plain text: each message under its role, tool calls with their
+    /// input and output. Selection stops at a block's edge, so this is how to copy it all.
+    fn thread_text(&self) -> String {
+        let responses = self.tool_responses();
+        let mut parts = Vec::new();
+        for &index in &self.entries {
+            let message = &self.conversation.messages()[index];
+            let mut body = Vec::new();
+            for content in &message.content {
+                match content {
+                    MessageContent::Text(text) => body.push(text.text.clone()),
+                    MessageContent::Thinking(thinking) => {
+                        body.push(format!("[Thinking]\n{}", thinking.thinking))
+                    }
+                    MessageContent::ToolRequest(request) => {
+                        let Ok(call) = &request.tool_call else {
+                            continue;
+                        };
+                        let args = call
+                            .arguments
+                            .clone()
+                            .map(serde_json::Value::Object)
+                            .unwrap_or_default();
+                        let mut text = format!(
+                            "[Tool: {}]\n{}",
+                            call.name,
+                            serde_json::to_string_pretty(&args).unwrap_or_default()
+                        );
+                        if let Some((output, _)) = responses.get(request.id.as_str()) {
+                            text.push_str("\n[Output]\n");
+                            text.push_str(output);
+                        }
+                        body.push(text);
+                    }
+                    _ => {}
+                }
+            }
+            let role = match message.role {
+                Role::User => "User",
+                Role::Assistant => "Hermes",
+            };
+            parts.push(format!("## {role}\n\n{}", body.join("\n\n")));
+        }
+        parts.join("\n\n")
+    }
+
     fn render_entry(
         &mut self,
         index: usize,
@@ -660,7 +680,7 @@ impl ChatView {
         // The row after the last message: Zed's generating indicator while a turn runs.
         let Some(&message_index) = self.entries.get(index) else {
             return if self.running.is_some() {
-                self.render_generating(cx).into_any_element()
+                self.render_generating().into_any_element()
             } else {
                 Empty.into_any_element()
             };
@@ -720,6 +740,7 @@ impl ChatView {
                         })
                 });
                 let whole = whole.clone();
+                let chat = chat.clone();
                 ContextMenu::build(window, cx, move |menu, _, _| {
                     let menu = match selected.clone() {
                         Some((text, markdown)) => {
@@ -741,8 +762,15 @@ impl ChatView {
                         None => menu,
                     };
                     let whole = whole.clone();
-                    menu.entry("Copy message", None, move |_, cx| {
+                    let chat = chat.clone();
+                    menu.entry("Copy Message", None, move |_, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(whole.clone()))
+                    })
+                    .entry("Copy Thread", None, move |_, cx| {
+                        if let Some(chat) = chat.upgrade() {
+                            let text = chat.read(cx).thread_text();
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
                     })
                 })
             })
@@ -863,8 +891,12 @@ impl ChatView {
             ..Default::default()
         };
         let markdown = cx.new(|cx| match key.2 {
-            // What the user typed is shown as written, not as markdown.
-            MarkdownKind::User => Markdown::new_text(text.to_string().into(), cx),
+            // What the user typed and what tools took and returned show as written.
+            MarkdownKind::User
+            | MarkdownKind::ToolInput
+            | MarkdownKind::ToolOutput
+            | MarkdownKind::TerminalCommand
+            | MarkdownKind::TerminalOutput => Markdown::new_text(text.to_string().into(), cx),
             _ => Markdown::new_with_options(
                 text.to_string().into(),
                 Some(languages),
@@ -1108,7 +1140,15 @@ impl ChatView {
             ),
         };
         if name == "terminal" {
-            return self.render_terminal_tool_call(request, &args, response, window, cx);
+            return self.render_terminal_tool_call(
+                message_index,
+                chunk,
+                request,
+                &args,
+                response,
+                window,
+                cx,
+            );
         }
         let key = format!("tool-{}", request.id);
         let open = self.expanded.contains(&key);
@@ -1194,10 +1234,42 @@ impl ChatView {
             .on_click(cx.listener(move |this, _, _, cx| this.toggle(toggle_key.clone(), cx)));
 
         let border_color = tool_card_border_color(cx);
-        let output = response
-            .as_ref()
-            .map(|(text, _)| render_result(text, cx))
-            .unwrap_or_else(|| div().into_any_element());
+        let output = match open.then_some(response.as_ref()).flatten() {
+            Some((text, _)) => {
+                let (fields, diff) = result_parts(text);
+                let mono = mono_style(window, cx);
+                v_flex()
+                    .gap_1()
+                    .when(!fields.is_empty(), |this| {
+                        this.child(self.markdown_block(
+                            (message_index, chunk, MarkdownKind::ToolOutput),
+                            &fields,
+                            mono.clone(),
+                            cx,
+                        ))
+                    })
+                    .when_some(diff, |this, diff| {
+                        this.child(self.markdown_block(
+                            (message_index, chunk, MarkdownKind::ToolDiff),
+                            &fenced("diff", &diff),
+                            mono,
+                            cx,
+                        ))
+                    })
+                    .into_any_element()
+            }
+            None => div().into_any_element(),
+        };
+        let input = open.then(|| {
+            let args_text = clip(&serde_json::to_string_pretty(&args).unwrap_or_default());
+            let style = mono_style(window, cx);
+            self.markdown_block(
+                (message_index, chunk, MarkdownKind::ToolInput),
+                &args_text,
+                style,
+                cx,
+            )
+        });
         let input_output_header = |text: &'static str| {
             Label::new(text)
                 .size(LabelSize::XSmall)
@@ -1217,7 +1289,6 @@ impl ChatView {
                     .child(output)
                     .into_any_element()
             } else {
-                let args_text = serde_json::to_string_pretty(&args).unwrap_or_default();
                 v_flex()
                     .mt_1p5()
                     .w_full()
@@ -1230,9 +1301,9 @@ impl ChatView {
                             .border_l_1()
                             .border_color(border_color)
                             .child(input_output_header("Raw Input:"))
-                            .child(div().font(mono.clone()).text_xs().child(clip(&args_text)))
+                            .children(input)
                             .child(input_output_header("Output:"))
-                            .child(div().font(mono.clone()).text_xs().child(output)),
+                            .child(output),
                     )
                     .child(
                         div()
@@ -1281,6 +1352,8 @@ impl ChatView {
     /// directory over the command, a spinner while it runs, its output when expanded.
     fn render_terminal_tool_call(
         &mut self,
+        message_index: usize,
+        chunk: usize,
         request: &hermes_llm::conversation::message::ToolRequest,
         args: &serde_json::Value,
         response: Option<(String, bool)>,
@@ -1314,7 +1387,6 @@ impl ChatView {
         let header_bg = tool_card_header_bg(cx);
         let group = SharedString::from(format!("terminal-tool-header-group-{id}"));
         let child_id = |name: &str| SharedString::from(format!("terminal-tool-{name}-{id}"));
-        let mono = theme::theme_settings(cx).buffer_font(cx).clone();
         let toggle_key = key.clone();
 
         let header_row = h_flex()
@@ -1373,19 +1445,24 @@ impl ChatView {
             })
             .on_click(cx.listener(move |this, _, _, cx| this.toggle(toggle_key.clone(), cx)));
 
+        let command_style = {
+            let mut style = mono_style(window, cx);
+            style.base_text_style.font_size = rems_from_px(12_f32).into();
+            style.base_text_style.line_height = rems_from_px(17_f32).into();
+            style
+        };
+        let command_text = self.markdown_block(
+            (message_index, chunk, MarkdownKind::TerminalCommand),
+            &command,
+            command_style,
+            cx,
+        );
         let command_slot = v_flex()
             .group(group.clone())
             .relative()
             .p_1p5()
             .bg(header_bg)
-            .child(
-                div()
-                    .font(mono.clone())
-                    .text_size(rems_from_px(12_f32))
-                    .line_height(rems_from_px(17_f32))
-                    .text_color(cx.theme().colors().text)
-                    .child(command.clone()),
-            )
+            .child(command_text)
             .child(
                 div().absolute().top_1().right_1().child(
                     CopyButton::new(child_id("copy-command"), command)
@@ -1401,7 +1478,15 @@ impl ChatView {
             .map(str::to_string)
             .or_else(|| response.as_ref().map(|(text, _)| text.clone()))
             .unwrap_or_default();
-        let _ = window;
+        let output = (is_expanded && response.is_some()).then(|| {
+            let style = mono_style(window, cx);
+            self.markdown_block(
+                (message_index, chunk, MarkdownKind::TerminalOutput),
+                &clip(output.trim_end()),
+                style,
+                cx,
+            )
+        });
         v_flex()
             .my_1p5()
             .border_1()
@@ -1417,7 +1502,7 @@ impl ChatView {
                     .child(header_row)
                     .child(command_slot),
             )
-            .when(is_expanded && response.is_some(), |this| {
+            .when_some(output, |this, output| {
                 this.child(
                     div()
                         .id(child_id("output"))
@@ -1428,44 +1513,17 @@ impl ChatView {
                         .max_h(rems(18.))
                         .overflow_y_scroll()
                         .p_2()
-                        .font(mono)
-                        .text_xs()
-                        .text_color(cx.theme().colors().text)
-                        .child(clip(output.trim_end())),
+                        .child(output),
                 )
             })
             .into_any_element()
     }
 
     /// Zed's `render_generating`: the spinner under the thread while a turn runs (sand and
-    /// "Awaiting Confirmation" while a question waits), with the elapsed time and tokens once
-    /// the turn passes Zed's thresholds.
-    fn render_generating(&self, cx: &Context<Self>) -> impl IntoElement {
+    /// "Awaiting Confirmation" while a question waits). The context ring in the composer shows
+    /// the token count, so the elapsed-time and token labels Zed adds here are left out.
+    fn render_generating(&self) -> impl IntoElement {
         let confirmation = self.clarify.is_some();
-        let elapsed_label = self
-            .turn_started
-            .map(|started| started.elapsed())
-            .filter(|elapsed| *elapsed > chat_ui::STOPWATCH_THRESHOLD)
-            .map(chat_ui::duration_alt_display);
-        let turn_tokens_label = elapsed_label
-            .is_some()
-            .then_some(self.turn_tokens)
-            .filter(|&tokens| tokens > chat_ui::TOKEN_THRESHOLD)
-            .map(chat_ui::humanize_token_count);
-        let is_waiting = confirmation
-            || self.conversation.last().is_some_and(|message| {
-                message.role == Role::Assistant
-                    && message
-                        .content
-                        .iter()
-                        .any(|c| matches!(c, MessageContent::ToolRequest(_)))
-            });
-        let arrow_icon = if is_waiting {
-            IconName::ArrowUp
-        } else {
-            IconName::ArrowDown
-        };
-        let _ = cx;
         h_flex()
             .id("generating-spinner")
             .py_2()
@@ -1496,33 +1554,10 @@ impl ChatView {
                     )
                 }
             })
-            .when_some(elapsed_label, |this, elapsed| {
-                this.child(
-                    Label::new(elapsed)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-            })
-            .when_some(turn_tokens_label, |this, tokens| {
-                this.child(
-                    h_flex()
-                        .gap_0p5()
-                        .child(
-                            Icon::new(arrow_icon)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Label::new(format!("{tokens} tokens"))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
-                )
-            })
     }
 
     /// Zed's thread controls under a finished turn: copy the response, scroll to the user's
-    /// message, and (at the bottom) the last turn's stats and scroll to top.
+    /// message, and (at the bottom) scroll to top. Token use shows in the context ring only.
     fn render_thread_controls(
         &self,
         index: usize,
@@ -1534,21 +1569,6 @@ impl ChatView {
             .iter()
             .rposition(|&m| self.conversation.messages()[m].role == Role::User);
         let response: Vec<usize> = self.entries[user_entry.map_or(0, |u| u + 1)..=index].to_vec();
-        let (last_turn_tokens, last_turn_clock) = match self.last_turn.filter(|_| is_thread_bottom)
-        {
-            Some((duration, tokens)) if duration > chat_ui::STOPWATCH_THRESHOLD => (
-                (tokens > chat_ui::TOKEN_THRESHOLD)
-                    .then(|| format!("{} tokens", chat_ui::humanize_token_count(tokens))),
-                Some(chat_ui::duration_alt_display(duration)),
-            ),
-            _ => (None, None),
-        };
-        let separator_dots = || {
-            Label::new("•")
-                .size(LabelSize::Small)
-                .color(Color::Muted)
-                .alpha(0.5)
-        };
         h_flex()
             .w_full()
             .py_1p5()
@@ -1556,28 +1576,6 @@ impl ChatView {
             .justify_end()
             .opacity(0.4)
             .hover(|s| s.opacity(1.))
-            .when(
-                last_turn_tokens.is_some() || last_turn_clock.is_some(),
-                |this| {
-                    this.child(
-                        h_flex()
-                            .px_1()
-                            .gap_1()
-                            .when_some(last_turn_tokens, |this, label| {
-                                this.child(
-                                    Label::new(label).size(LabelSize::Small).color(Color::Muted),
-                                )
-                                .child(separator_dots())
-                            })
-                            .when_some(last_turn_clock, |this, label| {
-                                this.child(
-                                    Label::new(label).size(LabelSize::Small).color(Color::Muted),
-                                )
-                                .child(separator_dots())
-                            }),
-                    )
-                },
-            )
             .child(
                 IconButton::new(("copy_agent_response", index), IconName::Copy)
                     .icon_size(IconSize::Small)
@@ -1804,7 +1802,10 @@ impl ChatView {
     /// Zed's model selector trigger: the model's name and a chevron; the picker opens upward.
     fn render_model_button(&self, cx: &Context<Self>) -> impl IntoElement {
         let chat = cx.entity().downgrade();
-        let selected = self.model.clone();
+        let selected = AppState::global(cx)
+            .read(cx)
+            .provider_for_model(&self.model)
+            .map(|provider| (provider.id.clone(), self.model.clone()));
         let name = AppState::global(cx)
             .read(cx)
             .model_info(&self.model)
@@ -1820,12 +1821,17 @@ impl ChatView {
             .menu(move |window, cx| {
                 let chat = chat.clone();
                 let on_select: crate::model_picker::OnSelect =
-                    std::rc::Rc::new(move |id, _, cx| {
-                        chat.update(cx, |chat, cx| chat.switch_model(id, cx)).ok();
+                    std::rc::Rc::new(move |provider, id, _, cx| {
+                        chat.update(cx, |chat, cx| chat.switch_model(provider, id, cx))
+                            .ok();
+                    });
+                let on_configure: crate::model_picker::OnConfigure =
+                    std::rc::Rc::new(|window, cx| {
+                        window.dispatch_action(Box::new(crate::workspace::OpenSettings), cx)
                     });
                 let selected = selected.clone();
                 Some(cx.new(|cx| {
-                    ModelPicker::new(Some(selected), px(320.), on_select, window, cx).in_popover()
+                    ModelPicker::new(selected, on_select, window, cx).in_popover(on_configure)
                 }))
             })
             .trigger_with_tooltip(
@@ -1975,11 +1981,14 @@ impl ChatView {
     fn render_token_usage(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
         let max = AppState::global(cx).read(cx).context_length(&self.model)? as u64;
         let used = self.usage.last_input_tokens.max(0) as u64;
-        if used == 0 || max == 0 {
+        if max == 0 {
             return None;
         }
         let ratio = used as f32 / max as f32;
-        let progress_color = if ratio >= 0.85 {
+        // Zed turns the ring to the warning color at 85%; past 95% it's about to overflow.
+        let progress_color = if ratio >= 0.95 {
+            cx.theme().status().error
+        } else if ratio >= 0.85 {
             cx.theme().status().warning
         } else {
             cx.theme().colors().text_muted
@@ -2407,65 +2416,47 @@ fn tool_card_border_color(cx: &App) -> gpui::Hsla {
     cx.theme().colors().border.opacity(0.8)
 }
 
-/// A tool result: JSON fields one per line, multi-line strings as real text, and a `diff`
-/// field colored like a diff view.
-fn render_result(text: &str, cx: &App) -> AnyElement {
-    let colors = cx.theme().colors();
+/// A tool result as selectable text: JSON fields one per line (multi-line strings under their
+/// key), and a `diff` field apart so it can be colored like a diff view.
+fn result_parts(text: &str) -> (String, Option<String>) {
     let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(text) else {
-        return div().child(clip(text)).into_any_element();
+        return (clip(text), None);
     };
-    let mut lines: Vec<AnyElement> = Vec::new();
+    let mut lines = Vec::new();
+    let mut diff = None;
     for (key, value) in &map {
         match value {
-            serde_json::Value::String(diff) if key == "diff" => {
-                lines.push(
-                    div()
-                        .text_color(colors.text_muted)
-                        .child("diff:")
-                        .into_any_element(),
-                );
-                for line in clip(diff).lines() {
-                    let color = if line.starts_with('+') && !line.starts_with("+++") {
-                        Some(colors.version_control_added)
-                    } else if line.starts_with('-') && !line.starts_with("---") {
-                        Some(colors.version_control_deleted)
-                    } else {
-                        None
-                    };
-                    let row = div().child(if line.is_empty() {
-                        " ".to_string()
-                    } else {
-                        line.to_string()
-                    });
-                    lines.push(match color {
-                        Some(color) => row.bg(color.opacity(0.2)).into_any_element(),
-                        None => row.into_any_element(),
-                    });
-                }
-            }
+            serde_json::Value::String(text) if key == "diff" => diff = Some(clip(text)),
             serde_json::Value::String(text) if text.contains('\n') => {
-                lines.push(
-                    div()
-                        .text_color(colors.text_muted)
-                        .child(format!("{key}:"))
-                        .into_any_element(),
-                );
-                lines.push(div().child(clip(text)).into_any_element());
+                lines.push(format!("{key}:"));
+                lines.push(clip(text));
             }
-            other => {
-                let shown = match other {
-                    serde_json::Value::String(text) => text.clone(),
-                    other => other.to_string(),
-                };
-                lines.push(
-                    div()
-                        .child(format!("{key}: {}", clip(&shown)))
-                        .into_any_element(),
-                );
-            }
+            serde_json::Value::String(text) => lines.push(format!("{key}: {}", clip(text))),
+            other => lines.push(format!("{key}: {}", clip(&other.to_string()))),
         }
     }
-    v_flex().children(lines).into_any_element()
+    (lines.join("\n"), diff)
+}
+
+/// `text` in a fenced code block tagged `language`; the fence outgrows any backtick run inside.
+fn fenced(language: &str, text: &str) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    format!(
+        "{fence}{language}\n{}\n{fence}",
+        text.trim_end_matches('\n')
+    )
+}
+
+/// Tool input and output: the agent's code font at Zed's extra-small size, selectable.
+fn mono_style(window: &Window, cx: &App) -> MarkdownStyle {
+    let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+    let settings = theme::theme_settings(cx);
+    style.base_text_style.font_family = settings.buffer_font(cx).family.clone();
+    style.base_text_style.font_size = ui::TextSize::XSmall.rems(cx).into();
+    style.base_text_style.color = cx.theme().colors().text;
+    style.code_block_overflow_x_scroll = true;
+    style
 }
 
 fn clip(text: &str) -> String {
@@ -2552,6 +2543,12 @@ enum MarkdownKind {
     Thinking,
     User,
     ToolLabel,
+    /// A tool call's arguments, its result, a diff it made, and a terminal command and output.
+    ToolInput,
+    ToolOutput,
+    ToolDiff,
+    TerminalCommand,
+    TerminalOutput,
 }
 
 /// (message index, content block, kind) of a rendered markdown block.

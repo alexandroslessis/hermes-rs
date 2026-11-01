@@ -309,6 +309,17 @@ pub fn language_registry(theme: &SyntaxTheme) -> Arc<LanguageRegistry> {
             registry.register(names, language);
         }
     }
+    registry.register(
+        &["diff", "patch"],
+        Arc::new(Language::new(
+            "diff".to_string(),
+            Some(Arc::new(DiffHighlighter {
+                plus: theme.highlight_id("diff.plus").map(HighlightId),
+                minus: theme.highlight_id("diff.minus").map(HighlightId),
+                header: theme.highlight_id("comment").map(HighlightId),
+            })),
+        )),
+    );
     Arc::new(registry)
 }
 
@@ -352,6 +363,62 @@ mod tests {
         assert!(
             runs.iter()
                 .any(|(range, id)| &text[range.clone()] == "\"hi\"" && *id == string)
+        );
+    }
+}
+
+/// Unified diffs, line by line: added lines in the theme's `diff.plus`, removed lines in
+/// `diff.minus`, hunk headers like comments. No grammar needed.
+struct DiffHighlighter {
+    plus: Option<HighlightId>,
+    minus: Option<HighlightId>,
+    header: Option<HighlightId>,
+}
+
+impl Highlighter for DiffHighlighter {
+    fn highlight(&self, text: &str) -> Vec<(Range<usize>, HighlightId)> {
+        let mut runs = Vec::new();
+        let mut start = 0;
+        for line in text.split_inclusive('\n') {
+            let id = if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@")
+            {
+                self.header
+            } else if line.starts_with('+') {
+                self.plus
+            } else if line.starts_with('-') {
+                self.minus
+            } else {
+                None
+            };
+            let end = start + line.trim_end_matches(['\n', '\r']).len();
+            if let Some(id) = id.filter(|_| end > start) {
+                runs.push((start..end, id));
+            }
+            start += line.len();
+        }
+        runs
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    #[test]
+    fn diff_lines_get_their_colors() {
+        let highlighter = DiffHighlighter {
+            plus: Some(HighlightId(1)),
+            minus: Some(HighlightId(2)),
+            header: Some(HighlightId(3)),
+        };
+        let runs = highlighter.highlight("@@ -1 +1 @@\n-old\n+new\n same\n");
+        assert_eq!(
+            runs,
+            vec![
+                (0..11, HighlightId(3)),
+                (12..16, HighlightId(2)),
+                (17..21, HighlightId(1)),
+            ]
         );
     }
 }

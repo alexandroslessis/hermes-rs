@@ -1,16 +1,9 @@
 //! Pieces of Zed's agent thread view (`crates/agent_ui/src/conversation_view/thread_view.rs`,
-//! GPL-3.0-or-later) that the chat reuses as they are: the generating spinner, the token and
-//! duration formats, and the context-usage tooltip.
-
-use std::time::Duration;
+//! GPL-3.0-or-later) that the chat reuses as they are: the generating spinner, the token
+//! count format, and the context-usage tooltip.
 
 use gpui::{App, Context, Window, prelude::*};
 use ui::{SpinnerLabel, SpinnerVariant, prelude::*};
-
-/// Turn stats show once a turn runs this long (Zed's `STOPWATCH_THRESHOLD`)...
-pub const STOPWATCH_THRESHOLD: Duration = Duration::from_secs(30);
-/// ...and its token count once it passes this (Zed's `TOKEN_THRESHOLD`).
-pub const TOKEN_THRESHOLD: u64 = 250;
 
 /// Zed's `GeneratingSpinner`: a view, so the spinner's animation keeps its frame across
 /// re-renders of the list item around it.
@@ -78,20 +71,6 @@ pub fn humanize_token_count(count: u64) -> String {
             }
         }
         _ => format!("{}M", (count + 500_000) / 1_000_000),
-    }
-}
-
-/// Zed's `duration_alt_display`: 45s, 2m 5s, 1h 3m 0s.
-pub fn duration_alt_display(duration: Duration) -> String {
-    let hours = duration.as_secs() / 3600;
-    let minutes = (duration.as_secs() % 3600) / 60;
-    let seconds = duration.as_secs() % 60;
-    if hours > 0 {
-        format!("{hours}h {minutes}m {seconds}s")
-    } else if minutes > 0 {
-        format!("{minutes}m {seconds}s")
-    } else {
-        format!("{seconds}s")
     }
 }
 
@@ -296,14 +275,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn token_counts_and_durations_read_like_zed() {
+    fn token_counts_read_like_zed() {
         assert_eq!(humanize_token_count(999), "999");
         assert_eq!(humanize_token_count(1050), "1.1k");
         assert_eq!(humanize_token_count(9960), "10k");
         assert_eq!(humanize_token_count(256_000), "256k");
         assert_eq!(humanize_token_count(1_250_000), "1.3M");
-        assert_eq!(duration_alt_display(Duration::from_secs(45)), "45s");
-        assert_eq!(duration_alt_display(Duration::from_secs(125)), "2m 5s");
     }
 
     #[test]

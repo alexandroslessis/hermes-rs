@@ -55,6 +55,15 @@ pub struct AppConfig {
     /// Stage the agent's skill writes for approval (Hermes's `skills.write_approval`).
     #[serde(default)]
     pub skill_write_approval: bool,
+    /// Models starred in the model selector (Zed's favorite models).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub favorite_models: Vec<FavoriteModel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FavoriteModel {
+    pub provider: String,
+    pub model: String,
 }
 
 impl Default for AppConfig {
@@ -73,6 +82,7 @@ impl Default for AppConfig {
             efforts: Default::default(),
             memory_write_approval: false,
             skill_write_approval: false,
+            favorite_models: Vec::new(),
         }
     }
 }

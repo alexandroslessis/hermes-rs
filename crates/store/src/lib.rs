@@ -80,6 +80,8 @@ pub struct UsageTotals {
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
     pub cost: Option<f64>,
+    /// The latest call's input tokens: how full the context window was.
+    pub last_input_tokens: i64,
 }
 
 pub struct Store {
@@ -307,7 +309,9 @@ impl Store {
         Ok(self.conn.lock().query_row(
             "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
                     COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0),
-                    SUM(cost)
+                    SUM(cost),
+                    COALESCE((SELECT input_tokens FROM usage WHERE session_id = ?1
+                              ORDER BY rowid DESC LIMIT 1), 0)
              FROM usage WHERE session_id = ?1",
             [session_id],
             |row| {
@@ -318,6 +322,7 @@ impl Store {
                     cache_read_tokens: row.get(3)?,
                     cache_write_tokens: row.get(4)?,
                     cost: row.get(5)?,
+                    last_input_tokens: row.get(6)?,
                 })
             },
         )?)
@@ -407,6 +412,7 @@ mod tests {
         assert_eq!(totals.calls, 2);
         assert_eq!(totals.input_tokens, 200);
         assert_eq!(totals.output_tokens, 20);
+        assert_eq!(totals.last_input_tokens, 100);
     }
 
     #[test]

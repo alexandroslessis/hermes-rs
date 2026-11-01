@@ -1,129 +1,388 @@
-//! A searchable list of the provider's models, used in Settings and in the composer's model
-//! popover (the role Zed's agent model selector plays).
+//! The model selector, after Zed's (`agent_ui/src/language_model_selector.rs` and
+//! `ui/model_selector_components.rs`, GPL-3.0-or-later): a search field over every provider's
+//! models, favorites first, then one group per provider; the current model is checked and any
+//! model can be starred. The composer opens it as a popover; Settings embeds it.
 
 use std::rc::Rc;
 
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
-    Subscription, UniformListScrollHandle, Window, prelude::*, uniform_list,
+    App, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    KeyDownEvent, ListAlignment, ListSizingBehavior, ListState, SharedString, Subscription, Window,
+    list, prelude::*,
 };
 use hermes_llm::discovery::DiscoveredModel;
-use ui::{Tooltip, prelude::*};
+use ui::{
+    Chip, CommonAnimationExt, Divider, ElevationIndex, ListItem, ListItemSpacing, Tooltip,
+    prelude::*,
+};
 
-use crate::state::AppState;
+use crate::config::{FavoriteModel, ProviderSettings};
+use crate::state::{AppState, provider_ready};
 use crate::text_area::{TextArea, TextAreaEvent};
 
-pub type OnSelect = Rc<dyn Fn(String, &mut Window, &mut App)>;
+/// Called with the provider id and the model id of the picked model.
+pub type OnSelect = Rc<dyn Fn(String, String, &mut Window, &mut App)>;
+/// Opens the provider settings (the footer's Configure button).
+pub type OnConfigure = Rc<dyn Fn(&mut Window, &mut App)>;
+
+#[derive(Clone)]
+struct ModelInfo {
+    provider: String,
+    icon: IconName,
+    model: DiscoveredModel,
+    is_favorite: bool,
+}
+
+enum Entry {
+    Header(SharedString),
+    Model(ModelInfo),
+}
 
 pub struct ModelPicker {
     search: Entity<TextArea>,
-    free_only: bool,
+    /// Hide models the provider says can't call tools (the agent needs them).
     tools_only: bool,
-    selected: Option<String>,
-    list_height: Pixels,
+    free_only: bool,
+    /// (provider id, model id) of the current model.
+    selected: Option<(String, String)>,
+    entries: Vec<Entry>,
+    /// The row the arrow keys are on.
+    focused: usize,
+    list: ListState,
     in_popover: bool,
-    scroll: UniformListScrollHandle,
     on_select: OnSelect,
+    on_configure: Option<OnConfigure>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<DismissEvent> for ModelPicker {}
 
-fn price(value: Option<f64>) -> String {
-    match value {
-        Some(0.0) => "free".into(),
-        Some(price) => format!("${price:.2}"),
-        None => "?".into(),
+/// The icon Zed shows for a provider, guessed from its name and address.
+pub fn provider_icon(provider: &ProviderSettings) -> IconName {
+    let haystack = format!("{} {}", provider.name, provider.base_url).to_lowercase();
+    if haystack.contains("openrouter") {
+        IconName::AiOpenRouter
+    } else if haystack.contains("ollama") || haystack.contains(":11434") {
+        IconName::AiOllama
+    } else if haystack.contains("lm studio") || haystack.contains(":1234") {
+        IconName::AiLmStudio
+    } else if haystack.contains("api.openai.com") {
+        IconName::AiOpenAi
+    } else {
+        IconName::AiOpenAiCompat
     }
 }
 
-fn context(value: Option<usize>) -> String {
-    match value {
-        Some(tokens) if tokens >= 1_000_000 => format!("{}M", tokens / 1_000_000),
-        Some(tokens) => format!("{}K", tokens / 1000),
-        None => "?".into(),
+/// Zed's cost chip: dollars per million tokens in / out, or "Free".
+fn cost_info(model: &DiscoveredModel) -> Option<SharedString> {
+    let trim = |price: f64| {
+        let text = format!("{price:.2}");
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    };
+    match (model.input_price, model.output_price) {
+        (Some(input), Some(output)) if input == 0. && output == 0. => Some("Free".into()),
+        (Some(input), Some(output)) => Some(format!("${}/${}", trim(input), trim(output)).into()),
+        _ => None,
     }
+}
+
+/// Whether `query`'s characters appear in `text` in order (Zed's fuzzy match, without scores).
+fn fuzzy_matches(text: &str, query: &str) -> bool {
+    let mut chars = text.chars();
+    query
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .all(|q| chars.any(|c| c == q))
 }
 
 impl ModelPicker {
     pub fn new(
-        selected: Option<String>,
-        list_height: Pixels,
+        selected: Option<(String, String)>,
         on_select: OnSelect,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let search = cx.new(|cx| TextArea::new("Search models…", cx).single_line());
+        let search = cx.new(|cx| TextArea::new("Select a model…", cx).single_line());
         let state = AppState::global(cx);
         let subscriptions = vec![
-            cx.observe(&state, |_, _, cx| cx.notify()),
+            cx.observe(&state, |this, _, cx| this.update_entries(cx)),
             cx.subscribe_in(
                 &search,
                 window,
                 |this: &mut Self, _, event, window, cx| match event {
-                    TextAreaEvent::Changed => cx.notify(),
-                    // Enter picks the first match.
-                    TextAreaEvent::Submit => {
-                        if let Some(model) = this.filtered(cx).into_iter().next() {
-                            this.select(model.id, window, cx);
-                        }
-                    }
+                    TextAreaEvent::Changed => this.update_entries(cx),
+                    TextAreaEvent::Submit => this.confirm(window, cx),
                 },
             ),
         ];
-        Self {
+        let mut this = Self {
             search,
-            free_only: false,
             tools_only: true,
+            free_only: false,
             selected,
-            list_height,
+            entries: Vec::new(),
+            focused: 0,
+            list: ListState::new(0, ListAlignment::Top, px(1000.)),
             in_popover: false,
-            scroll: UniformListScrollHandle::new(),
             on_select,
+            on_configure: None,
             _subscriptions: subscriptions,
-        }
+        };
+        this.update_entries(cx);
+        this.focus_selected();
+        this
     }
 
-    /// Renders as a floating card (the composer's model popover).
-    pub fn in_popover(mut self) -> Self {
+    /// Renders as Zed's popover: elevated, with a Configure footer.
+    pub fn in_popover(mut self, on_configure: OnConfigure) -> Self {
         self.in_popover = true;
+        self.on_configure = Some(on_configure);
         self
     }
 
-    pub fn set_selected(&mut self, selected: Option<String>, cx: &mut Context<Self>) {
+    pub fn set_selected(&mut self, selected: Option<(String, String)>, cx: &mut Context<Self>) {
         self.selected = selected;
         cx.notify();
     }
 
-    fn filtered(&self, cx: &App) -> Vec<DiscoveredModel> {
+    fn update_entries(&mut self, cx: &mut Context<Self>) {
         let query = self.search.read(cx).text().to_lowercase();
-        AppState::global(cx)
-            .read(cx)
-            .models
+        let state = AppState::global(cx).read(cx);
+        let favorites = &state.config.favorite_models;
+        let matches = |provider: &ProviderSettings, model: &DiscoveredModel| {
+            if self.tools_only && model.supports_tools == Some(false) {
+                return false;
+            }
+            if self.free_only && cost_info(model).as_deref() != Some("Free") {
+                return false;
+            }
+            if query.is_empty() {
+                return true;
+            }
+            let name = model.name.as_deref().unwrap_or(&model.id).to_lowercase();
+            let haystack = format!("{}/{name} {}", provider.name.to_lowercase(), model.id);
+            haystack.contains(&query) || fuzzy_matches(&haystack, &query)
+        };
+        let mut groups: Vec<(SharedString, Vec<ModelInfo>)> = Vec::new();
+        for provider in state.config.providers.iter().filter(|p| provider_ready(p)) {
+            let Some(list) = state.provider_models.get(&provider.id) else {
+                continue;
+            };
+            let icon = provider_icon(provider);
+            let models: Vec<ModelInfo> = list
+                .models
+                .iter()
+                .filter(|model| matches(provider, model))
+                .map(|model| ModelInfo {
+                    provider: provider.id.clone(),
+                    icon,
+                    is_favorite: favorites
+                        .iter()
+                        .any(|f| f.provider == provider.id && f.model == model.id),
+                    model: model.clone(),
+                })
+                .collect();
+            if !models.is_empty() {
+                groups.push((provider.name.clone().into(), models));
+            }
+        }
+        let mut entries = Vec::new();
+        let favorite: Vec<ModelInfo> = groups
             .iter()
-            .filter(|model| {
-                !self.free_only
-                    || model.id.ends_with(":free")
-                    || (model.input_price == Some(0.) && model.output_price == Some(0.))
-            })
-            .filter(|model| !self.tools_only || model.supports_tools != Some(false))
-            .filter(|model| {
-                query.is_empty()
-                    || model.id.to_lowercase().contains(&query)
-                    || model
-                        .name
-                        .as_deref()
-                        .is_some_and(|name| name.to_lowercase().contains(&query))
-            })
-            .cloned()
-            .collect()
+            .flat_map(|(_, models)| models.iter().filter(|m| m.is_favorite).cloned())
+            .collect();
+        if !favorite.is_empty() {
+            entries.push(Entry::Header("Favorite".into()));
+            entries.extend(favorite.into_iter().map(Entry::Model));
+        }
+        for (name, models) in groups {
+            entries.push(Entry::Header(name));
+            entries.extend(models.into_iter().map(Entry::Model));
+        }
+        self.entries = entries;
+        self.list.reset(self.entries.len());
+        self.focused = self.first_model_from(0).unwrap_or(0);
+        if query.is_empty() {
+            self.focus_selected();
+        }
+        cx.notify();
     }
 
-    fn select(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected = Some(id.clone());
-        (self.on_select)(id, window, cx);
+    /// Puts the arrow-key focus on the current model (Zed opens the selector there).
+    fn focus_selected(&mut self) {
+        let Some((provider, model)) = &self.selected else {
+            return;
+        };
+        if let Some(index) = self.entries.iter().position(|entry| {
+            matches!(entry, Entry::Model(info) if &info.provider == provider && &info.model.id == model)
+        }) {
+            self.focused = index;
+            self.list.scroll_to_reveal_item(index);
+        }
+    }
+
+    fn first_model_from(&self, start: usize) -> Option<usize> {
+        (start..self.entries.len()).find(|&i| matches!(self.entries[i], Entry::Model(_)))
+    }
+
+    fn move_focus(&mut self, down: bool, cx: &mut Context<Self>) {
+        let models: Vec<usize> = (0..self.entries.len())
+            .filter(|&i| matches!(self.entries[i], Entry::Model(_)))
+            .collect();
+        if models.is_empty() {
+            return;
+        }
+        let position = models.iter().position(|&i| i == self.focused).unwrap_or(0);
+        let next = if down {
+            (position + 1) % models.len()
+        } else {
+            (position + models.len() - 1) % models.len()
+        };
+        self.focused = models[next];
+        self.list.scroll_to_reveal_item(self.focused);
+        cx.notify();
+    }
+
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(Entry::Model(info)) = self.entries.get(self.focused) {
+            let (provider, model) = (info.provider.clone(), info.model.id.clone());
+            self.pick(provider, model, window, cx);
+        }
+    }
+
+    fn pick(
+        &mut self,
+        provider: String,
+        model: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected = Some((provider.clone(), model.clone()));
+        (self.on_select)(provider, model, window, cx);
         cx.emit(DismissEvent);
         cx.notify();
+    }
+
+    fn toggle_favorite(&mut self, provider: String, model: String, cx: &mut Context<Self>) {
+        AppState::global(cx).update(cx, |state, cx| {
+            let favorite = FavoriteModel { provider, model };
+            let favorites = &mut state.config.favorite_models;
+            match favorites.iter().position(|f| *f == favorite) {
+                Some(index) => {
+                    favorites.remove(index);
+                }
+                None => favorites.push(favorite),
+            }
+            state.save(cx);
+        });
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "up" => self.move_focus(false, cx),
+            "down" => self.move_focus(true, cx),
+            "escape" => cx.emit(DismissEvent),
+            "enter" => self.confirm(window, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    fn render_entry(
+        &mut self,
+        index: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match &self.entries[index] {
+            // Zed's `ModelSelectorHeader`.
+            Entry::Header(title) => div()
+                .px_2()
+                .pb_1()
+                .when(index > 1, |this| {
+                    this.mt_1()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border_variant)
+                })
+                .child(
+                    Label::new(title.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+            // Zed's `ModelSelectorListItem`.
+            Entry::Model(info) => {
+                let is_selected = self.selected.as_ref().is_some_and(|(provider, model)| {
+                    provider == &info.provider && model == &info.model.id
+                });
+                let is_favorite = info.is_favorite;
+                let title = info
+                    .model
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| info.model.id.clone());
+                let cost = cost_info(&info.model);
+                let (provider, model) = (info.provider.clone(), info.model.id.clone());
+                let (fav_provider, fav_model) = (provider.clone(), model.clone());
+                let (star, star_color, star_tooltip) = if is_favorite {
+                    (IconName::StarFilled, Color::Accent, "Unfavorite Model")
+                } else {
+                    (IconName::Star, Color::Default, "Favorite Model")
+                };
+                ListItem::new(index)
+                    .inset(true)
+                    .spacing(ListItemSpacing::Sparse)
+                    .toggle_state(index == self.focused)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_1p5()
+                            .child(
+                                Icon::new(info.icon)
+                                    .color(if is_selected {
+                                        Color::Accent
+                                    } else {
+                                        Color::Muted
+                                    })
+                                    .size(IconSize::Small),
+                            )
+                            .child(Label::new(title).truncate())
+                            .when_some(cost, |this, cost| {
+                                let tooltip = if cost.contains('$') {
+                                    format!("Cost per Million Tokens: {cost}")
+                                } else {
+                                    format!("Cost: {cost}")
+                                };
+                                this.child(Chip::new(cost).tooltip(Tooltip::text(tooltip)))
+                            }),
+                    )
+                    .end_slot(h_flex().pr_2().gap_1p5().when(is_selected, |this| {
+                        this.child(Icon::new(IconName::Check).color(Color::Accent))
+                    }))
+                    .end_slot_on_hover(
+                        div().pr_1p5().child(
+                            IconButton::new(("toggle-favorite", index), star)
+                                .layer(ElevationIndex::ElevatedSurface)
+                                .icon_color(star_color)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text(star_tooltip))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_favorite(
+                                        fav_provider.clone(),
+                                        fav_model.clone(),
+                                        cx,
+                                    )
+                                })),
+                        ),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.pick(provider.clone(), model.clone(), window, cx)
+                    }))
+                    .into_any_element()
+            }
+        }
     }
 }
 
@@ -135,142 +394,119 @@ impl Focusable for ModelPicker {
 
 impl Render for ModelPicker {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        let (loading, total) = {
+        let (loading, empty_label) = {
             let state = AppState::global(cx).read(cx);
-            (state.models_loading, state.models.len())
+            let loading = state.models_loading();
+            let label = if loading && self.entries.is_empty() {
+                "Loading models…"
+            } else {
+                "No matches"
+            };
+            (loading, label)
         };
-        let models = self.filtered(cx);
-        let count = models.len();
-        let selected = self.selected.clone();
-        v_flex()
-            .gap_1()
-            .when(self.in_popover, |this| {
-                this.w(px(560.)).p_2().elevation_3(cx)
+        let filter_toggle = |id: &'static str, icon: IconName, on: bool, tooltip: &'static str| {
+            IconButton::new(id, icon)
+                .icon_size(IconSize::Small)
+                .icon_color(if on { Color::Accent } else { Color::Muted })
+                .toggle_state(on)
+                .tooltip(Tooltip::text(tooltip))
+        };
+        let list_body = if self.entries.is_empty() {
+            div()
+                .px_2p5()
+                .py_2()
+                .child(Label::new(empty_label).color(Color::Muted))
+                .into_any_element()
+        } else {
+            list(
+                self.list.clone(),
+                cx.processor(|this, index, window, cx| this.render_entry(index, window, cx)),
+            )
+            .with_sizing_behavior(if self.in_popover {
+                ListSizingBehavior::Infer
+            } else {
+                ListSizingBehavior::Auto
             })
+            .flex_1()
+            .py(DynamicSpacing::Base04.rems(cx))
+            .into_any_element()
+        };
+        v_flex()
+            .key_context("ModelPicker")
+            .capture_key_down(cx.listener(Self::on_key_down))
+            .map(|this| {
+                if self.in_popover {
+                    this.w(rems(20.)).max_h(rems(24.)).elevation_3(cx)
+                } else {
+                    this.size_full()
+                }
+            })
+            .overflow_hidden()
+            // Zed's picker head: the query over a divider, filters at its trailing edge.
             .child(
                 h_flex()
+                    .h_9()
+                    .px_2p5()
+                    .flex_none()
                     .gap_1()
-                    .child(
-                        div()
-                            .flex_1()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(colors.border)
-                            .bg(colors.editor_background)
-                            .child(self.search.clone()),
-                    )
+                    .overflow_hidden()
+                    .child(div().flex_1().child(self.search.clone()))
+                    .when(loading, |this| {
+                        this.child(
+                            Icon::new(IconName::LoadCircle)
+                                .size(IconSize::Small)
+                                .color(Color::Muted)
+                                .with_rotate_animation(2),
+                        )
+                    })
                     .child(
                         Button::new("free-only", "Free")
                             .label_size(LabelSize::Small)
+                            .color(if self.free_only {
+                                Color::Accent
+                            } else {
+                                Color::Muted
+                            })
                             .toggle_state(self.free_only)
-                            .tooltip(Tooltip::text("Only free models"))
+                            .tooltip(Tooltip::text("Only Free Models"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.free_only = !this.free_only;
-                                cx.notify();
+                                this.update_entries(cx);
                             })),
                     )
                     .child(
-                        Button::new("tools-only", "Tools")
-                            .label_size(LabelSize::Small)
-                            .toggle_state(self.tools_only)
-                            .tooltip(Tooltip::text("Only models that support tool calling"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.tools_only = !this.tools_only;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                Label::new(if loading {
-                    "Loading models…".to_string()
-                } else {
-                    format!("{count} of {total} models · USD per million tokens in / out")
-                })
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .h(self.list_height)
-                    .rounded_md()
-                    .border_1()
-                    .border_color(colors.border)
-                    .bg(colors.editor_background)
-                    .child(
-                        uniform_list(
-                            "models",
-                            count,
-                            cx.processor(
-                                move |_this, range: std::ops::Range<usize>, _window, cx| {
-                                    let colors = cx.theme().colors();
-                                    range
-                                        .map(|index| {
-                                            let model = models[index].clone();
-                                            let is_selected =
-                                                selected.as_deref() == Some(model.id.as_str());
-                                            let id = model.id.clone();
-                                            h_flex()
-                                                .id(SharedString::from(format!("model-{index}")))
-                                                .w_full()
-                                                .px_2()
-                                                .h(px(28.))
-                                                .gap_2()
-                                                .cursor_pointer()
-                                                .when(is_selected, |row| {
-                                                    row.bg(colors.element_selected)
-                                                })
-                                                .hover(|row| row.bg(colors.ghost_element_hover))
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
-                                                        .text_sm()
-                                                        .child(model.id.clone()),
-                                                )
-                                                .when(
-                                                    model.supports_reasoning == Some(true),
-                                                    |row| {
-                                                        row.child(
-                                                            Icon::new(IconName::ToolThink)
-                                                                .size(IconSize::XSmall)
-                                                                .color(Color::Muted),
-                                                        )
-                                                    },
-                                                )
-                                                .child(
-                                                    Label::new(context(model.context_length))
-                                                        .size(LabelSize::XSmall)
-                                                        .color(Color::Muted),
-                                                )
-                                                .child(
-                                                    Label::new(format!(
-                                                        "{} / {}",
-                                                        price(model.input_price),
-                                                        price(model.output_price)
-                                                    ))
-                                                    .size(LabelSize::XSmall)
-                                                    .color(Color::Muted),
-                                                )
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        this.select(id.clone(), window, cx)
-                                                    },
-                                                ))
-                                        })
-                                        .collect()
-                                },
-                            ),
+                        filter_toggle(
+                            "tools-only",
+                            IconName::ToolHammer,
+                            self.tools_only,
+                            "Only Models That Can Call Tools",
                         )
-                        .track_scroll(&self.scroll)
-                        .size_full(),
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.tools_only = !this.tools_only;
+                            this.update_entries(cx);
+                        })),
                     ),
             )
+            .child(Divider::horizontal())
+            .child(list_body)
+            // Zed's `ModelSelectorFooter`.
+            .when_some(self.on_configure.clone(), |this, on_configure| {
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .p_1p5()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .child(
+                            Button::new("configure", "Configure")
+                                .full_width()
+                                .style(ButtonStyle::Outlined)
+                                .on_click(cx.listener(move |_, _, window, cx| {
+                                    cx.emit(DismissEvent);
+                                    on_configure(window, cx);
+                                })),
+                        ),
+                )
+            })
     }
 }

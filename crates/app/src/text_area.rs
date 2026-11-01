@@ -156,7 +156,16 @@ pub struct TextArea {
     goal_x: Option<Pixels>,
     scroll_top: Pixels,
     max_lines: usize,
+    /// Zed's cursor blink: whether the caret shows this half-period, the running blink's
+    /// generation (a newer one stops older timers), and where the caret was last frame.
+    cursor_visible: bool,
+    blink_epoch: usize,
+    blinking: bool,
+    last_caret: Option<(usize, usize)>,
 }
+
+/// Zed's `CURSOR_BLINK_INTERVAL`.
+const CURSOR_BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl EventEmitter<TextAreaEvent> for TextArea {}
 
@@ -175,7 +184,49 @@ impl TextArea {
             goal_x: None,
             scroll_top: px(0.),
             max_lines: 12,
+            cursor_visible: true,
+            blink_epoch: 0,
+            blinking: false,
+            last_caret: None,
         }
+    }
+
+    /// Runs each frame while focused. Like Zed's `BlinkManager`, the caret blinks every 500ms,
+    /// and shows steadily again (restarting the blink) whenever it moves or the text changes.
+    fn blink_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let caret = (self.cursor_offset(), self.content.len());
+        if self.blinking && self.last_caret == Some(caret) {
+            return;
+        }
+        self.last_caret = Some(caret);
+        self.cursor_visible = true;
+        self.blinking = true;
+        self.blink_epoch += 1;
+        let epoch = self.blink_epoch;
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(CURSOR_BLINK_INTERVAL).await;
+                let keep_blinking = this
+                    .update_in(cx, |this, window, cx| {
+                        if this.blink_epoch != epoch {
+                            return false;
+                        }
+                        if !this.focus_handle.is_focused(window) {
+                            this.blinking = false;
+                            this.cursor_visible = true;
+                            return false;
+                        }
+                        this.cursor_visible = !this.cursor_visible;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_blinking {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     pub fn text(&self) -> &str {
@@ -854,27 +905,32 @@ impl Element for TextAreaElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let player = cx.theme().players().local();
-        let (cursor_index, selection, layout, scroll_top) = self.input.update(cx, |input, _| {
-            // Keep the caret visible inside the scrolled viewport.
-            let layout = input.layout.clone();
-            let caret = layout.borrow().position_for_index(input.cursor_offset());
-            let line_height = layout.borrow().line_height;
-            let visible = bounds.size.height;
-            if caret.y < input.scroll_top {
-                input.scroll_top = caret.y;
-            } else if caret.y + line_height > input.scroll_top + visible {
-                input.scroll_top = caret.y + line_height - visible;
-            }
-            let max_scroll = (layout.borrow().content_height - visible).max(px(0.));
-            input.scroll_top = input.scroll_top.clamp(px(0.), max_scroll);
-            input.last_bounds = Some(bounds);
-            (
-                input.cursor_offset(),
-                input.selected_range.clone(),
-                layout,
-                input.scroll_top,
-            )
-        });
+        let (cursor_index, selection, layout, scroll_top, cursor_visible) =
+            self.input.update(cx, |input, cx| {
+                if input.focus_handle.is_focused(window) {
+                    input.blink_frame(window, cx);
+                }
+                // Keep the caret visible inside the scrolled viewport.
+                let layout = input.layout.clone();
+                let caret = layout.borrow().position_for_index(input.cursor_offset());
+                let line_height = layout.borrow().line_height;
+                let visible = bounds.size.height;
+                if caret.y < input.scroll_top {
+                    input.scroll_top = caret.y;
+                } else if caret.y + line_height > input.scroll_top + visible {
+                    input.scroll_top = caret.y + line_height - visible;
+                }
+                let max_scroll = (layout.borrow().content_height - visible).max(px(0.));
+                input.scroll_top = input.scroll_top.clamp(px(0.), max_scroll);
+                input.last_bounds = Some(bounds);
+                (
+                    input.cursor_offset(),
+                    input.selected_range.clone(),
+                    layout,
+                    input.scroll_top,
+                    input.cursor_visible,
+                )
+            });
         let layout = layout.borrow();
         let origin = point(bounds.left(), bounds.top() - scroll_top);
         let line_height = layout.line_height;
@@ -903,10 +959,14 @@ impl Element for TextAreaElement {
                 row_top += line_height;
             }
         }
-        let cursor = selection.is_empty().then(|| {
+        // The caret spans the text's height, centered in the line, not the full line spacing.
+        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        let caret_height = (font_size * 1.3).min(line_height);
+        let cursor = (selection.is_empty() && cursor_visible).then(|| {
             let caret = layout.position_for_index(cursor_index);
+            let top = caret.y + (line_height - caret_height) / 2.;
             fill(
-                Bounds::new(origin + caret, size(px(2.), line_height)),
+                Bounds::new(origin + point(caret.x, top), size(px(2.), caret_height)),
                 player.cursor,
             )
         });

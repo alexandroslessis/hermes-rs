@@ -65,7 +65,16 @@ impl ProviderConfig {
 
     /// Every model the endpoint serves, with context length, pricing and capabilities when known.
     pub async fn list_models(&self) -> Result<Vec<DiscoveredModel>> {
-        Ok(hermes_llm::discovery::list_models(&self.client()?, &self.base_url).await?)
+        let mut models = hermes_llm::discovery::list_models(&self.client()?, &self.base_url).await?;
+        // Ollama lists bare ids; its native API, beside `/v1`, has the context windows.
+        let base = self.base_url.trim_end_matches('/');
+        if let Some(root) = base.strip_suffix("/v1")
+            && models.iter().any(|model| model.context_length.is_none())
+        {
+            let root = ApiClient::new_with_tls(root.to_string(), AuthMethod::NoAuth, None)?;
+            hermes_llm::discovery::enrich_from_ollama(&root, &mut models).await;
+        }
+        Ok(models)
     }
 }
 

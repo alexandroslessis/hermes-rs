@@ -179,10 +179,117 @@ pub async fn list_models(
     parse_models_response(&json, catalog_provider_for(base_url))
 }
 
+/// Ollama's OpenAI-compatible `/v1/models` lists bare ids. Its native API (`root` is the server
+/// without `/v1`) knows the rest: `/api/show` gives a model's trained context window, the
+/// `num_ctx` it was configured with, and its capabilities; `/api/ps` the context a loaded model
+/// actually runs with. Does nothing when the server isn't Ollama.
+pub async fn enrich_from_ollama(root: &ApiClient, models: &mut [DiscoveredModel]) {
+    let is_ollama = match root.api_get("api/version").await {
+        Ok(response) => {
+            response.status.is_success()
+                && response
+                    .payload
+                    .as_ref()
+                    .is_some_and(|payload| payload.get("version").is_some())
+        }
+        Err(_) => false,
+    };
+    if !is_ollama {
+        return;
+    }
+    let running: std::collections::HashMap<String, usize> = match root.api_get("api/ps").await {
+        Ok(response) => response
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("models"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|model| {
+                Some((
+                    model.get("name")?.as_str()?.to_string(),
+                    model.get("context_length")?.as_u64()? as usize,
+                ))
+            })
+            .collect(),
+        Err(_) => Default::default(),
+    };
+    for model in models.iter_mut() {
+        let payload = serde_json::json!({ "model": model.id });
+        if let Ok(response) = root.api_post("api/show", &payload).await {
+            if let Some(show) = response.payload.filter(|_| response.status.is_success()) {
+                apply_ollama_show(model, &show, running.get(&model.id).copied());
+            }
+        }
+    }
+}
+
+fn apply_ollama_show(model: &mut DiscoveredModel, show: &Value, running: Option<usize>) {
+    let trained = show
+        .get("model_info")
+        .and_then(Value::as_object)
+        .and_then(|info| {
+            info.iter()
+                .find(|(key, _)| key.ends_with(".context_length"))
+                .and_then(|(_, value)| value.as_u64())
+        })
+        .map(|tokens| tokens as usize);
+    let configured = show
+        .get("parameters")
+        .and_then(Value::as_str)
+        .and_then(|parameters| {
+            parameters.lines().find_map(|line| {
+                let mut parts = line.split_whitespace();
+                (parts.next() == Some("num_ctx"))
+                    .then(|| parts.next()?.parse::<usize>().ok())
+                    .flatten()
+            })
+        });
+    // What the server runs the model with beats what the catalog guessed from its name.
+    if let Some(context) = running.or(configured).or(trained) {
+        model.context_length = Some(context);
+    }
+    if let Some(capabilities) = show.get("capabilities").and_then(Value::as_array) {
+        let has = |name: &str| capabilities.iter().any(|c| c.as_str() == Some(name));
+        model.supports_tools = Some(has("tools"));
+        model.supports_reasoning = Some(has("thinking"));
+        model.supports_vision = Some(has("vision"));
+    }
+    // A local server costs nothing per token.
+    model.input_price.get_or_insert(0.);
+    model.output_price.get_or_insert(0.);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ollama_show_fills_context_and_capabilities() {
+        let show = json!({
+            "parameters": "temperature 0.7\nnum_ctx 16384",
+            "model_info": {"qwen3.context_length": 40960},
+            "capabilities": ["completion", "tools", "thinking"],
+        });
+        let mut model = DiscoveredModel {
+            id: "qwen3:8b".into(),
+            ..Default::default()
+        };
+        apply_ollama_show(&mut model, &show, None);
+        assert_eq!(model.context_length, Some(16384));
+        assert_eq!(model.supports_tools, Some(true));
+        assert_eq!(model.supports_reasoning, Some(true));
+        assert_eq!(model.supports_vision, Some(false));
+        assert_eq!(model.input_price, Some(0.));
+        // A loaded model's real context wins.
+        apply_ollama_show(&mut model, &show, Some(32768));
+        assert_eq!(model.context_length, Some(32768));
+        // Without num_ctx, the trained window.
+        let show = json!({"model_info": {"llama.context_length": 131072}});
+        apply_ollama_show(&mut model, &show, None);
+        assert_eq!(model.context_length, Some(131072));
+    }
 
     #[test]
     fn parses_openrouter_rich_fields() {

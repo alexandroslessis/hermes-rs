@@ -1,21 +1,33 @@
-//! Settings: the OpenAI-compatible provider, its API key, and the default model.
+//! Settings: appearance, the OpenAI-compatible providers (a list, each edited in a dialog), and
+//! the default model.
 
 use std::rc::Rc;
 
-use gpui::{App, Context, Entity, FocusHandle, Focusable, Subscription, Window, prelude::*};
-use ui::{Callout, ContextMenu, Divider, DropdownMenu, Tooltip, prelude::*};
+use gpui::{
+    App, Context, Entity, FocusHandle, Focusable, KeyDownEvent, Subscription, Window, prelude::*,
+};
+use ui::{Chip, ContextMenu, Divider, DropdownMenu, TintColor, Tooltip, prelude::*};
 
 use crate::config::{self, ProviderSettings};
-use crate::model_picker::ModelPicker;
-use crate::state::AppState;
+use crate::model_picker::{ModelPicker, provider_icon};
+use crate::state::{AppState, provider_ready};
 use crate::text_area::{TextArea, TextAreaEvent};
 
-pub struct SettingsView {
+/// The add/edit provider dialog.
+struct ProviderForm {
+    /// The provider being edited; `None` adds a new one.
+    editing: Option<String>,
     name: Entity<TextArea>,
     base_url: Entity<TextArea>,
     api_key: Entity<TextArea>,
+    api_key_env: Entity<TextArea>,
+    error: Option<String>,
+    _subscriptions: Vec<Subscription>,
+}
+
+pub struct SettingsView {
     picker: Entity<ModelPicker>,
-    notice: Option<(Severity, String)>,
+    form: Option<ProviderForm>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -23,10 +35,53 @@ pub struct SettingsView {
 impl SettingsView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = AppState::global(cx);
-        let (provider, model) = {
-            let state = state.read(cx);
-            (state.provider().cloned(), state.config.model.clone())
-        };
+        let selected = Self::selected_model(cx);
+        let picker = cx.new(|cx| {
+            ModelPicker::new(
+                selected,
+                Rc::new(|provider, model, _, cx| {
+                    AppState::global(cx).update(cx, |state, cx| {
+                        state.config.provider = Some(provider);
+                        state.config.model = Some(model);
+                        state.save(cx);
+                    });
+                }),
+                window,
+                cx,
+            )
+        });
+        let subscriptions = vec![cx.observe(&state, |this, _, cx| {
+            let selected = Self::selected_model(cx);
+            this.picker
+                .update(cx, |picker, cx| picker.set_selected(selected, cx));
+        })];
+        Self {
+            picker,
+            form: None,
+            focus_handle: cx.focus_handle(),
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// (provider id, model id) of the default model.
+    fn selected_model(cx: &App) -> Option<(String, String)> {
+        let state = AppState::global(cx).read(cx);
+        let model = state.config.model.clone()?;
+        let provider = state.provider_for_model(&model)?.id.clone();
+        Some((provider, model))
+    }
+
+    /// Opens the provider dialog: `editing` names the provider to edit, `None` adds one.
+    fn open_form(&mut self, editing: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let existing = editing.as_ref().and_then(|id| {
+            AppState::global(cx)
+                .read(cx)
+                .config
+                .providers
+                .iter()
+                .find(|p| &p.id == id)
+                .cloned()
+        });
         let field = |placeholder: &'static str, text: String, cx: &mut Context<Self>| {
             cx.new(|cx| {
                 let mut area = TextArea::new(placeholder, cx).single_line();
@@ -35,145 +90,139 @@ impl SettingsView {
             })
         };
         let name = field(
-            "Provider name",
-            provider
+            "e.g. OpenRouter, Ollama",
+            existing
                 .as_ref()
                 .map(|p| p.name.clone())
                 .unwrap_or_default(),
             cx,
         );
         let base_url = field(
-            "Base URL, e.g. https://openrouter.ai/api/v1",
-            provider
+            "e.g. https://openrouter.ai/api/v1 or http://localhost:11434/v1",
+            existing
                 .as_ref()
                 .map(|p| p.base_url.clone())
                 .unwrap_or_default(),
             cx,
         );
         let api_key = field(
-            "Paste an API key to store it in Windows Credential Manager",
+            if existing.is_some() {
+                "Leave empty to keep the current key"
+            } else {
+                "Stored in Windows Credential Manager"
+            },
             String::new(),
             cx,
         );
-        let picker = cx.new(|cx| {
-            ModelPicker::new(
-                model,
-                px(360.),
-                Rc::new(|id, _, cx| {
-                    AppState::global(cx).update(cx, |state, cx| {
-                        state.config.model = Some(id);
-                        state.save(cx);
-                    });
-                }),
+        let api_key_env = field(
+            "Optional: read the key from this environment variable",
+            existing
+                .as_ref()
+                .and_then(|p| p.api_key_env.clone())
+                .unwrap_or_default(),
+            cx,
+        );
+        let mut subscriptions = Vec::new();
+        for input in [&name, &base_url, &api_key, &api_key_env] {
+            subscriptions.push(cx.subscribe_in(
+                input,
                 window,
-                cx,
-            )
-        });
-        let subscriptions = vec![
-            cx.observe(&state, |this, state, cx| {
-                let model = state.read(cx).config.model.clone();
-                this.picker
-                    .update(cx, |picker, cx| picker.set_selected(model, cx));
-            }),
-            cx.subscribe_in(&api_key, window, |this: &mut Self, _, event, _, cx| {
-                if let TextAreaEvent::Submit = event {
-                    this.save_provider(cx);
-                }
-            }),
-        ];
-        Self {
+                |this: &mut Self, _, event, _, cx| {
+                    if let TextAreaEvent::Submit = event {
+                        this.save_form(cx);
+                    }
+                },
+            ));
+        }
+        name.focus_handle(cx).focus(window, cx);
+        self.form = Some(ProviderForm {
+            editing,
             name,
             base_url,
             api_key,
-            picker,
-            notice: None,
-            focus_handle: cx.focus_handle(),
+            api_key_env,
+            error: None,
             _subscriptions: subscriptions,
-        }
+        });
+        cx.notify();
     }
 
-    fn save_provider(&mut self, cx: &mut Context<Self>) {
-        let name = self.name.read(cx).text().trim().to_string();
-        let base_url = self
-            .base_url
-            .read(cx)
-            .text()
-            .trim()
-            .trim_end_matches('/')
-            .to_string();
-        let key = self.api_key.read(cx).text().trim().to_string();
+    fn close_form(&mut self, cx: &mut Context<Self>) {
+        self.form = None;
+        cx.notify();
+    }
+
+    fn save_form(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        let text = |input: &Entity<TextArea>| input.read(cx).text().trim().to_string();
+        let name = text(&form.name);
+        let base_url = text(&form.base_url).trim_end_matches('/').to_string();
+        let key = text(&form.api_key);
+        let key_env = text(&form.api_key_env);
         if base_url.is_empty() {
-            self.notice = Some((Severity::Error, "The base URL is required.".into()));
+            form.error = Some("The base URL is required.".into());
             cx.notify();
             return;
         }
-        let state = AppState::global(cx);
-        let result = state.update(cx, |state, cx| {
-            let id = state
-                .provider()
-                .map(|p| p.id.clone())
-                .unwrap_or_else(|| "provider".into());
+        let editing = form.editing.clone();
+        let result = AppState::global(cx).update(cx, |state, cx| {
+            let providers = &mut state.config.providers;
+            let id = editing
+                .clone()
+                .unwrap_or_else(|| unique_id(&name_or(&name, &base_url), providers));
             let provider = ProviderSettings {
                 id: id.clone(),
-                name: if name.is_empty() {
-                    "Provider".into()
-                } else {
-                    name
-                },
+                name: name_or(&name, &base_url),
                 base_url,
-                api_key_env: state.provider().and_then(|p| p.api_key_env.clone()),
+                api_key_env: (!key_env.is_empty()).then_some(key_env),
             };
-            match state.config.providers.iter_mut().find(|p| p.id == id) {
+            match providers.iter_mut().find(|p| p.id == id) {
                 Some(existing) => *existing = provider,
-                None => state.config.providers.push(provider),
+                None => providers.push(provider),
             }
-            state.config.provider = Some(id.clone());
+            if state.config.provider.is_none() {
+                state.config.provider = Some(id.clone());
+            }
             let stored = if key.is_empty() {
                 Ok(())
             } else {
                 config::store_api_key(&id, &key)
             };
             state.save(cx);
-            state.refresh_models(cx);
+            state.refresh_provider_models(&id, cx);
             stored
         });
-        self.notice = Some(match result {
-            Ok(()) if key.is_empty() => (Severity::Success, "Provider saved.".into()),
-            Ok(()) => (
-                Severity::Success,
-                "Provider saved and API key stored in Windows Credential Manager.".into(),
-            ),
-            Err(error) => (Severity::Error, format!("{error:#}")),
+        match result {
+            Ok(()) => self.close_form(cx),
+            Err(error) => {
+                if let Some(form) = self.form.as_mut() {
+                    form.error = Some(format!("Couldn't store the API key: {error:#}"));
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn remove_provider(&mut self, id: String, cx: &mut Context<Self>) {
+        AppState::global(cx).update(cx, |state, cx| {
+            state.config.providers.retain(|p| p.id != id);
+            state
+                .config
+                .favorite_models
+                .retain(|favorite| favorite.provider != id);
+            if state.config.provider.as_deref() == Some(id.as_str()) {
+                state.config.provider = state.config.providers.first().map(|p| p.id.clone());
+            }
+            state.provider_models.remove(&id);
+            // The key goes with it.
+            let _ = config::store_api_key(&id, "");
+            state.save(cx);
         });
-        self.api_key.update(cx, |field, cx| field.set_text("", cx));
         cx.notify();
     }
 
-    fn field(label: &'static str, input: &Entity<TextArea>, cx: &App) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        v_flex()
-            .gap_1()
-            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
-            .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(colors.border)
-                    .bg(colors.editor_background)
-                    .child(input.clone()),
-            )
-    }
-}
-
-impl Focusable for SettingsView {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl SettingsView {
     /// Zed's bundled themes, light and dark, in a dropdown.
     fn theme_picker(window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let current = cx.theme().name.clone();
@@ -209,100 +258,440 @@ impl SettingsView {
             }
             menu
         });
+        DropdownMenu::new("theme-picker", current, menu)
+    }
+
+    fn section(title: &'static str, description: Option<&'static str>) -> impl IntoElement {
+        v_flex()
+            .gap_0p5()
+            .child(Label::new(title).size(LabelSize::Large))
+            .when_some(description, |this, description| {
+                this.child(
+                    Label::new(description)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+    }
+
+    /// One provider in the list: icon, name, address and key status, with edit and remove.
+    fn render_provider_row(
+        &self,
+        provider: &ProviderSettings,
+        is_active: bool,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let (key_icon, key_color, key_text) = key_status(provider);
+        let edit_id = provider.id.clone();
+        let remove_id = provider.id.clone();
         h_flex()
-            .gap_2()
-            .child(Label::new("Theme").color(Color::Muted))
-            .child(DropdownMenu::new("theme-picker", current, menu))
+            .id(SharedString::from(format!("provider-{}", provider.id)))
+            .group("provider-row")
+            .w_full()
+            .px_3()
+            .py_2()
+            .gap_3()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(colors.editor_background)
+            .hover(|style| style.border_color(colors.border))
+            .child(
+                Icon::new(provider_icon(provider))
+                    .size(IconSize::Medium)
+                    .color(if is_active {
+                        Color::Accent
+                    } else {
+                        Color::Muted
+                    }),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(Label::new(provider.name.clone()))
+                            .when(is_active, |this| {
+                                this.child(Chip::new("Active").label_color(Color::Accent))
+                            }),
+                    )
+                    .child(
+                        Label::new(provider.base_url.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .buffer_font(cx)
+                            .truncate(),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(Icon::new(key_icon).size(IconSize::XSmall).color(key_color))
+                            .child(
+                                Label::new(key_text)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .when_some(error, |this, error| {
+                        this.child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::XCircle)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Error),
+                                )
+                                .child(
+                                    Label::new(format!("Couldn't list models: {error}"))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Error)
+                                        .truncate(),
+                                ),
+                        )
+                    }),
+            )
+            .child(
+                Button::new(SharedString::from(format!("edit-{}", provider.id)), "Edit")
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .start_icon(Icon::new(IconName::Pencil).size(IconSize::XSmall))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_form(Some(edit_id.clone()), window, cx)
+                    })),
+            )
+            .child(
+                IconButton::new(
+                    SharedString::from(format!("remove-{}", provider.id)),
+                    IconName::Trash,
+                )
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Remove Provider"))
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.remove_provider(remove_id.clone(), cx)),
+                ),
+            )
+    }
+
+    fn render_form(&self, form: &ProviderForm, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let field = |label: &'static str, input: &Entity<TextArea>| {
+            v_flex()
+                .gap_1()
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.editor_background)
+                        .child(input.clone()),
+                )
+        };
+        let title = if form.editing.is_some() {
+            "Edit Provider"
+        } else {
+            "Add Provider"
+        };
+        // A dimmed backdrop over the settings with the dialog centered on it; clicking the
+        // backdrop or pressing Escape cancels.
+        div()
+            .id("provider-dialog-backdrop")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::black().opacity(0.4))
+            .occlude()
+            .on_click(cx.listener(|this, _, _, cx| this.close_form(cx)))
+            .child(
+                v_flex()
+                    .id("provider-dialog")
+                    .w(rems(30.))
+                    .max_w_full()
+                    .p_4()
+                    .gap_3()
+                    .elevation_3(cx)
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key == "escape" {
+                            this.close_form(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(Headline::new(title).size(HeadlineSize::Small))
+                            .child(
+                                IconButton::new("close-dialog", IconName::Close)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Close"))
+                                    .on_click(cx.listener(|this, _, _, cx| this.close_form(cx))),
+                            ),
+                    )
+                    .child(
+                        Label::new(
+                            "Any OpenAI-compatible endpoint: OpenRouter, OpenAI, LM Studio, \
+                             Ollama, vLLM… Servers on this machine need no key.",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .child(field("Name", &form.name))
+                    .child(field("Base URL", &form.base_url))
+                    .child(field("API Key", &form.api_key))
+                    .child(field("API Key Environment Variable", &form.api_key_env))
+                    .when_some(form.error.clone(), |this, error| {
+                        this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+                    })
+                    .child(
+                        h_flex()
+                            .pt_1()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("cancel-provider", "Cancel")
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(cx.listener(|this, _, _, cx| this.close_form(cx))),
+                            )
+                            .child(
+                                Button::new("save-provider", "Save Provider")
+                                    .style(ButtonStyle::Tinted(TintColor::Accent))
+                                    .on_click(cx.listener(|this, _, _, cx| this.save_form(cx))),
+                            ),
+                    ),
+            )
+    }
+}
+
+/// The provider's name, or one made from its address.
+fn name_or(name: &str, base_url: &str) -> String {
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest)
+        .split('/')
+        .next()
+        .unwrap_or("Provider")
+        .to_string()
+}
+
+/// A provider id from its name: lowercase letters, digits and dashes, unique in `providers`.
+fn unique_id(name: &str, providers: &[ProviderSettings]) -> String {
+    let base: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let base = if base.is_empty() {
+        "provider".into()
+    } else {
+        base
+    };
+    let mut id = base.clone();
+    let mut n = 2;
+    while providers.iter().any(|p| p.id == id) {
+        id = format!("{base}-{n}");
+        n += 1;
+    }
+    id
+}
+
+/// How the provider authenticates, for its row.
+fn key_status(provider: &ProviderSettings) -> (IconName, Color, String) {
+    if config::stored_api_key(&provider.id).is_some() {
+        return (
+            IconName::Check,
+            Color::Success,
+            "API key stored in Windows Credential Manager".into(),
+        );
+    }
+    if let Some(var) = &provider.api_key_env {
+        if provider_ready(provider) {
+            return (
+                IconName::Check,
+                Color::Success,
+                format!("API key read from the {var} environment variable"),
+            );
+        }
+    }
+    if provider.is_local() {
+        return (
+            IconName::Check,
+            Color::Success,
+            "No API key needed (a server on this machine)".into(),
+        );
+    }
+    (IconName::Warning, Color::Warning, "No API key set".into())
+}
+
+impl Focusable for SettingsView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        let state = AppState::global(cx);
-        let (has_key, key_source, selected, error) = {
-            let state = state.read(cx);
-            let provider = state.provider();
-            let stored = provider
-                .and_then(|p| config::stored_api_key(&p.id))
-                .is_some();
-            let source = match (stored, provider.and_then(|p| p.api_key_env.clone())) {
-                (true, _) => "stored in Windows Credential Manager".to_string(),
-                _ if provider.is_some_and(|p| p.is_local()) => {
-                    "not needed (a server on this machine)".to_string()
-                }
-                (false, Some(var)) if state.has_api_key() => {
-                    format!("read from the {var} environment variable")
-                }
-                _ => "not set".to_string(),
-            };
+        let (panel_background, border_variant, editor_background) = {
+            let colors = cx.theme().colors();
             (
-                state.has_api_key(),
-                source,
-                state.config.model.clone(),
-                state.models_error.clone(),
+                colors.panel_background,
+                colors.border_variant,
+                colors.editor_background,
             )
         };
+        let (providers, active, errors, selected) = {
+            let state = AppState::global(cx).read(cx);
+            let errors: Vec<Option<String>> = state
+                .config
+                .providers
+                .iter()
+                .map(|p| {
+                    state
+                        .provider_models
+                        .get(&p.id)
+                        .and_then(|list| list.error.clone())
+                })
+                .collect();
+            (
+                state.config.providers.clone(),
+                state.config.provider.clone(),
+                errors,
+                state.config.model.clone(),
+            )
+        };
+        let rows: Vec<AnyElement> = providers
+            .iter()
+            .zip(errors)
+            .map(|(provider, error)| {
+                let is_active = active.as_deref() == Some(provider.id.as_str());
+                self.render_provider_row(provider, is_active, error, cx)
+                    .into_any_element()
+            })
+            .collect();
 
-        v_flex()
+        let content = v_flex()
             .id("settings")
             .size_full()
             .p_6()
-            .gap_4()
-            .bg(colors.panel_background)
+            .gap_5()
             .overflow_y_scroll()
             .child(Headline::new("Settings").size(HeadlineSize::Large))
-            .child(Label::new("Appearance").size(LabelSize::Large))
-            .child(Self::theme_picker(window, cx))
-            .child(Divider::horizontal())
-            .child(Label::new("Provider").size(LabelSize::Large))
-            .child(Label::new("Any OpenAI-compatible endpoint: OpenRouter, OpenAI, LM Studio, Ollama, vLLM…").color(Color::Muted))
-            .child(Self::field("Name", &self.name, cx))
-            .child(Self::field("Base URL", &self.base_url, cx))
-            .child(Self::field("API key", &self.api_key, cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Icon::new(if has_key { IconName::Check } else { IconName::Warning })
-                            .color(if has_key { Color::Success } else { Color::Warning }),
-                    )
-                    .child(Label::new(format!("API key {key_source}")).size(LabelSize::Small).color(Color::Muted)),
-            )
-            .child(
-                h_flex().child(
-                    Button::new("save-provider", "Save provider")
-                        .style(ButtonStyle::Filled)
-                        .on_click(cx.listener(|this, _, _, cx| this.save_provider(cx))),
-                ),
-            )
-            .when_some(self.notice.clone(), |this, (severity, text)| {
-                this.child(Callout::new().severity(severity).title(text))
-            })
             .child(Divider::horizontal())
             .child(
                 h_flex()
                     .justify_between()
-                    .child(Label::new("Default model").size(LabelSize::Large))
-                    .child(
-                        IconButton::new("refresh-models", IconName::ArrowCircle)
-                            .tooltip(Tooltip::text("Reload the provider's model list"))
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                AppState::global(cx).update(cx, |state, cx| state.refresh_models(cx));
-                            })),
-                    ),
+                    .child(Self::section("Appearance", Some("The color theme, from Zed's.")))
+                    .child(Self::theme_picker(window, cx)),
             )
+            .child(Divider::horizontal())
             .child(
-                Label::new(match &selected {
-                    Some(model) => format!("New sessions use {model}. Each chat can switch from the model button under its message box."),
-                    None => "Pick the model new sessions use.".to_string(),
-                })
-                .size(LabelSize::Small)
-                .color(Color::Muted),
+                v_flex()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(Self::section(
+                                "Providers",
+                                Some("OpenAI-compatible endpoints. Picking a model in the model selector makes its provider active."),
+                            ))
+                            .child(
+                                Button::new("add-provider", "Add Provider")
+                                    .style(ButtonStyle::Tinted(TintColor::Accent))
+                                    .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_form(None, window, cx)
+                                    })),
+                            ),
+                    )
+                    .children(rows)
+                    .when(providers.is_empty(), |this| {
+                        this.child(
+                            Label::new("No providers yet. Add one to start chatting.")
+                                .color(Color::Muted),
+                        )
+                    }),
             )
-            .when_some(error, |this, error| {
-                this.child(Callout::new().severity(Severity::Error).title("Could not list models").description(error))
+            .child(Divider::horizontal())
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(Self::section(
+                                "Default Model",
+                                Some(match selected {
+                                    Some(_) => "New sessions use it; each chat can switch from the model button under its message box.",
+                                    None => "Pick the model new sessions use.",
+                                }),
+                            ))
+                            .child(
+                                Button::new("refresh-models", "Reload Models")
+                                    .style(ButtonStyle::Outlined)
+                                    .start_icon(Icon::new(IconName::ArrowCircle).size(IconSize::Small))
+                                    .tooltip(Tooltip::text("List every provider's models again"))
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        AppState::global(cx)
+                                            .update(cx, |state, cx| state.refresh_models(cx));
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h(px(420.))
+                            .flex_none()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border_variant)
+                            .bg(editor_background)
+                            .overflow_hidden()
+                            .child(self.picker.clone()),
+                    ),
+            );
+
+        div()
+            .relative()
+            .size_full()
+            .bg(panel_background)
+            .child(content)
+            .when_some(self.form.as_ref(), |this, form| {
+                this.child(self.render_form(form, cx))
             })
-            .child(self.picker.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_provider_ids_are_slugs_and_unique() {
+        let existing = vec![ProviderSettings {
+            id: "ollama".into(),
+            name: "Ollama".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            api_key_env: None,
+        }];
+        assert_eq!(unique_id("LM Studio", &existing), "lm-studio");
+        assert_eq!(unique_id("Ollama", &existing), "ollama-2");
+        assert_eq!(unique_id("!!", &existing), "provider");
+        assert_eq!(name_or("", "http://localhost:1234/v1"), "localhost:1234");
     }
 }
