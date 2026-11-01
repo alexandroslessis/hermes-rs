@@ -5,6 +5,7 @@ mod appearance;
 mod assets;
 mod backend;
 mod chat;
+mod chat_ui;
 mod config;
 mod memory_view;
 mod model_picker;

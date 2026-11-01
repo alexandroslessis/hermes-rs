@@ -3,12 +3,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, Entity, FocusHandle,
-    Focusable, FollowMode, ListAlignment, ListState, SharedString, Subscription, Task, Window,
-    list, prelude::*, px,
+    AnyElement, App, ClipboardItem, Context, Empty, Entity, FocusHandle, Focusable, FollowMode,
+    ListAlignment, ListOffset, ListState, SharedString, Subscription, Task, Window,
+    linear_color_stop, linear_gradient, list, prelude::*, px,
 };
 use hermes_agent::events::AgentEvent;
 use hermes_llm::conversation::Conversation;
@@ -21,8 +21,9 @@ use rmcp::model::Role;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use ui::{
-    Callout, CommonAnimationExt, ContextMenu, Disclosure, Divider, PopoverMenu, Tooltip,
-    prelude::*, right_click_menu,
+    ButtonLike, Callout, CircularProgress, CommonAnimationExt, ContextMenu, ContextMenuEntry,
+    CopyButton, Disclosure, Divider, LoadingLabel, PopoverMenu, PopoverMenuHandle, SpinnerVariant,
+    SplitButton, SplitButtonStyle, TintColor, Tooltip, prelude::*, right_click_menu,
 };
 
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownOptions, MarkdownStyle};
@@ -30,6 +31,7 @@ use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownOptions, Markdow
 use hermes_tools::{TodoItem, TodoStatus};
 
 use crate::backend::backend;
+use crate::chat_ui;
 use crate::model_picker::ModelPicker;
 use crate::state::AppState;
 use crate::text_area::{TextArea, TextAreaEvent};
@@ -59,6 +61,8 @@ pub struct TurnUsage {
 pub struct ChatView {
     pub session_id: String,
     pub model: String,
+    /// The session's working folder; tool labels show paths inside it relative to it.
+    cwd: Option<String>,
     conversation: Conversation,
     /// Indices into the conversation of the messages that render as list entries.
     entries: Vec<usize>,
@@ -80,6 +84,18 @@ pub struct ChatView {
     slash_matches: Vec<(String, String)>,
     /// A steer the turn ended before delivering: Hermes sends it as the next message.
     next_message: Option<String>,
+    /// When the running turn started, and the output tokens it has produced so far.
+    turn_started: Option<Instant>,
+    turn_tokens: u64,
+    /// How long the last finished turn ran and the tokens it produced.
+    last_turn: Option<(Duration, u64)>,
+    /// Thinking blocks the user opened or closed by hand (Zed's auto mode leaves the rest).
+    thinking_toggled: HashSet<String>,
+    composer_expanded: bool,
+    effort_menu: PopoverMenuHandle<ContextMenu>,
+    model_menu: PopoverMenuHandle<ModelPicker>,
+    /// Ticks the elapsed time shown under a running turn.
+    _turn_timer: Option<Task<()>>,
     pub usage: TurnUsage,
     error: Option<String>,
     focus_handle: FocusHandle,
@@ -102,13 +118,24 @@ impl ChatView {
             .store()
             .usage_totals(&session_id)
             .unwrap_or_default();
+        let cwd = backend
+            .runtime
+            .store()
+            .session(&session_id)
+            .ok()
+            .flatten()
+            .map(|session| session.cwd);
         let composer = cx.new(|cx| TextArea::new(COMPOSER_PLACEHOLDER, cx));
         let subscription = cx.subscribe_in(
             &composer,
             window,
             |this: &mut Self, _, event, window, cx| match event {
                 TextAreaEvent::Submit => this.submit(window, cx),
-                TextAreaEvent::Changed => this.update_slash_matches(cx),
+                TextAreaEvent::Changed => {
+                    this.update_slash_matches(cx);
+                    // The send button follows whether the composer is empty.
+                    cx.notify();
+                }
             },
         );
         let list_state = ListState::new(0, ListAlignment::Top, px(2000.));
@@ -116,6 +143,7 @@ impl ChatView {
         let mut this = Self {
             session_id,
             model,
+            cwd,
             conversation: Conversation::new_unvalidated(messages),
             entries: Vec::new(),
             list_state,
@@ -129,6 +157,14 @@ impl ChatView {
             editing: None,
             slash_matches: Vec::new(),
             next_message: None,
+            turn_started: None,
+            turn_tokens: 0,
+            last_turn: None,
+            thinking_toggled: HashSet::new(),
+            composer_expanded: false,
+            effort_menu: PopoverMenuHandle::default(),
+            model_menu: PopoverMenuHandle::default(),
+            _turn_timer: None,
             usage: TurnUsage {
                 last_input_tokens: 0,
                 total_input_tokens: totals.input_tokens,
@@ -152,7 +188,7 @@ impl ChatView {
             languages: AppState::global(cx).read(cx).languages.clone(),
         };
         this.rebuild_entries();
-        this.list_state.reset(this.entries.len());
+        this.list_state.reset(this.list_len());
         this.list_state.scroll_to_end();
         this
     }
@@ -163,6 +199,18 @@ impl ChatView {
 
     pub fn composer(&self) -> Entity<TextArea> {
         self.composer.clone()
+    }
+
+    /// The list's rows: one per entry, plus the trailer that shows the turn running.
+    fn list_len(&self) -> usize {
+        self.entries.len() + 1
+    }
+
+    /// Re-renders the trailer row (the generating indicator).
+    fn trailer_changed(&mut self, cx: &mut Context<Self>) {
+        let trailer = self.entries.len();
+        self.list_state.splice(trailer..trailer + 1, 1);
+        cx.notify();
     }
 
     fn rebuild_entries(&mut self) {
@@ -188,7 +236,8 @@ impl ChatView {
         self.rebuild_entries();
         let new = self.entries.len();
         let start = old.saturating_sub(1).min(new);
-        self.list_state.splice(start..old, new - start);
+        // The trailer row after the entries (the generating indicator) moves with them.
+        self.list_state.splice(start..old + 1, new + 1 - start);
         cx.notify();
     }
 
@@ -267,7 +316,7 @@ impl ChatView {
                 self.conversation = Conversation::new_unvalidated(messages);
                 self.markdown.clear();
                 self.rebuild_entries();
-                self.list_state.reset(self.entries.len());
+                self.list_state.reset(self.list_len());
             }
             Err(error) => {
                 self.error = Some(format!("{error:#}"));
@@ -357,6 +406,20 @@ impl ChatView {
         self.composer.update(cx, |composer, cx| {
             composer.set_placeholder(STEER_PLACEHOLDER, cx)
         });
+        self.turn_started = Some(Instant::now());
+        self.turn_tokens = 0;
+        self.trailer_changed(cx);
+        self._turn_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if this
+                    .update(cx, |this, cx| this.trailer_changed(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
         self.list_state.scroll_to_end();
         self.turn_task = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = turn.events.recv().await {
@@ -425,13 +488,14 @@ impl ChatView {
             RuntimeEvent::Agent(AgentEvent::HistoryReplaced(conversation)) => {
                 self.conversation = conversation;
                 self.rebuild_entries();
-                self.list_state.reset(self.entries.len());
+                self.list_state.reset(self.list_len());
                 cx.notify();
             }
             RuntimeEvent::Agent(AgentEvent::Usage(usage)) => {
                 self.usage.last_input_tokens = usage.usage.input_tokens.unwrap_or(0);
                 self.usage.total_input_tokens += i64::from(usage.usage.input_tokens.unwrap_or(0));
                 self.usage.total_output_tokens += i64::from(usage.usage.output_tokens.unwrap_or(0));
+                self.turn_tokens += usage.usage.output_tokens.unwrap_or(0).max(0) as u64;
                 self.usage.cost += usage.cost.unwrap_or(0.);
                 cx.notify();
             }
@@ -442,6 +506,10 @@ impl ChatView {
             }
             RuntimeEvent::TurnFinished(status) => {
                 self.running = None;
+                self._turn_timer = None;
+                if let Some(started) = self.turn_started.take() {
+                    self.last_turn = Some((started.elapsed(), self.turn_tokens));
+                }
                 self.composer.update(cx, |composer, cx| {
                     composer.set_placeholder(COMPOSER_PLACEHOLDER, cx)
                 });
@@ -589,20 +657,52 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // The row after the last message: Zed's generating indicator while a turn runs.
         let Some(&message_index) = self.entries.get(index) else {
-            return div().into_any_element();
+            return if self.running.is_some() {
+                self.render_generating(cx).into_any_element()
+            } else {
+                Empty.into_any_element()
+            };
         };
         let message = self.conversation.messages()[message_index].clone();
+        let is_last = index + 1 == self.entries.len();
         let content = match message.role {
             Role::User => self.render_user_message(&message, message_index, window, cx),
             Role::Assistant => {
-                self.render_assistant_message(&message, message_index, index, window, cx)
+                let body =
+                    self.render_assistant_message(&message, message_index, index, window, cx);
+                v_flex()
+                    .px_5()
+                    .py_1p5()
+                    .when(is_last, |this| this.pb_4())
+                    .w_full()
+                    .text_ui(cx)
+                    .child(body)
+                    .into_any_element()
             }
+        };
+        // Zed's thread controls close every finished turn: the last agent message before the
+        // next user message (or the end).
+        let turn_end = message.role == Role::Assistant
+            && self
+                .entries
+                .get(index + 1)
+                .is_none_or(|&next| self.conversation.messages()[next].role == Role::User)
+            && !(is_last && self.running.is_some());
+        let content = if turn_end {
+            v_flex()
+                .w_full()
+                .child(content)
+                .child(self.render_thread_controls(index, is_last, cx))
+                .into_any_element()
+        } else {
+            content
         };
         let chat = cx.entity().downgrade();
         let whole = message.as_concat_text();
         right_click_menu(SharedString::from(format!("entry-menu-{message_index}")))
-            .trigger(move |_, _, _| div().w_full().px_4().py_2().child(content))
+            .trigger(move |_, _, _| div().w_full().child(content))
             .menu(move |window, cx| {
                 // The markdown blocks of this message saw the right-click first and recorded
                 // what was selected in them.
@@ -649,6 +749,8 @@ impl ChatView {
             .into_any_element()
     }
 
+    /// Zed's user message: a full-width card with the editor background, a shadow and a focus
+    /// border on hover; its actions float over the top-right corner.
     fn render_user_message(
         &mut self,
         message: &Message,
@@ -665,54 +767,76 @@ impl ChatView {
         let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
         let body = self.markdown_block((message_index, 0, MarkdownKind::User), &shown, style, cx);
         let colors = cx.theme().colors();
+        let focus_border = colors.border_focused;
         let running = self.running.is_some();
         let group = SharedString::from(format!("user-message-{message_index}"));
         let action = |id: &str, icon: IconName, tooltip: &'static str| {
             IconButton::new(SharedString::from(format!("{id}-{message_index}")), icon)
-                .icon_size(IconSize::Small)
+                .icon_size(IconSize::XSmall)
                 .icon_color(Color::Muted)
                 .tooltip(Tooltip::text(tooltip))
         };
         let copy_text = shown.clone();
         v_flex()
+            .id(("user_message", message_index))
+            .pt_2()
+            .pb_3()
+            .px_2()
+            .gap_1p5()
             .w_full()
-            .items_end()
-            .gap_0p5()
-            .group(group.clone())
             .child(
                 div()
-                    .max_w(relative(0.85))
-                    .px_3()
-                    .py_2()
-                    .rounded_lg()
-                    .bg(colors.editor_background)
-                    .border_1()
-                    .border_color(colors.border)
-                    .text_color(colors.text)
-                    .child(body),
-            )
-            .child(
-                h_flex()
-                    .gap_0p5()
-                    .visible_on_hover(group)
-                    .child(action("copy-message", IconName::Copy, "Copy").on_click(
-                        move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()))
-                        },
-                    ))
+                    .relative()
+                    .group(group.clone())
                     .child(
-                        action("edit-message", IconName::Pencil, "Edit and resend")
-                            .disabled(running)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.edit_message(message_index, window, cx)
-                            })),
+                        div()
+                            .py_3()
+                            .px_2()
+                            .rounded_md()
+                            .bg(colors.editor_background)
+                            .border_1()
+                            .border_color(colors.border)
+                            .shadow_md()
+                            .hover(|style| style.border_color(focus_border.opacity(0.8)))
+                            .child(body),
                     )
                     .child(
-                        action("resend-message", IconName::Rerun, "Re-send from here")
-                            .disabled(running)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.resend(message_index, None, cx)
-                            })),
+                        h_flex()
+                            .absolute()
+                            .top_neg_3p5()
+                            .right_3()
+                            .gap_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.editor_background)
+                            .overflow_hidden()
+                            .visible_on_hover(group)
+                            .child(action("copy-message", IconName::Copy, "Copy").on_click(
+                                move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        copy_text.clone(),
+                                    ))
+                                },
+                            ))
+                            .child(
+                                action("edit-message", IconName::Pencil, "Edit and Resend")
+                                    .disabled(running)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.edit_message(message_index, window, cx)
+                                    })),
+                            )
+                            .child(
+                                action(
+                                    "resend-message",
+                                    IconName::Return,
+                                    "Resend: restarts the thread from this point",
+                                )
+                                .disabled(running)
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| this.resend(message_index, None, cx),
+                                )),
+                            ),
                     ),
             )
             .into_any_element()
@@ -806,7 +930,6 @@ impl ChatView {
                     let active = streaming_chunk == Some(chunk);
                     blocks.push(self.render_thinking(
                         message_index,
-                        entry,
                         chunk,
                         &thinking.thinking,
                         active,
@@ -816,7 +939,14 @@ impl ChatView {
                 }
                 MessageContent::ToolRequest(request) => {
                     let response = responses.get(&request.id).cloned();
-                    blocks.push(self.render_tool_call(request, response, cx));
+                    blocks.push(self.render_tool_call(
+                        message_index,
+                        chunk,
+                        request,
+                        response,
+                        window,
+                        cx,
+                    ));
                 }
                 MessageContent::Error(error) => {
                     let can_retry = self.running.is_none() && entry + 1 == self.entries.len();
@@ -845,7 +975,7 @@ impl ChatView {
         }
         v_flex()
             .w_full()
-            .gap_2()
+            .gap_3()
             .children(blocks)
             .into_any_element()
     }
@@ -855,27 +985,30 @@ impl ChatView {
             self.expanded.insert(key);
         }
         // Expanding changes the entry's height.
-        self.list_state.reset(self.entries.len());
+        self.list_state.reset(self.list_len());
         cx.notify();
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Zed's thinking block in its default "auto" display: a plain "Thinking" header (the
+    /// chevron shows on hover), opened while the thought streams and closed when it ends,
+    /// unless the user opened or closed it by hand.
     fn render_thinking(
         &mut self,
         message_index: usize,
-        entry: usize,
         chunk: usize,
         text: &str,
         active: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let key = format!("thinking-{entry}-{chunk}");
-        let open = self.expanded.contains(&key);
+        let key = format!("thinking-{message_index}-{chunk}");
+        let open = if self.thinking_toggled.contains(&key) {
+            self.expanded.contains(&key)
+        } else {
+            active
+        };
         let body = open.then(|| {
-            let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-            style.base_text_style.color = cx.theme().colors().text_muted;
-            style.base_text_style.font_size = TextSize::Small.rems(cx).into();
+            let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
             self.markdown_block(
                 (message_index, chunk, MarkdownKind::Thinking),
                 text.trim(),
@@ -884,55 +1017,83 @@ impl ChatView {
             )
         });
         let colors = cx.theme().colors();
-        let toggle_key = key.clone();
+        let card_header = SharedString::from(format!("{key}-card-header"));
+        let toggle = {
+            let key = key.clone();
+            move |this: &mut Self, cx: &mut Context<Self>| {
+                this.thinking_toggled.insert(key.clone());
+                if open {
+                    this.expanded.remove(&key);
+                } else {
+                    this.expanded.insert(key.clone());
+                }
+                this.list_state.reset(this.list_len());
+                cx.notify();
+            }
+        };
+        let header_toggle = toggle.clone();
         v_flex()
+            .id(SharedString::from(format!("thinking-block-{key}")))
             .gap_1()
             .child(
                 h_flex()
-                    .id(SharedString::from(format!("{key}-header")))
-                    .gap_1p5()
-                    .cursor_pointer()
+                    .id(SharedString::from(format!("thinking-block-header-{key}")))
+                    .group(card_header.clone())
+                    .relative()
+                    .w_full()
+                    .pr_1()
+                    .justify_between()
                     .child(
-                        Icon::new(IconName::ToolThink)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
+                        h_flex()
+                            .h(window.line_height() - px(2.))
+                            .gap_1p5()
+                            .overflow_hidden()
+                            .child(
+                                Icon::new(IconName::ToolThink)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                div()
+                                    .text_size(rems_from_px(13_f32))
+                                    .text_color(colors.text_muted)
+                                    .child("Thinking"),
+                            ),
                     )
-                    .child(if active {
-                        shimmer(SharedString::from(format!("{key}-shimmer")), "Thinking", cx)
-                    } else {
-                        Label::new("Thinking")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .into_any_element()
-                    })
-                    .child(Disclosure::new(
-                        SharedString::from(format!("{key}-disclosure")),
-                        open,
-                    ))
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.toggle(toggle_key.clone(), cx)),
-                    ),
+                    .child(
+                        Disclosure::new(SharedString::from(format!("{key}-expand")), open)
+                            .opened_icon(IconName::ChevronUp)
+                            .closed_icon(IconName::ChevronDown)
+                            .visible_on_hover(card_header)
+                            .on_click(cx.listener(move |this, _, _, cx| toggle(this, cx))),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| header_toggle(this, cx))),
             )
-            .when(open, |this| {
+            .when_some(body, |this, body| {
                 this.child(
                     div()
                         .ml_1p5()
                         .pl_3p5()
                         .border_l_1()
-                        .border_color(colors.border_variant)
-                        .children(body),
+                        .border_color(tool_card_border_color(cx))
+                        .overflow_hidden()
+                        .child(body),
                 )
             })
             .into_any_element()
     }
 
+    /// Zed's tool call: a plain row (icon, muted label, a fade at the right edge) that expands
+    /// into its input and output; edits get a card, and terminal commands Zed's terminal card.
     fn render_tool_call(
-        &self,
+        &mut self,
+        message_index: usize,
+        chunk: usize,
         request: &hermes_llm::conversation::message::ToolRequest,
         response: Option<(String, bool)>,
-        cx: &Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        let colors = cx.theme().colors();
         let (name, args) = match &request.tool_call {
             Ok(call) => (
                 call.name.to_string(),
@@ -946,105 +1107,525 @@ impl ChatView {
                 serde_json::json!({"error": error.message}),
             ),
         };
+        if name == "terminal" {
+            return self.render_terminal_tool_call(request, &args, response, window, cx);
+        }
         let key = format!("tool-{}", request.id);
         let open = self.expanded.contains(&key);
-        let toggle_key = key.clone();
-        let status: AnyElement = match (&response, self.running.is_some()) {
-            (Some((_, true)), _) => Icon::new(IconName::XCircle)
-                .size(IconSize::Small)
-                .color(Color::Error)
-                .into_any_element(),
-            (Some(_), _) => Icon::new(IconName::Check)
-                .size(IconSize::Small)
-                .color(Color::Success)
-                .into_any_element(),
-            (None, true) => Icon::new(IconName::LoadCircle)
-                .size(IconSize::Small)
-                .color(Color::Accent)
-                .with_keyed_rotate_animation(SharedString::from(format!("{key}-spin")), 2)
-                .into_any_element(),
-            (None, false) => Icon::new(IconName::Stop)
-                .size(IconSize::Small)
-                .color(Color::Muted)
-                .into_any_element(),
+        let failed = response.as_ref().is_some_and(|(_, failed)| *failed);
+        let is_edit = matches!(name.as_str(), "write_file" | "patch");
+        let use_card_layout = is_edit;
+        let card_header = SharedString::from(format!("inner-tool-call-header-{}", request.id));
+        let label_text = chat_ui::tool_label(&name, &args, self.cwd.as_deref());
+        let label_style = MarkdownStyle {
+            prevent_mouse_interaction: true,
+            ..MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx)
         };
-        let summary = tool_summary(&name, &args);
-        let mono = theme::theme_settings(cx).buffer_font(cx).clone();
-
-        v_flex()
+        let label = self.markdown_block(
+            (message_index, chunk, MarkdownKind::ToolLabel),
+            &label_text,
+            label_style,
+            cx,
+        );
+        let header_bg = tool_card_header_bg(cx);
+        let panel_bg = cx.theme().colors().panel_background;
+        let fade_bg = if use_card_layout { header_bg } else { panel_bg };
+        let gradient_overlay =
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .w_12()
+                .h_full()
+                .bg(linear_gradient(
+                    90.,
+                    linear_color_stop(fade_bg, 1.),
+                    linear_color_stop(fade_bg.opacity(0.2), 0.),
+                ));
+        let label_row = h_flex()
+            .relative()
             .w_full()
-            .rounded_md()
-            .border_1()
-            .border_color(colors.border_variant)
-            .bg(colors.editor_background)
+            .h(window.line_height() - px(2.))
+            .text_size(rems_from_px(13_f32))
+            .gap_1p5()
+            .when(use_card_layout, |this| this.px_1())
             .overflow_hidden()
             .child(
+                div().flex_none().child(
+                    Icon::new(tool_icon(&name))
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                ),
+            )
+            .child(h_flex().w_full().whitespace_nowrap().child(label))
+            .when(!is_edit, |this| this.child(gradient_overlay));
+        let toggle_key = key.clone();
+        let header = h_flex()
+            .id(SharedString::from(format!("{key}-header")))
+            .group(card_header.clone())
+            .relative()
+            .w_full()
+            .justify_between()
+            .cursor_pointer()
+            .when(use_card_layout, |this| {
+                this.p_0p5().rounded_t(rems_from_px(5_f32)).bg(header_bg)
+            })
+            .child(label_row)
+            .child(
                 h_flex()
-                    .id(SharedString::from(format!("{key}-header")))
+                    .pr_0p5()
+                    .gap_1()
+                    .when(response.is_some(), |this| {
+                        this.child(
+                            Disclosure::new(SharedString::from(format!("{key}-expand")), open)
+                                .opened_icon(IconName::ChevronUp)
+                                .closed_icon(IconName::ChevronDown)
+                                .visible_on_hover(card_header.clone()),
+                        )
+                    })
+                    .when(failed, |this| {
+                        this.child(
+                            Icon::new(IconName::Close)
+                                .color(Color::Error)
+                                .size(IconSize::Small),
+                        )
+                    }),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle(toggle_key.clone(), cx)));
+
+        let border_color = tool_card_border_color(cx);
+        let output = response
+            .as_ref()
+            .map(|(text, _)| render_result(text, cx))
+            .unwrap_or_else(|| div().into_any_element());
+        let input_output_header = |text: &'static str| {
+            Label::new(text)
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .buffer_font(cx)
+        };
+        let mono = theme::theme_settings(cx).buffer_font(cx).clone();
+        let collapse_key = key.clone();
+        let content = open.then(|| {
+            if use_card_layout {
+                v_flex()
+                    .p_2()
+                    .border_t_1()
+                    .border_color(border_color)
+                    .font(mono.clone())
+                    .text_xs()
+                    .child(output)
+                    .into_any_element()
+            } else {
+                let args_text = serde_json::to_string_pretty(&args).unwrap_or_default();
+                v_flex()
+                    .mt_1p5()
                     .w_full()
-                    .px_2()
-                    .py_1()
-                    .gap_2()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(colors.ghost_element_hover))
                     .child(
-                        Icon::new(tool_icon(&name))
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new(name.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Default),
+                        v_flex()
+                            .ml(rems(0.4))
+                            .px_3p5()
+                            .pb_1()
+                            .gap_1()
+                            .border_l_1()
+                            .border_color(border_color)
+                            .child(input_output_header("Raw Input:"))
+                            .child(div().font(mono.clone()).text_xs().child(clip(&args_text)))
+                            .child(input_output_header("Output:"))
+                            .child(div().font(mono.clone()).text_xs().child(output)),
                     )
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_sm()
-                            .text_color(colors.text_muted)
-                            .font(mono.clone())
-                            .child(summary),
+                            .ml(rems(0.4))
+                            .px_3p5()
+                            .pt_2()
+                            .border_l_1()
+                            .border_color(border_color)
+                            .child(
+                                IconButton::new(
+                                    SharedString::from(format!("tool_output-collapse-{key}")),
+                                    IconName::ChevronUp,
+                                )
+                                .full_width()
+                                .style(ButtonStyle::Outlined)
+                                .icon_color(Color::Muted)
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| this.toggle(collapse_key.clone(), cx),
+                                )),
+                            ),
                     )
-                    .child(status)
-                    .child(Disclosure::new(
-                        SharedString::from(format!("{key}-disclosure")),
-                        open,
-                    ))
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.toggle(toggle_key.clone(), cx)),
-                    ),
+                    .into_any_element()
+            }
+        });
+
+        v_flex()
+            .map(|this| {
+                if use_card_layout {
+                    this.my_1p5()
+                        .rounded_md()
+                        .border_1()
+                        .when(failed, |this| this.border_dashed())
+                        .border_color(border_color)
+                        .bg(cx.theme().colors().editor_background)
+                        .overflow_hidden()
+                } else {
+                    this.my_1()
+                }
+            })
+            .child(header)
+            .children(content)
+            .into_any_element()
+    }
+
+    /// Zed's terminal card (`TerminalToolHeader` + `render_collapsible_command`): the working
+    /// directory over the command, a spinner while it runs, its output when expanded.
+    fn render_terminal_tool_call(
+        &mut self,
+        request: &hermes_llm::conversation::message::ToolRequest,
+        args: &serde_json::Value,
+        response: Option<(String, bool)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = request.id.clone();
+        let key = format!("tool-{id}");
+        let is_expanded = self.expanded.contains(&key);
+        let running = response.is_none() && self.running.is_some();
+        let result: Option<serde_json::Value> = response
+            .as_ref()
+            .and_then(|(text, _)| serde_json::from_str(text).ok());
+        let exit_code = result
+            .as_ref()
+            .and_then(|r| r.get("exit_code"))
+            .and_then(|c| c.as_i64());
+        let failed = response.as_ref().is_some_and(|(_, failed)| *failed)
+            || exit_code.is_some_and(|code| code != 0);
+        let command = args
+            .get("command")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let working_dir = args
+            .get("workdir")
+            .and_then(|w| w.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| "terminal".into());
+        let border_color = tool_card_border_color(cx);
+        let header_bg = tool_card_header_bg(cx);
+        let group = SharedString::from(format!("terminal-tool-header-group-{id}"));
+        let child_id = |name: &str| SharedString::from(format!("terminal-tool-{name}-{id}"));
+        let mono = theme::theme_settings(cx).buffer_font(cx).clone();
+        let toggle_key = key.clone();
+
+        let header_row = h_flex()
+            .id(child_id("header"))
+            .pt_1()
+            .pl_1p5()
+            .pr_1()
+            .flex_none()
+            .gap_1()
+            .justify_between()
+            .rounded_t_md()
+            .cursor_pointer()
+            .child(
+                div().w_full().min_w_0().overflow_hidden().child(
+                    Label::new(working_dir)
+                        .buffer_font(cx)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .truncate_start(),
+                ),
             )
-            .when(open, |this| {
-                let args_text = serde_json::to_string_pretty(&args).unwrap_or_default();
-                let result = match response.as_ref() {
-                    Some((text, _)) => render_result(text, cx),
-                    None => div().child("(running…)").into_any_element(),
-                };
-                this.child(Divider::horizontal()).child(
-                    v_flex()
+            .child(
+                Disclosure::new(child_id("disclosure"), is_expanded)
+                    .opened_icon(IconName::ChevronUp)
+                    .closed_icon(IconName::ChevronDown)
+                    .visible_on_hover(group.clone()),
+            )
+            .when(running, |header| {
+                header
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::LoadCircle)
+                            .size(IconSize::Small)
+                            .color(Color::Muted)
+                            .with_keyed_rotate_animation(child_id("spinner"), 2),
+                    )
+                    .child(Divider::vertical().color(ui::DividerColor::Border).ml_1())
+                    .child(
+                        IconButton::new(child_id("stop"), IconName::Stop)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Error)
+                            .tooltip(Tooltip::text("Stop This Command"))
+                            .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
+                    )
+            })
+            .when(failed, |header| {
+                header.child(
+                    IconButton::new(child_id("failed"), IconName::Close)
+                        .style(ButtonStyle::Transparent)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Error)
+                        .when_some(exit_code, |this, code| {
+                            this.tooltip(Tooltip::text(format!("Exited with code {code}")))
+                        }),
+                )
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle(toggle_key.clone(), cx)));
+
+        let command_slot = v_flex()
+            .group(group.clone())
+            .relative()
+            .p_1p5()
+            .bg(header_bg)
+            .child(
+                div()
+                    .font(mono.clone())
+                    .text_size(rems_from_px(12_f32))
+                    .line_height(rems_from_px(17_f32))
+                    .text_color(cx.theme().colors().text)
+                    .child(command.clone()),
+            )
+            .child(
+                div().absolute().top_1().right_1().child(
+                    CopyButton::new(child_id("copy-command"), command)
+                        .tooltip_label("Copy Command")
+                        .visible_on_hover(group.clone()),
+                ),
+            );
+
+        let output = result
+            .as_ref()
+            .and_then(|r| r.get("output"))
+            .and_then(|o| o.as_str())
+            .map(str::to_string)
+            .or_else(|| response.as_ref().map(|(text, _)| text.clone()))
+            .unwrap_or_default();
+        let _ = window;
+        v_flex()
+            .my_1p5()
+            .border_1()
+            .when(failed, |card| card.border_dashed())
+            .border_color(border_color)
+            .rounded_md()
+            .overflow_hidden()
+            .child(
+                v_flex()
+                    .group(group)
+                    .text_xs()
+                    .bg(header_bg)
+                    .child(header_row)
+                    .child(command_slot),
+            )
+            .when(is_expanded && response.is_some(), |this| {
+                this.child(
+                    div()
+                        .id(child_id("output"))
+                        .border_t_1()
+                        .when(failed, |card| card.border_dashed())
+                        .border_color(border_color)
+                        .rounded_b_md()
+                        .max_h(rems(18.))
+                        .overflow_y_scroll()
                         .p_2()
-                        .gap_2()
                         .font(mono)
                         .text_xs()
-                        .child(
-                            Label::new("Arguments")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(div().text_color(colors.text).child(clip(&args_text)))
-                        .child(
-                            Label::new("Result")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(div().text_color(colors.text).child(result)),
+                        .text_color(cx.theme().colors().text)
+                        .child(clip(output.trim_end())),
                 )
             })
             .into_any_element()
+    }
+
+    /// Zed's `render_generating`: the spinner under the thread while a turn runs (sand and
+    /// "Awaiting Confirmation" while a question waits), with the elapsed time and tokens once
+    /// the turn passes Zed's thresholds.
+    fn render_generating(&self, cx: &Context<Self>) -> impl IntoElement {
+        let confirmation = self.clarify.is_some();
+        let elapsed_label = self
+            .turn_started
+            .map(|started| started.elapsed())
+            .filter(|elapsed| *elapsed > chat_ui::STOPWATCH_THRESHOLD)
+            .map(chat_ui::duration_alt_display);
+        let turn_tokens_label = elapsed_label
+            .is_some()
+            .then_some(self.turn_tokens)
+            .filter(|&tokens| tokens > chat_ui::TOKEN_THRESHOLD)
+            .map(chat_ui::humanize_token_count);
+        let is_waiting = confirmation
+            || self.conversation.last().is_some_and(|message| {
+                message.role == Role::Assistant
+                    && message
+                        .content
+                        .iter()
+                        .any(|c| matches!(c, MessageContent::ToolRequest(_)))
+            });
+        let arrow_icon = if is_waiting {
+            IconName::ArrowUp
+        } else {
+            IconName::ArrowDown
+        };
+        let _ = cx;
+        h_flex()
+            .id("generating-spinner")
+            .py_2()
+            .px(rems_from_px(22_f32))
+            .gap_2()
+            .map(|this| {
+                if confirmation {
+                    this.child(
+                        h_flex()
+                            .w_2()
+                            .justify_center()
+                            .child(chat_ui::GeneratingSpinnerElement::new(SpinnerVariant::Sand)),
+                    )
+                    .child(
+                        div().min_w(rems(8.)).child(
+                            LoadingLabel::new("Awaiting Confirmation")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .single_line(),
+                        ),
+                    )
+                } else {
+                    this.child(
+                        h_flex()
+                            .w_2()
+                            .justify_center()
+                            .child(chat_ui::GeneratingSpinnerElement::new(SpinnerVariant::Dots)),
+                    )
+                }
+            })
+            .when_some(elapsed_label, |this, elapsed| {
+                this.child(
+                    Label::new(elapsed)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .when_some(turn_tokens_label, |this, tokens| {
+                this.child(
+                    h_flex()
+                        .gap_0p5()
+                        .child(
+                            Icon::new(arrow_icon)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(format!("{tokens} tokens"))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
+    }
+
+    /// Zed's thread controls under a finished turn: copy the response, scroll to the user's
+    /// message, and (at the bottom) the last turn's stats and scroll to top.
+    fn render_thread_controls(
+        &self,
+        index: usize,
+        is_thread_bottom: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        // The turn: the agent entries since the previous user message.
+        let user_entry = self.entries[..index]
+            .iter()
+            .rposition(|&m| self.conversation.messages()[m].role == Role::User);
+        let response: Vec<usize> = self.entries[user_entry.map_or(0, |u| u + 1)..=index].to_vec();
+        let (last_turn_tokens, last_turn_clock) = match self.last_turn.filter(|_| is_thread_bottom)
+        {
+            Some((duration, tokens)) if duration > chat_ui::STOPWATCH_THRESHOLD => (
+                (tokens > chat_ui::TOKEN_THRESHOLD)
+                    .then(|| format!("{} tokens", chat_ui::humanize_token_count(tokens))),
+                Some(chat_ui::duration_alt_display(duration)),
+            ),
+            _ => (None, None),
+        };
+        let separator_dots = || {
+            Label::new("•")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .alpha(0.5)
+        };
+        h_flex()
+            .w_full()
+            .py_1p5()
+            .px_4()
+            .justify_end()
+            .opacity(0.4)
+            .hover(|s| s.opacity(1.))
+            .when(
+                last_turn_tokens.is_some() || last_turn_clock.is_some(),
+                |this| {
+                    this.child(
+                        h_flex()
+                            .px_1()
+                            .gap_1()
+                            .when_some(last_turn_tokens, |this, label| {
+                                this.child(
+                                    Label::new(label).size(LabelSize::Small).color(Color::Muted),
+                                )
+                                .child(separator_dots())
+                            })
+                            .when_some(last_turn_clock, |this, label| {
+                                this.child(
+                                    Label::new(label).size(LabelSize::Small).color(Color::Muted),
+                                )
+                                .child(separator_dots())
+                            }),
+                    )
+                },
+            )
+            .child(
+                IconButton::new(("copy_agent_response", index), IconName::Copy)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Copy This Agent Response"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let text = response
+                            .iter()
+                            .map(|&m| this.conversation.messages()[m].as_concat_text())
+                            .filter(|t| !t.trim().is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    })),
+            )
+            .child(
+                IconButton::new(
+                    ("scroll_to_recent_user_prompt", index),
+                    IconName::UserArrowUp,
+                )
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Scroll to User Message"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(user_entry) = user_entry {
+                        this.list_state.scroll_to(ListOffset {
+                            item_ix: user_entry,
+                            offset_in_item: px(0.),
+                        });
+                        cx.notify();
+                    }
+                })),
+            )
+            .when(is_thread_bottom, |this| {
+                this.child(
+                    IconButton::new(("scroll_to_top", index), IconName::ArrowUp)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Scroll to Top"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.list_state.scroll_to(ListOffset {
+                                item_ix: 0,
+                                offset_in_item: px(0.),
+                            });
+                            cx.notify();
+                        })),
+                )
+            })
     }
 
     fn render_clarify(&self, cx: &Context<Self>) -> Option<AnyElement> {
@@ -1125,9 +1706,8 @@ impl ChatView {
         )
     }
 
-    /// Hermes's reasoning pill: shows the model's effort and opens the levels. Only for
-    /// models whose provider reports reasoning support.
-    fn render_effort_pill(&self, cx: &Context<Self>) -> Option<AnyElement> {
+    /// Zed's thinking control: a toggle (thinking on/off) split with the effort selector.
+    fn render_thinking_control(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let state = AppState::global(cx).read(cx);
         let supports = state
             .model_info(&self.model)
@@ -1136,69 +1716,105 @@ impl ChatView {
             return None;
         }
         let current = state.config.efforts.get(&self.model).cloned();
+        let thinking = current.as_deref() != Some("none");
+        let (tooltip_label, icon, color) = if thinking {
+            (
+                "Disable Thinking Mode",
+                IconName::ThinkingMode,
+                Color::Accent,
+            )
+        } else {
+            (
+                "Enable Thinking Mode",
+                IconName::ThinkingModeOff,
+                Color::Custom(cx.theme().colors().icon_disabled.opacity(0.8)),
+            )
+        };
+        let model = self.model.clone();
+        let thinking_toggle = IconButton::new("thinking-mode", icon)
+            .icon_size(IconSize::Small)
+            .icon_color(color)
+            .tooltip(Tooltip::text(tooltip_label))
+            .on_click(move |_, _, cx| {
+                set_effort(&model, if thinking { Some("none") } else { None }, cx)
+            });
+        if !thinking {
+            return Some(thinking_toggle.into_any_element());
+        }
+
         let label = EFFORTS
             .iter()
             .find(|(_, wire)| current.as_deref() == Some(*wire))
             .map(|(label, _)| *label)
             .unwrap_or("Auto");
+        let (label_color, chevron) = if self.effort_menu.is_deployed() {
+            (Color::Accent, IconName::ChevronUp)
+        } else {
+            (Color::Muted, IconName::ChevronDown)
+        };
         let model = self.model.clone();
-        Some(
-            PopoverMenu::new("effort-selector")
-                .menu(move |window, cx| {
-                    let model = model.clone();
-                    let current = current.clone();
-                    Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
-                        menu = menu.header("Reasoning effort");
-                        let auto_model = model.clone();
-                        menu = menu.toggleable_entry(
-                            "Auto (provider default)",
-                            current.is_none(),
-                            IconPosition::Start,
-                            None,
-                            move |_, cx| {
-                                set_effort(&auto_model, None, cx);
-                            },
+        let selector = PopoverMenu::new("effort-selector")
+            .trigger_with_tooltip(
+                ButtonLike::new_rounded_right("effort-selector-trigger")
+                    .child(Label::new(label).size(LabelSize::Small).color(label_color))
+                    .child(
+                        Icon::new(chevron)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .selected_style(ButtonStyle::Tinted(TintColor::Accent)),
+                Tooltip::text("Change Thinking Effort"),
+            )
+            .menu(move |window, cx| {
+                let model = model.clone();
+                let current = current.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    menu = menu.header("Change Thinking Effort");
+                    let levels = std::iter::once(("Auto", None)).chain(
+                        EFFORTS
+                            .iter()
+                            .filter(|(_, wire)| *wire != "none")
+                            .map(|(label, wire)| (*label, Some(*wire))),
+                    );
+                    for (label, wire) in levels {
+                        let model = model.clone();
+                        let selected = current.as_deref() == wire;
+                        menu.push_item(
+                            ContextMenuEntry::new(label)
+                                .toggleable(IconPosition::End, selected)
+                                .handler(move |_, cx| set_effort(&model, wire, cx)),
                         );
-                        for (label, wire) in EFFORTS {
-                            let model = model.clone();
-                            menu = menu.toggleable_entry(
-                                *label,
-                                current.as_deref() == Some(*wire),
-                                IconPosition::Start,
-                                None,
-                                move |_, cx| {
-                                    set_effort(&model, Some(wire), cx);
-                                },
-                            );
-                        }
-                        menu
-                    }))
-                })
-                .trigger(
-                    Button::new("effort-button", label)
-                        .label_size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .disabled(self.running.is_some())
-                        .start_icon(
-                            Icon::new(IconName::ToolThink)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        ),
-                )
-                .anchor(gpui::Anchor::BottomLeft)
+                    }
+                    menu
+                }))
+            })
+            .with_handle(self.effort_menu.clone())
+            .offset(gpui::Point {
+                x: px(0.),
+                y: px(-2.),
+            })
+            .anchor(gpui::Anchor::BottomLeft);
+        Some(
+            SplitButton::new(thinking_toggle, selector.into_any_element())
+                .style(SplitButtonStyle::Transparent)
                 .into_any_element(),
         )
     }
 
+    /// Zed's model selector trigger: the model's name and a chevron; the picker opens upward.
     fn render_model_button(&self, cx: &Context<Self>) -> impl IntoElement {
         let chat = cx.entity().downgrade();
         let selected = self.model.clone();
-        let short = self
-            .model
-            .rsplit('/')
-            .next()
-            .unwrap_or(&self.model)
-            .to_string();
+        let name = AppState::global(cx)
+            .read(cx)
+            .model_info(&self.model)
+            .and_then(|model| model.name.clone())
+            .unwrap_or_else(|| self.model.clone());
+        let (color, chevron) = if self.model_menu.is_deployed() {
+            (Color::Accent, IconName::ChevronUp)
+        } else {
+            (Color::Muted, IconName::ChevronDown)
+        };
         let running = self.running.is_some();
         PopoverMenu::new("model-selector")
             .menu(move |window, cx| {
@@ -1212,18 +1828,233 @@ impl ChatView {
                     ModelPicker::new(Some(selected), px(320.), on_select, window, cx).in_popover()
                 }))
             })
-            .trigger(
-                Button::new("model-button", short)
+            .trigger_with_tooltip(
+                Button::new("active-model", name)
                     .label_size(LabelSize::Small)
-                    .color(Color::Muted)
+                    .color(color)
                     .disabled(running)
                     .end_icon(
-                        Icon::new(IconName::ChevronDown)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
+                        Icon::new(chevron)
+                            .color(Color::Muted)
+                            .size(IconSize::XSmall),
                     ),
+                Tooltip::text("Change Model"),
+            )
+            .with_handle(self.model_menu.clone())
+            .anchor(gpui::Anchor::BottomRight)
+    }
+
+    /// Zed's add-context button. Mentions of files, sessions and images arrive in M5; skills
+    /// work now (they insert the `/skill` command).
+    fn render_add_context_button(&self, cx: &Context<Self>) -> impl IntoElement {
+        let chat = cx.entity().downgrade();
+        PopoverMenu::new("add-context-menu")
+            .trigger_with_tooltip(
+                IconButton::new("add-context", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted),
+                Tooltip::text("Add Context"),
             )
             .anchor(gpui::Anchor::BottomLeft)
+            .offset(gpui::Point {
+                x: px(0.),
+                y: px(-2.),
+            })
+            .menu(move |window, cx| {
+                let skills: Vec<(String, String)> = backend(cx)
+                    .runtime
+                    .skills()
+                    .catalog()
+                    .into_iter()
+                    .map(|s| {
+                        let source = s.category.unwrap_or_else(|| "general".into());
+                        (s.name, source)
+                    })
+                    .collect();
+                let chat = chat.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let insert = |text: &'static str| {
+                        let chat = chat.clone();
+                        move |window: &mut Window, cx: &mut App| {
+                            chat.update(cx, |chat, cx| chat.insert_into_composer(text, window, cx))
+                                .ok();
+                        }
+                    };
+                    let soon = "Coming with context mentions (M5)";
+                    menu.key_context("AddContextMenu")
+                        .item(
+                            ContextMenuEntry::new("Files & Directories")
+                                .icon(IconName::File)
+                                .icon_color(Color::Muted)
+                                .icon_size(IconSize::XSmall)
+                                .documentation_aside(ui::DocumentationSide::Right, move |_| {
+                                    Label::new(soon).into_any_element()
+                                })
+                                .handler(insert("@file:")),
+                        )
+                        .item(
+                            ContextMenuEntry::new("Sessions")
+                                .icon(IconName::Thread)
+                                .icon_color(Color::Muted)
+                                .icon_size(IconSize::XSmall)
+                                .documentation_aside(ui::DocumentationSide::Right, move |_| {
+                                    Label::new(soon).into_any_element()
+                                })
+                                .handler(insert("@session:")),
+                        )
+                        .when(!skills.is_empty(), |this| {
+                            let chat = chat.clone();
+                            let skills = skills.clone();
+                            this.submenu_with_colored_icon(
+                                "Skills",
+                                IconName::Sparkle,
+                                Color::Muted,
+                                move |mut menu, _, _| {
+                                    for (name, source) in &skills {
+                                        let chat = chat.clone();
+                                        let command = format!("/{name} ");
+                                        menu = menu.item(
+                                            ContextMenuEntry::new(format!("{name} ({source})"))
+                                                .icon(IconName::Sparkle)
+                                                .icon_color(Color::Muted)
+                                                .icon_size(IconSize::XSmall)
+                                                .handler(move |window, cx| {
+                                                    let command = command.clone();
+                                                    chat.update(cx, |chat, cx| {
+                                                        chat.composer.update(cx, |c, cx| {
+                                                            c.set_text(command, cx)
+                                                        });
+                                                        chat.composer
+                                                            .focus_handle(cx)
+                                                            .focus(window, cx);
+                                                    })
+                                                    .ok();
+                                                }),
+                                        );
+                                    }
+                                    menu
+                                },
+                            )
+                        })
+                        .item(
+                            ContextMenuEntry::new("Image")
+                                .icon(IconName::Image)
+                                .icon_color(Color::Muted)
+                                .icon_size(IconSize::XSmall)
+                                .disabled(true),
+                        )
+                        .item(
+                            ContextMenuEntry::new("URL")
+                                .icon(IconName::ToolWeb)
+                                .icon_color(Color::Muted)
+                                .icon_size(IconSize::XSmall)
+                                .documentation_aside(ui::DocumentationSide::Right, move |_| {
+                                    Label::new(soon).into_any_element()
+                                })
+                                .handler(insert("@url:")),
+                        )
+                }))
+            })
+    }
+
+    /// Appends a mention prefix to the composer and focuses it.
+    fn insert_into_composer(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.composer.read(cx).text().to_string();
+        let separator = if current.is_empty() || current.ends_with(char::is_whitespace) {
+            ""
+        } else {
+            " "
+        };
+        let updated = format!("{current}{separator}{text}");
+        self.composer.update(cx, |c, cx| c.set_text(updated, cx));
+        self.composer.focus_handle(cx).focus(window, cx);
+    }
+
+    /// Zed's context indicator: a ring that fills as the context window does (warning color at
+    /// 85%), with the numbers and the session's cost on hover.
+    fn render_token_usage(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let max = AppState::global(cx).read(cx).context_length(&self.model)? as u64;
+        let used = self.usage.last_input_tokens.max(0) as u64;
+        if used == 0 || max == 0 {
+            return None;
+        }
+        let ratio = used as f32 / max as f32;
+        let progress_color = if ratio >= 0.85 {
+            cx.theme().status().warning
+        } else {
+            cx.theme().colors().text_muted
+        };
+        let percentage = SharedString::from(format!("{}%", (ratio * 100.).round() as u32));
+        let used_label = SharedString::from(chat_ui::humanize_token_count(used));
+        let max_label = SharedString::from(chat_ui::humanize_token_count(max));
+        let cost = (self.usage.cost > 0.).then(|| {
+            let precision = if self.usage.cost < 0.01 { 4 } else { 2 };
+            SharedString::from(format!("{:.precision$} USD", self.usage.cost))
+        });
+        Some(
+            h_flex()
+                .id("circular_progress_tokens")
+                .mt_px()
+                .mr_1()
+                .child(
+                    CircularProgress::new(used as f32, max as f32, px(16.), cx)
+                        .stroke_width(px(2.))
+                        .progress_color(progress_color),
+                )
+                .hoverable_tooltip(move |_, cx| {
+                    let (percentage, used, max, cost) = (
+                        percentage.clone(),
+                        used_label.clone(),
+                        max_label.clone(),
+                        cost.clone(),
+                    );
+                    cx.new(|_| chat_ui::TokenUsageTooltip {
+                        percentage,
+                        used,
+                        max,
+                        cost,
+                    })
+                    .into()
+                }),
+        )
+    }
+
+    /// Zed's send button: Stop while a turn runs and the box is empty; with text during a turn
+    /// it steers (Zed queues); disabled when there's nothing to send.
+    fn render_send_button(&self, cx: &Context<Self>) -> AnyElement {
+        let is_editor_empty = self.composer.read(cx).text().trim().is_empty();
+        let is_generating = self.running.is_some();
+        if is_generating && is_editor_empty {
+            return IconButton::new("stop-generation", IconName::Stop)
+                .icon_color(Color::Error)
+                .style(ButtonStyle::Tinted(TintColor::Error))
+                .tooltip(Tooltip::text("Stop Generation"))
+                .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
+                .into_any_element();
+        }
+        let icon = if is_generating {
+            IconName::QueueMessage
+        } else {
+            IconName::Send
+        };
+        IconButton::new("send-message", icon)
+            .style(ButtonStyle::Filled)
+            .map(|this| {
+                if is_editor_empty && !is_generating {
+                    this.disabled(true).icon_color(Color::Muted)
+                } else {
+                    this.icon_color(Color::Accent)
+                }
+            })
+            .tooltip(Tooltip::text(if is_editor_empty && !is_generating {
+                "Type to Send"
+            } else if is_generating {
+                "Steer the Agent (delivered after its current tool call)"
+            } else {
+                "Send Message"
+            }))
+            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
+            .into_any_element()
     }
 
     /// The agent's task list: the latest successful `todo_list` result in the conversation.
@@ -1361,123 +2192,174 @@ impl ChatView {
         )
     }
 
-    fn render_composer(&self, cx: &Context<Self>) -> impl IntoElement {
+    /// Zed's message editor: a strip across the bottom on the editor background, the input with
+    /// an expand toggle, and the toolbar under it (context and thinking on the left; context
+    /// usage, model and send on the right).
+    fn render_composer(&self, has_messages: bool, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let running = self.running.is_some();
-        v_flex()
-            .mx_4()
-            .mb_3()
-            .p_2()
-            .gap_1()
-            .rounded_lg()
-            .border_1()
-            .border_color(colors.border)
+        let (expand_icon, expand_tooltip) = if self.composer_expanded {
+            (IconName::Minimize, "Minimize Message Editor")
+        } else {
+            (IconName::Maximize, "Expand Message Editor")
+        };
+        h_flex()
+            .py_2()
             .bg(colors.editor_background)
-            .children((!self.slash_matches.is_empty()).then(|| {
-                v_flex()
-                    .pb_1()
-                    .children(self.slash_matches.iter().map(|(name, description)| {
-                        let command = format!("/{name} ");
-                        h_flex()
-                            .id(SharedString::from(format!("slash-{name}")))
-                            .gap_2()
-                            .px_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(colors.ghost_element_hover))
-                            .child(Label::new(format!("/{name}")).size(LabelSize::Small))
-                            .child(
-                                Label::new(description.clone())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .truncate(),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.composer
-                                    .update(cx, |c, cx| c.set_text(command.clone(), cx));
-                                this.composer.focus_handle(cx).focus(window, cx);
-                                this.slash_matches.clear();
-                                cx.notify();
-                            }))
-                    }))
-            }))
-            .when(self.editing.is_some(), |this| {
-                this.child(
-                    h_flex()
-                        .gap_1()
-                        .child(
-                            Icon::new(IconName::Pencil)
-                                .size(IconSize::XSmall)
-                                .color(Color::Accent),
-                        )
-                        .child(
-                            Label::new(
-                                "Editing a message: sending replaces it and everything after it",
-                            )
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            Button::new("cancel-edit", "Cancel")
-                                .label_size(LabelSize::Small)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.editing = None;
-                                    this.composer.update(cx, |c, cx| c.set_text("", cx));
-                                    cx.notify();
-                                })),
-                        ),
-                )
+            .justify_center()
+            .when(has_messages, |this| {
+                this.border_t_1().border_color(colors.border)
             })
-            .when_some(self.steering.clone(), |this, steering| {
-                this.child(
-                    h_flex()
-                        .gap_1()
-                        .child(
-                            Icon::new(IconName::ArrowRight)
-                                .size(IconSize::XSmall)
-                                .color(Color::Accent),
-                        )
-                        .child(
-                            Label::new(format!("Steering: {steering}"))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .truncate(),
-                        ),
-                )
-            })
-            .child(self.composer.clone())
             .child(
-                h_flex()
-                    .justify_between()
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .px_2()
+                    .gap_2()
+                    .children((!self.slash_matches.is_empty()).then(|| {
+                        v_flex().children(self.slash_matches.iter().map(|(name, description)| {
+                            let command = format!("/{name} ");
+                            h_flex()
+                                .id(SharedString::from(format!("slash-{name}")))
+                                .gap_2()
+                                .px_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(colors.ghost_element_hover))
+                                .child(Label::new(format!("/{name}")).size(LabelSize::Small))
+                                .child(
+                                    Label::new(description.clone())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.composer
+                                        .update(cx, |c, cx| c.set_text(command.clone(), cx));
+                                    this.composer.focus_handle(cx).focus(window, cx);
+                                    this.slash_matches.clear();
+                                    cx.notify();
+                                }))
+                        }))
+                    }))
+                    .when(self.editing.is_some(), |this| {
+                        this.child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::Pencil)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Accent),
+                                )
+                                .child(
+                                    Label::new(
+                                        "Editing a message: sending restarts the thread from it",
+                                    )
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    IconButton::new("cancel-edit", IconName::Close)
+                                        .icon_color(Color::Error)
+                                        .icon_size(IconSize::XSmall)
+                                        .tooltip(Tooltip::text("Cancel Editing"))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.editing = None;
+                                            this.composer.update(cx, |c, cx| c.set_text("", cx));
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                    })
+                    .when_some(self.steering.clone(), |this, steering| {
+                        this.child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::QueueMessage)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Accent),
+                                )
+                                .child(
+                                    Label::new(format!("Steering: {steering}"))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                ),
+                        )
+                    })
+                    .child(
+                        v_flex()
+                            .relative()
+                            .w_full()
+                            .min_h_0()
+                            .pt_1()
+                            .pr_2p5()
+                            .child(self.composer.clone())
+                            .when(has_messages, |this| {
+                                this.child(
+                                    h_flex()
+                                        .absolute()
+                                        .top_0()
+                                        .right_0()
+                                        .opacity(0.5)
+                                        .hover(|s| s.opacity(1.0))
+                                        .child(
+                                            IconButton::new("toggle-height", expand_icon)
+                                                .icon_size(IconSize::Small)
+                                                .icon_color(Color::Muted)
+                                                .tooltip(Tooltip::text(expand_tooltip))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.composer_expanded =
+                                                        !this.composer_expanded;
+                                                    let lines = if this.composer_expanded {
+                                                        32
+                                                    } else {
+                                                        12
+                                                    };
+                                                    this.composer.update(cx, |c, cx| {
+                                                        c.set_max_lines(lines, cx)
+                                                    });
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                            }),
+                    )
                     .child(
                         h_flex()
-                            .gap_1()
-                            .child(self.render_model_button(cx))
-                            .children(self.render_effort_pill(cx)),
-                    )
-                    .child(if running {
-                        IconButton::new("stop", IconName::Stop)
-                            .icon_color(Color::Error)
-                            .tooltip(Tooltip::text("Stop"))
-                            .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
-                            .into_any_element()
-                    } else {
-                        IconButton::new("send", IconName::Send)
-                            .icon_color(Color::Accent)
-                            .tooltip(Tooltip::text("Send (Enter)"))
-                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
-                            .into_any_element()
-                    }),
+                            .w_full()
+                            .min_w_0()
+                            .flex_none()
+                            .flex_wrap()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .flex_wrap()
+                                    .gap_0p5()
+                                    .child(self.render_add_context_button(cx))
+                                    .children(self.render_thinking_control(cx)),
+                            )
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .children(self.render_token_usage(cx))
+                                    .child(self.render_model_button(cx))
+                                    .child(self.render_send_button(cx)),
+                            ),
+                    ),
             )
     }
 }
 
-const COMPOSER_PLACEHOLDER: &str = "Message Hermes… (Enter to send, Shift+Enter for a new line)";
-const STEER_PLACEHOLDER: &str =
-    "Steer the agent… (delivered after its current tool call; Stop ends the turn)";
+const COMPOSER_PLACEHOLDER: &str =
+    "Message Hermes… (Enter to send, Shift+Enter for a new line, / for skills)";
+const STEER_PLACEHOLDER: &str = "Steer the agent… (delivered after its current tool call)";
 
-/// Effort levels shown in the pill: label and the value sent to the provider.
+/// Effort levels: label and the value sent to the provider.
 const EFFORTS: &[(&str, &str)] = &[
     ("Off", "none"),
     ("Minimal", "minimal"),
@@ -1500,68 +2382,29 @@ fn set_effort(model: &str, effort: Option<&str>, cx: &mut App) {
     });
 }
 
+/// Zed's tool icons by kind: reads and searches, edits, execution.
 fn tool_icon(name: &str) -> IconName {
     match name {
+        "read_file" | "search_files" | "session_search" | "skills_list" | "skill_view" => {
+            IconName::ToolSearch
+        }
+        "write_file" | "patch" | "skill_manage" | "memory" | "todo_list" => IconName::ToolPencil,
         "terminal" | "process_manage" => IconName::ToolTerminal,
-        "read_file" => IconName::FileTextOutlined,
-        "write_file" | "patch" => IconName::ToolPencil,
-        "search_files" => IconName::ToolSearch,
-        "todo_list" => IconName::ListTodo,
-        "clarify" => IconName::Info,
-        "memory" => IconName::Notepad,
-        "session_search" => IconName::HistoryRerun,
         _ => IconName::ToolHammer,
     }
 }
 
-/// The one-line summary shown on a tool card.
-fn tool_summary(name: &str, args: &serde_json::Value) -> String {
-    let field = |key: &str| args.get(key).and_then(|v| v.as_str()).map(str::to_string);
-    let summary = match name {
-        "terminal" => field("command"),
-        "read_file" | "write_file" | "patch" => field("path"),
-        "search_files" => field("pattern")
-            .map(|p| format!("{p}  in {}", field("path").unwrap_or_else(|| ".".into()))),
-        "process_manage" => Some(format!(
-            "{} {}",
-            field("action").unwrap_or_default(),
-            field("session_id").unwrap_or_default()
-        )),
-        "todo_list" => Some(match args.get("todos").and_then(|t| t.as_array()) {
-            Some(todos) => format!("{} items", todos.len()),
-            None => "read".into(),
-        }),
-        "memory" => {
-            let ops = args.get("operations").and_then(|o| o.as_array());
-            let first = ops
-                .and_then(|ops| ops.first())
-                .or(Some(args))
-                .and_then(|op| op.get("content").or_else(|| op.get("old_text")))
-                .and_then(|c| c.as_str())
-                .unwrap_or_default();
-            let more = ops.map_or(0, |ops| ops.len().saturating_sub(1));
-            Some(format!(
-                "{}: {first}{}",
-                field("target").unwrap_or_else(|| "memory".into()),
-                if more > 0 {
-                    format!(" (+{more} more)")
-                } else {
-                    String::new()
-                }
-            ))
-        }
-        "session_search" => field("query")
-            .or_else(|| field("session_id"))
-            .or_else(|| Some("recent sessions".into())),
-        "clarify" => args
-            .get("questions")
-            .and_then(|q| q.get(0))
-            .and_then(|q| q.get("question"))
-            .and_then(|q| q.as_str())
-            .map(str::to_string),
-        _ => None,
-    };
-    summary.unwrap_or_default().replace('\n', " ⏎ ")
+/// Zed's `tool_card_header_bg`.
+fn tool_card_header_bg(cx: &App) -> gpui::Hsla {
+    cx.theme()
+        .colors()
+        .element_background
+        .blend(cx.theme().colors().editor_foreground.opacity(0.025))
+}
+
+/// Zed's `tool_card_border_color`.
+fn tool_card_border_color(cx: &App) -> gpui::Hsla {
+    cx.theme().colors().border.opacity(0.8)
 }
 
 /// A tool result: JSON fields one per line, multi-line strings as real text, and a `diff`
@@ -1687,7 +2530,7 @@ impl Render for ChatView {
             })
             .children(self.render_clarify(cx))
             .children(self.render_todos(cx))
-            .child(self.render_composer(cx))
+            .child(self.render_composer(!empty, cx))
     }
 }
 
@@ -1703,49 +2546,12 @@ fn tool_output(content: &MessageContent) -> String {
     }
 }
 
-/// A label with a bright band sweeping across it, left to right: the "working" shimmer.
-fn shimmer(id: SharedString, text: &'static str, cx: &App) -> AnyElement {
-    let base = Color::Muted.color(cx);
-    let bright = cx.theme().colors().text;
-    let size = ui::TextSize::Small.rems(cx);
-    let chars = text.chars().count() as f32;
-    // Half-width of the band, in characters; it starts and ends fully off the text.
-    const BAND: f32 = 3.0;
-    div()
-        .text_size(size)
-        .text_color(base)
-        .child(text)
-        .with_animation(
-            id,
-            Animation::new(Duration::from_millis(1800)).repeat(),
-            move |_, delta| {
-                let center = -BAND + delta * (chars + 2. * BAND);
-                let runs = text.char_indices().enumerate().map(|(n, (i, c))| {
-                    let distance = (n as f32 + 0.5 - center).abs();
-                    let strength = (1. - distance / BAND).clamp(0., 1.);
-                    let color = base.blend(bright.opacity(strength * strength));
-                    (
-                        i..i + c.len_utf8(),
-                        gpui::HighlightStyle {
-                            color: Some(color),
-                            ..Default::default()
-                        },
-                    )
-                });
-                div()
-                    .text_size(size)
-                    .text_color(base)
-                    .child(gpui::StyledText::new(text).with_highlights(runs))
-            },
-        )
-        .into_any_element()
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum MarkdownKind {
     Text,
     Thinking,
     User,
+    ToolLabel,
 }
 
 /// (message index, content block, kind) of a rendered markdown block.
