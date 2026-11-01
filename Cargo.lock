@@ -2258,6 +2258,7 @@ dependencies = [
  "hermes_highlight",
  "hermes_llm",
  "hermes_memory",
+ "hermes_prompts",
  "hermes_runtime",
  "hermes_store",
  "hermes_themes",
