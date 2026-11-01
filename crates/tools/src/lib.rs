@@ -6,6 +6,7 @@
 
 pub mod approval;
 mod bundles;
+pub mod checkpoints;
 mod clarify;
 pub mod curator;
 mod files;
@@ -87,6 +88,8 @@ pub struct SessionToolsConfig {
     pub skills: Option<Arc<SkillStore>>,
     /// The dangerous-command policy (asking, and the always-allowed patterns).
     pub approvals: Option<Arc<approval::ApprovalStore>>,
+    /// Filesystem checkpoints taken before file changes (`/rollback`).
+    pub checkpoints: Option<Arc<checkpoints::Checkpoints>>,
 }
 
 pub struct SessionTools {
@@ -108,6 +111,9 @@ pub struct SessionTools {
     pub(crate) session_approved: parking_lot::Mutex<std::collections::HashSet<String>>,
     /// Directories whose AGENTS.md / CLAUDE.md the model has been shown.
     hints: parking_lot::Mutex<hints::HintTracker>,
+    checkpoints: Option<Arc<checkpoints::Checkpoints>>,
+    /// Projects already checkpointed this turn (one snapshot per project per turn).
+    turn_checkpoints: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 impl SessionTools {
@@ -127,12 +133,49 @@ impl SessionTools {
             history: config.history,
             skills: config.skills,
             approvals: config.approvals,
+            checkpoints: config.checkpoints,
+            turn_checkpoints: Default::default(),
             session_approved: Default::default(),
+        }
+    }
+
+    /// Hermes's checkpoint trigger: the project a `write_file` / `patch` touches, or the folder a
+    /// destructive terminal command runs in, is snapshotted once per turn before the change.
+    /// Returns the file a write targets, for the agent-write ledger.
+    fn checkpoint_before(&self, tool: &str, args: &Value) -> Option<PathBuf> {
+        let checkpoints = self.checkpoints.as_ref().filter(|c| c.enabled())?;
+        let mut taken = self.turn_checkpoints.lock();
+        match tool {
+            "write_file" | "patch" => {
+                let path = self.resolve(args.get("path")?.as_str()?);
+                let workdir = checkpoints.working_dir_for(&path, &self.home);
+                checkpoints.ensure(&workdir, &format!("before {tool}"), &self.home, &mut taken);
+                Some(path)
+            }
+            "terminal" => {
+                let command = args.get("command")?.as_str()?;
+                if checkpoints::is_destructive_command(command) {
+                    let cwd = match args.get("workdir").and_then(Value::as_str) {
+                        Some(dir) => self.resolve(dir),
+                        None => self.cwd(),
+                    };
+                    let short: String = command.chars().take(60).collect();
+                    checkpoints.ensure(
+                        &cwd,
+                        &format!("before terminal: {short}"),
+                        &self.home,
+                        &mut taken,
+                    );
+                }
+                None
+            }
+            _ => None,
         }
     }
 
     /// Called when a turn starts: per-turn tool state resets.
     pub fn begin_turn(&self) {
+        self.turn_checkpoints.lock().clear();
         *self.memory_failures.lock() = hermes_memory::TurnFailures::default();
     }
 
@@ -365,7 +408,7 @@ pub(crate) fn parse_args<T: serde::de::DeserializeOwned>(
         .map_err(|error| ToolOutput::error(format!("Invalid arguments for {tool}: {error}")))
 }
 
-pub(crate) fn display_path(path: &Path) -> String {
+pub fn display_path(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
 
@@ -403,6 +446,7 @@ pub(crate) mod tests {
             history: None,
             skills: None,
             approvals: None,
+            checkpoints: None,
         });
         (dir, tools)
     }
@@ -463,7 +507,13 @@ impl<S: Send + Sync + 'static> ToolProvider<S> for SessionTools {
         _emit: &Emitter,
     ) -> Result<CallToolResult, ErrorData> {
         let args = Value::Object(call.arguments.unwrap_or_else(JsonObject::new));
+        let written = self.checkpoint_before(&call.name, &args);
         let mut result = self.dispatch(&call.name, args.clone()).await.into_result();
+        if let (Some(path), Some(checkpoints)) = (written, &self.checkpoints)
+            && result.is_error != Some(true)
+        {
+            checkpoints.record_write(&path, &self.home);
+        }
         // Hermes appends a newly visited subdirectory's context file to the result.
         let hints = self.hints.lock().check(&call.name, &args, &self.cwd());
         if let Some(hints) = hints

@@ -1,6 +1,7 @@
 //! The agent runtime the desktop app talks to: create and open sessions, start a turn and
 //! receive its events, cancel it, list a provider's models.
 
+mod commands;
 pub mod compress;
 mod curator;
 mod guards;
@@ -40,6 +41,9 @@ pub use curator::{CuratorModel, CuratorOutcome};
 pub use hermes_tools::{
     ClarifyAnswer, ClarifyOutcome, ClarifyQuestion, ClarifyRequest, ClarifyResponse, ProcessNotice,
 };
+/// The operation note on a command report (`/rollback`, `/diff`) in the chat.
+pub const COMMAND_NOTE: &str = "command";
+
 pub use ops::{EMPTY_TERMINAL_MESSAGE, SUMMARY_REQUEST, TRUNCATED_MESSAGE};
 use session::{HermesEffect, OpenSession, TurnRuntime, TurnSession};
 
@@ -186,6 +190,8 @@ pub struct Runtime {
     skills: Arc<SkillStore>,
     /// The dangerous-command policy every session shares.
     approvals: Arc<hermes_tools::approval::ApprovalStore>,
+    /// Filesystem checkpoints every session shares (Hermes: opt-in).
+    checkpoints: Arc<hermes_tools::checkpoints::Checkpoints>,
     config: RuntimeConfig,
     bridge: Arc<dyn UserBridge>,
     windows_version: String,
@@ -204,11 +210,16 @@ impl Runtime {
         let skills = SkillStore::new(config.data_dir.join("skills"), config.skills.clone());
         skills.seed_bundled();
         let approvals = Arc::new(hermes_tools::approval::ApprovalStore::new(&config.data_dir));
+        let checkpoints = Arc::new(hermes_tools::checkpoints::Checkpoints::new(
+            config.data_dir.join("checkpoints"),
+            false,
+        ));
         Ok(Self {
             store: Arc::new(store),
             memory: Arc::new(memory),
             skills: Arc::new(skills),
             approvals,
+            checkpoints,
             windows_version: windows_version(),
             config,
             bridge,
@@ -374,6 +385,7 @@ impl Runtime {
             history: Some(self.store.clone()),
             skills: Some(self.skills.clone()),
             approvals: Some(self.approvals.clone()),
+            checkpoints: Some(self.checkpoints.clone()),
         });
         let user_turns = conversation
             .messages()
@@ -774,6 +786,82 @@ impl Runtime {
             memory,
             conversation: compress::estimate_messages(open.conversation.lock().messages()),
         })
+    }
+
+    /// The filesystem checkpoints (Settings turns them on and off).
+    pub fn checkpoints(&self) -> Arc<hermes_tools::checkpoints::Checkpoints> {
+        self.checkpoints.clone()
+    }
+
+    /// Hermes's `/rollback [diff] [N] [file] [--all]`. A restore also undoes the last chat turn,
+    /// so the conversation matches the files. Returns the conversation after it, which ends with
+    /// the report.
+    pub fn rollback(&self, session_id: &str, args: &str) -> Result<Vec<Message>> {
+        let open = self.idle_session(session_id)?;
+        let cwd = PathBuf::from(&open.record.lock().cwd);
+        let home = dirs::home_dir().context("no home directory")?;
+        let outcome = commands::rollback(&self.checkpoints, &cwd, &home, args);
+        let mut report = outcome.report;
+        if outcome.restored {
+            let last_turn = open.conversation.lock().messages().iter().rposition(|m| {
+                m.role == rmcp::model::Role::User
+                    && m.is_user_visible()
+                    && !m.is_tool_response()
+                    && m.content
+                        .iter()
+                        .any(|c| matches!(c, MessageContent::Text(_)))
+            });
+            if let Some(index) = last_turn {
+                self.rewind(session_id, index)?;
+                report.push_str("\n\nChat turn undone to match restored file state.");
+            }
+        }
+        self.add_command_output(&open, "rollback", &report)
+    }
+
+    /// Hermes's `/diff [working|staged|all|session] [--stat] [path…]`. Returns the conversation
+    /// after it, which ends with the diff.
+    pub fn diff(&self, session_id: &str, args: &str) -> Result<Vec<Message>> {
+        let open = self.idle_session(session_id)?;
+        let cwd = PathBuf::from(&open.record.lock().cwd);
+        let home = dirs::home_dir().context("no home directory")?;
+        let output = commands::diff(&self.checkpoints, &cwd, &home, args);
+        self.add_command_output(&open, "diff", &output)
+    }
+
+    fn idle_session(&self, session_id: &str) -> Result<Arc<OpenSession>> {
+        let open = self.open(session_id)?;
+        anyhow::ensure!(
+            open.running.lock().is_none(),
+            "a turn is running in this session; wait for it to end"
+        );
+        Ok(open)
+    }
+
+    /// A command's report in the chat: shown to the user, never sent to the model.
+    fn add_command_output(
+        &self,
+        open: &OpenSession,
+        command: &str,
+        text: &str,
+    ) -> Result<Vec<Message>> {
+        let mut message = Message::assistant()
+            .with_text(text)
+            .with_visibility(true, false)
+            .with_generated_id_if_missing();
+        message.metadata.set_operation_note(
+            COMMAND_NOTE,
+            "command",
+            serde_json::Value::String(command.to_string()),
+        );
+        let session_id = open.record.lock().id.clone();
+        let (index, messages) = {
+            let mut conversation = open.conversation.lock();
+            conversation.push(message.clone());
+            (conversation.len() - 1, conversation.messages().clone())
+        };
+        self.store.upsert_message(&session_id, index, &message)?;
+        Ok(messages)
     }
 
     /// Hermes's `/steer`: a message for the running turn, delivered to the model right after its

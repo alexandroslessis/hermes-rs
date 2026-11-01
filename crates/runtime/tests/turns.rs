@@ -1826,3 +1826,103 @@ async fn a_subdirectory_s_agents_md_arrives_with_the_first_tool_result_there() {
     assert!(second.contains("[Subdirectory context discovered: app/AGENTS.md]"));
     assert!(second.contains("Use tabs in app/."));
 }
+
+#[tokio::test]
+async fn rollback_restores_the_files_and_undoes_the_turn() {
+    let h = harness(vec![
+        tool_reply(&[(
+            "c1",
+            "write_file",
+            json!({"path": "notes.txt", "content": "changed\n"}),
+        )]),
+        text_reply("written"),
+    ])
+    .await;
+    std::fs::write(h.work.path().join("Cargo.toml"), "[package]").unwrap();
+    h.runtime.checkpoints().set_enabled(true);
+    let session = session_in(&h);
+    run_turn(&h, &session, "change notes.txt").await;
+    assert_eq!(
+        std::fs::read_to_string(h.work.path().join("notes.txt")).unwrap(),
+        "changed\n"
+    );
+
+    let listed = h.runtime.rollback(&session, "").unwrap();
+    let report = listed.last().unwrap().as_concat_text();
+    assert!(
+        report.contains("1. ") && report.contains("before write_file"),
+        "{report}"
+    );
+    assert!(!listed.last().unwrap().is_agent_visible());
+
+    let preview = h.runtime.rollback(&session, "diff 1").unwrap();
+    assert!(
+        preview
+            .last()
+            .unwrap()
+            .as_concat_text()
+            .contains("+changed")
+    );
+
+    let after = h.runtime.rollback(&session, "1").unwrap();
+    let report = after.last().unwrap().as_concat_text();
+    assert!(report.contains("✅ Restored to checkpoint"), "{report}");
+    assert!(report.contains("Chat turn undone"));
+    // The file the turn created is gone again.
+    assert!(!h.work.path().join("notes.txt").exists());
+    // Only the reports remain: the turn that wrote the file is gone.
+    assert!(
+        after
+            .iter()
+            .all(|m| m.as_concat_text() != "change notes.txt")
+    );
+}
+
+#[tokio::test]
+async fn rollback_without_checkpoints_says_how_to_enable_them() {
+    let h = harness(vec![]).await;
+    let session = session_in(&h);
+    let messages = h.runtime.rollback(&session, "").unwrap();
+    assert!(messages[0].as_concat_text().contains("not enabled"));
+}
+
+#[tokio::test]
+async fn diff_shows_git_changes_and_new_files() {
+    let h = harness(vec![]).await;
+    let session = session_in(&h);
+    let messages = h.runtime.diff(&session, "").unwrap();
+    assert_eq!(messages[0].as_concat_text(), "Not a git repository.");
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(h.work.path())
+            .output()
+            .unwrap()
+    };
+    git(&["init", "-q"]);
+    std::fs::write(h.work.path().join("a.txt"), "one\n").unwrap();
+    git(&["add", "a.txt"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "init",
+    ]);
+    std::fs::write(h.work.path().join("a.txt"), "two\n").unwrap();
+    std::fs::write(h.work.path().join("b.txt"), "new\n").unwrap();
+    let text = h
+        .runtime
+        .diff(&session, "")
+        .unwrap()
+        .last()
+        .unwrap()
+        .as_concat_text();
+    assert!(
+        text.contains("Unstaged:") && text.contains("+two"),
+        "{text}"
+    );
+    assert!(text.contains("+ b.txt") && text.contains("+new"), "{text}");
+}

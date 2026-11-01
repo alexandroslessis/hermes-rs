@@ -414,6 +414,22 @@ M5 part 3 status (2026-11-01): `@` references and subdirectory hints, done.
 - Not yet: `@url:` (needs web extract, later in M5), plugin reference providers, the context-file
   threat scan (not ported for startup context files either).
 
+M5 part 4 status (2026-11-01): checkpoints, `/rollback`, `/diff`, done.
+- `crates/tools/src/checkpoints.rs`: Hermes's v2 checkpoint store. One bare shadow repository
+  under `<data>/checkpoints/store` with a ref, an index and a ledger per project, git isolated
+  from user/system config (no signing, hooks, prompts, console windows), the default excludes, a
+  10 MB per-file cap, 50k-file and 20-snapshot limits (history rewritten onto fresh parents).
+  Before the first `write_file`/`patch` of a turn in a project (nearest marker folder below
+  home), or a destructive terminal command (Hermes's pattern plus PowerShell/cmd verbs), the
+  project is snapshotted. The agent-write ledger lets a restore keep hand edits; a pre-rollback
+  snapshot is taken first.
+- `/rollback` (list, `diff N`, `N [file] [--all]`, hash prefixes) and `/diff [working|staged|
+  all|session] [--stat] [path…]` (untracked files as additions) report in the chat as messages
+  the model never sees; a restore undoes the last chat turn like Hermes. Settings → Safety →
+  Checkpoints turns them on (off by default, as in Hermes).
+- Not ported: the store-wide size cap and periodic gc/prune, legacy-store migration, nested
+  repository handling, the cross-project listing, `/snapshot`.
+
 **M6: Polish.** Command palette (Tier 2 `picker`), find in transcript, themes and fonts, diff
 review pane, import from `~/.hermes`, installer (MSI), auto-update.
 

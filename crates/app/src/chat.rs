@@ -476,6 +476,33 @@ impl ChatView {
         let backend = backend(cx);
         // Hermes's `/refine [focus]` reviews the conversation in the background instead of
         // starting a turn; `/learn <request>` starts one with the learn prompt.
+        // Hermes's `/rollback` and `/diff` report in the chat instead of starting a turn.
+        let local = text.as_deref().and_then(|t| {
+            command_arg(t, "rollback")
+                .map(|args| ("rollback", args))
+                .or_else(|| command_arg(t, "diff").map(|args| ("diff", args)))
+        });
+        if let Some((command, args)) = local {
+            let runtime = backend.runtime.clone();
+            let result = if command == "rollback" {
+                runtime.rollback(&self.session_id, args)
+            } else {
+                runtime.diff(&self.session_id, args)
+            };
+            match result {
+                Ok(messages) => {
+                    self.conversation = Conversation::new_unvalidated(messages);
+                    self.error = None;
+                    self.rebuild_entries();
+                    self.list_state.reset(self.list_len());
+                    self.list_state.scroll_to_end();
+                    cx.emit(ChatEvent::Updated);
+                }
+                Err(error) => self.error = Some(format!("{error:#}")),
+            }
+            cx.notify();
+            return;
+        }
         if let Some(focus) = text.as_deref().and_then(|t| command_arg(t, "refine")) {
             let focus = (!focus.is_empty()).then(|| focus.to_string());
             let started = {
@@ -1059,9 +1086,12 @@ impl ChatView {
         // A compaction notice is neither: it closes the turn before it like a user message.
         let turn_end = message.role == Role::Assistant
             && compaction.is_none()
+            && !is_command_output(&message)
             && self.entries.get(index + 1).is_none_or(|&next| {
                 let next = &self.conversation.messages()[next];
-                next.role == Role::User || hermes_runtime::compress::notice(next).is_some()
+                next.role == Role::User
+                    || hermes_runtime::compress::notice(next).is_some()
+                    || is_command_output(next)
             })
             && !(is_last && self.running.is_some());
         let content = if turn_end {
@@ -3117,6 +3147,14 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
         "compress",
         "Compress the conversation context now (optional focus topic)",
     ),
+    (
+        "rollback",
+        "List file checkpoints; /rollback N restores one, /rollback diff N previews",
+    ),
+    (
+        "diff",
+        "Show git changes: working, staged, all, or session (since the first checkpoint)",
+    ),
 ];
 
 /// A user message as the user wrote it: the typed text of one whose `@` references were
@@ -3162,3 +3200,11 @@ const MENTION_KINDS: &[(&str, &str)] = &[
     ),
     ("@url:", "Attach a web page (not available yet)"),
 ];
+
+/// A `/rollback` or `/diff` report: shown like a reply, but no turn ends with it.
+fn is_command_output(message: &Message) -> bool {
+    message
+        .metadata
+        .operation_note(hermes_runtime::COMMAND_NOTE, "command")
+        .is_some()
+}

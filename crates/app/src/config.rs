@@ -63,6 +63,10 @@ pub struct AppConfig {
     /// manual when on, off when off). Hardline commands never run either way.
     #[serde(default = "default_true")]
     pub ask_dangerous_commands: bool,
+    /// Snapshot files before Hermes changes them, for `/rollback` (Hermes's `checkpoints.enabled`,
+    /// off by default).
+    #[serde(default)]
+    pub checkpoints: bool,
     /// Let the curator merge overlapping agent-written skills with the model (Hermes's
     /// `curator.consolidate`, off by default; the idle-skill archiving always runs).
     #[serde(default)]
@@ -105,6 +109,7 @@ impl Default for AppConfig {
             background_review: true,
             curator_consolidate: false,
             ask_dangerous_commands: true,
+            checkpoints: false,
             sidebar_width: None,
         }
     }

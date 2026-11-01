@@ -301,6 +301,7 @@ mod tests {
             history: None,
             skills: Some(skills.clone()),
             approvals: None,
+            checkpoints: None,
         });
         (
             dir,

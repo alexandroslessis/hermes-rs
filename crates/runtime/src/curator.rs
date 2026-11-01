@@ -141,6 +141,7 @@ impl Runtime {
             history: None,
             skills: Some(self.skills.clone()),
             approvals: None,
+            checkpoints: None,
         }));
         let system_prompt = self.system_prompt_with(
             &model.provider.id,

@@ -326,6 +326,7 @@ impl SettingsView {
     /// Hermes's command approvals: whether to ask, and the patterns always allowed.
     fn render_safety(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ask = AppState::global(cx).read(cx).config.ask_dangerous_commands;
+        let checkpoints = AppState::global(cx).read(cx).config.checkpoints;
         let always = backend(cx).runtime.approvals().always_allowed();
         let colors = cx.theme().colors();
         let (border, background) = (colors.border_variant, colors.editor_background);
@@ -350,6 +351,28 @@ impl SettingsView {
                                     state.save(cx);
                                 });
                                 backend(cx).runtime.approvals().set_ask(ask);
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_start()
+                    .gap_4()
+                    .child(Self::section(
+                        "Checkpoints",
+                        Some("Before Hermes first changes a project's files in a turn (writes, patches, deleting or moving commands), the project is snapshotted to a private store; its own .git is never touched. /rollback lists and restores snapshots, /diff session shows everything changed since the first."),
+                    ))
+                    .child(
+                        Switch::new("checkpoints", checkpoints.into())
+                            .label("Take checkpoints")
+                            .on_click(cx.listener(|_, state: &ToggleState, _, cx| {
+                                let enabled = *state == ToggleState::Selected;
+                                AppState::global(cx).update(cx, |state, cx| {
+                                    state.config.checkpoints = enabled;
+                                    state.save(cx);
+                                });
+                                backend(cx).runtime.checkpoints().set_enabled(enabled);
                             })),
                     ),
             )
