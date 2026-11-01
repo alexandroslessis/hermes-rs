@@ -16,6 +16,9 @@ use crate::model_picker::{ModelPicker, provider_icon};
 use crate::state::{AppState, provider_ready};
 use crate::text_area::{TextArea, TextAreaEvent};
 
+/// The MCP editor's placeholder: one local and one remote server.
+const MCP_EXAMPLE: &str = r#"{"time": {"command": "uvx", "args": ["mcp-server-time"]}, "remote": {"url": "https://example.com/mcp", "headers": {"Authorization": "Bearer ..."}}}"#;
+
 /// The add/edit provider dialog.
 struct ProviderForm {
     /// The provider being edited; `None` adds a new one.
@@ -32,6 +35,11 @@ pub struct SettingsView {
     picker: Entity<ModelPicker>,
     form: Option<ProviderForm>,
     scroll: gpui::ScrollHandle,
+    /// The MCP servers JSON being edited, and why the last save was refused.
+    mcp_editor: Option<Entity<TextArea>>,
+    mcp_error: Option<String>,
+    /// Re-renders while a server is still connecting.
+    mcp_poll: Option<gpui::Task<()>>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -63,6 +71,9 @@ impl SettingsView {
             picker,
             form: None,
             scroll: gpui::ScrollHandle::new(),
+            mcp_editor: None,
+            mcp_error: None,
+            mcp_poll: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
@@ -324,6 +335,229 @@ impl SettingsView {
     }
 
     /// Hermes's command approvals: whether to ask, and the patterns always allowed.
+    /// Applies MCP servers: saved to the settings and (re)connected.
+    fn apply_mcp(
+        servers: std::collections::BTreeMap<String, hermes_runtime::mcp::McpServerConfig>,
+        cx: &mut App,
+    ) {
+        AppState::global(cx).update(cx, |state, cx| {
+            state.config.mcp_servers = servers.clone();
+            state.save(cx);
+        });
+        let backend = backend(cx);
+        let _guard = backend.tokio.enter();
+        backend.runtime.mcp().configure(servers);
+    }
+
+    /// Hermes's `mcp_servers`: each server's state, an enable switch and Retry, and an editor for
+    /// the JSON (the shape Claude Desktop and Cursor use pastes in as is).
+    fn render_mcp(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        use hermes_runtime::mcp::ServerStatus;
+        let servers = AppState::global(cx).read(cx).config.mcp_servers.clone();
+        let statuses: std::collections::HashMap<String, ServerStatus> =
+            backend(cx).runtime.mcp().statuses().into_iter().collect();
+        if self.mcp_poll.is_none() && statuses.values().any(|s| *s == ServerStatus::Connecting) {
+            self.mcp_poll = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(700))
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.mcp_poll = None;
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
+        let colors = cx.theme().colors();
+        let editor = self.mcp_editor.clone();
+        let editing = editor.is_some();
+        v_flex()
+            .gap_3()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_start()
+                    .gap_4()
+                    .child(Self::section(
+                        "MCP Servers",
+                        Some("Tools from Model Context Protocol servers, offered to the agent as mcp__<server>__<tool>. A server is a local command (stdio) or a URL (Streamable HTTP)."),
+                    ))
+                    .when(!editing, |this| {
+                        this.child(
+                            Button::new("edit-mcp", "Edit Servers")
+                                .style(ButtonStyle::Outlined)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let servers =
+                                        AppState::global(cx).read(cx).config.mcp_servers.clone();
+                                    let text = if servers.is_empty() {
+                                        String::new()
+                                    } else {
+                                        serde_json::to_string_pretty(&servers).unwrap_or_default()
+                                    };
+                                    let editor = cx.new(|cx| {
+                                        let mut area = TextArea::new(MCP_EXAMPLE, cx).editor(16);
+                                        area.set_text(text, cx);
+                                        area
+                                    });
+                                    editor.focus_handle(cx).focus(window, cx);
+                                    this.mcp_editor = Some(editor);
+                                    this.mcp_error = None;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .when_some(editor, |this, editor| {
+                this.child(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .p_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(colors.border)
+                                .bg(colors.editor_background)
+                                .text_sm()
+                                .child(editor.clone()),
+                        )
+                        .when_some(self.mcp_error.clone(), |this, error| {
+                            this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+                        })
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(Button::new("cancel-mcp", "Cancel").on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.mcp_editor = None;
+                                        this.mcp_error = None;
+                                        cx.notify();
+                                    },
+                                )))
+                                .child(
+                                    Button::new("save-mcp", "Save")
+                                        .style(ButtonStyle::Filled)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let text = editor.read(cx).text().trim().to_string();
+                                            let text = if text.is_empty() {
+                                                "{}".to_string()
+                                            } else {
+                                                text
+                                            };
+                                            match hermes_runtime::mcp::parse_servers(&text) {
+                                                Ok(servers) => {
+                                                    Self::apply_mcp(servers, cx);
+                                                    this.mcp_editor = None;
+                                                    this.mcp_error = None;
+                                                }
+                                                Err(error) => this.mcp_error = Some(error),
+                                            }
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                )
+            })
+            .when(servers.is_empty() && !editing, |this| {
+                this.child(
+                    Label::new(
+                        "No MCP servers yet. Edit Servers to add one; a config from another app can be pasted in as is.",
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+            })
+            .children(servers.into_iter().map(|(name, server)| {
+                let status = statuses
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or(ServerStatus::Disabled);
+                let (status_text, status_color) = match &status {
+                    ServerStatus::Disabled => ("Off".to_string(), Color::Muted),
+                    ServerStatus::Connecting => ("Connecting…".to_string(), Color::Muted),
+                    ServerStatus::Connected { tools } => (
+                        format!(
+                            "Connected · {tools} tool{}",
+                            if *tools == 1 { "" } else { "s" }
+                        ),
+                        Color::Success,
+                    ),
+                    ServerStatus::Failed(error) => (format!("Failed: {error}"), Color::Error),
+                };
+                let target = match (&server.url, &server.command) {
+                    (Some(url), _) => url.clone(),
+                    (None, Some(command)) => std::iter::once(command.clone())
+                        .chain(server.args.iter().cloned())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    (None, None) => String::new(),
+                };
+                let toggle_name = name.clone();
+                let retry_name = name.clone();
+                let failed = matches!(status, ServerStatus::Failed(_));
+                h_flex()
+                    .gap_3()
+                    .justify_between()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(Label::new(name.clone()))
+                            .child(
+                                Label::new(target)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                            .child(
+                                Label::new(status_text)
+                                    .size(LabelSize::Small)
+                                    .color(status_color)
+                                    .truncate(),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_none()
+                            .when(failed, |this| {
+                                this.child(
+                                    Button::new(
+                                        SharedString::from(format!("retry-mcp-{name}")),
+                                        "Retry",
+                                    )
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(move |_, _, cx| {
+                                        let backend = backend(cx);
+                                        let _guard = backend.tokio.enter();
+                                        backend.runtime.mcp().reconnect(&retry_name);
+                                    }),
+                                )
+                            })
+                            .child(
+                                Switch::new(
+                                    SharedString::from(format!("mcp-{name}")),
+                                    server.enabled.into(),
+                                )
+                                .on_click(cx.listener(
+                                    move |_, state: &ToggleState, _, cx| {
+                                        let mut servers = AppState::global(cx)
+                                            .read(cx)
+                                            .config
+                                            .mcp_servers
+                                            .clone();
+                                        if let Some(server) = servers.get_mut(&toggle_name) {
+                                            server.enabled = *state == ToggleState::Selected;
+                                        }
+                                        Self::apply_mcp(servers, cx);
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    )
+            }))
+    }
+
     fn render_safety(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ask = AppState::global(cx).read(cx).config.ask_dangerous_commands;
         let checkpoints = AppState::global(cx).read(cx).config.checkpoints;
@@ -759,6 +993,8 @@ impl Render for SettingsView {
             .child(self.render_learning(cx))
             .child(Divider::horizontal())
             .child(self.render_safety(cx))
+            .child(Divider::horizontal())
+            .child(self.render_mcp(cx))
             .child(Divider::horizontal())
             .child(
                 v_flex()

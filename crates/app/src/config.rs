@@ -67,6 +67,9 @@ pub struct AppConfig {
     /// off by default).
     #[serde(default)]
     pub checkpoints: bool,
+    /// Hermes's `mcp_servers`: the MCP servers whose tools the agent gets.
+    #[serde(default)]
+    pub mcp_servers: std::collections::BTreeMap<String, hermes_runtime::mcp::McpServerConfig>,
     /// Let the curator merge overlapping agent-written skills with the model (Hermes's
     /// `curator.consolidate`, off by default; the idle-skill archiving always runs).
     #[serde(default)]
@@ -110,6 +113,7 @@ impl Default for AppConfig {
             curator_consolidate: false,
             ask_dangerous_commands: true,
             checkpoints: false,
+            mcp_servers: Default::default(),
             sidebar_width: None,
         }
     }

@@ -78,6 +78,8 @@ pub struct Delegator {
     pub supports_vision: bool,
     pub base_prompt: BasePrompt,
     pub child_tools: ChildTools,
+    /// MCP servers' tools, offered to the parent and (as in Hermes) inherited by children.
+    pub mcp: Arc<crate::mcp::McpManager>,
 }
 
 /// The parent's tools plus `delegate_task`.
@@ -89,7 +91,9 @@ pub struct DelegatingTools {
 #[async_trait]
 impl ToolProvider<TurnSession> for DelegatingTools {
     async fn tools(&self, session: &TurnSession) -> Result<Vec<Tool>> {
-        self.inner.tools(session).await
+        let mut tools = self.inner.tools(session).await?;
+        tools.extend(self.delegator.mcp.tools());
+        Ok(tools)
     }
 
     async fn call(
@@ -99,6 +103,10 @@ impl ToolProvider<TurnSession> for DelegatingTools {
         call: CallToolRequestParams,
         emit: &Emitter,
     ) -> Result<CallToolResult, ErrorData> {
+        if call.name.starts_with("mcp__") {
+            let arguments = call.arguments.unwrap_or_default();
+            return Ok(self.delegator.mcp.call(&call.name, arguments).await);
+        }
         if call.name != "delegate_task" {
             return self.inner.call(session, request_id, call, emit).await;
         }
@@ -117,6 +125,7 @@ impl ToolProvider<TurnSession> for DelegatingTools {
 /// A child's tools: the session's own, minus the ones subagents can't use.
 struct ChildToolProvider {
     inner: Arc<SessionTools>,
+    mcp: Arc<crate::mcp::McpManager>,
 }
 
 #[async_trait]
@@ -126,6 +135,7 @@ impl ToolProvider<TurnSession> for ChildToolProvider {
         Ok(tools
             .into_iter()
             .filter(|tool| !BLOCKED_TOOLS.contains(&tool.name.as_ref()))
+            .chain(self.mcp.tools())
             .collect())
     }
 
@@ -136,6 +146,10 @@ impl ToolProvider<TurnSession> for ChildToolProvider {
         call: CallToolRequestParams,
         emit: &Emitter,
     ) -> Result<CallToolResult, ErrorData> {
+        if call.name.starts_with("mcp__") {
+            let arguments = call.arguments.unwrap_or_default();
+            return Ok(self.mcp.call(&call.name, arguments).await);
+        }
         if BLOCKED_TOOLS.contains(&call.name.as_ref()) {
             let text = json!({"success": false, "error": format!("{} is not available to subagents.", call.name)});
             return Ok(CallToolResult::error(vec![ContentBlock::text(
@@ -362,10 +376,12 @@ impl Delegator {
             .into_iter()
             .filter(|name| !BLOCKED_TOOLS.contains(name))
             .map(str::to_string)
+            .chain(self.mcp.tool_names())
             .collect();
         let provider: Arc<dyn ToolProvider<TurnSession>> = Arc::new(ops::GuardedTools {
             inner: Arc::new(ChildToolProvider {
                 inner: tools.clone(),
+                mcp: self.mcp.clone(),
             }),
             scratch_dir: scratch.clone(),
             state: state.clone(),

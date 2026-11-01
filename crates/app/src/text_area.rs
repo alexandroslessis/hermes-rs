@@ -160,6 +160,8 @@ pub struct TextArea {
     goal_x: Option<Pixels>,
     scroll_top: Pixels,
     max_lines: usize,
+    /// Enter inserts a newline instead of submitting (a document editor).
+    enter_is_newline: bool,
     /// Zed's cursor blink: whether the caret shows this half-period, the running blink's
     /// generation (a newer one stops older timers), and where the caret was last frame.
     cursor_visible: bool,
@@ -188,6 +190,7 @@ impl TextArea {
             goal_x: None,
             scroll_top: px(0.),
             max_lines: 12,
+            enter_is_newline: false,
             cursor_visible: true,
             blink_epoch: 0,
             blinking: false,
@@ -260,6 +263,13 @@ impl TextArea {
     /// A one-line field: Enter submits, long text scrolls instead of growing.
     pub fn single_line(mut self) -> Self {
         self.max_lines = 1;
+        self
+    }
+
+    /// A text editor: Enter starts a new line, up to `lines` visible lines before scrolling.
+    pub fn editor(mut self, lines: usize) -> Self {
+        self.max_lines = lines;
+        self.enter_is_newline = true;
         self
     }
 
@@ -517,7 +527,17 @@ impl TextArea {
         self.replace(self.selected_range.clone(), "\n", window, cx);
     }
 
-    fn submit(&mut self, _: &Submit, _window: &mut Window, cx: &mut Context<Self>) {
+    fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.enter_is_newline {
+            self.replace(
+                self.selected_range.clone(),
+                "
+",
+                window,
+                cx,
+            );
+            return;
+        }
         cx.emit(TextAreaEvent::Submit);
     }
 

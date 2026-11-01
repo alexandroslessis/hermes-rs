@@ -2294,3 +2294,168 @@ async fn live_delegate_task_counts_files_in_a_subagent() {
     let answer = messages.last().unwrap().as_concat_text();
     assert!(delegated && answer.contains('3'), "{answer}");
 }
+
+/// A one-tool MCP server (`add`), served over an in-memory pipe.
+#[derive(Clone)]
+struct Calculator;
+
+impl rmcp::ServerHandler for Calculator {
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let schema = json!({"type": "object", "properties": {
+            "a": {"type": "number"}, "b": {"type": "number"}}, "required": ["a", "b"]});
+        let Value::Object(schema) = schema else {
+            unreachable!()
+        };
+        Ok(rmcp::model::ListToolsResult::with_all_items(vec![
+            rmcp::model::Tool::new("add", "Add two numbers", Arc::new(schema)),
+        ]))
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let args = request.arguments.unwrap_or_default();
+        let sum = args["a"].as_f64().unwrap_or(0.0) + args["b"].as_f64().unwrap_or(0.0);
+        Ok(
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                sum.to_string(),
+            )])
+            .into(),
+        )
+    }
+}
+
+#[tokio::test]
+async fn mcp_tools_are_offered_and_called() {
+    use rmcp::ServiceExt as _;
+    let h = harness(vec![
+        tool_reply(&[("m1", "mcp__calc__add", json!({"a": 2, "b": 3}))]),
+        text_reply("5"),
+    ])
+    .await;
+    let (client_write, server_read) = tokio::io::duplex(64 * 1024);
+    let (server_write, client_read) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let running = Calculator.serve((server_read, server_write)).await.unwrap();
+        let _ = running.waiting().await;
+    });
+    h.runtime
+        .mcp()
+        .connect_transport("calc", (client_read, client_write))
+        .await
+        .unwrap();
+    assert_eq!(h.runtime.mcp().tool_names(), ["mcp__calc__add"]);
+    let session = session_in(&h);
+    run_turn(&h, &session, "add 2 and 3").await;
+    let requests = h.requests.lock().clone();
+    assert!(requests[0]["tools"].to_string().contains("mcp__calc__add"));
+    let second = requests[1].to_string();
+    assert!(second.contains(r#"{\"result\":\"5\"}"#), "{second}");
+}
+
+/// MCP over stdio with a real model. Build the server first:
+/// `cargo build -p hermes_runtime --example mcp_calculator`, then
+/// `HERMES_LIVE_BASE_URL=http://localhost:11434/v1 HERMES_LIVE_MODEL=<model> cargo test -p hermes_runtime --test turns live_mcp -- --ignored --nocapture`
+#[tokio::test]
+#[ignore]
+async fn live_mcp_stdio_server_is_used_by_a_real_model() {
+    let (Ok(base_url), Ok(model)) = (
+        std::env::var("HERMES_LIVE_BASE_URL"),
+        std::env::var("HERMES_LIVE_MODEL"),
+    ) else {
+        panic!("set HERMES_LIVE_BASE_URL and HERMES_LIVE_MODEL");
+    };
+    let server = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/examples/mcp_calculator.exe");
+    assert!(server.exists(), "build the mcp_calculator example first");
+    let data = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let runtime = runtime_in(data.path());
+    let servers = hermes_runtime::mcp::parse_servers(
+        &json!({"calc": {"command": server.display().to_string()}}).to_string(),
+    )
+    .unwrap();
+    runtime.mcp().configure(servers);
+    for _ in 0..100 {
+        if !runtime.mcp().tool_names().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    println!("status: {:?}", runtime.mcp().statuses());
+    assert_eq!(runtime.mcp().tool_names(), ["mcp__calc__add"]);
+    let provider = ProviderConfig {
+        id: "live".into(),
+        base_url,
+        api_key: None,
+    };
+    let options = TurnOptions {
+        context_length: Some(32_768),
+        effort: None,
+        supports_vision: false,
+    };
+    let session = runtime
+        .create_session(&provider, &model, Some(32_768), work.path())
+        .unwrap();
+    let turn = runtime
+        .start_turn(
+            &session.id,
+            &provider,
+            options,
+            "Use the calculator tool to add 1234.5 and 4321.25, then tell me the result.",
+        )
+        .unwrap();
+    let events = {
+        let mut turn = turn;
+        let mut events = Vec::new();
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(600), turn.events.recv())
+            .await
+            .unwrap()
+        {
+            let done = matches!(event, RuntimeEvent::TurnFinished(_));
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        events
+    };
+    println!("turn: {:?}", finished_status(&events));
+    let messages = runtime.messages(&session.id).unwrap();
+    for message in &messages {
+        println!(
+            "{:?}: {}",
+            message.role,
+            message
+                .as_concat_text()
+                .chars()
+                .take(300)
+                .collect::<String>()
+        );
+    }
+    let called = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|c| c.as_tool_request())
+        .any(|r| {
+            r.tool_call
+                .as_ref()
+                .is_ok_and(|c| c.name == "mcp__calc__add")
+        });
+    let answer = messages.last().unwrap().as_concat_text();
+    assert!(called && answer.contains("5555.75"), "{answer}");
+}

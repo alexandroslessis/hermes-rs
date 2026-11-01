@@ -6,6 +6,7 @@ pub mod compress;
 mod curator;
 mod delegate;
 mod guards;
+pub mod mcp;
 mod ops;
 mod review;
 mod session;
@@ -198,6 +199,8 @@ pub struct Runtime {
     checkpoints: Arc<hermes_tools::checkpoints::Checkpoints>,
     /// The web tools every session shares.
     web: Arc<hermes_tools::web::Web>,
+    /// The configured MCP servers (Settings), shared by every session.
+    mcp: Arc<mcp::McpManager>,
     config: RuntimeConfig,
     bridge: Arc<dyn UserBridge>,
     windows_version: String,
@@ -226,6 +229,7 @@ impl Runtime {
             skills: Arc::new(skills),
             approvals,
             checkpoints,
+            mcp: Arc::default(),
             web: Arc::new(hermes_tools::web::Web::new(hermes_tools::web::cache_dir(
                 &config.data_dir,
             ))),
@@ -642,8 +646,10 @@ impl Runtime {
             supports_vision,
             base_prompt: self.child_base_prompt(&open, context_length),
             child_tools: self.child_tools(),
+            mcp: self.mcp.clone(),
         });
         let summarizer_llm = llm.clone();
+        let self_mcp = self.mcp.clone();
         *self.last_activity.lock() = std::time::Instant::now();
         let last_activity = self.last_activity.clone();
 
@@ -708,6 +714,7 @@ impl Runtime {
             let tool_names: Vec<String> = SessionTools::tool_names()
                 .into_iter()
                 .map(str::to_string)
+                .chain(self_mcp.tool_names())
                 .collect();
             let tools: Arc<dyn ToolProvider<TurnSession>> = Arc::new(ops::GuardedTools {
                 inner: Arc::new(delegate::DelegatingTools {
@@ -926,6 +933,11 @@ impl Runtime {
             memory,
             conversation: compress::estimate_messages(open.conversation.lock().messages()),
         })
+    }
+
+    /// The MCP servers (Settings configures them; their tools join every turn).
+    pub fn mcp(&self) -> Arc<mcp::McpManager> {
+        self.mcp.clone()
     }
 
     /// The filesystem checkpoints (Settings turns them on and off).

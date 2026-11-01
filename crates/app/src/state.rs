@@ -53,6 +53,11 @@ impl AppState {
             .runtime
             .checkpoints()
             .set_enabled(config.checkpoints);
+        {
+            let backend = backend(cx);
+            let _guard = backend.tokio.enter();
+            backend.runtime.mcp().configure(config.mcp_servers.clone());
+        }
         let registry = theme::ThemeRegistry::global(cx);
         hermes_themes::load_bundled_themes(&registry);
         let name = config.theme.as_deref().unwrap_or(theme::DEFAULT_DARK_THEME);

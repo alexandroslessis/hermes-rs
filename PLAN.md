@@ -487,6 +487,24 @@ M5 part 7 status (2026-11-01): delegation, done.
   orchestrator role), `output_schema` validation, child images, a separate delegation
   model/provider, child session persistence and live transcripts, summary spill files.
 
+M5 part 8 status (2026-11-01): MCP, done.
+- `crates/runtime/src/mcp.rs`: Hermes's `mcp_servers` (command/args/env/cwd for stdio, url/headers
+  for Streamable HTTP, enabled, timeout 300 s, connect_timeout 60 s, tools.include/exclude) on the
+  rmcp client. Servers connect in the background; Windows command lookup (`npx` → `npx.cmd` via
+  `cmd /c`) without console windows. Tools are offered as Hermes's `mcp__<server>__<tool>` (64-char
+  clamp with a stable hash), with object-normalized schemas; results render as Hermes's
+  `{"result": …}` / `{"error": …}`, `structuredContent` kept unless the text duplicates it, images
+  passed through for vision models. Subagents inherit MCP tools (Hermes's default).
+- Settings → MCP Servers: each server's state (connecting, connected · N tools, failed with the
+  error, off), an enable switch, Retry, and a JSON editor that also takes a pasted
+  `{"mcpServers": {…}}` from other apps. The text area gained an editor mode (Enter = newline).
+- `examples/mcp_calculator.rs`: a one-tool stdio server for trying it. Live-checked with Ollama
+  `qwen3.5:9b` (`live_mcp_stdio_server_is_used_by_a_real_model`): the server connected over stdio,
+  the model called `mcp__calc__add` and answered 5555.75.
+- Not ported: OAuth, SSE transport, the resource/prompt utility tools, sampling and elicitation,
+  trust gates and cost policies for untrusted servers, the OSV malware preflight, health checks
+  and automatic reconnect, the schema cache, server-sent tool-list updates.
+
 **M6: Polish.** Command palette (Tier 2 `picker`), find in transcript, themes and fonts, diff
 review pane, import from `~/.hermes`, installer (MSI), auto-update.
 
