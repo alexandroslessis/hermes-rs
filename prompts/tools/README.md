@@ -17,3 +17,4 @@ Hermes wording for it.
 | `process_manage` | No `handoff` (subagents arrive later); no cross-conversation result retention. |
 | `web_search` | "configured backend" → "search backend" (the keyless tier only, no backend choice yet). |
 | `web_extract` | "use a browser tool instead" → "say so rather than guessing" (no browser tools). |
+| `vision_analyze` | none (native path only: on a model without vision the tool says so instead of using an auxiliary vision model). |

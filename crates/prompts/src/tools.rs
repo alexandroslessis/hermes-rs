@@ -59,6 +59,10 @@ const SCHEMAS: &[(&str, &str)] = &[
         "web_extract",
         include_str!("../../../prompts/tools/web_extract.json"),
     ),
+    (
+        "vision_analyze",
+        include_str!("../../../prompts/tools/vision_analyze.json"),
+    ),
 ];
 
 /// A tool definition as stored: name, description and JSON-schema parameters.

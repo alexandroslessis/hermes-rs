@@ -150,6 +150,7 @@ async fn main() -> Result<()> {
         hermes_runtime::TurnOptions {
             context_length,
             effort: std::env::var("HERMES_EFFORT").ok(),
+            supports_vision: std::env::var("HERMES_VISION").is_ok(),
         },
         &prompt,
     )?;

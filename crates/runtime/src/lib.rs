@@ -96,6 +96,9 @@ pub struct TurnOptions {
     /// Reasoning effort for thinking models: `none`, `minimal`, `low`, `medium`, `high` or
     /// `xhigh`. `None` sends nothing and leaves the provider's default (Hermes: unset stays unset).
     pub effort: Option<String>,
+    /// The model accepts images (its discovered input modalities): attached images and
+    /// `vision_analyze` results are sent to it.
+    pub supports_vision: bool,
 }
 
 /// The request field that carries reasoning effort: OpenRouter normalizes it as
@@ -467,7 +470,19 @@ impl Runtime {
         options: TurnOptions,
         text: &str,
     ) -> Result<Turn> {
-        self.begin_turn(session_id, provider, options, Some(text))
+        self.begin_turn(session_id, provider, options, Some(text), Vec::new())
+    }
+
+    /// [`Self::start_turn`] with images the user attached (raw file bytes, any common format).
+    pub fn start_turn_with_images(
+        &self,
+        session_id: &str,
+        provider: &ProviderConfig,
+        options: TurnOptions,
+        text: &str,
+        images: Vec<Vec<u8>>,
+    ) -> Result<Turn> {
+        self.begin_turn(session_id, provider, options, Some(text), images)
     }
 
     /// Hermes's `/retry`: drops the provider error that ended the last turn and runs the agent
@@ -478,7 +493,7 @@ impl Runtime {
         provider: &ProviderConfig,
         options: TurnOptions,
     ) -> Result<Turn> {
-        self.begin_turn(session_id, provider, options, None)
+        self.begin_turn(session_id, provider, options, None, Vec::new())
     }
 
     fn begin_turn(
@@ -487,10 +502,12 @@ impl Runtime {
         provider: &ProviderConfig,
         options: TurnOptions,
         text: Option<&str>,
+        images: Vec<Vec<u8>>,
     ) -> Result<Turn> {
         let TurnOptions {
             context_length,
             effort,
+            supports_vision,
         } = options;
         let effort_params = effort
             .as_deref()
@@ -516,6 +533,7 @@ impl Runtime {
         let state: ops::SharedTurnState = Arc::default();
         *open.turn_state.lock() = Some(state.clone());
         open.tools.begin_turn();
+        open.tools.set_vision(supports_vision);
         let runtime = TurnRuntime {
             session: open.clone(),
             store: self.store.clone(),
@@ -538,20 +556,19 @@ impl Runtime {
             effort_params: effort_params.clone(),
             enabled: self.background_review.clone(),
         };
-        // A message with `@url:` references is added once its pages are fetched, in the turn's
-        // task (fetching can take seconds).
+        // A message with `@url:` references or images is added once its pages are fetched and
+        // its images prepared, in the turn's task (that can take seconds).
         let deferred = text
-            .filter(|t| !hermes_tools::references::url_targets(t).is_empty())
-            .map(str::to_string);
+            .filter(|t| !images.is_empty() || !hermes_tools::references::url_targets(t).is_empty())
+            .map(|t| (t.to_string(), images));
         let first_event = match text {
             Some(_) if deferred.is_some() => Ok(None),
-            Some(text) => {
-                user_message(&open, text, context_length, &Default::default()).and_then(|user| {
+            Some(text) => user_message(&open, text, context_length, &Default::default(), &[])
+                .and_then(|user| {
                     runtime
                         .append(user.clone())
                         .map(|()| Some(AgentEvent::Message(user)))
-                })
-            }
+                }),
             None => runtime
                 .drop_trailing_errors()
                 .and_then(|conversation| conversation.context("there is no failed turn to retry"))
@@ -579,7 +596,12 @@ impl Runtime {
         let session_id = session_id.to_string();
         let turn_cancel = cancel.clone();
         tokio::spawn(async move {
-            if let Some(text) = deferred {
+            if let Some((text, images)) = deferred {
+                let session = runtime.session.clone();
+                let attachments =
+                    tokio::task::spawn_blocking(move || attach_images(&session, images))
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")));
                 let mut pages = hermes_tools::references::FetchedPages::new();
                 for url in hermes_tools::references::url_targets(&text) {
                     let page = tokio::select! {
@@ -588,7 +610,16 @@ impl Runtime {
                     };
                     pages.insert(url, page);
                 }
-                let added = user_message(&runtime.session, &text, context_length, &pages)
+                let added = attachments
+                    .and_then(|attachments| {
+                        user_message(
+                            &runtime.session,
+                            &text,
+                            context_length,
+                            &pages,
+                            &attachments,
+                        )
+                    })
                     .and_then(|user| runtime.append(user.clone()).map(|()| user));
                 match added {
                     Ok(user) if !turn_cancel.is_cancelled() => {
@@ -625,7 +656,9 @@ impl Runtime {
                 state: state.clone(),
                 result_limit: ops::result_size_limit(context_length),
             });
-            let mut model_config = ModelConfig::new(&model).with_context_limit(context_length);
+            let mut model_config = ModelConfig::new(&model)
+                .with_context_limit(context_length)
+                .with_vision_support(supports_vision);
             if let Some(params) = effort_params {
                 model_config = model_config.with_merged_request_params(params);
             }
@@ -958,24 +991,65 @@ impl Runtime {
 /// The user's message as the model gets it: with its `@` references expanded (Hermes's
 /// `preprocess_context_references`), the typed text kept for the chat to show. Refused when the
 /// attached context would take over half the window.
+/// An image the user attached: what the model gets, and where the original was saved.
+struct Attachment {
+    image: hermes_tools::vision::PreparedImage,
+    path: PathBuf,
+}
+
+/// Prepares attached images for the model and saves the originals in the session's scratch
+/// folder, where tools (`vision_analyze` with a region, `read_file`) can reach them.
+fn attach_images(open: &OpenSession, images: Vec<Vec<u8>>) -> Result<Vec<Attachment>> {
+    let folder = open.tools.scratch_dir().join("attachments");
+    std::fs::create_dir_all(&folder)?;
+    images
+        .into_iter()
+        .map(|bytes| {
+            let image = hermes_tools::vision::prepare(
+                &bytes,
+                None,
+                hermes_tools::vision::EMBED_MAX_DIMENSION,
+                hermes_tools::vision::ATTACHMENT_TARGET_BYTES,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let path = hermes_tools::vision::save(&folder, &bytes)?;
+            Ok(Attachment { image, path })
+        })
+        .collect()
+}
+
 fn user_message(
     open: &OpenSession,
     text: &str,
     context_length: Option<usize>,
     pages: &hermes_tools::references::FetchedPages,
+    images: &[Attachment],
 ) -> Result<Message> {
     let cwd = PathBuf::from(&open.record.lock().cwd);
     let home = dirs::home_dir().context("no home directory")?;
-    let Some(expanded) = hermes_tools::references::expand(text, &cwd, &home, context_length, pages)
-    else {
+    let expanded = hermes_tools::references::expand(text, &cwd, &home, context_length, pages);
+    if let Some(expanded) = &expanded {
+        anyhow::ensure!(!expanded.blocked, "{}", expanded.warnings.join("\n"));
+    }
+    if expanded.is_none() && images.is_empty() {
         return Ok(Message::user()
             .with_text(text)
             .with_generated_id_if_missing());
-    };
-    anyhow::ensure!(!expanded.blocked, "{}", expanded.warnings.join("\n"));
-    let mut message = Message::user()
-        .with_text(expanded.message)
-        .with_generated_id_if_missing();
+    }
+    let mut body = expanded.map_or_else(|| text.to_string(), |e| e.message);
+    // Where each image was saved, so the model can zoom in with `vision_analyze` (or work with
+    // the file when it can't see images).
+    for attachment in images {
+        body.push_str(&format!(
+            "\n\n[Attached image: {}]",
+            hermes_tools::display_path(&attachment.path)
+        ));
+    }
+    let mut message = Message::user().with_text(body);
+    for attachment in images {
+        message = message.with_image(attachment.image.data.clone(), attachment.image.mime.clone());
+    }
+    let mut message = message.with_generated_id_if_missing();
     message.metadata.set_operation_note(
         hermes_tools::references::NOTE,
         "typed",

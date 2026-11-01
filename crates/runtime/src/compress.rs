@@ -139,7 +139,18 @@ pub fn estimate_message(message: &Message) -> usize {
                         .as_ref()
                         .map_or(0, |args| Value::Object(args.clone()).to_string().len())
             }),
-            MessageContent::ToolResponse(_) => response_text(content).len(),
+            MessageContent::ToolResponse(response) => {
+                let images = response.tool_result.as_ref().map_or(0, |result| {
+                    result
+                        .content
+                        .iter()
+                        .filter(|block| matches!(block, ContentBlock::Image(_)))
+                        .count()
+                });
+                response_text(content).len() + images * 1_600 * CHARS_PER_TOKEN
+            }
+            // Roughly what providers bill for an image of the embed size.
+            MessageContent::Image(_) => 1_600 * CHARS_PER_TOKEN,
             _ => 0,
         })
         .sum();

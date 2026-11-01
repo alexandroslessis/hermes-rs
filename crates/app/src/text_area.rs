@@ -85,6 +85,10 @@ pub fn bind_keys(cx: &mut App) {
 pub enum TextAreaEvent {
     Submit,
     Changed,
+    /// An image was pasted (the composer attaches it).
+    PastedImage(gpui::Image),
+    /// Files were pasted (copied in Explorer).
+    PastedPaths(Vec<std::path::PathBuf>),
 }
 
 struct LayoutLine {
@@ -518,9 +522,26 @@ impl TextArea {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        // Text wins (Excel cells come with a picture of themselves too); otherwise images and
+        // copied files go to whoever owns this text area (the composer attaches them).
+        if let Some(text) = item.text() {
             let text = text.replace("\r\n", "\n");
             self.replace(self.selected_range.clone(), &text, window, cx);
+            return;
+        }
+        for entry in item.entries() {
+            match entry {
+                gpui::ClipboardEntry::Image(image) => {
+                    cx.emit(TextAreaEvent::PastedImage(image.clone()));
+                }
+                gpui::ClipboardEntry::ExternalPaths(paths) => {
+                    cx.emit(TextAreaEvent::PastedPaths(paths.paths().to_vec()));
+                }
+                gpui::ClipboardEntry::String(_) => {}
+            }
         }
     }
 

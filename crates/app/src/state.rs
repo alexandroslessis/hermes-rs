@@ -122,6 +122,13 @@ impl AppState {
             .and_then(|model| model.context_length)
     }
 
+    /// Whether the model accepts images (its discovered input modalities; unknown counts as no).
+    pub fn supports_vision(&self, model: &str) -> bool {
+        self.model_info(model)
+            .and_then(|model| model.supports_vision)
+            .unwrap_or(false)
+    }
+
     pub fn save(&mut self, cx: &mut Context<Self>) {
         if let Err(error) = self.config.save(&self.data_dir) {
             tracing::error!("saving settings: {error:#}");
@@ -207,6 +214,7 @@ impl AppState {
             options: hermes_runtime::TurnOptions {
                 context_length: self.context_length(&model),
                 effort: self.config.efforts.get(&model).cloned(),
+                supports_vision: self.supports_vision(&model),
             },
             model,
         })

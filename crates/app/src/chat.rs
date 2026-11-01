@@ -90,6 +90,10 @@ pub struct ChatView {
     editing: Option<usize>,
     /// Skills matching a `/command` being typed: (name, short description).
     slash_matches: Vec<Suggestion>,
+    /// Images waiting to go with the next message (pasted, dropped or picked).
+    attachments: Vec<Arc<gpui::Image>>,
+    /// Decoded images of sent messages, by (message id, content block).
+    message_images: HashMap<(String, usize), Arc<gpui::Image>>,
     /// The working folder's files, listed when an `@file:` / `@folder:` mention starts.
     file_index: Option<Vec<(String, bool)>>,
     /// A steer the turn ended before delivering: Hermes sends it as the next message.
@@ -142,6 +146,8 @@ impl ChatView {
             window,
             |this: &mut Self, _, event, window, cx| match event {
                 TextAreaEvent::Submit => this.submit(window, cx),
+                TextAreaEvent::PastedImage(image) => this.attach_bytes(image.bytes.clone(), cx),
+                TextAreaEvent::PastedPaths(paths) => this.attach_paths(paths.clone(), cx),
                 TextAreaEvent::Changed => {
                     this.update_slash_matches(cx);
                     // The send button follows whether the composer is empty.
@@ -168,6 +174,8 @@ impl ChatView {
             editing: None,
             slash_matches: Vec::new(),
             file_index: None,
+            attachments: Vec::new(),
+            message_images: HashMap::new(),
             next_message: None,
             notices: Vec::new(),
             compacting: false,
@@ -253,7 +261,7 @@ impl ChatView {
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).text().trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && (self.attachments.is_empty() || self.running.is_some()) {
             return;
         }
         if self.running.is_none() {
@@ -284,6 +292,57 @@ impl ChatView {
 
     pub fn start_turn(&mut self, text: String, _window: &mut Window, cx: &mut Context<Self>) {
         self.begin(Some(text), cx);
+    }
+
+    /// Adds an image to the next message; anything that isn't an image Hermes can read is refused.
+    fn attach_bytes(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        match image_format(&bytes) {
+            Some(format) => {
+                self.attachments
+                    .push(Arc::new(gpui::Image::from_bytes(format, bytes)));
+                self.error = None;
+            }
+            None => {
+                self.error = Some(
+                    "That isn't an image Hermes can attach (PNG, JPEG, GIF, WebP, BMP or TIFF)."
+                        .into(),
+                )
+            }
+        }
+        cx.notify();
+    }
+
+    /// Attaches the image files among `paths` (dropped, pasted or picked).
+    fn attach_paths(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
+        for path in paths {
+            if !hermes_tools::vision::is_image_path(&path) {
+                continue;
+            }
+            match std::fs::read(&path) {
+                Ok(bytes) => self.attach_bytes(bytes, cx),
+                Err(error) => {
+                    self.error = Some(format!("Could not read {}: {error}", path.display()));
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// The `+` menu's Image entry: a file picker for images.
+    fn pick_images(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths.await {
+                this.update(cx, |this, cx| this.attach_paths(paths, cx))
+                    .ok();
+            }
+        })
+        .detach();
     }
 
     /// While the composer ends in an `@` mention: the reference kinds it could start, or the
@@ -465,6 +524,7 @@ impl ChatView {
                 hermes_runtime::TurnOptions {
                     context_length: state.context_length(&self.model),
                     effort: state.config.efforts.get(&self.model).cloned(),
+                    supports_vision: state.supports_vision(&self.model),
                 },
             )
         };
@@ -566,9 +626,17 @@ impl ChatView {
                     compress.clone().flatten(),
                 ),
                 Some(text) => {
-                    backend
-                        .runtime
-                        .start_turn(&self.session_id, &provider, options, text)
+                    let images: Vec<Vec<u8>> = std::mem::take(&mut self.attachments)
+                        .iter()
+                        .map(|image| image.bytes.clone())
+                        .collect();
+                    backend.runtime.start_turn_with_images(
+                        &self.session_id,
+                        &provider,
+                        options,
+                        text,
+                        images,
+                    )
                 }
                 None => backend
                     .runtime
@@ -1163,6 +1231,37 @@ impl ChatView {
 
     /// Zed's user message: a full-width card with the editor background, a shadow and a focus
     /// border on hover; its actions float over the top-right corner.
+    /// The images a message carries, decoded once and kept.
+    fn message_images(&mut self, message: &Message, message_index: usize) -> Vec<Arc<gpui::Image>> {
+        use base64::Engine as _;
+        message
+            .content
+            .iter()
+            .enumerate()
+            .filter_map(|(block, content)| {
+                let MessageContent::Image(image) = content else {
+                    return None;
+                };
+                let key = (
+                    message
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| message_index.to_string()),
+                    block,
+                );
+                if let Some(cached) = self.message_images.get(&key) {
+                    return Some(cached.clone());
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(image.data.as_bytes())
+                    .ok()?;
+                let decoded = Arc::new(gpui::Image::from_bytes(image_format(&bytes)?, bytes));
+                self.message_images.insert(key, decoded.clone());
+                Some(decoded)
+            })
+            .collect()
+    }
+
     fn render_user_message(
         &mut self,
         message: &Message,
@@ -1174,6 +1273,7 @@ impl ChatView {
         let shown = shown_user_text(message);
         let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
         let body = self.markdown_block((message_index, 0, MarkdownKind::User), &shown, style, cx);
+        let images = self.message_images(message, message_index);
         let colors = cx.theme().colors();
         let focus_border = colors.border_focused;
         let running = self.running.is_some();
@@ -1206,7 +1306,24 @@ impl ChatView {
                             .border_color(colors.border)
                             .shadow_md()
                             .hover(|style| style.border_color(focus_border.opacity(0.8)))
-                            .child(body),
+                            .child(body)
+                            .when(!images.is_empty(), |this| {
+                                this.child(h_flex().pt_2().gap_2().flex_wrap().children(
+                                    images.into_iter().map(|image| {
+                                        div()
+                                            .rounded_md()
+                                            .overflow_hidden()
+                                            .border_1()
+                                            .border_color(colors.border)
+                                            .child(
+                                                gpui::img(image)
+                                                    .max_w(px(240.))
+                                                    .max_h(px(180.))
+                                                    .object_fit(gpui::ObjectFit::Contain),
+                                            )
+                                    }),
+                                ))
+                            }),
                     )
                     .child(
                         h_flex()
@@ -2467,7 +2584,12 @@ impl ChatView {
                                 .icon(IconName::Image)
                                 .icon_color(Color::Muted)
                                 .icon_size(IconSize::XSmall)
-                                .disabled(true),
+                                .handler({
+                                    let chat = chat.clone();
+                                    move |_, cx| {
+                                        chat.update(cx, |chat, cx| chat.pick_images(cx)).ok();
+                                    }
+                                }),
                         )
                         .item(
                             ContextMenuEntry::new("URL")
@@ -2587,6 +2709,8 @@ impl ChatView {
     fn render_send_button(&self, cx: &Context<Self>) -> AnyElement {
         let is_editor_empty = self.composer.read(cx).text().trim().is_empty();
         let is_generating = self.running.is_some();
+        // Pending images alone can be sent (between turns).
+        let nothing_to_send = is_editor_empty && self.attachments.is_empty();
         if is_generating && is_editor_empty {
             return IconButton::new("stop-generation", IconName::Stop)
                 .icon_color(Color::Error)
@@ -2603,13 +2727,13 @@ impl ChatView {
         IconButton::new("send-message", icon)
             .style(ButtonStyle::Filled)
             .map(|this| {
-                if is_editor_empty && !is_generating {
+                if nothing_to_send && !is_generating {
                     this.disabled(true).icon_color(Color::Muted)
                 } else {
                     this.icon_color(Color::Accent)
                 }
             })
-            .tooltip(Tooltip::text(if is_editor_empty && !is_generating {
+            .tooltip(Tooltip::text(if nothing_to_send && !is_generating {
                 "Type to Send"
             } else if is_generating {
                 "Steer the Agent (delivered after its current tool call)"
@@ -2758,6 +2882,65 @@ impl ChatView {
     /// Zed's message editor: a strip across the bottom on the editor background, the input with
     /// an expand toggle, and the toolbar under it (context and thinking on the left; context
     /// usage, model and send on the right).
+    /// Thumbnails of the images going with the next message, each with a remove button; a note
+    /// when the model can't see them.
+    fn render_attachments(&self, cx: &Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let sees_images = AppState::global(cx).read(cx).supports_vision(&self.model);
+        v_flex()
+            .gap_1()
+            .child(h_flex().gap_2().flex_wrap().children(self.attachments.iter().enumerate().map(
+                |(index, image)| {
+                    let group = SharedString::from(format!("attachment-{index}"));
+                    div()
+                        .id(group.clone())
+                        .group(group.clone())
+                        .relative()
+                        .size(px(56.))
+                        .rounded_md()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(colors.border)
+                        .child(
+                            gpui::img(image.clone())
+                                .size_full()
+                                .object_fit(gpui::ObjectFit::Cover),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0p5()
+                                .right_0p5()
+                                .visible_on_hover(group)
+                                .child(
+                                    IconButton::new(
+                                        SharedString::from(format!("remove-attachment-{index}")),
+                                        IconName::Close,
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .style(ButtonStyle::Filled)
+                                    .tooltip(Tooltip::text("Remove Image"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if index < this.attachments.len() {
+                                            this.attachments.remove(index);
+                                        }
+                                        cx.notify();
+                                    })),
+                                ),
+                        )
+                },
+            )))
+            .when(!sees_images, |this| {
+                this.child(
+                    Label::new(
+                        "This model can't see images: it gets the saved file paths only. Pick a model with image input to have them looked at.",
+                    )
+                    .size(LabelSize::XSmall)
+                    .color(Color::Warning),
+                )
+            })
+    }
+
     fn render_composer(&self, has_messages: bool, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         h_flex()
@@ -2767,12 +2950,22 @@ impl ChatView {
             .when(has_messages, |this| {
                 this.border_t_1().border_color(colors.border)
             })
+            // Dropped image files attach to the next message.
+            .drag_over::<gpui::ExternalPaths>(|style, _, _, cx| {
+                style.bg(cx.theme().colors().drop_target_background)
+            })
+            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
+                this.attach_paths(paths.paths().to_vec(), cx);
+            }))
             .child(
                 v_flex()
                     .w_full()
                     .min_w_0()
                     .px_2()
                     .gap_2()
+                    .when(!self.attachments.is_empty(), |this| {
+                        this.child(self.render_attachments(cx))
+                    })
                     .children((!self.slash_matches.is_empty()).then(|| {
                         v_flex().children(self.slash_matches.iter().map(|suggestion| {
                             let command = suggestion.text.clone();
@@ -3203,4 +3396,24 @@ fn is_command_output(message: &Message) -> bool {
         .metadata
         .operation_note(hermes_runtime::COMMAND_NOTE, "command")
         .is_some()
+}
+
+/// The image format of attachable bytes, by their signature.
+fn image_format(bytes: &[u8]) -> Option<gpui::ImageFormat> {
+    let starts = |prefix: &[u8]| bytes.starts_with(prefix);
+    Some(if starts(b"\x89PNG") {
+        gpui::ImageFormat::Png
+    } else if starts(&[0xff, 0xd8, 0xff]) {
+        gpui::ImageFormat::Jpeg
+    } else if starts(b"GIF8") {
+        gpui::ImageFormat::Gif
+    } else if starts(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        gpui::ImageFormat::Webp
+    } else if starts(b"BM") {
+        gpui::ImageFormat::Bmp
+    } else if starts(b"II*\0") || starts(b"MM\0*") {
+        gpui::ImageFormat::Tiff
+    } else {
+        return None;
+    })
 }

@@ -446,6 +446,28 @@ M5 part 5 status (2026-11-01): web search and extract, done.
   their Settings, the managed Nous gateway, the result memo cache, website policy rules,
   connect-time DNS-rebinding checks, binary-payload detection.
 
+M5 part 6 status (2026-11-01): vision and image paste, done (live check pending, see below).
+- `crates/tools/src/vision.rs`: images from a path, an http(s) URL (public addresses only) or a
+  `data:` URL; an optional `region` crop at full resolution; then Hermes's embed caps (long edge
+  1568 px; 256 KB base64 for `vision_analyze`, 1 MB for attachments) by re-encoding as JPEG with
+  lower quality, then smaller size; the scale/crop note says how to map coordinates back.
+- `vision_analyze`: Hermes's native path. The image goes into the tool result (the provider layer
+  moves it into a following user message). On a model without vision the tool says so; Hermes
+  would use an auxiliary vision model there, which hermes-rs doesn't have yet.
+- Attached images: paste (text wins when the clipboard holds both), drag and drop, or `+` →
+  Image; thumbnails with remove buttons over the composer and a warning when the model can't see
+  images. The runtime prepares them off the UI thread, saves the originals in the session's
+  `scratch/attachments`, and the model gets the images plus `[Attached image: path]` lines (a
+  model without vision gets the paths and a placeholder). Sent messages show their images.
+- `TurnOptions::supports_vision` comes from discovery (OpenRouter input modalities, Ollama
+  capabilities). Compaction counts ~1,600 tokens per image.
+- Live check: blocked today (the OpenRouter account's free-model daily quota ran out; the local
+  Ollama model has no vision). `live_vision_sees_attached_and_loaded_images` is ready for
+  `google/gemma-4-31b-it:free` or a local vision model.
+- Not ported: the auxiliary vision model and `image_input_mode`, video, SVG/HEIC conversion,
+  per-turn duplicate/repeat caps, detecting image paths in typed text (the provider layer does
+  that for vision models).
+
 **M6: Polish.** Command palette (Tier 2 `picker`), find in transcript, themes and fonts, diff
 review pane, import from `~/.hermes`, installer (MSI), auto-update.
 

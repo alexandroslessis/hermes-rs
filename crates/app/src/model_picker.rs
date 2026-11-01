@@ -112,6 +112,7 @@ impl ModelPicker {
                 |this: &mut Self, _, event, window, cx| match event {
                     TextAreaEvent::Changed => this.update_entries(cx),
                     TextAreaEvent::Submit => this.confirm(window, cx),
+                    TextAreaEvent::PastedImage(_) | TextAreaEvent::PastedPaths(_) => {}
                 },
             ),
         ];

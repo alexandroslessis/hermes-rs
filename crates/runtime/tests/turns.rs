@@ -511,6 +511,7 @@ async fn effort_is_sent_only_when_set() {
     let options = TurnOptions {
         context_length: None,
         effort: Some("high".into()),
+        supports_vision: false,
     };
     let mut turn = h
         .runtime
@@ -1354,6 +1355,7 @@ async fn live_refine_saves_something() {
     let options = TurnOptions {
         context_length: Some(32768),
         effort: None,
+        supports_vision: false,
     };
     let session = runtime
         .create_session(&provider, &model, Some(32768), work.path())
@@ -1590,6 +1592,7 @@ async fn a_request_past_the_threshold_is_compressed_before_the_next_call() {
     let options = TurnOptions {
         context_length: Some(40_000),
         effort: None,
+        supports_vision: false,
     };
     let h = harness(vec![
         text_reply("one"),
@@ -1670,6 +1673,7 @@ async fn live_compress_keeps_what_matters() {
     let options = TurnOptions {
         context_length: Some(16384),
         effort: None,
+        supports_vision: false,
     };
     let session = runtime
         .create_session(&provider, &model, Some(16384), work.path())
@@ -1799,6 +1803,7 @@ async fn too_much_attached_context_refuses_the_message() {
     let options = TurnOptions {
         context_length: Some(2_000),
         effort: None,
+        supports_vision: false,
     };
     // Each file fits on its own (under half of 2k tokens), together they don't.
     let error = h
@@ -1945,5 +1950,203 @@ async fn an_url_reference_is_fetched_before_the_message_is_added() {
     assert_eq!(
         hermes_tools::references::typed_text(&user),
         Some("what is at @url:http://127.0.0.1/admin")
+    );
+}
+
+/// A 1x1 PNG.
+fn tiny_png() -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+        .unwrap()
+}
+
+fn vision(supports_vision: bool) -> TurnOptions {
+    TurnOptions {
+        context_length: None,
+        effort: None,
+        supports_vision,
+    }
+}
+
+#[tokio::test]
+async fn attached_images_reach_a_vision_model_and_are_saved() {
+    let h = harness(vec![text_reply("a pixel"), text_reply("can't see")]).await;
+    let session = session_in(&h);
+    let turn = h
+        .runtime
+        .start_turn_with_images(
+            &session,
+            &h.provider,
+            vision(true),
+            "what is this",
+            vec![tiny_png()],
+        )
+        .unwrap();
+    assert_eq!(finished_status(&collect(turn).await), TurnStatus::Completed);
+    let sent = h.requests.lock()[0].to_string();
+    assert!(sent.contains("data:image/png;base64,iVBOR"), "{sent}");
+    assert!(sent.contains("[Attached image: "));
+    let user = h.runtime.messages(&session).unwrap()[0].clone();
+    assert_eq!(
+        hermes_tools::references::typed_text(&user),
+        Some("what is this")
+    );
+    let text = user.as_concat_text();
+    let path = text
+        .split("[Attached image: ")
+        .nth(1)
+        .unwrap()
+        .trim_end_matches(']');
+    assert_eq!(std::fs::read(path).unwrap(), tiny_png());
+
+    // A model without vision gets the path and a placeholder, not the image.
+    let turn = h
+        .runtime
+        .start_turn_with_images(
+            &session,
+            &h.provider,
+            vision(false),
+            "and this?",
+            vec![tiny_png()],
+        )
+        .unwrap();
+    collect(turn).await;
+    let sent = h.requests.lock()[1].to_string();
+    assert!(sent.contains("[image omitted: model does not support vision]"));
+}
+
+#[tokio::test]
+async fn vision_analyze_shows_the_image_to_a_vision_model() {
+    let h = harness(vec![
+        tool_reply(&[(
+            "c1",
+            "vision_analyze",
+            json!({"image_url": "pixel.png", "question": "what color?"}),
+        )]),
+        text_reply("white"),
+        tool_reply(&[(
+            "c2",
+            "vision_analyze",
+            json!({"image_url": "pixel.png", "question": "again"}),
+        )]),
+        text_reply("no vision"),
+    ])
+    .await;
+    std::fs::write(h.work.path().join("pixel.png"), tiny_png()).unwrap();
+    let session = session_in(&h);
+    let turn = h
+        .runtime
+        .start_turn(&session, &h.provider, vision(true), "look at pixel.png")
+        .unwrap();
+    collect(turn).await;
+    let second = h.requests.lock()[1].to_string();
+    assert!(
+        second.contains("Image loaded into your context"),
+        "{second}"
+    );
+    assert!(second.contains("data:image/png;base64,"));
+
+    let turn = h
+        .runtime
+        .start_turn(&session, &h.provider, vision(false), "once more")
+        .unwrap();
+    collect(turn).await;
+    let fourth = h.requests.lock()[3].to_string();
+    assert!(fourth.contains("no vision support"), "{fourth}");
+}
+
+fn solid_png(rgb: [u8; 3]) -> Vec<u8> {
+    let image = image::RgbImage::from_pixel(64, 64, image::Rgb(rgb));
+    let mut out = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+/// A real vision model on OpenRouter (key in `hermes_rs_or_api_key`):
+/// `HERMES_LIVE_VISION_MODEL=google/gemma-4-31b-it:free cargo test -p hermes_runtime --test turns live_vision -- --ignored --nocapture`
+#[tokio::test]
+#[ignore]
+async fn live_vision_sees_attached_and_loaded_images() {
+    let model = std::env::var("HERMES_LIVE_VISION_MODEL").expect("set HERMES_LIVE_VISION_MODEL");
+    let key = std::env::var("hermes_rs_or_api_key").expect("set hermes_rs_or_api_key");
+    let data = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    std::fs::write(work.path().join("swatch.png"), solid_png([0, 0, 255])).unwrap();
+    let runtime = runtime_in(data.path());
+    let provider = ProviderConfig {
+        id: "openrouter".into(),
+        base_url: "https://openrouter.ai/api/v1".into(),
+        api_key: Some(key),
+    };
+    let options = TurnOptions {
+        context_length: Some(128_000),
+        effort: None,
+        supports_vision: true,
+    };
+    let session = runtime
+        .create_session(&provider, &model, Some(128_000), work.path())
+        .unwrap();
+    let last_reply = |runtime: &Runtime| {
+        runtime
+            .messages(&session.id)
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|m| m.role == rmcp::model::Role::Assistant)
+            .map(|m| m.as_concat_text())
+            .unwrap_or_default()
+    };
+    let turn = runtime
+        .start_turn_with_images(
+            &session.id,
+            &provider,
+            options.clone(),
+            "What color is this image? Answer with one word, no tools.",
+            vec![solid_png([255, 0, 0])],
+        )
+        .unwrap();
+    println!("attached: {:?}", finished_status(&collect(turn).await));
+    for message in runtime.messages(&session.id).unwrap() {
+        println!(
+            "{:?} {:?}: {}",
+            message.role,
+            message.error_kind(),
+            serde_json::to_string(&message)
+                .unwrap()
+                .chars()
+                .take(1500)
+                .collect::<String>()
+        );
+    }
+    let answer = last_reply(&runtime);
+    println!("--- attached image answer ---\n{answer}");
+    assert!(answer.to_lowercase().contains("red"), "{answer}");
+
+    let turn = runtime
+        .start_turn(
+            &session.id,
+            &provider,
+            options,
+            "Use the vision_analyze tool to look at swatch.png in the working folder, then tell me its color in one word.",
+        )
+        .unwrap();
+    println!("tool: {:?}", finished_status(&collect(turn).await));
+    let used_tool = runtime
+        .messages(&session.id)
+        .unwrap()
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|c| c.as_tool_request())
+        .any(|r| {
+            r.tool_call
+                .as_ref()
+                .is_ok_and(|c| c.name == "vision_analyze")
+        });
+    let answer = last_reply(&runtime);
+    println!("--- vision_analyze answer (tool used: {used_tool}) ---\n{answer}");
+    assert!(
+        used_tool && answer.to_lowercase().contains("blue"),
+        "{answer}"
     );
 }

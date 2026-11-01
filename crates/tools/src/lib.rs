@@ -23,6 +23,7 @@ mod shell;
 mod skill_manage;
 pub mod skills;
 mod todo;
+pub mod vision;
 pub mod web;
 
 use std::path::{Path, PathBuf};
@@ -118,6 +119,8 @@ pub struct SessionTools {
     web: Option<Arc<web::Web>>,
     /// Projects already checkpointed this turn (one snapshot per project per turn).
     turn_checkpoints: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Whether the session's model accepts images (set per turn; `vision_analyze` needs it).
+    vision: std::sync::atomic::AtomicBool,
 }
 
 impl SessionTools {
@@ -140,6 +143,7 @@ impl SessionTools {
             checkpoints: config.checkpoints,
             web: config.web,
             turn_checkpoints: Default::default(),
+            vision: Default::default(),
             session_approved: Default::default(),
         }
     }
@@ -175,6 +179,71 @@ impl SessionTools {
                 None
             }
             _ => None,
+        }
+    }
+
+    /// Whether the model of the coming turn accepts images.
+    pub fn set_vision(&self, supported: bool) {
+        self.vision
+            .store(supported, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Hermes's native `vision_analyze`: the image goes into the tool result, which the model
+    /// sees as an image.
+    async fn vision_analyze(&self, args: &Value) -> CallToolResult {
+        if !self.vision.load(std::sync::atomic::Ordering::Relaxed) {
+            return ToolOutput::error(vision::NO_VISION_MESSAGE).into_result();
+        }
+        let Some(source) = args
+            .get("image_url")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return ToolOutput::error("image_url is required").into_result();
+        };
+        let question = args.get("question").and_then(Value::as_str).unwrap_or("");
+        let region = match args.get("region") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(values)) if values.len() == 4 => {
+                let numbers: Vec<u32> = values
+                    .iter()
+                    .filter_map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()))
+                    .collect();
+                match numbers.as_slice() {
+                    &[x1, y1, x2, y2] => Some([x1, y1, x2, y2]),
+                    _ => {
+                        return ToolOutput::error(
+                            "region must be four non-negative integers [x1, y1, x2, y2]",
+                        )
+                        .into_result();
+                    }
+                }
+            }
+            Some(_) => {
+                return ToolOutput::error("region must be four integers [x1, y1, x2, y2]")
+                    .into_result();
+            }
+        };
+        let bytes = match vision::load_source(source, &self.cwd(), &self.home).await {
+            Ok(bytes) => bytes,
+            Err(error) => return ToolOutput::error(error).into_result(),
+        };
+        let prepared = tokio::task::spawn_blocking(move || {
+            vision::prepare(
+                &bytes,
+                region,
+                vision::EMBED_MAX_DIMENSION,
+                vision::EMBED_TARGET_BYTES,
+            )
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+        match prepared {
+            Ok(image) => CallToolResult::success(vec![
+                ContentBlock::text(vision::native_result_text(question, image.note.as_deref())),
+                ContentBlock::image(image.data, image.mime),
+            ]),
+            Err(error) => ToolOutput::error(error).into_result(),
         }
     }
 
@@ -538,6 +607,9 @@ impl<S: Send + Sync + 'static> ToolProvider<S> for SessionTools {
         _emit: &Emitter,
     ) -> Result<CallToolResult, ErrorData> {
         let args = Value::Object(call.arguments.unwrap_or_else(JsonObject::new));
+        if call.name == "vision_analyze" {
+            return Ok(self.vision_analyze(&args).await);
+        }
         let written = self.checkpoint_before(&call.name, &args);
         let mut result = self.dispatch(&call.name, args.clone()).await.into_result();
         if let (Some(path), Some(checkpoints)) = (written, &self.checkpoints)
