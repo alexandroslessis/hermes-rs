@@ -158,10 +158,19 @@ fn is_output_limit_error(error: &ErrorData) -> bool {
     error.message.contains("reached its output token limit")
 }
 
+/// Hermes's rule: arguments were cut off mid-stream only if they don't end in `}` or `]`.
+/// Anything else that fails to parse (a stray bracket, say) is malformed and gets retried. The
+/// parse error carries the arguments' tail after "cut off at: ".
 fn is_truncated_args_error(error: &ErrorData) -> bool {
-    error
-        .message
-        .starts_with("The model's response was truncated")
+    let message = error.message.as_ref();
+    if !message.starts_with("The model's response was truncated") {
+        return false;
+    }
+    let tail = message
+        .rsplit_once("cut off at: ")
+        .map(|(_, tail)| tail.trim_end())
+        .unwrap_or_default();
+    !(tail.ends_with('}') || tail.ends_with(']'))
 }
 
 /// `boosted_output_cap`: base·2ⁿ, at most max(32768, 2·base).

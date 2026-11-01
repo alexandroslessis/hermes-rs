@@ -460,6 +460,34 @@ fn find_hits(content: &str, old: &str, new: &str) -> (Strategy, Vec<Hit>) {
     (Strategy::Exact, Vec::new())
 }
 
+/// `patch`'s matching for other editors (skill_manage): the content with `old` replaced, and the
+/// number of replacements. Errors name what to do next.
+pub(crate) fn replace_in(
+    content: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<(String, usize), String> {
+    if old == new {
+        return Err("new_string is identical to old_string; nothing to change.".into());
+    }
+    let (_, hits) = find_hits(content, old, new);
+    if hits.is_empty() {
+        return Err("old_string was not found (also tried ignoring line endings, trailing whitespace and indentation). Copy the text exactly from the current file.".into());
+    }
+    if hits.len() > 1 && !replace_all {
+        return Err(format!(
+            "old_string matches {} places. Include more surrounding lines to make it unique, or set replace_all=true.",
+            hits.len()
+        ));
+    }
+    let mut updated = content.to_string();
+    for hit in hits.iter().rev() {
+        updated.replace_range(hit.range.clone(), &hit.replacement);
+    }
+    Ok((updated, hits.len()))
+}
+
 fn line_number(content: &str, byte: usize) -> usize {
     content[..byte].matches('\n').count() + 1
 }

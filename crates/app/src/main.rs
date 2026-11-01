@@ -10,6 +10,7 @@ mod memory_view;
 mod model_picker;
 mod settings;
 mod sidebar;
+mod skills_view;
 mod state;
 mod text_area;
 mod title_bar;
@@ -26,7 +27,9 @@ use crate::appearance::Appearance;
 use crate::assets::Assets;
 use crate::backend::{Backend, BackendGlobal};
 use crate::state::AppState;
-use crate::workspace::{NewSession, OpenMemory, OpenSettings, ToggleSidebar, Workspace};
+use crate::workspace::{
+    NewSession, OpenMemory, OpenSettings, OpenSkills, ToggleSidebar, Workspace,
+};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -57,6 +60,7 @@ fn main() {
                 KeyBinding::new("ctrl-b", ToggleSidebar, None),
                 KeyBinding::new("ctrl-,", OpenSettings, None),
                 KeyBinding::new("ctrl-shift-m", OpenMemory, None),
+                KeyBinding::new("ctrl-shift-k", OpenSkills, None),
                 // Copy the text selected in a chat message.
                 KeyBinding::new("ctrl-c", markdown::Copy, Some("Markdown")),
             ]);

@@ -39,6 +39,18 @@ const SCHEMAS: &[(&str, &str)] = &[
         "session_search",
         include_str!("../../../prompts/tools/session_search.json"),
     ),
+    (
+        "skills_list",
+        include_str!("../../../prompts/tools/skills_list.json"),
+    ),
+    (
+        "skill_view",
+        include_str!("../../../prompts/tools/skill_view.json"),
+    ),
+    (
+        "skill_manage",
+        include_str!("../../../prompts/tools/skill_manage.json"),
+    ),
 ];
 
 /// A tool definition as stored: name, description and JSON-schema parameters.

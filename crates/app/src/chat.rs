@@ -76,6 +76,8 @@ pub struct ChatView {
     steering: Option<String>,
     /// The user message being edited in the composer; sending rewinds the conversation there.
     editing: Option<usize>,
+    /// Skills matching a `/command` being typed: (name, short description).
+    slash_matches: Vec<(String, String)>,
     /// A steer the turn ended before delivering: Hermes sends it as the next message.
     next_message: Option<String>,
     pub usage: TurnUsage,
@@ -104,10 +106,9 @@ impl ChatView {
         let subscription = cx.subscribe_in(
             &composer,
             window,
-            |this: &mut Self, _, event, window, cx| {
-                if let TextAreaEvent::Submit = event {
-                    this.submit(window, cx);
-                }
+            |this: &mut Self, _, event, window, cx| match event {
+                TextAreaEvent::Submit => this.submit(window, cx),
+                TextAreaEvent::Changed => this.update_slash_matches(cx),
             },
         );
         let list_state = ListState::new(0, ListAlignment::Top, px(2000.));
@@ -126,6 +127,7 @@ impl ChatView {
             clarify: None,
             steering: None,
             editing: None,
+            slash_matches: Vec::new(),
             next_message: None,
             usage: TurnUsage {
                 last_input_tokens: 0,
@@ -225,6 +227,36 @@ impl ChatView {
         self.begin(Some(text), cx);
     }
 
+    /// While the composer holds a bare `/word`, the skills whose name contains it.
+    fn update_slash_matches(&mut self, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).text().to_string();
+        let query = text
+            .strip_prefix('/')
+            .filter(|q| !q.contains(char::is_whitespace))
+            .map(str::to_lowercase);
+        let matches = match query {
+            Some(query) => backend(cx)
+                .runtime
+                .skills()
+                .catalog()
+                .into_iter()
+                .filter(|s| s.name.contains(&query))
+                .take(6)
+                .map(|s| {
+                    (
+                        s.name,
+                        hermes_tools::skills::clip_description(&s.description),
+                    )
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        if matches != self.slash_matches {
+            self.slash_matches = matches;
+            cx.notify();
+        }
+    }
+
     /// Hermes's edit-and-resend: the conversation rewinds to just before user message
     /// `message_index`, then that message (or `text`, its edited version) is sent again.
     fn resend(&mut self, message_index: usize, text: Option<String>, cx: &mut Context<Self>) {
@@ -280,6 +312,25 @@ impl ChatView {
             return;
         };
         let backend = backend(cx);
+        // `/skill-name instruction` sends the message that loads the skill.
+        let text = match text {
+            Some(text) if text.starts_with('/') => match backend.runtime.skill_command(&text) {
+                Some(message) => Some(message),
+                None => {
+                    let name = text[1..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    self.error = Some(format!(
+                        "There is no skill named '{name}'. Open Skills (Ctrl+Shift+K) to see them."
+                    ));
+                    cx.notify();
+                    return;
+                }
+            },
+            other => other,
+        };
         let turn = {
             let _guard = backend.tokio.enter();
             match &text {
@@ -606,8 +657,13 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let text = message.as_concat_text();
+        // A skill command: show what was typed, not the skill it loaded.
+        let shown = match hermes_tools::skills::describe_invocation(&text) {
+            Some((skill, instruction)) => format!("/{skill} {instruction}").trim_end().to_string(),
+            None => text.clone(),
+        };
         let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-        let body = self.markdown_block((message_index, 0, MarkdownKind::User), &text, style, cx);
+        let body = self.markdown_block((message_index, 0, MarkdownKind::User), &shown, style, cx);
         let colors = cx.theme().colors();
         let running = self.running.is_some();
         let group = SharedString::from(format!("user-message-{message_index}"));
@@ -617,7 +673,7 @@ impl ChatView {
                 .icon_color(Color::Muted)
                 .tooltip(Tooltip::text(tooltip))
         };
-        let copy_text = text.clone();
+        let copy_text = shown.clone();
         v_flex()
             .w_full()
             .items_end()
@@ -1317,6 +1373,34 @@ impl ChatView {
             .border_1()
             .border_color(colors.border)
             .bg(colors.editor_background)
+            .children((!self.slash_matches.is_empty()).then(|| {
+                v_flex()
+                    .pb_1()
+                    .children(self.slash_matches.iter().map(|(name, description)| {
+                        let command = format!("/{name} ");
+                        h_flex()
+                            .id(SharedString::from(format!("slash-{name}")))
+                            .gap_2()
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(colors.ghost_element_hover))
+                            .child(Label::new(format!("/{name}")).size(LabelSize::Small))
+                            .child(
+                                Label::new(description.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.composer
+                                    .update(cx, |c, cx| c.set_text(command.clone(), cx));
+                                this.composer.focus_handle(cx).focus(window, cx);
+                                this.slash_matches.clear();
+                                cx.notify();
+                            }))
+                    }))
+            }))
             .when(self.editing.is_some(), |this| {
                 this.child(
                     h_flex()

@@ -144,6 +144,7 @@ fn runtime_in(data_dir: &Path) -> Runtime {
             shell: detect_shell(),
             max_iterations: 20,
             memory: Default::default(),
+            skills: Default::default(),
         },
         Arc::new(Bridge),
     )
@@ -1076,4 +1077,81 @@ async fn rewinding_is_refused_while_a_turn_runs() {
     assert!(h.runtime.rewind(&session, 0).is_err());
     collect(turn).await;
     assert!(h.runtime.rewind(&session, 0).is_ok());
+}
+
+#[tokio::test]
+async fn a_skill_written_in_one_session_is_indexed_and_invocable_in_the_next() {
+    let skill = "---\nname: release-notes\ndescription: Use when writing release notes. Groups changes.\n---\n# Release notes\nGroup changes under Added / Fixed.\n";
+    let h = harness(vec![
+        tool_reply(&[(
+            "call_k",
+            "skill_manage",
+            json!({"operations": [{"action": "create", "name": "release-notes", "category": "writing", "content": skill}]}),
+        )]),
+        text_reply("Saved the skill."),
+    ])
+    .await;
+    let first = session_in(&h);
+    run_turn(&h, &first, "Save how we write release notes as a skill").await;
+    let result = sent_messages(&h.requests.lock()[1])
+        .into_iter()
+        .rfind(|m| m["role"] == "tool")
+        .unwrap();
+    assert!(
+        result["content"]
+            .as_str()
+            .unwrap()
+            .contains("Skill 'release-notes' created.")
+    );
+    let prompt = |id: &str| {
+        h.runtime
+            .store()
+            .session(id)
+            .unwrap()
+            .unwrap()
+            .system_prompt
+    };
+    assert!(!prompt(&first).contains("release-notes: Use when writing release notes."));
+    let second = session_in(&h);
+    let system = prompt(&second);
+    assert!(system.contains("## Skills\n"));
+    assert!(system.contains("  - release-notes: Use when writing release notes. Groups changes."));
+    assert!(system.contains("record it with skill_manage for future reuse"));
+    // Bundled skills are seeded and indexed too.
+    assert!(system.contains("- systematic-debugging: "));
+    let invocation = h.runtime.skill_command("/release-notes for v2.0").unwrap();
+    assert!(invocation.contains("# Release notes"));
+    assert!(invocation.ends_with("alongside the skill invocation: for v2.0"));
+    assert!(h.runtime.skill_command("/no-such-skill").is_none());
+    assert!(h.runtime.skill_command("not a command").is_none());
+    // The change is in the skills history.
+    assert_eq!(
+        h.runtime.skills().history(1)[0].message,
+        "skill_manage: create release-notes"
+    );
+}
+
+#[tokio::test]
+async fn unbalanced_arguments_ending_in_a_bracket_are_retried_not_refused() {
+    // Seen live: valid-looking arguments with a stray `]` after the closing brace.
+    let stray = r#"{"path": "a.txt", "content": "x"}}
+]"#;
+    let h = harness(vec![
+        raw_tool_reply("write_file", stray, "tool_calls"),
+        tool_reply(&[(
+            "call_2",
+            "write_file",
+            json!({"path": "a.txt", "content": "x"}),
+        )]),
+        text_reply("written"),
+    ])
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "write it").await;
+    assert_eq!(h.requests.lock().len(), 3);
+    assert_eq!(
+        std::fs::read_to_string(h.work.path().join("a.txt")).unwrap(),
+        "x"
+    );
+    assert_eq!(last_text(&h, &session), "written");
 }

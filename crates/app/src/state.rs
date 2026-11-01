@@ -31,6 +31,11 @@ impl AppState {
             write_approval: config.memory_write_approval,
             ..memory.config()
         });
+        let skills = backend(cx).runtime.skills();
+        skills.set_config(hermes_tools::SkillsConfig {
+            write_approval: config.skill_write_approval,
+            ..skills.config()
+        });
         let registry = theme::ThemeRegistry::global(cx);
         hermes_themes::load_bundled_themes(&registry);
         let name = config.theme.as_deref().unwrap_or(theme::DEFAULT_DARK_THEME);

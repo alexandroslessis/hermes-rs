@@ -25,7 +25,9 @@ use hermes_llm::openai_compatible::OpenAiCompatibleProvider;
 use hermes_memory::{MemoryConfig, MemoryStore};
 use hermes_prompts::{Shell, SystemPromptInput, build_system_prompt};
 use hermes_store::{NewSession, SessionRecord, Store};
-use hermes_tools::{SessionTools, SessionToolsConfig, ShellKind, TodoItem, UserBridge};
+use hermes_tools::{
+    SessionTools, SessionToolsConfig, ShellKind, SkillStore, SkillsConfig, TodoItem, UserBridge,
+};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -101,6 +103,8 @@ pub struct RuntimeConfig {
     pub max_iterations: u32,
     /// `MEMORY.md` / `USER.md` limits and the write-approval gate.
     pub memory: MemoryConfig,
+    /// Skill write approval and extra skill folders.
+    pub skills: SkillsConfig,
 }
 
 impl RuntimeConfig {
@@ -118,6 +122,7 @@ impl RuntimeConfig {
             shell: hermes_tools::detect_shell(),
             max_iterations: 500,
             memory: MemoryConfig::default(),
+            skills: SkillsConfig::default(),
         })
     }
 }
@@ -147,6 +152,7 @@ pub struct Turn {
 pub struct Runtime {
     store: Arc<Store>,
     memory: Arc<MemoryStore>,
+    skills: Arc<SkillStore>,
     config: RuntimeConfig,
     bridge: Arc<dyn UserBridge>,
     windows_version: String,
@@ -157,9 +163,12 @@ impl Runtime {
     pub fn new(config: RuntimeConfig, bridge: Arc<dyn UserBridge>) -> Result<Self> {
         let store = Store::open(&config.data_dir.join("sessions.db"))?;
         let memory = MemoryStore::new(config.data_dir.join("memories"), config.memory.clone());
+        let skills = SkillStore::new(config.data_dir.join("skills"), config.skills.clone());
+        skills.seed_bundled();
         Ok(Self {
             store: Arc::new(store),
             memory: Arc::new(memory),
+            skills: Arc::new(skills),
             windows_version: windows_version(),
             config,
             bridge,
@@ -169,6 +178,19 @@ impl Runtime {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// The skills folder every session shares (the Skills screen edits it too).
+    pub fn skills(&self) -> Arc<SkillStore> {
+        self.skills.clone()
+    }
+
+    /// Hermes's skill slash commands: `/skill-name instruction` becomes the message that loads
+    /// the skill. `None` when `text` isn't a command for an existing skill.
+    pub fn skill_command(&self, text: &str) -> Option<String> {
+        let rest = text.trim().strip_prefix('/')?;
+        let (name, instruction) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        self.skills.invocation_message(name, instruction)
     }
 
     /// The memory store every session shares (the Memory screen edits it too).
@@ -232,6 +254,7 @@ impl Runtime {
         let home = dirs::home_dir().context("no home directory")?;
         let soul = std::fs::read_to_string(self.config.data_dir.join("SOUL.md")).ok();
         let tool_names = SessionTools::tool_names();
+        let skills_index = self.skills.index_prompt();
         // Memory as it is now; writes during the session don't change this prompt.
         let snapshot = self.memory.snapshot();
         let memory = [snapshot.memory, snapshot.user]
@@ -255,7 +278,7 @@ impl Runtime {
             tool_names: &tool_names,
             soul: soul.as_deref(),
             memory: memory.as_deref(),
-            skills_index: None,
+            skills_index: skills_index.as_deref(),
             context_length,
             now: chrono::Local::now(),
         });
@@ -281,6 +304,7 @@ impl Runtime {
             todos: restore_todos(&conversation),
             memory: Some(self.memory.clone()),
             history: Some(self.store.clone()),
+            skills: Some(self.skills.clone()),
         });
         let open = Arc::new(OpenSession {
             record: Mutex::new(record),

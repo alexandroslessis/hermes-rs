@@ -127,6 +127,9 @@ fn tool_guidance_block(tool_names: &[&str]) -> Option<String> {
         tool_names
             .contains(&"session_search")
             .then(|| text::SESSION_SEARCH_GUIDANCE.to_string()),
+        tool_names
+            .contains(&"skill_manage")
+            .then(|| text::SKILLS_GUIDANCE.to_string()),
     ]
     .into_iter()
     .flatten()

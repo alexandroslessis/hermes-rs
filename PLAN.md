@@ -298,6 +298,23 @@ M3 status (2026-11-01): done, verified live with a free model (save → new sess
 skill slash commands, background review, `/refine`, `/learn`, curator, skills browser screen.
 Behavior tuning starts here and continues with real use.
 
+M4 part 1 status (2026-11-01): the skills system, in `crates/tools/src/skills.rs` and
+`skill_manage.rs`.
+- Skills under `%APPDATA%\hermes-rs\skills` (agentskills.io `SKILL.md` + references/templates/
+  scripts/assets), Hermes's 39 Windows-compatible bundled skills seeded from `assets/skills`
+  (a manifest keeps user edits and deletions), external read-only folders (`skills.external_dirs`).
+- Progressive disclosure: Hermes's `## Skills` index (60-char descriptions, by category) in the
+  volatile prompt tier; `skills_list` / `skill_view` (linked files, usage counts).
+- `skill_manage`: Hermes's operations batch (create / patch / write_file / remove_file, delete
+  alone), validation and messages, the 60-char description budget, a threat scan, all-or-nothing
+  with snapshots; every batch is one git commit; outside edits are committed as "Outside changes".
+- Write approval (staged, approved in the Skills screen); `/skill-name instruction` slash commands
+  with suggestions while typing; the Skills screen (by category, read, delete, history with
+  restore, approval switch).
+- Also fixed: M2.5 refused arguments as "truncated" whenever brackets didn't balance; Hermes's rule
+  (truncated only if they don't end in `}` or `]`) now decides, so a stray bracket is retried.
+- Part 2 (next): background review after turns, `/refine`, `/learn`, the curator, skill bundles.
+
 **M5: Breadth.** Compression, delegation, MCP, web search/extract, vision and image paste,
 context files + subdirectory hints, `@` references, checkpoints/`/rollback`, `/diff`, steer/queue,
 auxiliary model routing, usage and context breakdown.

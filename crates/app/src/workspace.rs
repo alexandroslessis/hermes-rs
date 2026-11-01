@@ -18,12 +18,19 @@ use crate::backend::{UiRequest, backend};
 use crate::chat::{ChatEvent, ChatView};
 use crate::memory_view::MemoryView;
 use crate::settings::SettingsView;
+use crate::skills_view::SkillsView;
 use crate::state::AppState;
 use crate::title_bar::TitleBar;
 
 actions!(
     workspace,
-    [NewSession, ToggleSidebar, OpenSettings, OpenMemory]
+    [
+        NewSession,
+        ToggleSidebar,
+        OpenSettings,
+        OpenMemory,
+        OpenSkills
+    ]
 );
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -31,6 +38,7 @@ enum Main {
     Chat,
     Settings,
     Memory,
+    Skills,
 }
 
 pub struct Workspace {
@@ -40,6 +48,7 @@ pub struct Workspace {
     main: Main,
     settings: Entity<SettingsView>,
     memory: Entity<MemoryView>,
+    skills: Entity<SkillsView>,
     sidebar_open: bool,
     collapsed: HashSet<String>,
     hovered_session: Option<String>,
@@ -71,6 +80,7 @@ impl Workspace {
     ) -> Self {
         let settings = cx.new(|cx| SettingsView::new(window, cx));
         let memory = cx.new(|cx| MemoryView::new(window, cx));
+        let skills = cx.new(SkillsView::new);
         let state = AppState::global(cx);
         let requests_task = cx.spawn_in(window, async move |this, cx| {
             while let Some(request) = requests.recv().await {
@@ -91,6 +101,7 @@ impl Workspace {
             main: Main::Chat,
             settings,
             memory,
+            skills,
             sidebar_open: true,
             collapsed: HashSet::new(),
             hovered_session: None,
@@ -123,6 +134,7 @@ impl Workspace {
         };
         match self.main {
             Main::Memory => self.memory.update(cx, |memory, cx| memory.refresh(cx)),
+            Main::Skills => self.skills.update(cx, |skills, cx| skills.refresh(cx)),
             Main::Chat => {
                 if let Some(chat) = self.active.as_ref().and_then(|id| self.chats.get(id)) {
                     let composer = chat.read(cx).composer();
@@ -205,7 +217,12 @@ impl Workspace {
                         .find(|m| m.role == rmcp::model::Role::User)
                 })
             {
-                let title = title_from(&first.as_concat_text());
+                let text = first.as_concat_text();
+                // A skill command's message is the whole skill: title it with what was typed.
+                let title = match hermes_tools::skills::describe_invocation(&text) {
+                    Some((skill, instruction)) => title_from(&format!("/{skill} {instruction}")),
+                    None => title_from(&text),
+                };
                 if !title.is_empty() {
                     let _ = backend.runtime.store().set_title(&session_id, &title);
                 }
@@ -608,6 +625,7 @@ impl Render for Workspace {
         let main: AnyElement = match self.main {
             Main::Settings => self.settings.clone().into_any_element(),
             Main::Memory => self.memory.clone().into_any_element(),
+            Main::Skills => self.skills.clone().into_any_element(),
             Main::Chat => match self.active.as_ref().and_then(|id| self.chats.get(id)) {
                 Some(chat) => chat.clone().into_any_element(),
                 None => v_flex()
@@ -634,6 +652,7 @@ impl Render for Workspace {
         };
         let settings_open = matches!(self.main, Main::Settings);
         let memory_open = matches!(self.main, Main::Memory);
+        let skills_open = matches!(self.main, Main::Skills);
         let _ = window;
         v_flex()
             .size_full()
@@ -650,6 +669,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenMemory, window, cx| {
                 this.toggle_main(Main::Memory, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenSkills, window, cx| {
+                this.toggle_main(Main::Skills, window, cx)
             }))
             .font(theme::theme_settings(cx).ui_font(cx).clone())
             .text_color(colors.text)
@@ -676,6 +698,18 @@ impl Render for Workspace {
                         Label::new("Hermes")
                             .size(LabelSize::Small)
                             .color(Color::Muted),
+                    )
+                    .right(
+                        IconButton::new("open-skills", IconName::Book)
+                            .icon_color(if skills_open {
+                                Color::Accent
+                            } else {
+                                Color::Muted
+                            })
+                            .tooltip(Tooltip::text("Skills (Ctrl+Shift+K)"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_main(Main::Skills, window, cx)
+                            })),
                     )
                     .right(
                         IconButton::new("open-memory", IconName::Notepad)

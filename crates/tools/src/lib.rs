@@ -12,6 +12,8 @@ mod process;
 mod recall;
 mod search;
 mod shell;
+mod skill_manage;
+pub mod skills;
 mod todo;
 
 use std::path::{Path, PathBuf};
@@ -30,6 +32,8 @@ pub use clarify::{
 };
 pub use process::ProcessNotice;
 pub use shell::{ShellKind, detect_shell};
+pub use skill_manage::{PendingSkillWrite, SkillOp};
+pub use skills::{SkillCommit, SkillEntry, SkillStore, SkillsConfig};
 pub use todo::{TodoItem, TodoStatus};
 
 /// What the tools need from the app: answers to `clarify`, and somewhere to deliver
@@ -54,6 +58,8 @@ pub struct SessionToolsConfig {
     pub memory: Option<Arc<hermes_memory::MemoryStore>>,
     /// Past conversations (the `session_search` tool).
     pub history: Option<Arc<hermes_store::Store>>,
+    /// The skills folder (`skills_list`, `skill_view`, `skill_manage`).
+    pub skills: Option<Arc<SkillStore>>,
 }
 
 pub struct SessionTools {
@@ -69,6 +75,7 @@ pub struct SessionTools {
     /// Failed memory consolidations this turn (Hermes caps them per turn).
     memory_failures: parking_lot::Mutex<hermes_memory::TurnFailures>,
     history: Option<Arc<hermes_store::Store>>,
+    skills: Option<Arc<SkillStore>>,
 }
 
 impl SessionTools {
@@ -85,6 +92,7 @@ impl SessionTools {
             memory: config.memory,
             memory_failures: Default::default(),
             history: config.history,
+            skills: config.skills,
         }
     }
 
@@ -147,6 +155,7 @@ impl SessionTools {
             "todo_list" => todo::todo_list(self, args),
             "memory" => self.memory_tool(&args),
             "session_search" => self.session_search(&args),
+            "skills_list" | "skill_view" | "skill_manage" => self.skills_tool(name, &args),
             "clarify" => clarify::clarify(self, args).await,
             other => ToolOutput::error(format!("Unknown tool '{other}'.")),
         }
@@ -154,6 +163,22 @@ impl SessionTools {
 }
 
 impl SessionTools {
+    fn skills_tool(&self, name: &str, args: &Value) -> ToolOutput {
+        let Some(skills) = &self.skills else {
+            return ToolOutput::error("Skills are not available in this session.");
+        };
+        let result = match name {
+            "skills_list" => skills.list_tool(args),
+            "skill_view" => skills.view_tool(args),
+            _ => skills.manage_tool(args),
+        };
+        let failed = result.get("success") == Some(&Value::Bool(false));
+        ToolOutput {
+            value: result,
+            is_error: failed,
+        }
+    }
+
     fn memory_tool(&self, args: &Value) -> ToolOutput {
         let Some(memory) = &self.memory else {
             return ToolOutput::error(
@@ -254,6 +279,7 @@ pub(crate) mod tests {
             todos: Vec::new(),
             memory: None,
             history: None,
+            skills: None,
         });
         (dir, tools)
     }

@@ -36,6 +36,9 @@ pub struct AppConfig {
     /// Stage the agent's memory writes for approval (Hermes's `memory.write_approval`).
     #[serde(default)]
     pub memory_write_approval: bool,
+    /// Stage the agent's skill writes for approval (Hermes's `skills.write_approval`).
+    #[serde(default)]
+    pub skill_write_approval: bool,
 }
 
 impl Default for AppConfig {
@@ -53,6 +56,7 @@ impl Default for AppConfig {
             theme: None,
             efforts: Default::default(),
             memory_write_approval: false,
+            skill_write_approval: false,
         }
     }
 }
