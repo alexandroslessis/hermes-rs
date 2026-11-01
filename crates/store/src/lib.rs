@@ -17,7 +17,7 @@ mod projects;
 mod search;
 
 pub use projects::{Project, is_under, project_for_path};
-pub use search::{SearchHit, SearchQuery, SearchRow, SearchSort};
+pub use search::{Insights, SearchHit, SearchQuery, SearchRow, SearchSort};
 
 /// v2 added the session-search index, v3 projects, v4 pinned sessions.
 const SCHEMA_VERSION: i32 = 4;

@@ -469,3 +469,79 @@ mod sidebar_tests {
         );
     }
 }
+
+/// Hermes's `/insights` over the sessions active since a time.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Insights {
+    pub sessions: i64,
+    pub messages: i64,
+    pub user_messages: i64,
+    pub tool_calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost: Option<f64>,
+    /// First session start and last activity (Unix ms).
+    pub first_ms: Option<i64>,
+    pub last_ms: Option<i64>,
+    /// (model, sessions, tokens), most tokens first.
+    pub models: Vec<(String, i64, i64)>,
+    /// (tool, calls), most calls first.
+    pub tools: Vec<(String, i64)>,
+}
+
+impl crate::Store {
+    pub fn insights(&self, since_ms: i64) -> Result<Insights> {
+        let conn = self.conn.lock();
+        let mut insights = Insights::default();
+        (insights.sessions, insights.first_ms, insights.last_ms) = conn.query_row(
+            "SELECT COUNT(*), MIN(created_at), MAX(updated_at) FROM sessions WHERE updated_at >= ?1",
+            [since_ms],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        (insights.messages, insights.user_messages, insights.tool_calls) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(r.role = 'user'), 0),
+                    COALESCE(SUM(CASE WHEN r.tool_calls IS NOT NULL THEN json_array_length(r.tool_calls) ELSE 0 END), 0)
+             FROM search_rows r JOIN sessions s ON s.id = r.session_id
+             WHERE s.updated_at >= ?1 AND r.role IN ('user', 'assistant')",
+            [since_ms],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let mut models = conn.prepare(
+            "SELECT model, COUNT(DISTINCT session_id), SUM(input_tokens), SUM(output_tokens), SUM(cost)
+             FROM usage WHERE at >= ?1 GROUP BY model ORDER BY SUM(input_tokens + output_tokens) DESC",
+        )?;
+        let rows = models.query_map([since_ms], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (model, sessions, input, output, cost) = row?;
+            insights.input_tokens += input;
+            insights.output_tokens += output;
+            if let Some(cost) = cost {
+                *insights.cost.get_or_insert(0.0) += cost;
+            }
+            insights.models.push((model, sessions, input + output));
+        }
+        let mut tools = conn.prepare(
+            "SELECT json_extract(t.value, '$.name'), COUNT(*)
+             FROM search_rows r JOIN sessions s ON s.id = r.session_id, json_each(r.tool_calls) t
+             WHERE s.updated_at >= ?1 AND r.tool_calls IS NOT NULL
+             GROUP BY 1 ORDER BY 2 DESC LIMIT 15",
+        )?;
+        insights.tools = tools
+            .query_map([since_ms], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    row.get(1)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(insights)
+    }
+}

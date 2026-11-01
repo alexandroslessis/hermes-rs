@@ -799,17 +799,30 @@ impl ChatView {
         };
         // Hermes's `/rollback` and `/diff` report in the chat instead of starting a turn.
         let local = text.as_deref().and_then(|t| {
-            command_arg(t, "rollback")
-                .map(|args| ("rollback", args))
-                .or_else(|| command_arg(t, "diff").map(|args| ("diff", args)))
+            ["rollback", "diff", "undo", "usage", "insights"]
+                .into_iter()
+                .find_map(|name| command_arg(t, name).map(|args| (name, args)))
         });
         if let Some((command, args)) = local {
             let runtime = backend.runtime.clone();
-            let result = if command == "rollback" {
-                runtime.rollback(&self.session_id, args)
-            } else {
-                runtime.diff(&self.session_id, args)
+            let context_length = AppState::global(cx).read(cx).context_length(&self.model);
+            let mut restore = None;
+            let result = match command {
+                "rollback" => runtime.rollback(&self.session_id, args),
+                "undo" => runtime
+                    .undo(&self.session_id, args)
+                    .map(|(messages, typed)| {
+                        restore = typed;
+                        messages
+                    }),
+                "usage" => runtime.usage(&self.session_id, context_length),
+                "insights" => runtime.insights(&self.session_id, args),
+                _ => runtime.diff(&self.session_id, args),
             };
+            // `/undo` puts the undone message back in the box.
+            if let Some(typed) = restore {
+                self.composer.update(cx, |c, cx| c.set_text(typed, cx));
+            }
             match result {
                 Ok(messages) => {
                     self.conversation = Conversation::new_unvalidated(messages);
@@ -3643,6 +3656,18 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     (
         "steer",
         "Send guidance to the running turn, delivered after its current tool call",
+    ),
+    (
+        "undo",
+        "Remove the last exchange (/undo N for more) and put the message back in the box",
+    ),
+    (
+        "usage",
+        "Token use, cost and context breakdown for this session",
+    ),
+    (
+        "insights",
+        "Usage across sessions: /insights --days N (default 30)",
     ),
     (
         "queue",

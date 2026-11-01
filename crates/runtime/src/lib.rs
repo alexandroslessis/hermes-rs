@@ -1057,6 +1057,98 @@ impl Runtime {
         self.add_command_output(&open, "diff", &output)
     }
 
+    /// Hermes's `/undo [N]`: removes the last N exchanges (default 1). Returns the conversation
+    /// after it (ending with the report) and the first removed message as the user typed it, for
+    /// the composer.
+    pub fn undo(&self, session_id: &str, args: &str) -> Result<(Vec<Message>, Option<String>)> {
+        let open = self.idle_session(session_id)?;
+        let turns = match args.trim() {
+            "" => 1,
+            arg => match arg.parse::<usize>() {
+                Ok(n) if n > 0 => n,
+                _ => {
+                    let report = format!("Invalid count \"{arg}\" — use /undo or /undo N.");
+                    return Ok((self.add_command_output(&open, "undo", &report)?, None));
+                }
+            },
+        };
+        let starts: Vec<usize> = open
+            .conversation
+            .lock()
+            .messages()
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m.role == rmcp::model::Role::User
+                    && m.is_user_visible()
+                    && !m.is_tool_response()
+                    && m.content
+                        .iter()
+                        .any(|c| matches!(c, MessageContent::Text(_)))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let Some(&start) = starts
+            .iter()
+            .rev()
+            .nth(turns.min(starts.len()).saturating_sub(1))
+        else {
+            return Ok((
+                self.add_command_output(&open, "undo", "Nothing to undo.")?,
+                None,
+            ));
+        };
+        let undone = turns.min(starts.len());
+        let (removed, typed) = {
+            let conversation = open.conversation.lock();
+            let message = &conversation.messages()[start];
+            let typed = hermes_tools::references::typed_text(message)
+                .map(str::to_string)
+                .unwrap_or_else(|| message.as_concat_text());
+            // Counted without command reports (/usage, /diff, …), which aren't the conversation.
+            let removed = conversation.messages()[start..]
+                .iter()
+                .filter(|m| m.metadata.operation_note(COMMAND_NOTE, "command").is_none())
+                .count();
+            (removed, typed)
+        };
+        self.rewind(session_id, start)?;
+        let report = format!(
+            "↩️ Undid {undone} turn{} ({removed} message{}). The message is back in the box to edit and resend.",
+            if undone == 1 { "" } else { "s" },
+            if removed == 1 { "" } else { "s" },
+        );
+        Ok((
+            self.add_command_output(&open, "undo", &report)?,
+            Some(typed),
+        ))
+    }
+
+    /// Hermes's `/usage`: the session's token use, cost, context and its estimated breakdown.
+    pub fn usage(&self, session_id: &str, context_length: Option<usize>) -> Result<Vec<Message>> {
+        let open = self.idle_session(session_id)?;
+        let totals = self.store.usage_totals(session_id)?;
+        let model = open.record.lock().model.clone();
+        let compressions = open
+            .conversation
+            .lock()
+            .messages()
+            .iter()
+            .filter(|m| compress::notice(m).is_some())
+            .count();
+        let breakdown = self.context_breakdown(session_id)?;
+        let report =
+            commands::usage_report(&model, &totals, context_length, compressions, &breakdown);
+        self.add_command_output(&open, "usage", &report)
+    }
+
+    /// Hermes's `/insights [--days N]`: activity across sessions.
+    pub fn insights(&self, session_id: &str, args: &str) -> Result<Vec<Message>> {
+        let open = self.idle_session(session_id)?;
+        let report = commands::insights_report(&self.store, args);
+        self.add_command_output(&open, "insights", &report)
+    }
+
     fn idle_session(&self, session_id: &str) -> Result<Arc<OpenSession>> {
         let open = self.open(session_id)?;
         anyhow::ensure!(

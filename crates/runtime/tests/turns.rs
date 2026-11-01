@@ -2505,3 +2505,50 @@ async fn compression_uses_the_auxiliary_model_when_one_is_set() {
     assert_eq!(requests[3]["model"], "test-model");
     assert_eq!(requests[4]["model"], "summary-model");
 }
+
+#[tokio::test]
+async fn undo_usage_and_insights_report_in_the_chat() {
+    let h = harness(vec![text_reply("one"), text_reply("two")]).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "first").await;
+    run_turn(&h, &session, "second").await;
+
+    let usage = h.runtime.usage(&session, Some(1_000)).unwrap();
+    let report = usage.last().unwrap().as_concat_text();
+    assert!(
+        report.contains("API calls: 2") && report.contains("Context: 100 / 1,000 (10%)"),
+        "{report}"
+    );
+    assert!(report.contains("• Conversation: ~"));
+
+    let insights = h.runtime.insights(&session, "--days 7").unwrap();
+    let report = insights.last().unwrap().as_concat_text();
+    assert!(
+        report.contains("Sessions: 1") && report.contains("`test-model`"),
+        "{report}"
+    );
+    assert!(
+        h.runtime
+            .insights(&session, "--days x")
+            .unwrap()
+            .last()
+            .unwrap()
+            .as_concat_text()
+            .starts_with("Invalid")
+    );
+
+    let (messages, typed) = h.runtime.undo(&session, "").unwrap();
+    assert_eq!(typed.as_deref(), Some("second"));
+    assert!(messages.iter().all(|m| m.as_concat_text() != "two"));
+    assert!(
+        messages
+            .last()
+            .unwrap()
+            .as_concat_text()
+            .starts_with("↩️ Undid 1 turn (2 messages)")
+    );
+    let (_, typed) = h.runtime.undo(&session, "5").unwrap();
+    assert_eq!(typed.as_deref(), Some("first"));
+    let (messages, typed) = h.runtime.undo(&session, "").unwrap();
+    assert!(typed.is_none() && messages.last().unwrap().as_concat_text() == "Nothing to undo.");
+}

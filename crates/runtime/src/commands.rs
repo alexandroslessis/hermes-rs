@@ -348,3 +348,180 @@ fn git<S: AsRef<str>>(args: &[S], cwd: &Path) -> Option<(bool, String)> {
     });
     Some((ok, out))
 }
+
+fn thousands(n: i64) -> String {
+    let digits = n.abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if n < 0 { format!("-{out}") } else { out }
+}
+
+/// Hermes's `/usage`: the session's token use, cost and context, with the estimated breakdown.
+pub fn usage_report(
+    model: &str,
+    totals: &hermes_store::UsageTotals,
+    context_length: Option<usize>,
+    compressions: usize,
+    breakdown: &crate::ContextBreakdown,
+) -> String {
+    let mut lines = vec!["📊 **Session Token Usage**".to_string(), String::new()];
+    lines.push(format!("Model: `{model}`"));
+    if totals.calls == 0 {
+        lines.push(format!(
+            "Estimated context: ~{} tokens",
+            thousands(breakdown.total() as i64)
+        ));
+        lines.push("_(Detailed usage available after the first agent response)_".into());
+    } else {
+        lines.push(format!("Input tokens: {}", thousands(totals.input_tokens)));
+        if totals.cache_read_tokens > 0 {
+            lines.push(format!(
+                "Cache read tokens: {}",
+                thousands(totals.cache_read_tokens)
+            ));
+        }
+        if totals.cache_write_tokens > 0 {
+            lines.push(format!(
+                "Cache write tokens: {}",
+                thousands(totals.cache_write_tokens)
+            ));
+        }
+        lines.push(format!(
+            "Output tokens: {}",
+            thousands(totals.output_tokens)
+        ));
+        lines.push(format!(
+            "Total: {}",
+            thousands(totals.input_tokens + totals.output_tokens)
+        ));
+        lines.push(format!("API calls: {}", thousands(totals.calls)));
+        if let Some(cost) = totals.cost {
+            lines.push(format!("Cost: ${cost:.4}"));
+        }
+        if let Some(total) = context_length.filter(|&n| n > 0) {
+            let used = totals.last_input_tokens;
+            lines.push(format!(
+                "Context: {} / {} ({}%)",
+                thousands(used),
+                thousands(total as i64),
+                (used as f64 * 100.0 / total as f64).round()
+            ));
+        }
+    }
+    if compressions > 0 {
+        lines.push(format!("Compressions: {compressions}"));
+    }
+    let total = breakdown.total().max(1) as f64;
+    lines.push(String::new());
+    lines.push("🧩 **Context breakdown** _(estimated)_".into());
+    for (label, count) in [
+        ("System prompt", breakdown.system_prompt),
+        ("Tool definitions", breakdown.tool_definitions),
+        ("Skills", breakdown.skills),
+        ("Memory", breakdown.memory),
+        ("Conversation", breakdown.conversation),
+    ] {
+        if count > 0 || label == "Conversation" {
+            lines.push(format!(
+                "• {label}: ~{} ({}%)",
+                thousands(count as i64),
+                (count as f64 * 100.0 / total).round()
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Hermes's `/insights [--days N]`: activity, tokens, models and tools over the last N days.
+pub fn insights_report(store: &hermes_store::Store, args: &str) -> String {
+    let mut days = 30i64;
+    let mut words = args.split_whitespace();
+    while let Some(word) = words.next() {
+        let value = match word.strip_prefix("--days=") {
+            Some(value) => Some(value.to_string()),
+            None if word == "--days" => words.next().map(str::to_string),
+            None => Some(word.to_string()),
+        };
+        match value.and_then(|v| v.parse::<i64>().ok()).filter(|&d| d > 0) {
+            Some(value) => days = value,
+            None => return format!("Invalid --days value: {word}"),
+        }
+    }
+    let since = chrono::Utc::now().timestamp_millis() - days * 86_400_000;
+    let insights = match store.insights(since) {
+        Ok(insights) => insights,
+        Err(error) => return format!("Error generating insights: {error:#}"),
+    };
+    if insights.sessions == 0 {
+        return format!("No sessions found in the last {days} days.");
+    }
+    let day = |ms: Option<i64>| {
+        ms.and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|t| {
+                t.with_timezone(&chrono::Local)
+                    .format("%b %d, %Y")
+                    .to_string()
+            })
+            .unwrap_or_default()
+    };
+    let mut lines = vec![
+        format!("📊 **Hermes Insights**: last {days} days"),
+        format!(
+            "Period: {} — {}",
+            day(insights.first_ms),
+            day(insights.last_ms)
+        ),
+        String::new(),
+        "📋 **Overview**".into(),
+        format!(
+            "Sessions: {} · Messages: {} · User messages: {} · Tool calls: {}",
+            thousands(insights.sessions),
+            thousands(insights.messages),
+            thousands(insights.user_messages),
+            thousands(insights.tool_calls)
+        ),
+        format!(
+            "Input tokens: {} · Output tokens: {} · Total: {}",
+            thousands(insights.input_tokens),
+            thousands(insights.output_tokens),
+            thousands(insights.input_tokens + insights.output_tokens)
+        ),
+        format!(
+            "Avg messages/session: {:.1}",
+            insights.messages as f64 / insights.sessions as f64
+        ),
+    ];
+    if let Some(cost) = insights.cost {
+        lines.push(format!("Estimated cost: ${cost:.2}"));
+    }
+    if !insights.models.is_empty() {
+        lines.push(String::new());
+        lines.push("🤖 **Models Used**".into());
+        lines.push("| Model | Sessions | Tokens |\n|---|---:|---:|".into());
+        for (model, sessions, tokens) in &insights.models {
+            lines.push(format!(
+                "| `{model}` | {sessions} | {} |",
+                thousands(*tokens)
+            ));
+        }
+    }
+    if !insights.tools.is_empty() {
+        let total: i64 = insights.tools.iter().map(|(_, n)| n).sum();
+        lines.push(String::new());
+        lines.push("🔧 **Top Tools**".into());
+        lines.push("| Tool | Calls | % |\n|---|---:|---:|".into());
+        for (tool, count) in &insights.tools {
+            lines.push(format!(
+                "| `{tool}` | {} | {:.1}% |",
+                thousands(*count),
+                *count as f64 * 100.0 / total.max(1) as f64
+            ));
+        }
+    }
+    lines.join("\n")
+}
