@@ -115,6 +115,7 @@ mod tests {
             system_prompt: String::new(),
             created_at: 0,
             updated_at: 0,
+            pinned: false,
         }
     }
 

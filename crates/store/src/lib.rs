@@ -19,8 +19,8 @@ mod search;
 pub use projects::{Project, is_under, project_for_path};
 pub use search::{SearchHit, SearchQuery, SearchRow, SearchSort};
 
-/// v2 added the session-search index, v3 projects.
-const SCHEMA_VERSION: i32 = 3;
+/// v2 added the session-search index, v3 projects, v4 pinned sessions.
+const SCHEMA_VERSION: i32 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE sessions (
@@ -54,6 +54,9 @@ CREATE TABLE usage (
 CREATE INDEX usage_by_session ON usage(session_id);
 ";
 
+/// v4: pinned sessions.
+const PINNED_COLUMN: &str = "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;";
+
 /// A stored session. `system_prompt` is frozen at creation and only replaced by compaction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionRecord {
@@ -65,6 +68,8 @@ pub struct SessionRecord {
     pub system_prompt: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Kept at the top of the sidebar.
+    pub pinned: bool,
 }
 
 pub struct NewSession {
@@ -117,12 +122,18 @@ impl Store {
             conn.execute_batch(SCHEMA)?;
             conn.execute_batch(search::SEARCH_SCHEMA)?;
             conn.execute_batch(projects::PROJECTS_SCHEMA)?;
+            conn.execute_batch(PINNED_COLUMN)?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if version < SCHEMA_VERSION {
             if version < 2 {
                 search::migrate(&conn)?;
             }
-            projects::migrate(&conn)?;
+            if version < 3 {
+                projects::migrate(&conn)?;
+            }
+            if version < 4 {
+                conn.execute_batch(PINNED_COLUMN)?;
+            }
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if version != SCHEMA_VERSION {
             anyhow::bail!(
@@ -145,6 +156,7 @@ impl Store {
             system_prompt: new.system_prompt,
             created_at: now,
             updated_at: now,
+            pinned: false,
         };
         self.conn.lock().execute(
             "INSERT INTO sessions (id, title, cwd, provider, model, system_prompt, created_at, updated_at)
@@ -159,7 +171,7 @@ impl Store {
             .conn
             .lock()
             .query_row(
-                "SELECT id, title, cwd, provider, model, system_prompt, created_at, updated_at
+                "SELECT id, title, cwd, provider, model, system_prompt, created_at, updated_at, pinned
                  FROM sessions WHERE id = ?1",
                 [id],
                 |row| {
@@ -172,6 +184,7 @@ impl Store {
                         system_prompt: row.get(5)?,
                         created_at: row.get(6)?,
                         updated_at: row.get(7)?,
+                        pinned: row.get(8)?,
                     })
                 },
             )
@@ -182,7 +195,7 @@ impl Store {
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionRecord>> {
         let conn = self.conn.lock();
         let mut statement = conn.prepare(
-            "SELECT id, title, cwd, provider, model, system_prompt, created_at, updated_at
+            "SELECT id, title, cwd, provider, model, system_prompt, created_at, updated_at, pinned
              FROM sessions ORDER BY updated_at DESC LIMIT ?1",
         )?;
         let rows = statement.query_map([limit as i64], |row| {
@@ -195,9 +208,19 @@ impl Store {
                 system_prompt: row.get(5)?,
                 created_at: row.get(6)?,
                 updated_at: row.get(7)?,
+                pinned: row.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Pins or unpins a session (its place in the list by time is kept).
+    pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE sessions SET pinned = ?2 WHERE id = ?1",
+            params![id, pinned],
+        )?;
+        Ok(())
     }
 
     pub fn set_title(&self, id: &str, title: &str) -> Result<()> {

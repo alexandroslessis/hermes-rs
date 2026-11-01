@@ -164,6 +164,7 @@ impl Runtime {
                 system_prompt,
                 created_at: 0,
                 updated_at: 0,
+                pinned: false,
             }),
             conversation: Mutex::new(Conversation::new_unvalidated(vec![message])),
             tools: tools.clone(),

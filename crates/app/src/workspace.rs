@@ -13,7 +13,7 @@ use hermes_store::{Project, SessionRecord};
 use tokio::sync::mpsc;
 use ui::{
     AgentThreadStatus, Callout, CommonAnimationExt, ContextMenu, Divider, PopoverMenu, ThreadItem,
-    TintColor, Tooltip, prelude::*,
+    TintColor, Tooltip, prelude::*, right_click_menu,
 };
 
 use crate::backend::{UiRequest, backend};
@@ -25,6 +25,7 @@ use crate::settings::SettingsView;
 use crate::sidebar::{ProjectGroup, folder_name, group_sessions, project_root};
 use crate::skills_view::SkillsView;
 use crate::state::AppState;
+use crate::text_area::{TextArea, TextAreaEvent};
 use crate::title_bar::TitleBar;
 
 actions!(
@@ -65,6 +66,11 @@ pub struct Workspace {
     sidebar_open: bool,
     collapsed: HashSet<String>,
     hovered_session: Option<String>,
+    /// The sidebar search box, and the sessions matching it (`None` when it's empty).
+    search: Entity<TextArea>,
+    search_hits: Option<HashSet<String>>,
+    /// The session being renamed and its title editor.
+    renaming: Option<(String, Entity<TextArea>, Subscription)>,
     project_roots: RefCell<HashMap<String, PathBuf>>,
     sidebar_scroll: ScrollHandle,
     project_dialog: Option<(Entity<ProjectDialog>, Vec<Subscription>)>,
@@ -101,6 +107,12 @@ impl Workspace {
         let settings = cx.new(|cx| SettingsView::new(window, cx));
         let memory = cx.new(|cx| MemoryView::new(window, cx));
         let skills = cx.new(SkillsView::new);
+        let search = cx.new(|cx| TextArea::new("Search sessions…", cx).single_line());
+        let search_subscription = cx.subscribe(&search, |this: &mut Self, _, event, cx| {
+            if matches!(event, TextAreaEvent::Changed) {
+                this.update_search(cx);
+            }
+        });
         let state = AppState::global(cx);
         let requests_task = cx.spawn_in(window, async move |this, cx| {
             while let Some(request) = requests.recv().await {
@@ -126,6 +138,9 @@ impl Workspace {
             sidebar_open: true,
             collapsed: HashSet::new(),
             hovered_session: None,
+            search,
+            search_hits: None,
+            renaming: None,
             project_roots: RefCell::default(),
             sidebar_scroll: ScrollHandle::new(),
             project_dialog: None,
@@ -149,6 +164,7 @@ impl Workspace {
             }),
             _subscriptions: vec![
                 cx.observe(&state, |_, _, cx| cx.notify()),
+                search_subscription,
                 // Coming back to the window counts as seeing the session on screen.
                 cx.observe_window_activation(window, |this, window, cx| {
                     if window.is_window_active() {
@@ -217,6 +233,71 @@ impl Workspace {
         });
     }
 
+    /// Re-runs the sidebar search for the search box's text.
+    fn update_search(&mut self, cx: &mut Context<Self>) {
+        let text = self.search.read(cx).text().trim().to_string();
+        self.search_hits = (!text.is_empty()).then(|| {
+            backend(cx)
+                .runtime
+                .store()
+                .sessions_matching(&text)
+                .unwrap_or_default()
+        });
+        cx.notify();
+    }
+
+    /// Whether a session shows under the current search.
+    fn shown(&self, id: &str) -> bool {
+        self.search_hits
+            .as_ref()
+            .is_none_or(|hits| hits.contains(id))
+    }
+
+    fn set_pinned(&mut self, id: &str, pinned: bool, cx: &mut Context<Self>) {
+        if let Err(error) = backend(cx).runtime.store().set_pinned(id, pinned) {
+            self.notice = Some(format!("{error:#}"));
+        }
+        self.reload_sessions(cx);
+    }
+
+    /// Replaces a session's title with an editor; Enter saves, Escape cancels.
+    fn start_rename(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.title.clone())
+            .unwrap_or_default();
+        let editor = cx.new(|cx| {
+            let mut area = TextArea::new("Session name", cx).single_line();
+            area.set_text(title, cx);
+            area
+        });
+        let subscription = cx.subscribe(&editor, |this, editor, event, cx| {
+            if matches!(event, TextAreaEvent::Submit) {
+                let title = editor.read(cx).text().trim().to_string();
+                this.finish_rename(Some(title), cx);
+            }
+        });
+        editor.focus_handle(cx).focus(window, cx);
+        self.renaming = Some((id, editor, subscription));
+        cx.notify();
+    }
+
+    /// Saves the new title (`None` cancels; an empty title keeps the old one).
+    fn finish_rename(&mut self, title: Option<String>, cx: &mut Context<Self>) {
+        let Some((id, _, _)) = self.renaming.take() else {
+            return;
+        };
+        if let Some(title) = title.filter(|t| !t.is_empty()) {
+            if let Err(error) = backend(cx).runtime.store().set_title(&id, &title) {
+                self.notice = Some(format!("{error:#}"));
+            }
+            self.reload_sessions(cx);
+        }
+        cx.notify();
+    }
+
     fn reload_projects(&mut self, cx: &mut Context<Self>) {
         self.projects = backend(cx)
             .runtime
@@ -226,9 +307,16 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The project groups of the sessions shown (pinned ones are listed apart).
     fn groups(&self) -> Vec<ProjectGroup> {
+        let sessions: Vec<SessionRecord> = self
+            .sessions
+            .iter()
+            .filter(|s| !s.pinned && self.shown(&s.id))
+            .cloned()
+            .collect();
         group_sessions(
-            &self.sessions,
+            &sessions,
             &self.projects,
             &mut self.project_roots.borrow_mut(),
         )
@@ -869,12 +957,33 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
+        if let Some((_, editor, _)) = self
+            .renaming
+            .as_ref()
+            .filter(|(id, _, _)| *id == session.id)
+        {
+            return div()
+                .mx_2()
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .border_1()
+                .border_color(colors.border_focused)
+                .bg(colors.editor_background)
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.finish_rename(None, cx);
+                    }
+                }))
+                .child(editor.clone())
+                .into_any_element();
+        }
         let (button_hover, button_active) = (colors.element_background, colors.element_active);
         let id = session.id.clone();
         let delete_id = session.id.clone();
         let hover_id = session.id.clone();
         let hovered = self.hovered_session.as_deref() == Some(session.id.as_str());
-        ThreadItem::new(
+        let row = ThreadItem::new(
             SharedString::from(session.id.clone()),
             session
                 .title
@@ -915,7 +1024,40 @@ impl Workspace {
             )
         })
         .on_click(cx.listener(move |this, _, window, cx| this.open_session(id.clone(), window, cx)))
-        .into_any_element()
+        .into_any_element();
+        // Right-click: rename, pin, delete.
+        let workspace = cx.entity().downgrade();
+        let (menu_id, pinned) = (session.id.clone(), session.pinned);
+        right_click_menu(SharedString::from(format!("session-menu-{}", session.id)))
+            .trigger(move |_, _, _| div().w_full().child(row))
+            .menu(move |window, cx| {
+                let (workspace, id) = (workspace.clone(), menu_id.clone());
+                ContextMenu::build(window, cx, move |menu, _, _| {
+                    let (rename, pin, delete) =
+                        (workspace.clone(), workspace.clone(), workspace.clone());
+                    let (rename_id, pin_id, delete_id) = (id.clone(), id.clone(), id.clone());
+                    menu.entry("Rename", None, move |window, cx| {
+                        rename
+                            .update(cx, |this, cx| {
+                                this.start_rename(rename_id.clone(), window, cx)
+                            })
+                            .ok();
+                    })
+                    .entry(if pinned { "Unpin" } else { "Pin" }, None, move |_, cx| {
+                        pin.update(cx, |this, cx| this.set_pinned(&pin_id, !pinned, cx))
+                            .ok();
+                    })
+                    .separator()
+                    .entry("Delete", None, move |window, cx| {
+                        delete
+                            .update(cx, |this, cx| {
+                                this.delete_session(delete_id.clone(), window, cx)
+                            })
+                            .ok();
+                    })
+                })
+            })
+            .into_any_element()
     }
 
     fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -927,6 +1069,36 @@ impl Workspace {
             .find(|g| Some(&g.key) == selected_key.as_ref())
             .map(|g| g.name.clone());
         let mut rows: Vec<AnyElement> = Vec::new();
+        // Pinned sessions first, whatever their project.
+        let pinned: Vec<&SessionRecord> = self
+            .sessions
+            .iter()
+            .filter(|s| s.pinned && self.shown(&s.id))
+            .collect();
+        if !pinned.is_empty() {
+            rows.push(
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::Pin)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("Pinned")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            );
+            for session in pinned {
+                rows.push(self.render_session_row(session, now, cx));
+            }
+            rows.push(div().py_1().child(Divider::horizontal()).into_any_element());
+        }
+        let searching = self.search_hits.is_some();
         for (index, group) in groups.iter().enumerate() {
             // A line between projects.
             if index > 0 {
@@ -937,7 +1109,7 @@ impl Workspace {
             if self.collapsed.contains(&group.key) {
                 continue;
             }
-            if group.sessions.is_empty() {
+            if group.sessions.is_empty() && !searching {
                 rows.push(
                     div()
                         .px_3()
@@ -1024,6 +1196,27 @@ impl Workspace {
                                     cx.listener(|this, _, window, cx| this.new_session(window, cx)),
                                 ),
                         ),
+                    ),
+            )
+            .child(
+                div()
+                    .mx_2()
+                    .mb_2()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.editor_background)
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .child(
+                                Icon::new(IconName::MagnifyingGlass)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(div().flex_1().child(self.search.clone())),
                     ),
             )
             .child(Divider::horizontal())

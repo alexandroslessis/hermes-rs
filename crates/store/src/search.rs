@@ -393,3 +393,79 @@ mod tests {
         assert_eq!(hits[0].session_id, "s1");
     }
 }
+
+impl crate::Store {
+    /// Sessions whose title contains `text` or whose messages contain its words (as prefixes),
+    /// for filtering the session list.
+    pub fn sessions_matching(&self, text: &str) -> Result<std::collections::HashSet<String>> {
+        let text = text.trim();
+        let mut found = std::collections::HashSet::new();
+        if text.is_empty() {
+            return Ok(found);
+        }
+        let conn = self.conn.lock();
+        let mut titles =
+            conn.prepare("SELECT id FROM sessions WHERE title LIKE '%' || ?1 || '%'")?;
+        for id in titles.query_map([text], |row| row.get::<_, String>(0))? {
+            found.insert(id?);
+        }
+        let terms = text
+            .split_whitespace()
+            .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut messages = conn.prepare(
+            "SELECT DISTINCT r.session_id FROM search_fts JOIN search_rows r ON r.id = search_fts.rowid
+             WHERE search_fts MATCH ?1 LIMIT 1000",
+        )?;
+        if let Ok(rows) = messages.query_map([terms], |row| row.get::<_, String>(0)) {
+            for id in rows.flatten() {
+                found.insert(id);
+            }
+        }
+        Ok(found)
+    }
+}
+
+#[cfg(test)]
+mod sidebar_tests {
+    use crate::{NewSession, Store};
+    use hermes_llm::conversation::message::Message;
+
+    #[test]
+    fn sessions_match_by_title_and_text_and_pins_persist() {
+        let store = Store::open_in_memory().unwrap();
+        let new = || NewSession {
+            cwd: "C:/w".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            system_prompt: String::new(),
+        };
+        let a = store.create_session(new()).unwrap();
+        let b = store.create_session(new()).unwrap();
+        store.set_title(&a.id, "Fix the parser").unwrap();
+        store
+            .upsert_message(
+                &b.id,
+                0,
+                &Message::user()
+                    .with_text("deploying to staging")
+                    .with_generated_id_if_missing(),
+            )
+            .unwrap();
+        assert!(store.sessions_matching("parser").unwrap().contains(&a.id));
+        let hits = store.sessions_matching("deploy").unwrap();
+        assert!(hits.contains(&b.id) && !hits.contains(&a.id));
+        store.set_pinned(&b.id, true).unwrap();
+        assert!(store.session(&b.id).unwrap().unwrap().pinned);
+        assert!(
+            !store
+                .list_sessions(10)
+                .unwrap()
+                .iter()
+                .find(|s| s.id == a.id)
+                .unwrap()
+                .pinned
+        );
+    }
+}
