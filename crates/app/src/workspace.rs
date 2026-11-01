@@ -486,9 +486,8 @@ impl Workspace {
                         .find(|m| m.role == rmcp::model::Role::User)
                 })
             {
-                let text = first.as_concat_text();
-                // A skill command's message is the whole skill: title it with what was typed.
-                let title = title_from(&crate::chat::typed_command(&text).unwrap_or(text));
+                // A skill command or expanded references: title it with what was typed.
+                let title = title_from(&crate::chat::shown_user_text(&first));
                 if !title.is_empty() {
                     let _ = backend.runtime.store().set_title(&session_id, &title);
                 }

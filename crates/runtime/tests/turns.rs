@@ -1773,3 +1773,56 @@ async fn rewinding_past_a_compaction_brings_the_summarized_turns_back() {
 fn long_two() -> String {
     format!("two {}", "x".repeat(8_000))
 }
+
+#[tokio::test]
+async fn at_references_attach_context_the_chat_does_not_show() {
+    let h = harness(vec![text_reply("got it")]).await;
+    std::fs::write(h.work.path().join("notes.md"), "line one\nline two\n").unwrap();
+    let session = session_in(&h);
+    run_turn(&h, &session, "summarize @file:notes.md:2").await;
+    let sent = h.requests.lock()[0].to_string();
+    assert!(sent.contains("--- Attached Context ---"));
+    assert!(sent.contains("line two") && !sent.contains("line one"));
+    let user = h.runtime.messages(&session).unwrap()[0].clone();
+    assert_eq!(
+        hermes_tools::references::typed_text(&user),
+        Some("summarize @file:notes.md:2")
+    );
+}
+
+#[tokio::test]
+async fn too_much_attached_context_refuses_the_message() {
+    let h = harness(vec![]).await;
+    std::fs::write(h.work.path().join("a.txt"), "x".repeat(3_000)).unwrap();
+    std::fs::write(h.work.path().join("b.txt"), "y".repeat(3_000)).unwrap();
+    let session = session_in(&h);
+    let options = TurnOptions {
+        context_length: Some(2_000),
+        effort: None,
+    };
+    // Each file fits on its own (under half of 2k tokens), together they don't.
+    let error = h
+        .runtime
+        .start_turn(&session, &h.provider, options, "@file:a.txt @file:b.txt")
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("50% hard limit"), "{error}");
+    assert!(h.runtime.messages(&session).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_subdirectory_s_agents_md_arrives_with_the_first_tool_result_there() {
+    let h = harness(vec![
+        tool_reply(&[("c1", "read_file", json!({"path": "app/main.rs"}))]),
+        text_reply("done"),
+    ])
+    .await;
+    std::fs::create_dir(h.work.path().join("app")).unwrap();
+    std::fs::write(h.work.path().join("app/AGENTS.md"), "Use tabs in app/.").unwrap();
+    std::fs::write(h.work.path().join("app/main.rs"), "fn main() {}").unwrap();
+    let session = session_in(&h);
+    run_turn(&h, &session, "read app/main.rs").await;
+    let second = h.requests.lock()[1].to_string();
+    assert!(second.contains("[Subdirectory context discovered: app/AGENTS.md]"));
+    assert!(second.contains("Use tabs in app/."));
+}

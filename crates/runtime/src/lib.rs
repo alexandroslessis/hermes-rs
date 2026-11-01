@@ -521,14 +521,11 @@ impl Runtime {
             enabled: self.background_review.clone(),
         };
         let first_event = match text {
-            Some(text) => {
-                let user = Message::user()
-                    .with_text(text)
-                    .with_generated_id_if_missing();
+            Some(text) => user_message(&open, text, context_length).and_then(|user| {
                 runtime
                     .append(user.clone())
                     .map(|()| AgentEvent::Message(user))
-            }
+            }),
             None => runtime
                 .drop_trailing_errors()
                 .and_then(|conversation| conversation.context("there is no failed turn to retry"))
@@ -823,6 +820,29 @@ impl Runtime {
         let _ = std::fs::remove_dir_all(self.scratch_dir(session_id));
         Ok(())
     }
+}
+
+/// The user's message as the model gets it: with its `@` references expanded (Hermes's
+/// `preprocess_context_references`), the typed text kept for the chat to show. Refused when the
+/// attached context would take over half the window.
+fn user_message(open: &OpenSession, text: &str, context_length: Option<usize>) -> Result<Message> {
+    let cwd = PathBuf::from(&open.record.lock().cwd);
+    let home = dirs::home_dir().context("no home directory")?;
+    let Some(expanded) = hermes_tools::references::expand(text, &cwd, &home, context_length) else {
+        return Ok(Message::user()
+            .with_text(text)
+            .with_generated_id_if_missing());
+    };
+    anyhow::ensure!(!expanded.blocked, "{}", expanded.warnings.join("\n"));
+    let mut message = Message::user()
+        .with_text(expanded.message)
+        .with_generated_id_if_missing();
+    message.metadata.set_operation_note(
+        hermes_tools::references::NOTE,
+        "typed",
+        serde_json::Value::String(text.to_string()),
+    );
+    Ok(message)
 }
 
 /// What the frozen system prompt is built from; cloned into a compaction so it can rebuild it.

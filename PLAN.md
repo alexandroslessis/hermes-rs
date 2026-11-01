@@ -395,6 +395,25 @@ M5 part 2 status (2026-11-01): compression and the context breakdown, done.
   cooldown timers, micro-compaction, anti-thrash counters beyond "not twice without growth",
   the session-log/anchor-index sections, skill-prune markers, memory-provider context.
 
+M5 part 3 status (2026-11-01): `@` references and subdirectory hints, done.
+- `crates/tools/src/references.rs`: Hermes's `@file:path[:start-end]` (quoted paths too),
+  `@folder:`, `@diff`, `@staged`, `@git:N` (1-10); the tokens stay in the message, the blocks
+  follow "--- Attached Context ---" in Hermes's shapes (📄 fenced text, 📁 listing, 🧾 diff, 📎
+  on-disk pointer for binary or oversized files), problems under "--- Context Warnings ---". Paths
+  stay inside the working folder; credential folders, dotfiles and secret files are refused; the
+  16-reference cap, the 25% warning and the 50% refusal. git runs with external diff, textconv,
+  fsmonitor, hooks and prompts off, 30 s and 4 MB bounds.
+- The model gets the expanded message; the chat, edit-and-resend and the session title use what
+  was typed. The composer completes `@` kinds and `@file:` / `@folder:` paths (ignore files
+  honored); the `+` menu inserts File, Folder and Git Changes mentions.
+- `crates/tools/src/hints.rs`: Hermes's subdirectory hints. The first tool call touching a folder
+  below the working folder (path arguments, `cd`/`Set-Location` operands, path-like words of a
+  command; up to five ancestors) appends its AGENTS.md / CLAUDE.md / .cursorrules (32k cap) to
+  the result; links must resolve inside the folder, duplicates by content are skipped, dependency
+  and build trees and a home working folder are ignored.
+- Not yet: `@url:` (needs web extract, later in M5), plugin reference providers, the context-file
+  threat scan (not ported for startup context files either).
+
 **M6: Polish.** Command palette (Tier 2 `picker`), find in transcript, themes and fonts, diff
 review pane, import from `~/.hermes`, installer (MSI), auto-update.
 

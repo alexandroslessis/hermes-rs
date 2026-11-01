@@ -89,7 +89,9 @@ pub struct ChatView {
     /// The user message being edited in the composer; sending rewinds the conversation there.
     editing: Option<usize>,
     /// Skills matching a `/command` being typed: (name, short description).
-    slash_matches: Vec<(String, String)>,
+    slash_matches: Vec<Suggestion>,
+    /// The working folder's files, listed when an `@file:` / `@folder:` mention starts.
+    file_index: Option<Vec<(String, bool)>>,
     /// A steer the turn ended before delivering: Hermes sends it as the next message.
     next_message: Option<String>,
     /// A flagged command waiting for the user's decision, and where the answer goes.
@@ -165,6 +167,7 @@ impl ChatView {
             steering: None,
             editing: None,
             slash_matches: Vec::new(),
+            file_index: None,
             next_message: None,
             notices: Vec::new(),
             compacting: false,
@@ -283,6 +286,79 @@ impl ChatView {
         self.begin(Some(text), cx);
     }
 
+    /// While the composer ends in an `@` mention: the reference kinds it could start, or the
+    /// files (folders) whose path contains what follows `@file:` (`@folder:`). `None` otherwise.
+    fn mention_matches(&mut self, text: &str) -> Option<Vec<Suggestion>> {
+        let start = text.rfind(char::is_whitespace).map_or(0, |index| {
+            index + text[index..].chars().next().map_or(1, char::len_utf8)
+        });
+        let (before, token) = text.split_at(start);
+        if !token.starts_with('@') {
+            return None;
+        }
+        let complete = |reference: String| Suggestion {
+            label: reference.clone(),
+            description: String::new(),
+            text: format!("{before}{reference} "),
+        };
+        let (kind, partial) = match token.split_once(':') {
+            Some((kind @ ("@file" | "@folder"), partial)) => (kind, partial),
+            Some(_) => return Some(Vec::new()),
+            None => {
+                let kinds = MENTION_KINDS
+                    .iter()
+                    .filter(|(name, _)| name.starts_with(token))
+                    .map(|(name, description)| Suggestion {
+                        label: name.to_string(),
+                        description: description.to_string(),
+                        text: if name.ends_with(':') {
+                            format!("{before}{name}")
+                        } else {
+                            format!("{before}{name} ")
+                        },
+                    })
+                    .collect();
+                return Some(kinds);
+            }
+        };
+        let cwd = self.cwd.clone()?;
+        let index = self.file_index.get_or_insert_with(|| {
+            hermes_tools::references::workspace_entries(std::path::Path::new(&cwd), 20_000)
+        });
+        let query = partial.trim_start_matches(['`', '"', '\'']).to_lowercase();
+        let folders = kind == "@folder";
+        let mut matches: Vec<(u8, &String)> = index
+            .iter()
+            .filter(|(_, is_dir)| *is_dir == folders)
+            .filter_map(|(path, _)| {
+                let lower = path.to_lowercase();
+                let name = lower.rsplit('/').next().unwrap_or(&lower);
+                if query.is_empty() || name.starts_with(&query) {
+                    Some((0, path))
+                } else if lower.contains(&query) {
+                    Some((1, path))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        matches.sort_by_key(|(rank, path)| (*rank, path.len()));
+        Some(
+            matches
+                .into_iter()
+                .take(8)
+                .map(|(_, path)| {
+                    let mut suggestion = complete(format!(
+                        "{kind}:{}",
+                        hermes_tools::references::format_value(path)
+                    ));
+                    suggestion.label = format!("{kind}:{path}");
+                    suggestion
+                })
+                .collect(),
+        )
+    }
+
     /// While the composer holds a bare `/word`, the skills whose name contains it.
     fn update_slash_matches(&mut self, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).text().to_string();
@@ -290,7 +366,15 @@ impl ChatView {
             .strip_prefix('/')
             .filter(|q| !q.contains(char::is_whitespace))
             .map(str::to_lowercase);
-        let matches = match query {
+        if let Some(mentions) = self.mention_matches(&text) {
+            if mentions != self.slash_matches {
+                self.slash_matches = mentions;
+                cx.notify();
+            }
+            return;
+        }
+        self.file_index = None;
+        let matches: Vec<Suggestion> = match query {
             Some(query) => BUILTIN_COMMANDS
                 .iter()
                 .filter(|(name, _)| name.contains(query.as_str()))
@@ -319,6 +403,11 @@ impl ChatView {
                         }),
                 )
                 .take(6)
+                .map(|(name, description)| Suggestion {
+                    label: format!("/{name}"),
+                    description,
+                    text: format!("/{name} "),
+                })
                 .collect(),
             None => Vec::new(),
         };
@@ -351,7 +440,7 @@ impl ChatView {
 
     /// Puts a user message in the composer; sending it rewinds the conversation there.
     fn edit_message(&mut self, message_index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.conversation.messages()[message_index].as_concat_text();
+        let text = shown_user_text(&self.conversation.messages()[message_index]);
         self.composer
             .update(cx, |composer, cx| composer.set_text(text, cx));
         self.composer.focus_handle(cx).focus(window, cx);
@@ -1051,9 +1140,8 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let text = message.as_concat_text();
-        // A skill command: show what was typed, not the skill it loaded.
-        let shown = typed_command(&text).unwrap_or_else(|| text.clone());
+        // What was typed, not the skill it loaded or the context its references attached.
+        let shown = shown_user_text(message);
         let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
         let body = self.markdown_block((message_index, 0, MarkdownKind::User), &shown, style, cx);
         let colors = cx.theme().colors();
@@ -2288,27 +2376,27 @@ impl ChatView {
                                 .ok();
                         }
                     };
-                    let soon = "Coming with context mentions (M5)";
                     menu.key_context("AddContextMenu")
                         .item(
-                            ContextMenuEntry::new("Files & Directories")
+                            ContextMenuEntry::new("File")
                                 .icon(IconName::File)
                                 .icon_color(Color::Muted)
                                 .icon_size(IconSize::XSmall)
-                                .documentation_aside(ui::DocumentationSide::Right, move |_| {
-                                    Label::new(soon).into_any_element()
-                                })
                                 .handler(insert("@file:")),
                         )
                         .item(
-                            ContextMenuEntry::new("Sessions")
-                                .icon(IconName::Thread)
+                            ContextMenuEntry::new("Folder")
+                                .icon(IconName::Folder)
                                 .icon_color(Color::Muted)
                                 .icon_size(IconSize::XSmall)
-                                .documentation_aside(ui::DocumentationSide::Right, move |_| {
-                                    Label::new(soon).into_any_element()
-                                })
-                                .handler(insert("@session:")),
+                                .handler(insert("@folder:")),
+                        )
+                        .item(
+                            ContextMenuEntry::new("Git Changes")
+                                .icon(IconName::GitBranch)
+                                .icon_color(Color::Muted)
+                                .icon_size(IconSize::XSmall)
+                                .handler(insert("@diff ")),
                         )
                         .when(!skills.is_empty(), |this| {
                             let chat = chat.clone();
@@ -2356,10 +2444,11 @@ impl ChatView {
                                 .icon(IconName::ToolWeb)
                                 .icon_color(Color::Muted)
                                 .icon_size(IconSize::XSmall)
-                                .documentation_aside(ui::DocumentationSide::Right, move |_| {
-                                    Label::new(soon).into_any_element()
+                                .documentation_aside(ui::DocumentationSide::Right, |_| {
+                                    Label::new("Web pages can be attached once web extract lands")
+                                        .into_any_element()
                                 })
-                                .handler(insert("@url:")),
+                                .disabled(true),
                         )
                 }))
             })
@@ -2659,18 +2748,21 @@ impl ChatView {
                     .px_2()
                     .gap_2()
                     .children((!self.slash_matches.is_empty()).then(|| {
-                        v_flex().children(self.slash_matches.iter().map(|(name, description)| {
-                            let command = format!("/{name} ");
+                        v_flex().children(self.slash_matches.iter().map(|suggestion| {
+                            let command = suggestion.text.clone();
                             h_flex()
-                                .id(SharedString::from(format!("slash-{name}")))
+                                .id(SharedString::from(format!(
+                                    "suggestion-{}",
+                                    suggestion.label
+                                )))
                                 .gap_2()
                                 .px_1()
                                 .rounded_sm()
                                 .cursor_pointer()
                                 .hover(|style| style.bg(colors.ghost_element_hover))
-                                .child(Label::new(format!("/{name}")).size(LabelSize::Small))
+                                .child(Label::new(suggestion.label.clone()).size(LabelSize::Small))
                                 .child(
-                                    Label::new(description.clone())
+                                    Label::new(suggestion.description.clone())
                                         .size(LabelSize::Small)
                                         .color(Color::Muted)
                                         .truncate(),
@@ -3027,6 +3119,16 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ),
 ];
 
+/// A user message as the user wrote it: the typed text of one whose `@` references were
+/// expanded, the command of one that loads a skill, else its text.
+pub fn shown_user_text(message: &Message) -> String {
+    if let Some(typed) = hermes_tools::references::typed_text(message) {
+        return typed.to_string();
+    }
+    let text = message.as_concat_text();
+    typed_command(&text).unwrap_or(text)
+}
+
 /// What the user typed to produce a message that loads a skill, a bundle or the learn prompt
 /// (`/name instruction`); `None` for an ordinary message. Those messages are long, so the chat
 /// shows (and titles) them by the command.
@@ -3038,3 +3140,25 @@ pub fn typed_command(text: &str) -> Option<String> {
         })?;
     Some(format!("/{command} {argument}").trim_end().to_string())
 }
+
+/// One row under the composer: a `/command` or an `@` mention, and the composer text that
+/// accepting it leaves.
+#[derive(Clone, PartialEq)]
+struct Suggestion {
+    label: String,
+    description: String,
+    text: String,
+}
+
+/// Hermes's built-in `@` reference kinds, offered as an `@` mention is typed.
+const MENTION_KINDS: &[(&str, &str)] = &[
+    ("@file:", "Attach a file (add :start-end for lines)"),
+    ("@folder:", "Attach a folder's file listing"),
+    ("@diff", "Attach the unstaged git changes"),
+    ("@staged", "Attach the staged git changes"),
+    (
+        "@git:",
+        "Attach the last N commits with patches, e.g. @git:3",
+    ),
+    ("@url:", "Attach a web page (not available yet)"),
+];

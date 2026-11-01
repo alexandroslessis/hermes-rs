@@ -9,11 +9,13 @@ mod bundles;
 mod clarify;
 pub mod curator;
 mod files;
+mod hints;
 mod job;
 mod paths;
 mod process;
 mod recall;
 pub mod redact;
+pub mod references;
 mod review;
 mod search;
 mod shell;
@@ -104,11 +106,14 @@ pub struct SessionTools {
     approvals: Option<Arc<approval::ApprovalStore>>,
     /// Patterns the user approved for this session.
     pub(crate) session_approved: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Directories whose AGENTS.md / CLAUDE.md the model has been shown.
+    hints: parking_lot::Mutex<hints::HintTracker>,
 }
 
 impl SessionTools {
     pub fn new(config: SessionToolsConfig) -> Self {
         Self {
+            hints: parking_lot::Mutex::new(hints::HintTracker::new(&config.cwd, &config.home)),
             shell: shell::ShellSession::new(config.shell, config.cwd, config.scratch_dir.clone()),
             processes: process::ProcessRegistry::default(),
             files: files::FileState::default(),
@@ -458,7 +463,15 @@ impl<S: Send + Sync + 'static> ToolProvider<S> for SessionTools {
         _emit: &Emitter,
     ) -> Result<CallToolResult, ErrorData> {
         let args = Value::Object(call.arguments.unwrap_or_else(JsonObject::new));
-        Ok(self.dispatch(&call.name, args).await.into_result())
+        let mut result = self.dispatch(&call.name, args.clone()).await.into_result();
+        // Hermes appends a newly visited subdirectory's context file to the result.
+        let hints = self.hints.lock().check(&call.name, &args, &self.cwd());
+        if let Some(hints) = hints
+            && let Some(ContentBlock::Text(text)) = result.content.first_mut()
+        {
+            text.text.push_str(&hints);
+        }
+        Ok(result)
     }
 }
 

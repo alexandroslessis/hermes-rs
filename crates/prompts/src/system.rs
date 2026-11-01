@@ -233,7 +233,8 @@ fn context_file_max_chars(context_length: Option<usize>) -> usize {
     }
 }
 
-fn truncate(content: &str, label: &str, path: &Path, max_chars: usize) -> String {
+/// Hermes's `_truncate_content`: head and tail kept, a marker naming the file to read in full.
+pub fn truncate(content: &str, label: &str, path: &Path, max_chars: usize) -> String {
     let total = content.chars().count();
     if total <= max_chars {
         return content.to_string();
