@@ -23,6 +23,12 @@ pub enum UiRequest {
         session_id: String,
         notice: ProcessNotice,
     },
+    /// A command matched a dangerous pattern and waits for the user's decision.
+    Approval {
+        session_id: String,
+        request: hermes_tools::approval::CommandApproval,
+        reply: oneshot::Sender<hermes_tools::approval::ApprovalChoice>,
+    },
     /// A background review (or `/refine`) of a session finished.
     ReviewFinished {
         session_id: String,
@@ -56,6 +62,26 @@ impl UserBridge for UiBridge {
             session_id: session_id.to_string(),
             notice,
         });
+    }
+
+    async fn approve_command(
+        &self,
+        session_id: &str,
+        request: hermes_tools::approval::CommandApproval,
+    ) -> hermes_tools::approval::ApprovalChoice {
+        let (reply, answer) = oneshot::channel();
+        let sent = self.requests.send(UiRequest::Approval {
+            session_id: session_id.to_string(),
+            request,
+            reply,
+        });
+        if sent.is_err() {
+            return hermes_tools::approval::ApprovalChoice::Deny;
+        }
+        // A dropped reply (the session view closed) counts as a denial.
+        answer
+            .await
+            .unwrap_or(hermes_tools::approval::ApprovalChoice::Deny)
     }
 
     fn review_finished(&self, session_id: &str, actions: Vec<String>, requested: bool) {

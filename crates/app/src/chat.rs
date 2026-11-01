@@ -47,6 +47,8 @@ pub enum ChatEvent {
     TurnFinished { failed: bool, used_tools: bool },
     /// The agent asked a question and waits for the answer.
     NeedsInput,
+    /// A command waits for the user's approval.
+    NeedsApproval,
 }
 
 struct ClarifyForm {
@@ -90,6 +92,11 @@ pub struct ChatView {
     slash_matches: Vec<(String, String)>,
     /// A steer the turn ended before delivering: Hermes sends it as the next message.
     next_message: Option<String>,
+    /// A flagged command waiting for the user's decision, and where the answer goes.
+    approval: Option<(
+        hermes_tools::approval::CommandApproval,
+        Option<oneshot::Sender<hermes_tools::approval::ApprovalChoice>>,
+    )>,
     /// Background-review notes shown under the thread until the next turn (Hermes prints them).
     notices: Vec<String>,
     effort_menu: PopoverMenuHandle<ContextMenu>,
@@ -156,6 +163,7 @@ impl ChatView {
             slash_matches: Vec::new(),
             next_message: None,
             notices: Vec::new(),
+            approval: None,
             effort_menu: PopoverMenuHandle::default(),
             model_menu: PopoverMenuHandle::default(),
             usage: TurnUsage {
@@ -501,6 +509,101 @@ impl ChatView {
                 let _ = reply.send(ClarifyOutcome::Cancelled);
             }
         }
+        // Stopping denies a command waiting for approval.
+        if let Some((_, Some(reply))) = self.approval.take() {
+            let _ = reply.send(hermes_tools::approval::ApprovalChoice::Deny);
+        }
+        cx.notify();
+    }
+
+    /// Zed's permission buttons (`render_permission_buttons`) under a flagged command: why it was
+    /// flagged, then Allow Once / for This Session / Always and Deny (Hermes's four choices).
+    fn render_permission(&self, description: &str, id: &str, cx: &Context<Self>) -> AnyElement {
+        use hermes_tools::approval::ApprovalChoice;
+        let option =
+            |label: String, key: &str, icon: IconName, color: Color, choice: ApprovalChoice| {
+                Button::new(SharedString::from(format!("{key}-{id}")), label)
+                    .full_width()
+                    .start_icon(Icon::new(icon).size(IconSize::XSmall).color(color))
+                    .on_click(cx.listener(move |this, _, _, cx| this.answer_approval(choice, cx)))
+            };
+        v_flex()
+            .p_1()
+            .gap_0p5()
+            .w_full()
+            .border_t_1()
+            .border_color(tool_card_border_color(cx))
+            .child(
+                h_flex()
+                    .px_1p5()
+                    .py_1()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::XSmall)
+                            .color(Color::Warning),
+                    )
+                    .child(
+                        Label::new(format!("Needs your approval: {description}"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(option(
+                "Allow Once".into(),
+                "allow-once",
+                IconName::Check,
+                Color::Success,
+                ApprovalChoice::Once,
+            ))
+            .child(option(
+                "Allow for This Session".into(),
+                "allow-session",
+                IconName::Check,
+                Color::Success,
+                ApprovalChoice::Session,
+            ))
+            .child(option(
+                format!("Always Allow: {description}"),
+                "allow-always",
+                IconName::CheckDouble,
+                Color::Success,
+                ApprovalChoice::Always,
+            ))
+            .child(option(
+                "Deny".into(),
+                "deny",
+                IconName::Close,
+                Color::Error,
+                ApprovalChoice::Deny,
+            ))
+            .into_any_element()
+    }
+
+    /// A command matched a dangerous pattern: its card shows the approval buttons.
+    pub fn show_approval(
+        &mut self,
+        request: hermes_tools::approval::CommandApproval,
+        reply: oneshot::Sender<hermes_tools::approval::ApprovalChoice>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_, Some(previous))) = self.approval.replace((request, Some(reply))) {
+            let _ = previous.send(hermes_tools::approval::ApprovalChoice::Deny);
+        }
+        self.list_state.remeasure_items(0..self.list_len());
+        cx.emit(ChatEvent::NeedsApproval);
+        cx.notify();
+    }
+
+    fn answer_approval(
+        &mut self,
+        choice: hermes_tools::approval::ApprovalChoice,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_, Some(reply))) = self.approval.take() {
+            let _ = reply.send(choice);
+        }
+        self.list_state.remeasure_items(0..self.list_len());
         cx.notify();
     }
 
@@ -617,7 +720,7 @@ impl ChatView {
 
     /// Whether the agent waits on a question for the user (Zed's "waiting for confirmation").
     pub fn needs_input(&self) -> bool {
-        self.clarify.is_some()
+        self.clarify.is_some() || self.approval.is_some()
     }
 
     /// Whether the last turn failed (shown with Zed's error status in the sidebar).
@@ -1491,6 +1594,12 @@ impl ChatView {
             .and_then(|c| c.as_str())
             .unwrap_or_default()
             .to_string();
+        // Zed's permission buttons, on the card of the command waiting for approval.
+        let permission = self
+            .approval
+            .as_ref()
+            .filter(|(request, _)| response.is_none() && request.command == command)
+            .map(|(request, _)| self.render_permission(&request.description, &id, cx));
         let working_dir = args
             .get("workdir")
             .and_then(|w| w.as_str())
@@ -1615,6 +1724,7 @@ impl ChatView {
                     .child(header_row)
                     .child(command_slot),
             )
+            .children(permission)
             .when_some(output, |this, output| {
                 this.child(
                     div()
@@ -1658,7 +1768,7 @@ impl ChatView {
     /// "Awaiting Confirmation" while a question waits). The context ring in the composer shows
     /// the token count, so the elapsed-time and token labels Zed adds here are left out.
     fn render_generating(&self) -> impl IntoElement {
-        let confirmation = self.clarify.is_some();
+        let confirmation = self.clarify.is_some() || self.approval.is_some();
         h_flex()
             .id("generating-spinner")
             .py_2()

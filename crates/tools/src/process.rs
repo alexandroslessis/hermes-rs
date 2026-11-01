@@ -251,6 +251,7 @@ pub async fn spawn(
                     .collect::<Vec<_>>()
                     .join("\n")
             };
+            let tail = crate::redact::redact_terminal_output(&tail, &process.command);
             bridge.process_finished(
                 &session_id,
                 ProcessNotice {

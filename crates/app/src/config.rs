@@ -59,6 +59,10 @@ pub struct AppConfig {
     /// `background_review.enabled`, on by default).
     #[serde(default = "default_true")]
     pub background_review: bool,
+    /// Ask before running commands that match a dangerous pattern (Hermes's `approvals.mode`:
+    /// manual when on, off when off). Hardline commands never run either way.
+    #[serde(default = "default_true")]
+    pub ask_dangerous_commands: bool,
     /// Let the curator merge overlapping agent-written skills with the model (Hermes's
     /// `curator.consolidate`, off by default; the idle-skill archiving always runs).
     #[serde(default)]
@@ -100,6 +104,7 @@ impl Default for AppConfig {
             selected_project: None,
             background_review: true,
             curator_consolidate: false,
+            ask_dangerous_commands: true,
             sidebar_width: None,
         }
     }

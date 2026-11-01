@@ -4,6 +4,7 @@
 //! persistent shell, background processes, todo list and the file-read state that guards
 //! `write_file`. Tool results are JSON text, like Hermes's.
 
+pub mod approval;
 mod bundles;
 mod clarify;
 pub mod curator;
@@ -12,6 +13,7 @@ mod job;
 mod paths;
 mod process;
 mod recall;
+pub mod redact;
 mod review;
 mod search;
 mod shell;
@@ -29,6 +31,10 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, JsonObject, Tool,
 };
 use serde_json::{Value, json};
+
+/// How long a flagged command waits for the user (Hermes's `approvals.timeout`, 300 s); then
+/// it's denied.
+const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 pub use bundles::{Bundle, describe_bundle_invocation};
 pub use clarify::{
@@ -50,6 +56,15 @@ pub trait UserBridge: Send + Sync {
     /// A background review of the session finished: what it changed (Hermes's "Self-improvement
     /// review" summary). `requested` is true for `/refine`, which reports even when nothing changed.
     fn review_finished(&self, _session_id: &str, _actions: Vec<String>, _requested: bool) {}
+    /// A command matched a dangerous pattern: ask the user. Without an answer the command
+    /// doesn't run.
+    async fn approve_command(
+        &self,
+        _session_id: &str,
+        _request: approval::CommandApproval,
+    ) -> approval::ApprovalChoice {
+        approval::ApprovalChoice::Deny
+    }
 }
 
 pub struct SessionToolsConfig {
@@ -68,6 +83,8 @@ pub struct SessionToolsConfig {
     pub history: Option<Arc<hermes_store::Store>>,
     /// The skills folder (`skills_list`, `skill_view`, `skill_manage`).
     pub skills: Option<Arc<SkillStore>>,
+    /// The dangerous-command policy (asking, and the always-allowed patterns).
+    pub approvals: Option<Arc<approval::ApprovalStore>>,
 }
 
 pub struct SessionTools {
@@ -84,6 +101,9 @@ pub struct SessionTools {
     memory_failures: parking_lot::Mutex<hermes_memory::TurnFailures>,
     history: Option<Arc<hermes_store::Store>>,
     skills: Option<Arc<SkillStore>>,
+    approvals: Option<Arc<approval::ApprovalStore>>,
+    /// Patterns the user approved for this session.
+    pub(crate) session_approved: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 impl SessionTools {
@@ -101,6 +121,8 @@ impl SessionTools {
             memory_failures: Default::default(),
             history: config.history,
             skills: config.skills,
+            approvals: config.approvals,
+            session_approved: Default::default(),
         }
     }
 
@@ -153,6 +175,54 @@ impl SessionTools {
     }
 
     async fn dispatch(&self, name: &str, args: Value) -> ToolOutput {
+        let read_path = (name == "read_file")
+            .then(|| {
+                args.get("path")
+                    .and_then(Value::as_str)
+                    .map(|p| self.resolve(p))
+            })
+            .flatten();
+        let mut output = self.dispatch_unredacted(name, args).await;
+        // Hermes masks secrets in what file reads, searches and process logs hand the model.
+        match name {
+            "read_file" => {
+                let secret_file = read_path.as_deref().is_some_and(redact::is_secret_file);
+                redact_field(
+                    &mut output.value,
+                    "content",
+                    redact::Source::File { secret_file },
+                );
+            }
+            "search_files" => {
+                if let Some(Value::Array(matches)) = output.value.get_mut("matches") {
+                    for entry in matches {
+                        let secret_file = entry
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .is_some_and(|p| redact::is_secret_file(Path::new(p)));
+                        let source = redact::Source::File { secret_file };
+                        redact_field(entry, "content", source);
+                        if let Some(Value::Array(lines)) = entry.get_mut("context") {
+                            for line in lines {
+                                if let Value::String(text) = line {
+                                    *text = redact::redact(text, source);
+                                } else {
+                                    redact_field(line, "content", source);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "process_manage" => {
+                redact_field(&mut output.value, "output", redact::Source::Output);
+            }
+            _ => {}
+        }
+        output
+    }
+
+    async fn dispatch_unredacted(&self, name: &str, args: Value) -> ToolOutput {
         match name {
             "read_file" => files::read_file(self, args).await,
             "write_file" => files::write_file(self, args).await,
@@ -184,6 +254,45 @@ impl SessionTools {
         ToolOutput {
             value: result,
             is_error: failed,
+        }
+    }
+
+    /// Hermes's terminal approval guard. `Ok` means run it (carrying the pattern when the user
+    /// just approved it); `Err` is the blocked result for the model.
+    pub(crate) async fn check_command(&self, command: &str) -> Result<Option<String>, ToolOutput> {
+        let Some(store) = &self.approvals else {
+            return Ok(None);
+        };
+        let gate = approval::gate(command, store, &self.session_approved.lock());
+        let blocked = |message: String| {
+            ToolOutput::error_with(
+                message,
+                json!({"output": "", "exit_code": -1, "status": "blocked"}),
+            )
+        };
+        let request = match gate {
+            approval::Gate::Run { approved } => return Ok(approved),
+            approval::Gate::Blocked(message) => return Err(blocked(message)),
+            approval::Gate::Ask(request) => request,
+        };
+        let key = request.description.clone();
+        let answer = tokio::time::timeout(
+            APPROVAL_TIMEOUT,
+            self.bridge.approve_command(&self.session_id, request),
+        )
+        .await;
+        match answer {
+            Ok(approval::ApprovalChoice::Once) => Ok(Some(key)),
+            Ok(approval::ApprovalChoice::Session) => {
+                self.session_approved.lock().insert(key.clone());
+                Ok(Some(key))
+            }
+            Ok(approval::ApprovalChoice::Always) => {
+                store.allow_always(&key);
+                Ok(Some(key))
+            }
+            Ok(approval::ApprovalChoice::Deny) => Err(blocked(approval::denied_message())),
+            Err(_) => Err(blocked(approval::timeout_message())),
         }
     }
 
@@ -288,12 +397,41 @@ pub(crate) mod tests {
             memory: None,
             history: None,
             skills: None,
+            approvals: None,
         });
         (dir, tools)
     }
 
     pub fn tools_in() -> (tempfile::TempDir, SessionTools) {
         tools_with_bridge(Arc::new(TestBridge::default()))
+    }
+
+    #[tokio::test]
+    async fn file_reads_and_searches_mask_secrets() {
+        let (dir, tools) = tools_in();
+        std::fs::write(
+            dir.path().join(".env"),
+            "DB_PASSWORD=hunter2hunter2\nOPENAI_KEY=sk-abcdefghijklmnop1234\n",
+        )
+        .unwrap();
+        let read = tools.dispatch("read_file", json!({"path": ".env"})).await;
+        let content = read.value["content"].as_str().unwrap();
+        assert!(
+            !content.contains("hunter2") && !content.contains("sk-abcdefghij"),
+            "{content}"
+        );
+        assert!(content.contains("«redacted:sk-…»"), "{content}");
+        let found = tools
+            .dispatch(
+                "search_files",
+                json!({"pattern": "OPENAI", "target": "content", "path": "."}),
+            )
+            .await;
+        assert!(
+            !found.value.to_string().contains("sk-abcdefghij"),
+            "{}",
+            found.value
+        );
     }
 }
 
@@ -321,5 +459,12 @@ impl<S: Send + Sync + 'static> ToolProvider<S> for SessionTools {
     ) -> Result<CallToolResult, ErrorData> {
         let args = Value::Object(call.arguments.unwrap_or_else(JsonObject::new));
         Ok(self.dispatch(&call.name, args).await.into_result())
+    }
+}
+
+/// Masks the secrets in one string field of a tool result.
+fn redact_field(value: &mut Value, field: &str, source: redact::Source) {
+    if let Some(Value::String(text)) = value.get_mut(field) {
+        *text = redact::redact(text, source);
     }
 }

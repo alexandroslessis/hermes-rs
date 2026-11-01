@@ -287,6 +287,16 @@ impl Workspace {
                     chat.update(cx, |chat, cx| chat.process_finished(notice, window, cx));
                 }
             }
+            UiRequest::Approval {
+                session_id,
+                request,
+                reply,
+            } => match self.chats.get(&session_id) {
+                Some(chat) => chat.update(cx, |chat, cx| chat.show_approval(request, reply, cx)),
+                None => {
+                    let _ = reply.send(hermes_tools::approval::ApprovalChoice::Deny);
+                }
+            },
             UiRequest::ReviewFinished {
                 session_id,
                 actions,
@@ -327,6 +337,17 @@ impl Workspace {
                             this.session_needs_attention(
                                 id,
                                 "Waiting for input",
+                                IconName::Info,
+                                window,
+                                cx,
+                            );
+                        }
+                        // Zed's caption for a tool waiting on the user.
+                        ChatEvent::NeedsApproval => {
+                            let id = chat.read(cx).session_id.clone();
+                            this.session_needs_attention(
+                                id,
+                                "Waiting for tool confirmation",
                                 IconName::Info,
                                 window,
                                 cx,

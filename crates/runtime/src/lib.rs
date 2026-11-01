@@ -167,6 +167,8 @@ pub struct Runtime {
     store: Arc<Store>,
     memory: Arc<MemoryStore>,
     skills: Arc<SkillStore>,
+    /// The dangerous-command policy every session shares.
+    approvals: Arc<hermes_tools::approval::ApprovalStore>,
     config: RuntimeConfig,
     bridge: Arc<dyn UserBridge>,
     windows_version: String,
@@ -184,10 +186,12 @@ impl Runtime {
         let memory = MemoryStore::new(config.data_dir.join("memories"), config.memory.clone());
         let skills = SkillStore::new(config.data_dir.join("skills"), config.skills.clone());
         skills.seed_bundled();
+        let approvals = Arc::new(hermes_tools::approval::ApprovalStore::new(&config.data_dir));
         Ok(Self {
             store: Arc::new(store),
             memory: Arc::new(memory),
             skills: Arc::new(skills),
+            approvals,
             windows_version: windows_version(),
             config,
             bridge,
@@ -221,6 +225,11 @@ impl Runtime {
     /// Turns automatic background reviews (memory and skills, after turns) on or off.
     pub fn set_background_review(&self, enabled: bool) {
         self.background_review.store(enabled, Ordering::Relaxed);
+    }
+
+    /// The dangerous-command policy (Settings shows and edits it).
+    pub fn approvals(&self) -> Arc<hermes_tools::approval::ApprovalStore> {
+        self.approvals.clone()
     }
 
     /// The memory store every session shares (the Memory screen edits it too).
@@ -353,6 +362,7 @@ impl Runtime {
             memory: Some(self.memory.clone()),
             history: Some(self.store.clone()),
             skills: Some(self.skills.clone()),
+            approvals: Some(self.approvals.clone()),
         });
         let user_turns = conversation
             .messages()

@@ -1396,3 +1396,93 @@ async fn live_refine_saves_something() {
         .collect();
     println!("skills created: {created:?}");
 }
+
+/// Answers every approval request with `choice`, and records what it was asked.
+struct ApproveBridge {
+    choice: hermes_tools::approval::ApprovalChoice,
+    asked: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl UserBridge for ApproveBridge {
+    async fn clarify(&self, _session_id: &str, _request: ClarifyRequest) -> ClarifyOutcome {
+        ClarifyOutcome::Undelivered
+    }
+    fn process_finished(&self, _session_id: &str, _notice: ProcessNotice) {}
+    async fn approve_command(
+        &self,
+        _session_id: &str,
+        request: hermes_tools::approval::CommandApproval,
+    ) -> hermes_tools::approval::ApprovalChoice {
+        self.asked.lock().push(request.description);
+        self.choice
+    }
+}
+
+async fn approval_run(
+    choice: hermes_tools::approval::ApprovalChoice,
+    command: &str,
+) -> (Harness, Vec<String>, String) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let h = harness_with(
+        vec![
+            tool_reply(&[("call_t", "terminal", json!({"command": command}))]),
+            text_reply("Done."),
+        ],
+        Arc::new(ApproveBridge {
+            choice,
+            asked: asked.clone(),
+        }),
+    )
+    .await;
+    std::fs::create_dir_all(h.work.path().join("build")).unwrap();
+    let session = h
+        .runtime
+        .create_session(&h.provider, "test-model", None, h.work.path())
+        .unwrap();
+    let events = run_turn(&h, &session.id, "Clean up.").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let result = h
+        .runtime
+        .messages(&session.id)
+        .unwrap()
+        .iter()
+        .flat_map(|m| m.content.clone())
+        .find_map(|c| c.as_tool_response_text())
+        .unwrap();
+    let asked = asked.lock().clone();
+    (h, asked, result)
+}
+
+#[tokio::test]
+async fn an_approved_dangerous_command_runs_with_a_note() {
+    use hermes_tools::approval::ApprovalChoice;
+    let (h, asked, result) = approval_run(ApprovalChoice::Once, "rm -rf build").await;
+    assert_eq!(asked, vec!["recursive delete"]);
+    assert!(result.contains("was approved by the user"), "{result}");
+    assert!(!h.work.path().join("build").exists());
+}
+
+#[tokio::test]
+async fn a_denied_command_does_not_run() {
+    use hermes_tools::approval::ApprovalChoice;
+    let (h, asked, result) = approval_run(ApprovalChoice::Deny, "rm -rf build").await;
+    assert_eq!(asked.len(), 1);
+    assert!(
+        result.contains("BLOCKED: User denied this command."),
+        "{result}"
+    );
+    assert!(result.contains("\"status\":\"blocked\""), "{result}");
+    assert!(h.work.path().join("build").exists());
+}
+
+#[tokio::test]
+async fn hardline_commands_never_reach_the_user() {
+    use hermes_tools::approval::ApprovalChoice;
+    let (_h, asked, result) = approval_run(ApprovalChoice::Always, "rm -rf /").await;
+    assert!(asked.is_empty());
+    assert!(
+        result.contains("BLOCKED (hardline): recursive delete of root filesystem"),
+        "{result}"
+    );
+}

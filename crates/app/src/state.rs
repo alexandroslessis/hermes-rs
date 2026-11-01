@@ -45,6 +45,10 @@ impl AppState {
         backend(cx)
             .runtime
             .set_background_review(config.background_review);
+        backend(cx)
+            .runtime
+            .approvals()
+            .set_ask(config.ask_dangerous_commands);
         let registry = theme::ThemeRegistry::global(cx);
         hermes_themes::load_bundled_themes(&registry);
         let name = config.theme.as_deref().unwrap_or(theme::DEFAULT_DARK_THEME);

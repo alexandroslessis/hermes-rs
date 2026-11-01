@@ -2460,6 +2460,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "dirs",
+ "fancy-regex",
  "futures",
  "hermes_agent",
  "hermes_memory",
@@ -2477,6 +2478,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "unicode-normalization",
  "uuid",
  "windows",
 ]

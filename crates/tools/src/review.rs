@@ -300,6 +300,7 @@ mod tests {
             memory: Some(memory),
             history: None,
             skills: Some(skills.clone()),
+            approvals: None,
         });
         (
             dir,

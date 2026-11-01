@@ -323,6 +323,85 @@ impl SettingsView {
             )
     }
 
+    /// Hermes's command approvals: whether to ask, and the patterns always allowed.
+    fn render_safety(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let ask = AppState::global(cx).read(cx).config.ask_dangerous_commands;
+        let always = backend(cx).runtime.approvals().always_allowed();
+        let colors = cx.theme().colors();
+        let (border, background) = (colors.border_variant, colors.editor_background);
+        v_flex()
+            .gap_3()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_start()
+                    .gap_4()
+                    .child(Self::section(
+                        "Safety",
+                        Some("Commands that match a dangerous pattern (recursive deletes, force pushes, piping downloads into a shell, inline scripts…) wait for your approval on their card. Commands that could wreck the system never run through the agent."),
+                    ))
+                    .child(
+                        Switch::new("ask-dangerous", ask.into())
+                            .label("Ask before dangerous commands")
+                            .on_click(cx.listener(|_, state: &ToggleState, _, cx| {
+                                let ask = *state == ToggleState::Selected;
+                                AppState::global(cx).update(cx, |state, cx| {
+                                    state.config.ask_dangerous_commands = ask;
+                                    state.save(cx);
+                                });
+                                backend(cx).runtime.approvals().set_ask(ask);
+                            })),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Label::new("Always allowed")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        v_flex()
+                            .p_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .bg(background)
+                            .when(always.is_empty(), |this| {
+                                this.child(
+                                    div().px_1p5().py_1().child(
+                                        Label::new("Nothing yet. \"Always Allow\" on a command's card adds its pattern here.")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
+                                )
+                            })
+                            .children(always.into_iter().map(|pattern| {
+                                let forget = pattern.clone();
+                                h_flex()
+                                    .px_1p5()
+                                    .gap_2()
+                                    .justify_between()
+                                    .child(Label::new(pattern.clone()).size(LabelSize::Small))
+                                    .child(
+                                        IconButton::new(
+                                            SharedString::from(format!("forget-{pattern}")),
+                                            IconName::Close,
+                                        )
+                                        .icon_size(IconSize::XSmall)
+                                        .icon_color(Color::Muted)
+                                        .tooltip(Tooltip::text("Ask again for this pattern"))
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            backend(cx).runtime.approvals().forget(&forget);
+                                            cx.notify();
+                                        })),
+                                    )
+                            })),
+                    ),
+            )
+    }
+
     /// One provider in the list: icon, name, address and key status, with edit and remove.
     fn render_provider_row(
         &self,
@@ -655,6 +734,8 @@ impl Render for SettingsView {
             )
             .child(Divider::horizontal())
             .child(self.render_learning(cx))
+            .child(Divider::horizontal())
+            .child(self.render_safety(cx))
             .child(Divider::horizontal())
             .child(
                 v_flex()

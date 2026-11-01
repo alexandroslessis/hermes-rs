@@ -521,8 +521,19 @@ pub async fn terminal(tools: &SessionTools, args: Value) -> ToolOutput {
         }
         None => None,
     };
+    let approved = match tools.check_command(&args.command).await {
+        Ok(approved) => approved,
+        Err(blocked) => return blocked,
+    };
+    let approval_note = approved.map(|description| {
+        format!("Command required approval ({description}) and was approved by the user.")
+    });
     if args.background {
-        return crate::process::spawn(tools, &args.command, workdir, args.notify).await;
+        let mut started = crate::process::spawn(tools, &args.command, workdir, args.notify).await;
+        if let Some(note) = approval_note {
+            started.value["approval"] = json!(note);
+        }
+        return started;
     }
 
     let timeout = Duration::from_secs(
@@ -535,7 +546,9 @@ pub async fn terminal(tools: &SessionTools, args: Value) -> ToolOutput {
         .shell
         .run(&args.command, workdir.as_deref(), timeout)
         .await;
-    let (output, saved) = limit_output(result.output, tools.shell.scratch_dir());
+    // Secrets are masked before the output is trimmed or saved (Hermes redacts the spill too).
+    let output = crate::redact::redact_terminal_output(&result.output, &args.command);
+    let (output, saved) = limit_output(output, tools.shell.scratch_dir());
     let cwd = display_path(&tools.shell.cwd());
     let mut value = json!({
         "output": output,
@@ -543,6 +556,9 @@ pub async fn terminal(tools: &SessionTools, args: Value) -> ToolOutput {
         "cwd": cwd,
         "duration_ms": started.elapsed().as_millis() as u64,
     });
+    if let Some(note) = approval_note {
+        value["approval"] = json!(note);
+    }
     if let Some(path) = saved {
         value["output_file"] = json!(display_path(&path));
     }

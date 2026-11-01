@@ -344,6 +344,27 @@ skill that governs it (after reading it first).
 context files + subdirectory hints, `@` references, checkpoints/`/rollback`, `/diff`, steer/queue,
 auxiliary model routing, usage and context breakdown.
 
+M5 order (2026-11-01): safety first, since command approvals (F1/F2) and redaction (F4) were kept
+but never scheduled; then compression and the context breakdown (local models hit their window
+fast); `@` references and subdirectory hints; checkpoints, `/rollback`, `/diff`; web search and
+extract; vision and image paste; delegation; MCP; queue and auxiliary model routing.
+
+M5 part 1 status (2026-11-01): safety, done.
+- `crates/tools/src/approval.rs`: Hermes's hardline and dangerous-command tables (plus Windows
+  drive-root hardlines Hermes's POSIX list lacks), its normalization (ANSI, NFKC, escapes, empty
+  quotes, `$IFS`, home folding), quote masking, the grep-safe variant, command-start anchoring,
+  interpreter `-c`/`-e` and `bash -c` payload checks. The gate in `terminal` (incl. background):
+  hardline never runs; otherwise once / session / always / deny through the bridge, 5-minute
+  timeout = denied, Hermes's STOP messages; the always-list in `command_allowlist.json`.
+- The chat shows Zed's permission buttons on the waiting terminal card; the session row shows
+  "waiting" and Zed's "Waiting for tool confirmation" notification fires. Settings → Safety: ask
+  on/off, the always-allowed patterns with remove.
+- `crates/tools/src/redact.rs`: Hermes's prefix-key, header, private-key, connection-string, JWT
+  and assignment passes; terminal and process output (assignments only for env dumps and secret
+  files), `read_file` and `search_files` (non-reusable sentinel).
+- Not ported: smart (aux-model) approvals (F3, later), the user deny list, the sudo-password
+  guard, execute_code gating (no execute_code tool).
+
 **M6: Polish.** Command palette (Tier 2 `picker`), find in transcript, themes and fonts, diff
 review pane, import from `~/.hermes`, installer (MSI), auto-update.
 
