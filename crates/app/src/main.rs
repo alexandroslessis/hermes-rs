@@ -33,7 +33,8 @@ use crate::assets::Assets;
 use crate::backend::{Backend, BackendGlobal};
 use crate::state::AppState;
 use crate::workspace::{
-    NewSession, OpenMemory, OpenSettings, OpenSkills, ToggleSidebar, Workspace,
+    CloseTab, NewSession, NextTab, OpenMemory, OpenSettings, OpenSkills, PreviousTab,
+    ToggleSidebar, Workspace,
 };
 
 fn main() {
@@ -62,6 +63,10 @@ fn main() {
             text_area::bind_keys(cx);
             cx.bind_keys([
                 KeyBinding::new("ctrl-n", NewSession, None),
+                KeyBinding::new("ctrl-t", NewSession, None),
+                KeyBinding::new("ctrl-w", CloseTab, None),
+                KeyBinding::new("ctrl-tab", NextTab, None),
+                KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
                 KeyBinding::new("ctrl-b", ToggleSidebar, None),
                 KeyBinding::new("ctrl-,", OpenSettings, None),
                 KeyBinding::new("ctrl-shift-m", OpenMemory, None),

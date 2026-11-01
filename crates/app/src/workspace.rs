@@ -12,8 +12,8 @@ use gpui::{
 use hermes_store::{Project, SessionRecord};
 use tokio::sync::mpsc;
 use ui::{
-    AgentThreadStatus, Callout, CommonAnimationExt, ContextMenu, Divider, PopoverMenu, ThreadItem,
-    TintColor, Tooltip, prelude::*, right_click_menu,
+    AgentThreadStatus, Callout, CommonAnimationExt, ContextMenu, Divider, PopoverMenu, Tab, TabBar,
+    TabPosition, ThreadItem, TintColor, Tooltip, prelude::*, right_click_menu,
 };
 
 use crate::backend::{UiRequest, backend};
@@ -33,6 +33,9 @@ actions!(
     [
         NewSession,
         ToggleSidebar,
+        CloseTab,
+        NextTab,
+        PreviousTab,
         OpenSettings,
         OpenMemory,
         OpenSkills
@@ -58,6 +61,8 @@ pub struct Workspace {
     sessions: Vec<SessionRecord>,
     projects: Vec<Project>,
     chats: HashMap<String, Entity<ChatView>>,
+    /// Open sessions, in tab order.
+    tabs: Vec<String>,
     active: Option<String>,
     main: Main,
     settings: Entity<SettingsView>,
@@ -130,6 +135,7 @@ impl Workspace {
             sessions: Vec::new(),
             projects: Vec::new(),
             chats: HashMap::new(),
+            tabs: Vec::new(),
             active: None,
             main: Main::Chat,
             settings,
@@ -446,6 +452,15 @@ impl Workspace {
             self._subscriptions.push(subscription);
             self.chats.insert(id.clone(), chat);
         }
+        if !self.tabs.contains(&id) {
+            // A new tab opens next to the current one.
+            let at = self
+                .active
+                .as_ref()
+                .and_then(|active| self.tabs.iter().position(|t| t == active))
+                .map_or(self.tabs.len(), |i| i + 1);
+            self.tabs.insert(at, id.clone());
+        }
         self.active = Some(id.clone());
         self.main = Main::Chat;
         if let Some(record) = self.sessions.iter().find(|s| s.id == id) {
@@ -745,8 +760,111 @@ impl Workspace {
         self.reload_projects(cx);
     }
 
+    /// Closes a session's tab. A chat with a running turn stays alive (the turn keeps going and
+    /// the sidebar shows it); the next tab to the right (else left) becomes active.
+    fn close_tab(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.tabs.iter().position(|t| t == id) else {
+            return;
+        };
+        self.tabs.remove(index);
+        let running = backend(cx).runtime.is_running(id);
+        if !running {
+            self.chats.remove(id);
+        }
+        if self.active.as_deref() == Some(id) {
+            self.active = None;
+            let next = self
+                .tabs
+                .get(index)
+                .or_else(|| index.checked_sub(1).and_then(|i| self.tabs.get(i)))
+                .cloned();
+            if let Some(next) = next {
+                self.open_session(next, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+Tab / Ctrl+Shift+Tab: the next or previous tab, wrapping around.
+    fn cycle_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.len() < 2 {
+            return;
+        }
+        let current = self
+            .active
+            .as_ref()
+            .and_then(|id| self.tabs.iter().position(|t| t == id))
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % self.tabs.len()
+        } else {
+            (current + self.tabs.len() - 1) % self.tabs.len()
+        };
+        let id = self.tabs[next].clone();
+        self.open_session(id, window, cx);
+    }
+
+    /// Zed's tab bar over the chat: one tab per open session, with its status and a close button.
+    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = self.tabs.len();
+        let active = self
+            .active
+            .as_ref()
+            .and_then(|id| self.tabs.iter().position(|t| t == id))
+            .unwrap_or(0);
+        TabBar::new("session-tabs").children(self.tabs.iter().enumerate().map(|(index, id)| {
+            let title = self
+                .sessions
+                .iter()
+                .find(|s| &s.id == id)
+                .and_then(|s| s.title.clone())
+                .unwrap_or_else(|| "New session".into());
+            let position = if index == 0 {
+                TabPosition::First
+            } else if index + 1 == count {
+                TabPosition::Last
+            } else {
+                TabPosition::Middle(index.cmp(&active))
+            };
+            let running = matches!(self.session_status(id, cx), AgentThreadStatus::Running);
+            let (open_id, close_id) = (id.clone(), id.clone());
+            Tab::new(SharedString::from(format!("tab-{id}")))
+                .position(position)
+                .toggle_state(index == active)
+                .start_slot::<AnyElement>(running.then(|| {
+                    Icon::new(IconName::LoadCircle)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted)
+                        .with_rotate_animation(2)
+                        .into_any_element()
+                }))
+                .end_slot(
+                    IconButton::new(
+                        SharedString::from(format!("close-tab-{id}")),
+                        IconName::Close,
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Close Tab (Ctrl+W)"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_tab(&close_id, window, cx)
+                    })),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_session(open_id.clone(), window, cx)
+                }))
+                .child(
+                    div()
+                        .max_w(rems(14.))
+                        .child(Label::new(title).size(LabelSize::Small).truncate()),
+                )
+        }))
+    }
+
     fn delete_session(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.chats.remove(&id);
+        self.tabs.retain(|t| t != &id);
         self.unseen.remove(&id);
         self.dismiss_notifications(Some(&id), cx);
         let backend = backend(cx);
@@ -1301,13 +1419,18 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tab_bar = (self.tabs.len() > 1).then(|| self.render_tabs(cx).into_any_element());
         let colors = cx.theme().colors();
         let main: AnyElement = match self.main {
             Main::Settings => self.settings.clone().into_any_element(),
             Main::Memory => self.memory.clone().into_any_element(),
             Main::Skills => self.skills.clone().into_any_element(),
             Main::Chat => match self.active.as_ref().and_then(|id| self.chats.get(id)) {
-                Some(chat) => chat.clone().into_any_element(),
+                Some(chat) => v_flex()
+                    .size_full()
+                    .children(tab_bar)
+                    .child(div().flex_1().min_h_0().child(chat.clone()))
+                    .into_any_element(),
                 None => v_flex()
                     .size_full()
                     .items_center()
@@ -1343,6 +1466,17 @@ impl Render for Workspace {
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &NewSession, window, cx| this.new_session(window, cx)))
+            .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
+                if let Some(id) = this.active.clone() {
+                    this.close_tab(&id, window, cx);
+                }
+            }))
+            .on_action(
+                cx.listener(|this, _: &NextTab, window, cx| this.cycle_tab(true, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &PreviousTab, window, cx| this.cycle_tab(false, window, cx)),
+            )
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
                 cx.notify();
