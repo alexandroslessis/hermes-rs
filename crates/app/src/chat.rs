@@ -3,11 +3,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Empty, Entity, FocusHandle, Focusable, FollowMode,
-    ListAlignment, ListOffset, ListState, SharedString, Subscription, Task, Window,
-    linear_color_stop, linear_gradient, list, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, Empty, Entity,
+    FocusHandle, Focusable, FollowMode, ListAlignment, ListOffset, ListState, SharedString,
+    Subscription, Task, Window, linear_color_stop, linear_gradient, list, prelude::*, px,
 };
 use hermes_agent::events::AgentEvent;
 use hermes_llm::conversation::Conversation;
@@ -89,8 +90,6 @@ pub struct ChatView {
     slash_matches: Vec<(String, String)>,
     /// A steer the turn ended before delivering: Hermes sends it as the next message.
     next_message: Option<String>,
-    /// Thinking blocks the user opened or closed by hand (Zed's auto mode leaves the rest).
-    thinking_toggled: HashSet<String>,
     effort_menu: PopoverMenuHandle<ContextMenu>,
     model_menu: PopoverMenuHandle<ModelPicker>,
     pub usage: TurnUsage,
@@ -154,7 +153,6 @@ impl ChatView {
             editing: None,
             slash_matches: Vec::new(),
             next_message: None,
-            thinking_toggled: HashSet::new(),
             effort_menu: PopoverMenuHandle::default(),
             model_menu: PopoverMenuHandle::default(),
             usage: TurnUsage {
@@ -1061,8 +1059,9 @@ impl ChatView {
         if !self.expanded.remove(&key) {
             self.expanded.insert(key);
         }
-        // Expanding changes the entry's height.
-        self.list_state.reset(self.list_len());
+        // Expanding changes the entry's height: remeasure, keeping the scroll position (a reset
+        // would drop it and jump to the top).
+        self.list_state.remeasure_items(0..self.list_len());
         cx.notify();
     }
 
@@ -1079,11 +1078,8 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let key = format!("thinking-{message_index}-{chunk}");
-        let open = if self.thinking_toggled.contains(&key) {
-            self.expanded.contains(&key)
-        } else {
-            active
-        };
+        // Closed until opened; the label shimmers while the thought streams.
+        let open = self.expanded.contains(&key);
         let body = open.then(|| {
             let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
             self.markdown_block(
@@ -1098,13 +1094,12 @@ impl ChatView {
         let toggle = {
             let key = key.clone();
             move |this: &mut Self, cx: &mut Context<Self>| {
-                this.thinking_toggled.insert(key.clone());
                 if open {
                     this.expanded.remove(&key);
                 } else {
                     this.expanded.insert(key.clone());
                 }
-                this.list_state.reset(this.list_len());
+                this.list_state.remeasure_items(0..this.list_len());
                 cx.notify();
             }
         };
@@ -1130,12 +1125,19 @@ impl ChatView {
                                     .size(IconSize::Small)
                                     .color(Color::Muted),
                             )
-                            .child(
+                            .child(if active {
+                                shimmer(
+                                    SharedString::from(format!("{key}-shimmer")),
+                                    "Thinking",
+                                    cx,
+                                )
+                            } else {
                                 div()
                                     .text_size(rems_from_px(13_f32))
                                     .text_color(colors.text_muted)
-                                    .child("Thinking"),
-                            ),
+                                    .child("Thinking")
+                                    .into_any_element()
+                            }),
                     )
                     .child(
                         Disclosure::new(SharedString::from(format!("{key}-expand")), open)
@@ -2572,3 +2574,41 @@ enum MarkdownKind {
 
 /// (message index, content block, kind) of a rendered markdown block.
 type MarkdownKey = (usize, usize, MarkdownKind);
+
+/// A label with a bright band sweeping across it, left to right: the "working" shimmer.
+fn shimmer(id: SharedString, text: &'static str, cx: &App) -> AnyElement {
+    let base = Color::Muted.color(cx);
+    let bright = cx.theme().colors().text;
+    let size = rems_from_px(13_f32);
+    let chars = text.chars().count() as f32;
+    // Half-width of the band, in characters; it starts and ends fully off the text.
+    const BAND: f32 = 3.0;
+    div()
+        .text_size(size)
+        .text_color(base)
+        .child(text)
+        .with_animation(
+            id,
+            Animation::new(Duration::from_millis(1800)).repeat(),
+            move |_, delta| {
+                let center = -BAND + delta * (chars + 2. * BAND);
+                let runs = text.char_indices().enumerate().map(|(n, (i, c))| {
+                    let distance = (n as f32 + 0.5 - center).abs();
+                    let strength = (1. - distance / BAND).clamp(0., 1.);
+                    let color = base.blend(bright.opacity(strength * strength));
+                    (
+                        i..i + c.len_utf8(),
+                        gpui::HighlightStyle {
+                            color: Some(color),
+                            ..Default::default()
+                        },
+                    )
+                });
+                div()
+                    .text_size(size)
+                    .text_color(base)
+                    .child(gpui::StyledText::new(text).with_highlights(runs))
+            },
+        )
+        .into_any_element()
+}

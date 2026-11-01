@@ -58,6 +58,9 @@ pub struct AppConfig {
     /// The sidebar group new sessions start in: a project id, or `auto:` and a folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_project: Option<String>,
+    /// The session sidebar's width, set by dragging its edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_width: Option<f32>,
     /// Models starred in the model selector (Zed's favorite models).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub favorite_models: Vec<FavoriteModel>,
@@ -87,6 +90,7 @@ impl Default for AppConfig {
             skill_write_approval: false,
             favorite_models: Vec::new(),
             selected_project: None,
+            sidebar_width: None,
         }
     }
 }

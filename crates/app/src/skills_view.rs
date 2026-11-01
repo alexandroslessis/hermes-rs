@@ -167,6 +167,8 @@ impl SkillsView {
             .flex_none()
             .border_r_1()
             .border_color(colors.border)
+            .overflow_y_scroll()
+            .track_scroll(&self.list_scroll)
             .vertical_scrollbar_for(&self.list_scroll, window, cx)
             .children(rows)
     }
@@ -198,6 +200,8 @@ impl SkillsView {
             .size_full()
             .p_4()
             .gap_2()
+            .overflow_y_scroll()
+            .track_scroll(&self.detail_scroll)
             .vertical_scrollbar_for(&self.detail_scroll, window, cx)
             .child(
                 h_flex()

@@ -413,7 +413,12 @@ impl SettingsView {
             .justify_center()
             .bg(gpui::black().opacity(0.4))
             .occlude()
-            .on_click(cx.listener(|this, _, _, cx| this.close_form(cx)))
+            // On press, not click: a drag that starts in a field and ends out here must not
+            // close the dialog.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_form(cx)),
+            )
             .child(
                 v_flex()
                     .id("provider-dialog")
@@ -422,7 +427,7 @@ impl SettingsView {
                     .p_4()
                     .gap_3()
                     .elevation_3(cx)
-                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                         if event.keystroke.key == "escape" {
                             this.close_form(cx);
@@ -666,6 +671,8 @@ impl Render for SettingsView {
                             .child(self.picker.clone()),
                     ),
             )
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
             .vertical_scrollbar_for(&self.scroll, window, cx);
 
         div()

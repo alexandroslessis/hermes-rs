@@ -223,7 +223,7 @@ impl Render for ProjectDialog {
             .p_4()
             .gap_3()
             .elevation_3(cx)
-            .on_click(|_, _, cx| cx.stop_propagation())
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_key_down(cx.listener(|_, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
                     cx.emit(DismissEvent);

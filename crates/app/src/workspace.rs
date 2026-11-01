@@ -585,6 +585,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
+        // Zed's header buttons: their hover must differ from the hovered header behind them.
+        let (button_hover, button_active) = (colors.element_background, colors.element_active);
         let key = group.key.clone();
         let collapsed = self.collapsed.contains(&key);
         let running = group.sessions.iter().any(|s| {
@@ -675,6 +677,8 @@ impl Workspace {
                         )
                         .icon_size(IconSize::Small)
                         .icon_color(Color::Muted)
+                        .hover_background(button_hover)
+                        .active_background(button_active)
                         .tooltip(Tooltip::text(if collapsed { "Expand" } else { "Collapse" }))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
@@ -691,6 +695,8 @@ impl Workspace {
                         )
                         .icon_size(IconSize::Small)
                         .icon_color(Color::Muted)
+                        .hover_background(button_hover)
+                        .active_background(button_active)
                         .tooltip(Tooltip::text(format!("New Session in {}", group.name)))
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
@@ -707,7 +713,9 @@ impl Workspace {
                                     IconName::Ellipsis,
                                 )
                                 .icon_size(IconSize::Small)
-                                .icon_color(Color::Muted),
+                                .icon_color(Color::Muted)
+                                .hover_background(button_hover)
+                                .active_background(button_active),
                             )
                             .anchor(gpui::Anchor::TopRight)
                             .menu(move |window, cx| {
@@ -893,42 +901,70 @@ impl Workspace {
             Some(name) => format!("New Session in {name} (Ctrl+N)"),
             None => "New Session (Ctrl+N)".to_string(),
         };
+        let width = sidebar_width(cx);
         v_flex()
-            .w(px(280.))
+            .relative()
+            .w(width)
             .h_full()
             .flex_none()
             .bg(colors.panel_background)
             .border_r_1()
             .border_color(colors.border)
+            // Zed's panel resize handle: a thin strip over the border; drag it to resize, double-click
+            // to restore the default width.
+            .child(
+                div()
+                    .id("sidebar-resize-handle")
+                    .absolute()
+                    .top_0()
+                    .right(px(-3.))
+                    .h_full()
+                    .w(px(6.))
+                    .cursor_col_resize()
+                    .on_drag(DraggedSidebar, |dragged, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| dragged.clone())
+                    })
+                    .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                        if event.click_count() == 2 {
+                            set_sidebar_width(None, cx);
+                        }
+                    })),
+            )
             .child(
                 h_flex()
                     .p_2()
                     .gap_2()
+                    // Each takes half the row (two full-width buttons alone would push one out).
                     .child(
-                        Button::new("new-project", "New Project")
-                            .style(ButtonStyle::Outlined)
-                            .full_width()
-                            .start_icon(Icon::new(IconName::FolderAdd).size(IconSize::Small))
-                            .tooltip(Tooltip::text("Group folders into a project"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_project_dialog(
-                                    None,
-                                    String::new(),
-                                    Vec::new(),
-                                    window,
-                                    cx,
-                                )
-                            })),
+                        div().flex_1().child(
+                            Button::new("new-project", "New Project")
+                                .style(ButtonStyle::Outlined)
+                                .full_width()
+                                .start_icon(Icon::new(IconName::FolderAdd).size(IconSize::Small))
+                                .tooltip(Tooltip::text("Group folders into a project"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_project_dialog(
+                                        None,
+                                        String::new(),
+                                        Vec::new(),
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                        ),
                     )
                     .child(
-                        Button::new("new-session", "New Session")
-                            .style(ButtonStyle::Tinted(TintColor::Accent))
-                            .full_width()
-                            .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
-                            .tooltip(Tooltip::text(new_session_tooltip))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.new_session(window, cx)),
-                            ),
+                        div().flex_1().child(
+                            Button::new("new-session", "New Session")
+                                .style(ButtonStyle::Tinted(TintColor::Accent))
+                                .full_width()
+                                .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
+                                .tooltip(Tooltip::text(new_session_tooltip))
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.new_session(window, cx)),
+                                ),
+                        ),
                     ),
             )
             .child(Divider::horizontal())
@@ -939,61 +975,10 @@ impl Workspace {
                     .pt_1()
                     .pb_2()
                     .children(rows)
+                    .overflow_y_scroll()
+                    .track_scroll(&self.sidebar_scroll)
                     .vertical_scrollbar_for(&self.sidebar_scroll, window, cx),
             )
-    }
-
-    /// The selected project and the active model.
-    fn render_status_bar(&self, cx: &App) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        let state = AppState::global(cx).read(cx);
-        let groups = self.groups();
-        let project = self.selected_group(&groups, cx).map(|g| g.name.clone());
-        let model = self
-            .active
-            .as_ref()
-            .and_then(|id| self.chats.get(id))
-            .map(|chat| chat.read(cx).model.clone())
-            .or_else(|| state.config.model.clone())
-            .map(|id| {
-                state
-                    .model_info(&id)
-                    .and_then(|m| m.name.clone())
-                    .unwrap_or(id)
-            });
-        h_flex()
-            .h(px(24.))
-            .px_2()
-            .gap_4()
-            .flex_none()
-            .justify_between()
-            .bg(colors.status_bar_background)
-            .border_t_1()
-            .border_color(colors.border)
-            .child(h_flex().gap_1().when_some(project, |this, project| {
-                this.child(
-                    Icon::new(IconName::FolderOpen)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(
-                    Label::new(project)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-            }))
-            .child(h_flex().gap_1().when_some(model, |this, model| {
-                this.child(
-                    Icon::new(IconName::Sparkle)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(
-                    Label::new(model)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-            }))
     }
 }
 
@@ -1128,6 +1113,20 @@ impl Render for Workspace {
                 h_flex()
                     .flex_1()
                     .min_h_0()
+                    .on_drag_move(cx.listener(
+                        |_, event: &gpui::DragMoveEvent<DraggedSidebar>, _, cx| {
+                            let width = event.event.position.x - event.bounds.left();
+                            let width = width.clamp(px(MIN_SIDEBAR_WIDTH), px(MAX_SIDEBAR_WIDTH));
+                            // Kept in memory while dragging; written to disk on release.
+                            AppState::global(cx).update(cx, |state, cx| {
+                                state.config.sidebar_width = Some(f32::from(width));
+                                cx.notify();
+                            });
+                        },
+                    ))
+                    .on_drop(cx.listener(|_, _: &DraggedSidebar, _, cx| {
+                        AppState::global(cx).update(cx, |state, cx| state.save(cx));
+                    }))
                     .when(self.sidebar_open, |this| {
                         this.child(self.render_sidebar(window, cx))
                     })
@@ -1144,7 +1143,6 @@ impl Render for Workspace {
                             .child(main),
                     ),
             )
-            .child(self.render_status_bar(cx))
             // The project dialog over a dimmed window; clicking outside it cancels.
             .when_some(dialog, |this, dialog| {
                 this.child(
@@ -1157,12 +1155,48 @@ impl Render for Workspace {
                         .justify_center()
                         .bg(gpui::black().opacity(0.4))
                         .occlude()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.project_dialog = None;
-                            cx.notify();
-                        }))
+                        // On press, not click: a drag that starts in a field and ends out
+                        // here must not close the dialog.
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.project_dialog = None;
+                                cx.notify();
+                            }),
+                        )
                         .child(dialog),
                 )
             })
     }
+}
+
+const DEFAULT_SIDEBAR_WIDTH: f32 = 280.;
+const MIN_SIDEBAR_WIDTH: f32 = 200.;
+const MAX_SIDEBAR_WIDTH: f32 = 600.;
+
+/// What's dragged when resizing the sidebar (Zed drags a marker like this for its panels).
+#[derive(Clone)]
+struct DraggedSidebar;
+
+impl Render for DraggedSidebar {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+fn sidebar_width(cx: &App) -> Pixels {
+    let width = AppState::global(cx)
+        .read(cx)
+        .config
+        .sidebar_width
+        .unwrap_or(DEFAULT_SIDEBAR_WIDTH);
+    px(width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH))
+}
+
+/// Sets and saves the sidebar width; `None` restores the default.
+fn set_sidebar_width(width: Option<f32>, cx: &mut App) {
+    AppState::global(cx).update(cx, |state, cx| {
+        state.config.sidebar_width = width;
+        state.save(cx);
+    });
 }

@@ -428,6 +428,8 @@ impl Render for MemoryView {
             .p_6()
             .gap_4()
             .bg(colors.panel_background)
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
             .vertical_scrollbar_for(&self.scroll, window, cx)
             .child(Headline::new("Memory").size(HeadlineSize::Large))
             .child(

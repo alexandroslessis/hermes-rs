@@ -577,17 +577,6 @@ impl TextArea {
         self.is_selecting = false;
     }
 
-    fn on_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), window, cx);
-        }
-    }
-
     fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         let layout = self.layout.borrow();
         let visible = self.last_bounds.map(|b| b.size.height).unwrap_or_default();
@@ -982,6 +971,25 @@ impl Element for TextAreaElement {
         let focus_handle = input.focus_handle.clone();
         let layout = input.layout.clone();
         let scroll_top = input.scroll_top;
+        // While a drag selects, follow the mouse anywhere in the window, as Zed's editor does: a
+        // fast drag leaves the field between two move events, and the field's own move
+        // handler only hears moves over it.
+        if input.is_selecting {
+            let entity = self.input.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                if phase != gpui::DispatchPhase::Bubble
+                    || event.pressed_button != Some(MouseButton::Left)
+                {
+                    return;
+                }
+                entity.update(cx, |input, cx| {
+                    if input.is_selecting {
+                        let index = input.index_for_mouse_position(event.position);
+                        input.select_to(index, window, cx);
+                    }
+                });
+            });
+        }
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(bounds, self.input.clone()),
@@ -1048,7 +1056,6 @@ impl Render for TextArea {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll(cx.listener(Self::on_scroll))
             .child(TextAreaElement { input: cx.entity() })
     }
