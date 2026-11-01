@@ -301,6 +301,8 @@ impl HintTracker {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // Same injection scan as the startup context files.
+        let content = hermes_prompts::system::scan_context(&content, &name);
         let content =
             hermes_prompts::system::truncate(&content, &name, Path::new(&shown), MAX_HINT_CHARS);
         Some(format!(

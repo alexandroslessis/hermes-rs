@@ -10,6 +10,8 @@ description = "Prompt text, tool schemas and the tiered system-prompt builder"
 workspace = true
 
 [dependencies]
+tracing.workspace = true
+hermes_memory.workspace = true
 anyhow.workspace = true
 chrono = { workspace = true, features = ["clock"] }
 serde_json.workspace = true
