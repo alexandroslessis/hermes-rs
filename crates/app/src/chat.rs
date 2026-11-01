@@ -90,6 +90,8 @@ pub struct ChatView {
     editing: Option<usize>,
     /// Skills matching a `/command` being typed: (name, short description).
     slash_matches: Vec<Suggestion>,
+    /// Which earlier message ↑ recalled (0 = the latest), while the composer shows it.
+    history_index: Option<usize>,
     /// Prompts waiting for the running turn to end (Hermes's `/queue`).
     queued: Vec<String>,
     /// Images waiting to go with the next message (pasted, dropped or picked).
@@ -152,7 +154,16 @@ impl ChatView {
                 TextAreaEvent::Submit => this.submit(window, cx),
                 TextAreaEvent::PastedImage(image) => this.attach_bytes(image.bytes.clone(), cx),
                 TextAreaEvent::PastedPaths(paths) => this.attach_paths(paths.clone(), cx),
+                TextAreaEvent::HistoryPrev => this.step_history(true, cx),
+                TextAreaEvent::HistoryNext => this.step_history(false, cx),
                 TextAreaEvent::Changed => {
+                    // Typing over a recalled message leaves the history.
+                    if let Some(index) = this.history_index {
+                        let text = this.composer.read(cx).text().to_string();
+                        if this.history().get(index) != Some(&text) {
+                            this.history_index = None;
+                        }
+                    }
                     this.update_slash_matches(cx);
                     // The send button follows whether the composer is empty.
                     cx.notify();
@@ -180,6 +191,7 @@ impl ChatView {
             file_index: None,
             attachments: Vec::new(),
             queued: Vec::new(),
+            history_index: None,
             message_images: HashMap::new(),
             subagent_progress: HashMap::new(),
             next_message: None,
@@ -463,6 +475,48 @@ impl ChatView {
         self.begin(Some(text), cx);
     }
 
+    /// What the user sent in this session, newest first (as typed), without repeats in a row.
+    fn history(&self) -> Vec<String> {
+        let mut sent: Vec<String> = self
+            .conversation
+            .messages()
+            .iter()
+            .rev()
+            .filter(|m| m.role == Role::User && m.is_user_visible() && !m.is_tool_response())
+            .map(shown_user_text)
+            .filter(|text| !text.trim().is_empty())
+            .collect();
+        sent.dedup();
+        sent
+    }
+
+    /// ↑ / ↓ at the composer's edge: steps through earlier messages when the composer is empty
+    /// or already shows one; ↓ past the newest clears it again.
+    fn step_history(&mut self, back: bool, cx: &mut Context<Self>) {
+        let empty = self.composer.read(cx).text().trim().is_empty();
+        if self.history_index.is_none() && !empty {
+            return;
+        }
+        let history = self.history();
+        let next = match (self.history_index, back) {
+            (None, true) => Some(0),
+            (None, false) => return,
+            (Some(i), true) => Some((i + 1).min(history.len().saturating_sub(1))),
+            (Some(0), false) => None,
+            (Some(i), false) => Some(i - 1),
+        };
+        let text = next
+            .and_then(|i| history.get(i))
+            .cloned()
+            .unwrap_or_default();
+        if next.is_some() && text.is_empty() {
+            return;
+        }
+        self.history_index = next;
+        self.composer.update(cx, |c, cx| c.set_text(text, cx));
+        cx.notify();
+    }
+
     /// Adds an image to the next message; anything that isn't an image Hermes can read is refused.
     fn attach_bytes(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
         match image_format(&bytes) {
@@ -481,10 +535,24 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Attaches the image files among `paths` (dropped, pasted or picked).
+    /// Attaches the image files among `paths` (dropped, pasted or picked); other files and folders
+    /// become `@file:` / `@folder:` mentions (relative to the session folder when inside it).
     fn attach_paths(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
+        let mut mentions = Vec::new();
         for path in paths {
             if !hermes_tools::vision::is_image_path(&path) {
+                let shown = self
+                    .cwd
+                    .as_deref()
+                    .and_then(|cwd| path.strip_prefix(cwd).ok())
+                    .map(|relative| relative.display().to_string())
+                    .unwrap_or_else(|| path.display().to_string())
+                    .replace('\\', "/");
+                let kind = if path.is_dir() { "folder" } else { "file" };
+                mentions.push(format!(
+                    "@{kind}:{}",
+                    hermes_tools::references::format_value(&shown)
+                ));
                 continue;
             }
             match std::fs::read(&path) {
@@ -494,6 +562,17 @@ impl ChatView {
                     cx.notify();
                 }
             }
+        }
+        if !mentions.is_empty() {
+            let current = self.composer.read(cx).text().to_string();
+            let separator = if current.is_empty() || current.ends_with(char::is_whitespace) {
+                ""
+            } else {
+                " "
+            };
+            let text = format!("{current}{separator}{} ", mentions.join(" "));
+            self.composer.update(cx, |c, cx| c.set_text(text, cx));
+            cx.notify();
         }
     }
 

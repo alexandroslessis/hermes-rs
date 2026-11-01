@@ -89,6 +89,9 @@ pub enum TextAreaEvent {
     PastedImage(gpui::Image),
     /// Files were pasted (copied in Explorer).
     PastedPaths(Vec<std::path::PathBuf>),
+    /// Up on the first line / Down on the last: the owner may step through earlier input.
+    HistoryPrev,
+    HistoryNext,
 }
 
 struct LayoutLine {
@@ -412,11 +415,17 @@ impl TextArea {
     }
 
     fn up(&mut self, _: &Up, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.content[..self.cursor_offset()].contains('\n') {
+            cx.emit(TextAreaEvent::HistoryPrev);
+        }
         let target = self.vertical_target(-1.);
         self.move_to(target, window, cx);
     }
 
     fn down(&mut self, _: &Down, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.content[self.cursor_offset()..].contains('\n') {
+            cx.emit(TextAreaEvent::HistoryNext);
+        }
         let target = self.vertical_target(1.);
         self.move_to(target, window, cx);
     }
