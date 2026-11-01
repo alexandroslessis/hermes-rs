@@ -74,8 +74,10 @@ impl AppState {
         self.provider().map(config::runtime_provider)
     }
 
+    /// Whether the active provider can be called: it has a key, or it's local and needs none.
     pub fn has_api_key(&self) -> bool {
-        self.provider().and_then(config::api_key).is_some()
+        self.provider()
+            .is_some_and(|p| p.is_local() || config::api_key(p).is_some())
     }
 
     pub fn model_info(&self, id: &str) -> Option<&DiscoveredModel> {

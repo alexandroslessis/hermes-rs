@@ -18,6 +18,22 @@ pub struct ProviderSettings {
     pub api_key_env: Option<String>,
 }
 
+impl ProviderSettings {
+    /// A server on this machine (Ollama, LM Studio, llama.cpp): it works without an API key.
+    pub fn is_local(&self) -> bool {
+        let rest = self
+            .base_url
+            .split_once("://")
+            .map_or(self.base_url.as_str(), |(_, rest)| rest);
+        let authority = rest.split('/').next().unwrap_or_default();
+        let host = match authority.strip_prefix('[') {
+            Some(ipv6) => ipv6.split(']').next().unwrap_or_default(),
+            None => authority.split(':').next().unwrap_or_default(),
+        };
+        host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub providers: Vec<ProviderSettings>,
@@ -142,5 +158,25 @@ pub fn runtime_provider(provider: &ProviderSettings) -> ProviderConfig {
         id: provider.id.clone(),
         base_url: provider.base_url.clone(),
         api_key: api_key(provider),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_servers_need_no_key() {
+        let provider = |base_url: &str| ProviderSettings {
+            id: "p".into(),
+            name: "P".into(),
+            base_url: base_url.into(),
+            api_key_env: None,
+        };
+        assert!(provider("http://localhost:11434/v1").is_local());
+        assert!(provider("http://127.0.0.1:1234/v1").is_local());
+        assert!(provider("http://[::1]:8080/v1").is_local());
+        assert!(!provider("https://openrouter.ai/api/v1").is_local());
+        assert!(!provider("http://localhost.example.com/v1").is_local());
     }
 }

@@ -228,6 +228,9 @@ impl Render for SettingsView {
                 .is_some();
             let source = match (stored, provider.and_then(|p| p.api_key_env.clone())) {
                 (true, _) => "stored in Windows Credential Manager".to_string(),
+                _ if provider.is_some_and(|p| p.is_local()) => {
+                    "not needed (a server on this machine)".to_string()
+                }
                 (false, Some(var)) if state.has_api_key() => {
                     format!("read from the {var} environment variable")
                 }
