@@ -23,6 +23,7 @@ mod shell;
 mod skill_manage;
 pub mod skills;
 mod todo;
+pub mod web;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -90,6 +91,8 @@ pub struct SessionToolsConfig {
     pub approvals: Option<Arc<approval::ApprovalStore>>,
     /// Filesystem checkpoints taken before file changes (`/rollback`).
     pub checkpoints: Option<Arc<checkpoints::Checkpoints>>,
+    /// `web_search` / `web_extract` (the keyless vendor ring, shared by every session).
+    pub web: Option<Arc<web::Web>>,
 }
 
 pub struct SessionTools {
@@ -112,6 +115,7 @@ pub struct SessionTools {
     /// Directories whose AGENTS.md / CLAUDE.md the model has been shown.
     hints: parking_lot::Mutex<hints::HintTracker>,
     checkpoints: Option<Arc<checkpoints::Checkpoints>>,
+    web: Option<Arc<web::Web>>,
     /// Projects already checkpointed this turn (one snapshot per project per turn).
     turn_checkpoints: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
@@ -134,6 +138,7 @@ impl SessionTools {
             skills: config.skills,
             approvals: config.approvals,
             checkpoints: config.checkpoints,
+            web: config.web,
             turn_checkpoints: Default::default(),
             session_approved: Default::default(),
         }
@@ -283,12 +288,37 @@ impl SessionTools {
             "session_search" => self.session_search(&args),
             "skills_list" | "skill_view" | "skill_manage" => self.skills_tool(name, &args),
             "clarify" => clarify::clarify(self, args).await,
+            "web_search" | "web_extract" => self.web_tool(name, &args).await,
             other => ToolOutput::error(format!("Unknown tool '{other}'.")),
         }
     }
 }
 
 impl SessionTools {
+    async fn web_tool(&self, name: &str, args: &Value) -> ToolOutput {
+        let Some(web) = &self.web else {
+            return ToolOutput::error("Web tools are not available in this session.");
+        };
+        let value = if name == "web_search" {
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+            web.search(query, args.get("limit").and_then(Value::as_i64))
+                .await
+        } else {
+            let urls = args
+                .get("urls")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            web.extract(&urls, args.get("char_limit").and_then(Value::as_i64))
+                .await
+        };
+        let failed = value.get("success") == Some(&Value::Bool(false));
+        ToolOutput {
+            value,
+            is_error: failed,
+        }
+    }
+
     fn skills_tool(&self, name: &str, args: &Value) -> ToolOutput {
         let Some(skills) = &self.skills else {
             return ToolOutput::error("Skills are not available in this session.");
@@ -447,6 +477,7 @@ pub(crate) mod tests {
             skills: None,
             approvals: None,
             checkpoints: None,
+            web: None,
         });
         (dir, tools)
     }

@@ -302,6 +302,7 @@ mod tests {
             skills: Some(skills.clone()),
             approvals: None,
             checkpoints: None,
+            web: None,
         });
         (
             dir,

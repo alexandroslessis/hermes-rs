@@ -2470,6 +2470,7 @@ dependencies = [
  "ignore",
  "parking_lot",
  "regex",
+ "reqwest",
  "rmcp",
  "rust-embed",
  "serde",
@@ -2480,6 +2481,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-normalization",
+ "url",
  "uuid",
  "windows",
 ]

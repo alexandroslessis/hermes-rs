@@ -2474,11 +2474,7 @@ impl ChatView {
                                 .icon(IconName::ToolWeb)
                                 .icon_color(Color::Muted)
                                 .icon_size(IconSize::XSmall)
-                                .documentation_aside(ui::DocumentationSide::Right, |_| {
-                                    Label::new("Web pages can be attached once web extract lands")
-                                        .into_any_element()
-                                })
-                                .disabled(true),
+                                .handler(insert("@url:")),
                         )
                 }))
             })
@@ -3198,7 +3194,7 @@ const MENTION_KINDS: &[(&str, &str)] = &[
         "@git:",
         "Attach the last N commits with patches, e.g. @git:3",
     ),
-    ("@url:", "Attach a web page (not available yet)"),
+    ("@url:", "Attach a web page's text"),
 ];
 
 /// A `/rollback` or `/diff` report: shown like a reply, but no turn ends with it.

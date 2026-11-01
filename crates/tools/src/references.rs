@@ -234,11 +234,25 @@ pub fn format_value(value: &str) -> String {
 
 /// `preprocess_context_references`: expands the references in `message`. Paths must stay under
 /// `cwd` (Hermes's default allowed root). `None` when the message has no references.
+/// Pages for `@url:` references, fetched beforehand (`url_targets`), by URL as typed.
+pub type FetchedPages = std::collections::HashMap<String, Result<String, String>>;
+
+/// The URLs of the message's `@url:` references, to fetch before [`expand`].
+pub fn url_targets(message: &str) -> Vec<String> {
+    parse(message)
+        .into_iter()
+        .filter(|r| r.kind == "url")
+        .map(|r| r.target)
+        .take(MAX_EXPANDED_REFERENCES)
+        .collect()
+}
+
 pub fn expand(
     message: &str,
     cwd: &Path,
     home: &Path,
     context_length: Option<usize>,
+    pages: &FetchedPages,
 ) -> Option<Expanded> {
     let references = parse(message);
     if references.is_empty() {
@@ -253,7 +267,7 @@ pub fn expand(
     let mut warnings = Vec::new();
     let mut blocks = Vec::new();
     for reference in references.iter().take(MAX_EXPANDED_REFERENCES) {
-        match expand_one(reference, &cwd, home, hard_limit) {
+        match expand_one(reference, &cwd, home, hard_limit, pages) {
             Ok(block) => blocks.push(block),
             Err(warning) => warnings.push(warning),
         }
@@ -310,6 +324,7 @@ fn expand_one(
     cwd: &Path,
     home: &Path,
     max_inline_tokens: usize,
+    pages: &FetchedPages,
 ) -> Result<String, String> {
     let raw = &reference.raw;
     match reference.kind.as_str() {
@@ -321,9 +336,15 @@ fn expand_one(
             let count = reference.target.parse::<u32>().unwrap_or(1).clamp(1, 10);
             git(raw, cwd, &["log", &format!("-{count}"), "-p"])
         }
-        "url" => Err(format!(
-            "{raw}: web pages can't be attached yet (web extraction isn't available)"
-        )),
+        "url" => match pages.get(&reference.target) {
+            Some(Ok(content)) => Ok(format!(
+                "🌐 {raw} ({} tokens)
+{content}",
+                estimate_tokens(content)
+            )),
+            Some(Err(error)) => Err(format!("{raw}: {error}")),
+            None => Err(format!("{raw}: no content extracted")),
+        },
         _ => Err(format!("{raw}: unsupported reference type")),
     }
 }
@@ -665,6 +686,7 @@ mod tests {
             dir.path(),
             home.path(),
             None,
+            &FetchedPages::new(),
         )
         .unwrap();
         assert!(!expanded.blocked);
@@ -685,13 +707,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("big.txt"), "x".repeat(4_000)).unwrap();
         // Over half of a 1k window: the file goes on disk as a pointer.
-        let expanded = expand("@file:big.txt", dir.path(), dir.path(), Some(1_000)).unwrap();
+        let expanded = expand(
+            "@file:big.txt",
+            dir.path(),
+            dir.path(),
+            Some(1_000),
+            &FetchedPages::new(),
+        )
+        .unwrap();
         assert!(
             expanded
                 .message
                 .contains("📎 @file:big.txt (text file, approximately 1000 tokens")
         );
-        assert!(expand("no references", dir.path(), dir.path(), None).is_none());
+        assert!(
+            expand(
+                "no references",
+                dir.path(),
+                dir.path(),
+                None,
+                &FetchedPages::new()
+            )
+            .is_none()
+        );
+        let pages =
+            FetchedPages::from([("example.com/a".to_string(), Ok("page text".to_string()))]);
+        let expanded = expand(
+            "read @url:example.com/a",
+            dir.path(),
+            dir.path(),
+            None,
+            &pages,
+        )
+        .unwrap();
+        assert!(expanded.message.contains(
+            "🌐 @url:example.com/a (3 tokens)
+page text"
+        ));
+        assert_eq!(url_targets("@url:a.com and @url:b.com"), ["a.com", "b.com"]);
     }
 }
 

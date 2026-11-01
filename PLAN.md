@@ -430,6 +430,22 @@ M5 part 4 status (2026-11-01): checkpoints, `/rollback`, `/diff`, done.
 - Not ported: the store-wide size cap and periodic gc/prune, legacy-store migration, nested
   repository handling, the cross-project listing, `/snapshot`.
 
+M5 part 5 status (2026-11-01): web search and extract, done.
+- `crates/tools/src/web.rs`: `web_search` and `web_extract` on Hermes's keyless tier, the public
+  free endpoints of Exa and Parallel (MCP `tools/call` over HTTPS, JSON or SSE bodies), Firecrawl
+  and Keenable, round-robin from a random start with failover on rate limits and HTTP
+  401/402/403/5xx refusals (extract: only when every URL was throttled). No keys or user ids are
+  sent; Parallel gets a random per-run session id. Live-checked: all four vendors served.
+- Extract: at most five URLs, URLs carrying secrets refused outright, private/loopback/link-local
+  and metadata addresses blocked (fail closed on DNS), base64 images to `[IMAGE: alt]`, Hermes's
+  15k budget (2k-500k) with a 75/25 head/tail window and a footer pointing `read_file` at the
+  full text saved under `<data>/cache/web`.
+- `@url:` references fetch through the same ring before the message is added (in the turn's task,
+  cancellable); the composer offers `@url:` and the `+` menu's URL entry inserts it.
+- Not ported: keyed backends (Tavily, Exa, Firecrawl, Parallel, Brave, SearXNG, ddgs, xAI…) and
+  their Settings, the managed Nous gateway, the result memo cache, website policy rules,
+  connect-time DNS-rebinding checks, binary-payload detection.
+
 **M6: Polish.** Command palette (Tier 2 `picker`), find in transcript, themes and fonts, diff
 review pane, import from `~/.hermes`, installer (MSI), auto-update.
 

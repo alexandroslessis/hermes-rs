@@ -192,6 +192,8 @@ pub struct Runtime {
     approvals: Arc<hermes_tools::approval::ApprovalStore>,
     /// Filesystem checkpoints every session shares (Hermes: opt-in).
     checkpoints: Arc<hermes_tools::checkpoints::Checkpoints>,
+    /// The web tools every session shares.
+    web: Arc<hermes_tools::web::Web>,
     config: RuntimeConfig,
     bridge: Arc<dyn UserBridge>,
     windows_version: String,
@@ -220,6 +222,9 @@ impl Runtime {
             skills: Arc::new(skills),
             approvals,
             checkpoints,
+            web: Arc::new(hermes_tools::web::Web::new(hermes_tools::web::cache_dir(
+                &config.data_dir,
+            ))),
             windows_version: windows_version(),
             config,
             bridge,
@@ -386,6 +391,7 @@ impl Runtime {
             skills: Some(self.skills.clone()),
             approvals: Some(self.approvals.clone()),
             checkpoints: Some(self.checkpoints.clone()),
+            web: Some(self.web.clone()),
         });
         let user_turns = conversation
             .messages()
@@ -532,16 +538,24 @@ impl Runtime {
             effort_params: effort_params.clone(),
             enabled: self.background_review.clone(),
         };
+        // A message with `@url:` references is added once its pages are fetched, in the turn's
+        // task (fetching can take seconds).
+        let deferred = text
+            .filter(|t| !hermes_tools::references::url_targets(t).is_empty())
+            .map(str::to_string);
         let first_event = match text {
-            Some(text) => user_message(&open, text, context_length).and_then(|user| {
-                runtime
-                    .append(user.clone())
-                    .map(|()| AgentEvent::Message(user))
-            }),
+            Some(_) if deferred.is_some() => Ok(None),
+            Some(text) => {
+                user_message(&open, text, context_length, &Default::default()).and_then(|user| {
+                    runtime
+                        .append(user.clone())
+                        .map(|()| Some(AgentEvent::Message(user)))
+                })
+            }
             None => runtime
                 .drop_trailing_errors()
                 .and_then(|conversation| conversation.context("there is no failed turn to retry"))
-                .map(AgentEvent::HistoryReplaced),
+                .map(|conversation| Some(AgentEvent::HistoryReplaced(conversation))),
         };
         let first_event = match first_event {
             Ok(event) => event,
@@ -550,18 +564,49 @@ impl Runtime {
                 return Err(error);
             }
         };
-        let turn_start = open.conversation.lock().messages().len();
+        let mut turn_start = open.conversation.lock().messages().len();
+        let web = self.web.clone();
         let rebuild_prompt = self.prompt_rebuild(&open, context_length);
         let summarizer_llm = llm.clone();
         *self.last_activity.lock() = std::time::Instant::now();
         let last_activity = self.last_activity.clone();
 
         let (events_tx, events_rx) = mpsc::unbounded_channel();
-        let _ = events_tx.send(RuntimeEvent::Agent(first_event));
+        if let Some(event) = first_event {
+            let _ = events_tx.send(RuntimeEvent::Agent(event));
+        }
         let max_iterations = self.config.max_iterations;
         let session_id = session_id.to_string();
         let turn_cancel = cancel.clone();
         tokio::spawn(async move {
+            if let Some(text) = deferred {
+                let mut pages = hermes_tools::references::FetchedPages::new();
+                for url in hermes_tools::references::url_targets(&text) {
+                    let page = tokio::select! {
+                        page = web.fetch_for_reference(&url) => page,
+                        _ = turn_cancel.cancelled() => Err("cancelled".into()),
+                    };
+                    pages.insert(url, page);
+                }
+                let added = user_message(&runtime.session, &text, context_length, &pages)
+                    .and_then(|user| runtime.append(user.clone()).map(|()| user));
+                match added {
+                    Ok(user) if !turn_cancel.is_cancelled() => {
+                        turn_start = runtime.session.conversation.lock().len();
+                        let _ = events_tx.send(RuntimeEvent::Agent(AgentEvent::Message(user)));
+                    }
+                    outcome => {
+                        *runtime.session.running.lock() = None;
+                        *runtime.session.turn_state.lock() = None;
+                        let status = match outcome {
+                            Err(error) => TurnStatus::Failed(format!("{error:#}")),
+                            Ok(_) => TurnStatus::Cancelled,
+                        };
+                        let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
+                        return;
+                    }
+                }
+            }
             let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
             let forward_tx = events_tx.clone();
             let forward = tokio::spawn(async move {
@@ -913,10 +958,16 @@ impl Runtime {
 /// The user's message as the model gets it: with its `@` references expanded (Hermes's
 /// `preprocess_context_references`), the typed text kept for the chat to show. Refused when the
 /// attached context would take over half the window.
-fn user_message(open: &OpenSession, text: &str, context_length: Option<usize>) -> Result<Message> {
+fn user_message(
+    open: &OpenSession,
+    text: &str,
+    context_length: Option<usize>,
+    pages: &hermes_tools::references::FetchedPages,
+) -> Result<Message> {
     let cwd = PathBuf::from(&open.record.lock().cwd);
     let home = dirs::home_dir().context("no home directory")?;
-    let Some(expanded) = hermes_tools::references::expand(text, &cwd, &home, context_length) else {
+    let Some(expanded) = hermes_tools::references::expand(text, &cwd, &home, context_length, pages)
+    else {
         return Ok(Message::user()
             .with_text(text)
             .with_generated_id_if_missing());

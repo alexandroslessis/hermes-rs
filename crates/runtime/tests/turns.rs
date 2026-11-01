@@ -1926,3 +1926,24 @@ async fn diff_shows_git_changes_and_new_files() {
     );
     assert!(text.contains("+ b.txt") && text.contains("+new"), "{text}");
 }
+
+#[tokio::test]
+async fn an_url_reference_is_fetched_before_the_message_is_added() {
+    let h = harness(vec![text_reply("ok")]).await;
+    let session = session_in(&h);
+    // A private address is refused before any request, so this stays offline.
+    let events = run_turn(&h, &session, "what is at @url:http://127.0.0.1/admin").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert!(matches!(
+        events.first(),
+        Some(RuntimeEvent::Agent(AgentEvent::Message(_)))
+    ));
+    let sent = h.requests.lock()[0].to_string();
+    assert!(sent.contains("--- Context Warnings ---"), "{sent}");
+    assert!(sent.contains("private or internal network address"));
+    let user = h.runtime.messages(&session).unwrap()[0].clone();
+    assert_eq!(
+        hermes_tools::references::typed_text(&user),
+        Some("what is at @url:http://127.0.0.1/admin")
+    );
+}

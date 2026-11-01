@@ -15,3 +15,5 @@ Hermes wording for it.
 | `search_files` | Walks with the `ignore` crate instead of ripgrep; wording about ripgrep removed, gitignore/hidden/binary behavior stated. |
 | `terminal` | No `pty`, `heartbeat`, `persist_on_release`; `notify` is boolean only (no line patterns); no automatic promotion to background above 600 s. Timeout restart behavior stated. |
 | `process_manage` | No `handoff` (subagents arrive later); no cross-conversation result retention. |
+| `web_search` | "configured backend" → "search backend" (the keyless tier only, no backend choice yet). |
+| `web_extract` | "use a browser tool instead" → "say so rather than guessing" (no browser tools). |
