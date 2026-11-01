@@ -9,7 +9,7 @@ use gpui::{
     ScrollHandle, Subscription, Window, prelude::*,
 };
 use hermes_tools::Bundle;
-use ui::{Checkbox, TintColor, ToggleState, Tooltip, WithScrollbar, prelude::*};
+use ui::{Checkbox, TintColor, ToggleState, Tooltip, prelude::*};
 
 use crate::backend::backend;
 use crate::text_area::{TextArea, TextAreaEvent};
@@ -146,6 +146,17 @@ impl Render for BundleDialog {
                 .into_any_element()
             })
             .collect();
+        let skill_list = {
+            let colors = cx.theme().colors();
+            let wrapper = div()
+                .h(rems(14.))
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border_variant)
+                .bg(colors.editor_background);
+            let content = v_flex().id("bundle-skills").p_2().gap_1().children(rows);
+            crate::scroll::with_scrollbar(wrapper, content, &self.scroll, window, cx)
+        };
         let colors = cx.theme().colors();
         let field = |label: &'static str, input: &Entity<TextArea>| {
             v_flex()
@@ -211,21 +222,7 @@ impl Render for BundleDialog {
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
-                    .child(
-                        v_flex()
-                            .id("bundle-skills")
-                            .max_h(rems(14.))
-                            .p_2()
-                            .gap_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(colors.border_variant)
-                            .bg(colors.editor_background)
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll)
-                            .vertical_scrollbar_for(&self.scroll, window, cx)
-                            .children(rows),
-                    ),
+                    .child(skill_list),
             )
             .when_some(self.error.clone(), |this, error| {
                 this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))

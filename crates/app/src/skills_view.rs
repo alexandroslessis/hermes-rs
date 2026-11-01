@@ -7,7 +7,7 @@ use gpui::{App, Context, Entity, FocusHandle, Focusable, Window, prelude::*};
 use hermes_tools::curator::{ArchivedSkill, CuratorState, SkillState};
 use hermes_tools::{Bundle, PendingSkillWrite, SkillCommit, SkillEntry, SkillStore};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
-use ui::{Callout, Checkbox, Divider, ToggleState, Tooltip, WithScrollbar, prelude::*};
+use ui::{Callout, Checkbox, Divider, ToggleState, Tooltip, prelude::*};
 
 use crate::backend::backend;
 use crate::bundle_dialog::{BundleDialog, BundleDialogEvent};
@@ -580,17 +580,14 @@ impl SkillsView {
                     .into_any_element(),
             );
         }
-        v_flex()
-            .id("skills-list")
+        let wrapper = div()
             .w(px(300.))
             .h_full()
             .flex_none()
             .border_r_1()
-            .border_color(colors.border)
-            .overflow_y_scroll()
-            .track_scroll(&self.list_scroll)
-            .vertical_scrollbar_for(&self.list_scroll, window, cx)
-            .children(rows)
+            .border_color(colors.border);
+        let content = v_flex().id("skills-list").children(rows);
+        crate::scroll::with_scrollbar(wrapper, content, &self.list_scroll, window, cx)
     }
 
     fn render_detail(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -626,14 +623,10 @@ impl SkillsView {
             })
             .unwrap_or_default();
         let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-        v_flex()
+        let content = v_flex()
             .id("skill-detail")
-            .size_full()
             .p_4()
             .gap_2()
-            .overflow_y_scroll()
-            .track_scroll(&self.detail_scroll)
-            .vertical_scrollbar_for(&self.detail_scroll, window, cx)
             .child(
                 h_flex()
                     .justify_between()
@@ -681,7 +674,8 @@ impl SkillsView {
                 div()
                     .id("skill-markdown")
                     .child(MarkdownElement::new(document, style)),
-            )
+            );
+        crate::scroll::with_scrollbar(div().size_full(), content, &self.detail_scroll, window, cx)
             .into_any_element()
     }
 

@@ -7,8 +7,7 @@ use gpui::{
     App, Context, Entity, FocusHandle, Focusable, KeyDownEvent, Subscription, Window, prelude::*,
 };
 use ui::{
-    Chip, ContextMenu, Divider, DropdownMenu, Switch, TintColor, ToggleState, Tooltip,
-    WithScrollbar, prelude::*,
+    Chip, ContextMenu, Divider, DropdownMenu, Switch, TintColor, ToggleState, Tooltip, prelude::*,
 };
 
 use crate::backend::backend;
@@ -720,10 +719,9 @@ impl Render for SettingsView {
                             .overflow_hidden()
                             .child(self.picker.clone()),
                     ),
-            )
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
-            .vertical_scrollbar_for(&self.scroll, window, cx);
+            );
+        let content =
+            crate::scroll::with_scrollbar(div().size_full(), content, &self.scroll, window, cx);
 
         div()
             .relative()

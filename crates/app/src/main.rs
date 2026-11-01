@@ -12,6 +12,7 @@ mod memory_view;
 mod model_picker;
 mod notification;
 mod project_dialog;
+mod scroll;
 mod settings;
 mod sidebar;
 mod skills_view;

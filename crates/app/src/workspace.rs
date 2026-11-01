@@ -13,7 +13,7 @@ use hermes_store::{Project, SessionRecord};
 use tokio::sync::mpsc;
 use ui::{
     AgentThreadStatus, Callout, CommonAnimationExt, ContextMenu, Divider, PopoverMenu, ThreadItem,
-    TintColor, Tooltip, WithScrollbar, prelude::*,
+    TintColor, Tooltip, prelude::*,
 };
 
 use crate::backend::{UiRequest, backend};
@@ -1003,17 +1003,13 @@ impl Workspace {
                     ),
             )
             .child(Divider::horizontal())
-            .child(
-                v_flex()
-                    .id("sessions")
-                    .flex_1()
-                    .pt_1()
-                    .pb_2()
-                    .children(rows)
-                    .overflow_y_scroll()
-                    .track_scroll(&self.sidebar_scroll)
-                    .vertical_scrollbar_for(&self.sidebar_scroll, window, cx),
-            )
+            .child(crate::scroll::with_scrollbar(
+                div().flex_1().min_h_0(),
+                v_flex().id("sessions").pt_1().pb_2().children(rows),
+                &self.sidebar_scroll,
+                window,
+                cx,
+            ))
     }
 }
 
