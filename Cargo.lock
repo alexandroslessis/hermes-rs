@@ -2405,6 +2405,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "dirs",
+ "futures",
  "hermes_agent",
  "hermes_llm",
  "hermes_memory",
@@ -2420,6 +2421,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
  "wiremock",
 ]
 

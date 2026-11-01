@@ -4,6 +4,7 @@
 mod commands;
 pub mod compress;
 mod curator;
+mod delegate;
 mod guards;
 mod ops;
 mod review;
@@ -354,6 +355,53 @@ impl Runtime {
         }
     }
 
+    /// A subagent's base prompt: the session's, built now without memory (Hermes builds children
+    /// with `skip_memory`).
+    fn child_base_prompt(
+        &self,
+        open: &OpenSession,
+        context_length: Option<usize>,
+    ) -> delegate::BasePrompt {
+        let source = self.prompt_source();
+        let (provider, model, cwd) = {
+            let record = open.record.lock();
+            (
+                record.provider.clone(),
+                record.model.clone(),
+                PathBuf::from(&record.cwd),
+            )
+        };
+        Arc::new(move || source.build(&provider, &model, context_length, &cwd, false))
+    }
+
+    /// How a subagent's own tools are made: the session's kinds of tools, no memory and no one to
+    /// ask (`ChildBridge`).
+    fn child_tools(&self) -> delegate::ChildTools {
+        let shell = self.config.shell.clone();
+        let store = self.store.clone();
+        let skills = self.skills.clone();
+        let approvals = self.approvals.clone();
+        let checkpoints = self.checkpoints.clone();
+        let web = self.web.clone();
+        Arc::new(move |session_id, cwd, scratch_dir| {
+            SessionTools::new(SessionToolsConfig {
+                session_id: session_id.to_string(),
+                cwd: cwd.to_path_buf(),
+                home: dirs::home_dir().unwrap_or_default(),
+                scratch_dir: scratch_dir.to_path_buf(),
+                shell: shell.clone(),
+                bridge: Arc::new(delegate::ChildBridge),
+                todos: Vec::new(),
+                memory: None,
+                history: Some(store.clone()),
+                skills: Some(skills.clone()),
+                approvals: Some(approvals.clone()),
+                checkpoints: Some(checkpoints.clone()),
+                web: Some(web.clone()),
+            })
+        })
+    }
+
     /// Rebuilds a session's frozen prompt as it would be built now (after a compaction).
     fn prompt_rebuild(
         &self,
@@ -584,6 +632,17 @@ impl Runtime {
         let mut turn_start = open.conversation.lock().messages().len();
         let web = self.web.clone();
         let rebuild_prompt = self.prompt_rebuild(&open, context_length);
+        let delegator = Arc::new(delegate::Delegator {
+            parent: open.clone(),
+            store: self.store.clone(),
+            llm: llm.clone(),
+            model: model.clone(),
+            context_length,
+            effort_params: effort_params.clone(),
+            supports_vision,
+            base_prompt: self.child_base_prompt(&open, context_length),
+            child_tools: self.child_tools(),
+        });
         let summarizer_llm = llm.clone();
         *self.last_activity.lock() = std::time::Instant::now();
         let last_activity = self.last_activity.clone();
@@ -651,7 +710,10 @@ impl Runtime {
                 .map(str::to_string)
                 .collect();
             let tools: Arc<dyn ToolProvider<TurnSession>> = Arc::new(ops::GuardedTools {
-                inner: runtime.session.tools.clone(),
+                inner: Arc::new(delegate::DelegatingTools {
+                    inner: runtime.session.tools.clone(),
+                    delegator,
+                }),
                 scratch_dir: runtime.session.tools.scratch_dir().to_path_buf(),
                 state: state.clone(),
                 result_limit: ops::result_size_limit(context_length),

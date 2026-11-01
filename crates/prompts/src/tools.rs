@@ -63,6 +63,10 @@ const SCHEMAS: &[(&str, &str)] = &[
         "vision_analyze",
         include_str!("../../../prompts/tools/vision_analyze.json"),
     ),
+    (
+        "delegate_task",
+        include_str!("../../../prompts/tools/delegate_task.json"),
+    ),
 ];
 
 /// A tool definition as stored: name, description and JSON-schema parameters.
@@ -116,12 +120,7 @@ mod tests {
     fn no_schema_names_a_tool_we_do_not_have() {
         for name in tool_names() {
             let description = tool_schema(name).unwrap().description;
-            for absent in [
-                "vision_analyze",
-                "execute_code",
-                "delegate_task",
-                "browser_",
-            ] {
+            for absent in ["execute_code", "cronjob", "browser_"] {
                 assert!(
                     !description.contains(absent),
                     "{name} description mentions unavailable tool {absent}"

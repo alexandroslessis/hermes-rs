@@ -92,6 +92,8 @@ pub struct ChatView {
     slash_matches: Vec<Suggestion>,
     /// Images waiting to go with the next message (pasted, dropped or picked).
     attachments: Vec<Arc<gpui::Image>>,
+    /// Each running `delegate_task` call'"'"'s subagents and what they last started, by tool call id.
+    subagent_progress: HashMap<String, std::collections::BTreeMap<usize, String>>,
     /// Decoded images of sent messages, by (message id, content block).
     message_images: HashMap<(String, usize), Arc<gpui::Image>>,
     /// The working folder's files, listed when an `@file:` / `@folder:` mention starts.
@@ -176,6 +178,7 @@ impl ChatView {
             file_index: None,
             attachments: Vec::new(),
             message_images: HashMap::new(),
+            subagent_progress: HashMap::new(),
             next_message: None,
             notices: Vec::new(),
             compacting: false,
@@ -831,6 +834,18 @@ impl ChatView {
                 self.usage.total_input_tokens += i64::from(usage.usage.input_tokens.unwrap_or(0));
                 self.usage.total_output_tokens += i64::from(usage.usage.output_tokens.unwrap_or(0));
                 self.usage.cost += usage.cost.unwrap_or(0.);
+                cx.notify();
+            }
+            RuntimeEvent::Agent(AgentEvent::SubagentProgress {
+                tool_call_id,
+                task,
+                text,
+            }) => {
+                self.subagent_progress
+                    .entry(tool_call_id)
+                    .or_default()
+                    .insert(task, text);
+                self.list_state.remeasure_items(0..self.list_len());
                 cx.notify();
             }
             RuntimeEvent::Agent(AgentEvent::Compacting) => {
@@ -1832,6 +1847,25 @@ impl ChatView {
             .on_click(cx.listener(move |this, _, _, cx| this.toggle(toggle_key.clone(), cx)));
 
         let border_color = tool_card_border_color(cx);
+        // A running `delegate_task`: what each subagent is doing now.
+        let progress = (name == "delegate_task" && response.is_none())
+            .then(|| self.subagent_progress.get(&request.id))
+            .flatten()
+            .map(|tasks| {
+                v_flex()
+                    .ml(rems(0.4))
+                    .px_3p5()
+                    .py_1()
+                    .gap_0p5()
+                    .border_l_1()
+                    .border_color(border_color)
+                    .children(tasks.iter().map(|(task, line)| {
+                        Label::new(format!("Subagent {} · {line}", task + 1))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate()
+                    }))
+            });
         let output = match open.then_some(response.as_ref()).flatten() {
             Some((text, _)) => {
                 let (fields, diff) = result_parts(text);
@@ -1942,6 +1976,7 @@ impl ChatView {
                 }
             })
             .child(header)
+            .when_some(progress, |this, progress| this.child(progress))
             .children(content)
             .into_any_element()
     }

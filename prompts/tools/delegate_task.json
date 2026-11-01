@@ -1,0 +1,29 @@
+{
+  "name": "delegate_task",
+  "description": "Spawn isolated subagents for parallel or context-heavy work. Each gets its own conversation, terminal session, and toolset, and only its final summary returns to you. Pass every task in `tasks` — one entry spawns one subagent, several run in parallel (limit in the tasks description).\n\nParallel children are joined and their results return in this tool call.\n\nUSE FOR: reasoning-heavy subtasks, work that would flood your context, or independent parallel workstreams.\nDO NOT USE FOR (use these instead):\n- Mechanical multi-step work with no reasoning needed -> do it yourself with terminal\n- A single tool call -> call the tool directly\n- Tasks needing user interaction -> subagents cannot ask questions\n- Durable work that must survive this session -> terminal(background=True, notify=True); Stop or closing the session halts running subagents; each returns an 'interrupted' completion with partial output.\n\nRULES:\n- Children know nothing of this conversation: pass everything needed via 'context', including any required output language, tone, or style (e.g. \"respond in Chinese\").\n- Child summaries are SELF-REPORTS, not verified facts: a child claiming \"uploaded successfully\" or \"file written\" may be wrong. For external side effects (uploads, remote writes, publishing), require a verifiable handle (URL, ID, absolute path) and verify it yourself before telling the user the operation succeeded.\n- Children cannot close tracked work: a child asked to close it returns findings instead; the parent applies the transition.\n- Children cannot call delegate_task, clarify, or memory.\n- Children inherit the parent model.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "tasks": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "properties": {
+            "goal": {
+              "type": "string",
+              "description": "What this subagent should accomplish. Be specific and self-contained — it knows nothing about your conversation history."
+            },
+            "context": {
+              "type": "string",
+              "description": "Background THIS child needs: file paths, error messages, constraints. Each child sees only its own context — repeat shared background in every task that needs it."
+            }
+          },
+          "required": ["goal"]
+        },
+        "description": "The task(s), up to 10 in parallel. Each entry spawns one subagent with isolated context and terminal session; a single task is a one-entry array. Required."
+      }
+    },
+    "required": ["tasks"]
+  }
+}

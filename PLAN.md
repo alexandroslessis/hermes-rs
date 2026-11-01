@@ -468,6 +468,25 @@ M5 part 6 status (2026-11-01): vision and image paste, done.
   per-turn duplicate/repeat caps, detecting image paths in typed text (the provider layer does
   that for vision models).
 
+M5 part 7 status (2026-11-01): delegation, done.
+- `crates/runtime/src/delegate.rs`: Hermes's `delegate_task` in its joined mode (results return
+  in the tool call; the background delivery with list/steer/stop needs a later-result consumer
+  and isn't ported). Up to 10 tasks run in parallel, each a subagent with its own conversation
+  (goal as the first user message), terminal session, scratch folder and 250-step budget, the same
+  turn pipeline (validation, guardrails, recovery, compression) and the parent's model, effort
+  and vision. Its prompt is the session's built without memory plus Hermes's leaf block
+  (context, workspace path, completion instructions). Children can't use `delegate_task`,
+  `clarify` or `memory`; dangerous commands are denied; usage counts toward the parent session.
+  Results carry Hermes's entry fields (status, summary capped at 24k, error, api_calls,
+  duration, model, exit_reason, truncated, tool_trace).
+- The chat shows each running subagent's latest tool call under the delegate card; tool labels
+  for web, vision and delegation. `read_file`'s `vision_analyze` mention restored.
+- Live-checked with Ollama `qwen3.5:9b`: the parent delegated, the child ran `search_files`, and
+  the parent reported the 3 `.txt` files.
+- Not ported: background delegation and live control, nesting (`max_spawn_depth` > 1, the
+  orchestrator role), `output_schema` validation, child images, a separate delegation
+  model/provider, child session persistence and live transcripts, summary spill files.
+
 **M6: Polish.** Command palette (Tier 2 `picker`), find in transcript, themes and fonts, diff
 review pane, import from `~/.hermes`, installer (MSI), auto-update.
 

@@ -9,7 +9,7 @@ Hermes wording for it.
 |---|---|
 | `todo_list` | none |
 | `clarify` | none |
-| `read_file` | No document extraction (Office, PDF, notebooks, SQLite) yet: feature C24. Mentions of `vision_analyze` removed until it exists. |
+| `read_file` | No document extraction (Office, PDF, notebooks, SQLite) yet: feature C24. `vision_analyze` mention restored (M5). |
 | `write_file` | No post-write syntax checks / lint yet. "this task" → "this session". |
 | `patch` | Fuzzy matching is exact → whitespace/indentation/line-ending tolerant instead of Hermes's 9 strategies. No post-edit syntax checks yet. |
 | `search_files` | Walks with the `ignore` crate instead of ripgrep; wording about ripgrep removed, gitignore/hidden/binary behavior stated. |
@@ -18,3 +18,4 @@ Hermes wording for it.
 | `web_search` | "configured backend" → "search backend" (the keyless tier only, no backend choice yet). |
 | `web_extract` | "use a browser tool instead" → "say so rather than guessing" (no browser tools). |
 | `vision_analyze` | none (native path only: on a model without vision the tool says so instead of using an auxiliary vision model). |
+| `delegate_task` | Joined mode only (results return in the call; no background delivery, so no `action` list/steer/stop or `group`); no `output_schema` or `images` per task; flat (children never delegate); execute_code and cronjob references replaced; limits stated as fixed (10 parallel). |

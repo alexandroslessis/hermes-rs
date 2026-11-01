@@ -2156,3 +2156,141 @@ async fn live_vision_sees_attached_and_loaded_images() {
         "{answer}"
     );
 }
+
+#[tokio::test]
+async fn delegate_task_runs_a_subagent_and_returns_its_summary() {
+    let h = harness(vec![
+        tool_reply(&[(
+            "d1",
+            "delegate_task",
+            json!({"tasks": [{"goal": "count the files", "context": "only the top folder"}]}),
+        )]),
+        text_reply("- 3 files"),
+        text_reply("The subagent found 3 files."),
+    ])
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "delegate counting the files").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 3);
+    // The child: its own prompt and goal, no delegate_task/clarify/memory.
+    let child = &requests[1];
+    let messages = sent_messages(child);
+    let system = messages[0]["content"].to_string();
+    assert!(system.contains("You are a focused subagent"), "{system}");
+    assert!(system.contains(r"CONTEXT:\nonly the top folder"));
+    assert_eq!(messages.last().unwrap()["content"], "count the files");
+    let child_tools: Vec<String> = child["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !child_tools
+            .iter()
+            .any(|t| ["delegate_task", "clarify", "memory"].contains(&t.as_str()))
+    );
+    assert!(child_tools.contains(&"terminal".to_string()));
+    // The parent gets the summary as the tool result.
+    let last = requests[2].to_string();
+    assert!(
+        last.contains("- 3 files") && last.contains("\\\"status\\\":\\\"completed\\\""),
+        "{last}"
+    );
+    assert_eq!(last_text(&h, &session), "The subagent found 3 files.");
+}
+
+#[tokio::test]
+async fn too_many_delegated_tasks_are_refused() {
+    let tasks: Vec<Value> = (0..11)
+        .map(|i| json!({"goal": format!("task {i}")}))
+        .collect();
+    let h = harness(vec![
+        tool_reply(&[("d1", "delegate_task", json!({"tasks": tasks}))]),
+        text_reply("ok"),
+    ])
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "go").await;
+    let second = h.requests.lock()[1].to_string();
+    assert!(second.contains("Too many tasks (11)"), "{second}");
+}
+
+/// A real model delegating: `HERMES_LIVE_BASE_URL=http://localhost:11434/v1 HERMES_LIVE_MODEL=<model> cargo test -p hermes_runtime --test turns live_delegate -- --ignored --nocapture`
+#[tokio::test]
+#[ignore]
+async fn live_delegate_task_counts_files_in_a_subagent() {
+    let (Ok(base_url), Ok(model)) = (
+        std::env::var("HERMES_LIVE_BASE_URL"),
+        std::env::var("HERMES_LIVE_MODEL"),
+    ) else {
+        panic!("set HERMES_LIVE_BASE_URL and HERMES_LIVE_MODEL");
+    };
+    let data = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    for name in ["a.txt", "b.txt", "c.txt", "notes.md"] {
+        std::fs::write(work.path().join(name), "x").unwrap();
+    }
+    let runtime = runtime_in(data.path());
+    let provider = ProviderConfig {
+        id: "live".into(),
+        base_url,
+        api_key: None,
+    };
+    let options = TurnOptions {
+        context_length: Some(32_768),
+        effort: None,
+        supports_vision: false,
+    };
+    let session = runtime
+        .create_session(&provider, &model, Some(32_768), work.path())
+        .unwrap();
+    let mut turn = runtime
+        .start_turn(
+            &session.id,
+            &provider,
+            options,
+            "Use the delegate_task tool (one task) to have a subagent count the .txt files in the working folder. Then tell me the number it found.",
+        )
+        .unwrap();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(900), turn.events.recv())
+        .await
+        .unwrap()
+    {
+        match event {
+            RuntimeEvent::Agent(AgentEvent::SubagentProgress { task, text, .. }) => {
+                println!("subagent {task}: {text}");
+            }
+            RuntimeEvent::TurnFinished(status) => {
+                println!("turn: {status:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    let messages = runtime.messages(&session.id).unwrap();
+    for message in &messages {
+        println!(
+            "{:?}: {}",
+            message.role,
+            message
+                .as_concat_text()
+                .chars()
+                .take(400)
+                .collect::<String>()
+        );
+    }
+    let delegated = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|c| c.as_tool_request())
+        .any(|r| {
+            r.tool_call
+                .as_ref()
+                .is_ok_and(|c| c.name == "delegate_task")
+        });
+    let answer = messages.last().unwrap().as_concat_text();
+    assert!(delegated && answer.contains('3'), "{answer}");
+}

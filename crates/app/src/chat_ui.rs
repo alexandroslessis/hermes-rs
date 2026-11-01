@@ -256,6 +256,32 @@ pub fn tool_label(name: &str, args: &serde_json::Value, cwd: Option<&str>) -> St
                 }
             )
         }
+        "web_search" => format!("Search the web for{}", code(field("query"))),
+        "web_extract" => {
+            let urls: Vec<&str> = args
+                .get("urls")
+                .and_then(|u| u.as_array())
+                .map(|u| u.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let more = urls.len().saturating_sub(1);
+            format!(
+                "Read{}{}",
+                code(urls.first().map(|u| u.to_string())),
+                if more > 0 {
+                    format!(" (+{more} more)")
+                } else {
+                    String::new()
+                }
+            )
+        }
+        "vision_analyze" => format!("Look at{}", code(field("image_url"))),
+        "delegate_task" => {
+            let count = args
+                .get("tasks")
+                .and_then(|t| t.as_array())
+                .map_or(1, Vec::len);
+            format!("Delegate {count} task{}", if count == 1 { "" } else { "s" })
+        }
         "clarify" => "Ask a question".into(),
         "invalid tool call" => "Invalid tool call".into(),
         other => format!("`{other}`"),

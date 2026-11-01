@@ -358,6 +358,7 @@ impl SessionTools {
             "skills_list" | "skill_view" | "skill_manage" => self.skills_tool(name, &args),
             "clarify" => clarify::clarify(self, args).await,
             "web_search" | "web_extract" => self.web_tool(name, &args).await,
+            "delegate_task" => ToolOutput::error("delegate_task is not available here."),
             other => ToolOutput::error(format!("Unknown tool '{other}'.")),
         }
     }

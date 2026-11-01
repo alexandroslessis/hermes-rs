@@ -23,4 +23,10 @@ pub enum AgentEvent {
     },
     /// Context compression was skipped (`None`: nothing to summarize) or failed.
     CompactionFailed(Option<String>),
+    /// A `delegate_task` child (`task`) started a tool call (`text`), under the parent's call.
+    SubagentProgress {
+        tool_call_id: String,
+        task: usize,
+        text: String,
+    },
 }
