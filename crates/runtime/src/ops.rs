@@ -20,7 +20,6 @@ use hermes_agent::operation::{
 use hermes_agent::tool::ToolProvider;
 use hermes_llm::conversation::Conversation;
 use hermes_llm::conversation::message::{Message, MessageContent, ToolRequest};
-use hermes_tools::SessionTools;
 use parking_lot::Mutex;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Role, Tool};
 use serde_json::Value;
@@ -643,7 +642,9 @@ fn spill_oversized(
 /// identical results become a reference stub, oversized ones are spilled to a file, and loop
 /// warnings are appended to the result. During the budget summary the model gets no tools.
 pub struct GuardedTools {
-    pub inner: Arc<SessionTools>,
+    pub inner: Arc<dyn ToolProvider<TurnSession>>,
+    /// Where oversized results are spilled (the session's scratch folder).
+    pub scratch_dir: std::path::PathBuf,
     pub state: SharedTurnState,
     /// Characters a single result may put into the context (see [`result_size_limit`]).
     pub result_limit: usize,
@@ -688,7 +689,7 @@ impl ToolProvider<TurnSession> for GuardedTools {
                         &name,
                         request_id,
                         self.result_limit,
-                        self.inner.scratch_dir(),
+                        &self.scratch_dir,
                     ),
                 };
                 // The chat shows the tool's own output; the model sees the guarded text.

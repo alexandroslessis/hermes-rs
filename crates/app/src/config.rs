@@ -55,6 +55,14 @@ pub struct AppConfig {
     /// Stage the agent's skill writes for approval (Hermes's `skills.write_approval`).
     #[serde(default)]
     pub skill_write_approval: bool,
+    /// Review sessions in the background to save memories and improve skills (Hermes's
+    /// `background_review.enabled`, on by default).
+    #[serde(default = "default_true")]
+    pub background_review: bool,
+    /// Let the curator merge overlapping agent-written skills with the model (Hermes's
+    /// `curator.consolidate`, off by default; the idle-skill archiving always runs).
+    #[serde(default)]
+    pub curator_consolidate: bool,
     /// The sidebar group new sessions start in: a project id, or `auto:` and a folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_project: Option<String>,
@@ -90,6 +98,8 @@ impl Default for AppConfig {
             skill_write_approval: false,
             favorite_models: Vec::new(),
             selected_project: None,
+            background_review: true,
+            curator_consolidate: false,
             sidebar_width: None,
         }
     }
@@ -197,4 +207,8 @@ mod tests {
         assert!(!provider("https://openrouter.ai/api/v1").is_local());
         assert!(!provider("http://localhost.example.com/v1").is_local());
     }
+}
+
+fn default_true() -> bool {
+    true
 }

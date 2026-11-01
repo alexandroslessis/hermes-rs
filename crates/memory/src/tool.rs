@@ -132,6 +132,17 @@ impl MemoryStore {
     /// The `memory` tool. Accepts Hermes's batch shape (`target` + `operations`) and the legacy
     /// single-op shape (`action`, `content`/`new_text`, `old_text`).
     pub fn tool(&self, args: &Value, failures: &mut TurnFailures) -> Value {
+        self.tool_as(args, failures, false)
+    }
+
+    /// The `memory` tool for an unattended background review (Hermes's `_background_delete_gate`):
+    /// adding stays available, but patches and removals are staged for the user's approval
+    /// instead of applied, since nobody is watching.
+    pub fn unattended_tool(&self, args: &Value, failures: &mut TurnFailures) -> Value {
+        self.tool_as(args, failures, true)
+    }
+
+    fn tool_as(&self, args: &Value, failures: &mut TurnFailures, unattended: bool) -> Value {
         let text = |key: &str| {
             args.get(key)
                 .and_then(Value::as_str)
@@ -220,6 +231,16 @@ impl MemoryStore {
                 vec![op]
             }
         };
+        if unattended && ops.iter().any(|op| op.action != "add") {
+            let mut staged = self.stage(target, ops);
+            if staged["success"] == json!(true) {
+                staged["proposal_staged"] = json!(true);
+                staged["message"] = json!(
+                    "Background review may not change or delete memory entries unattended. The proposed change was staged for the user's approval in the Memory screen."
+                );
+            }
+            return staged;
+        }
         if self.config().write_approval {
             return self.stage(target, ops);
         }
@@ -251,6 +272,25 @@ mod tests {
         let legacy = store.tool(&json!({"target": "memory", "action": "patch", "old_text": "cargo", "new_text": "cargo + uv"}), &mut f);
         assert_eq!(legacy["success"], true, "{legacy}");
         assert_eq!(store.entries(Target::Memory), vec!["Repo uses cargo + uv"]);
+    }
+
+    #[test]
+    fn an_unattended_review_adds_but_stages_changes_and_removals() {
+        let (_dir, store) = store(false);
+        let mut f = TurnFailures::default();
+        let added = store.unattended_tool(
+            &json!({"target": "memory", "operations": [{"action": "add", "content": "Repo uses cargo"}]}),
+            &mut f,
+        );
+        assert_eq!(added["success"], true, "{added}");
+        assert!(added.get("staged").is_none());
+        let removal = store.unattended_tool(
+            &json!({"target": "memory", "operations": [{"action": "remove", "old_text": "cargo"}]}),
+            &mut f,
+        );
+        assert_eq!(removal["proposal_staged"], true, "{removal}");
+        assert_eq!(store.entries(Target::Memory), vec!["Repo uses cargo"]);
+        assert_eq!(store.pending().len(), 1);
     }
 
     #[test]

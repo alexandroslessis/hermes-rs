@@ -6,8 +6,12 @@ use std::rc::Rc;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, KeyDownEvent, Subscription, Window, prelude::*,
 };
-use ui::{Chip, ContextMenu, Divider, DropdownMenu, TintColor, Tooltip, WithScrollbar, prelude::*};
+use ui::{
+    Chip, ContextMenu, Divider, DropdownMenu, Switch, TintColor, ToggleState, Tooltip,
+    WithScrollbar, prelude::*,
+};
 
+use crate::backend::backend;
 use crate::config::{self, ProviderSettings};
 use crate::model_picker::{ModelPicker, provider_icon};
 use crate::state::{AppState, provider_ready};
@@ -274,6 +278,50 @@ impl SettingsView {
                         .color(Color::Muted),
                 )
             })
+    }
+
+    /// Hermes's self-improvement switch: background reviews after turns.
+    fn render_learning(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (enabled, consolidate) = {
+            let config = &AppState::global(cx).read(cx).config;
+            (config.background_review, config.curator_consolidate)
+        };
+        h_flex()
+            .justify_between()
+            .items_start()
+            .gap_4()
+            .child(Self::section(
+                "Learning",
+                Some("After some turns, the agent reviews the conversation in the background to save memories and improve its skills. /refine runs a review now; /learn turns anything into a skill. The curator archives skills the agent wrote that go unused for a month (Skills screen)."),
+            ))
+            .child(
+                v_flex()
+                    .flex_none()
+                    .gap_2()
+                    .child(
+                        Switch::new("background-review", enabled.into())
+                            .label("Review in the background")
+                            .on_click(cx.listener(|_, state: &ToggleState, _, cx| {
+                                let enabled = *state == ToggleState::Selected;
+                                AppState::global(cx).update(cx, |state, cx| {
+                                    state.config.background_review = enabled;
+                                    state.save(cx);
+                                });
+                                backend(cx).runtime.set_background_review(enabled);
+                            })),
+                    )
+                    .child(
+                        Switch::new("curator-consolidate", consolidate.into())
+                            .label("Curator merges overlapping skills")
+                            .on_click(cx.listener(|_, state: &ToggleState, _, cx| {
+                                let on = *state == ToggleState::Selected;
+                                AppState::global(cx).update(cx, |state, cx| {
+                                    state.config.curator_consolidate = on;
+                                    state.save(cx);
+                                });
+                            })),
+                    ),
+            )
     }
 
     /// One provider in the list: icon, name, address and key status, with edit and remove.
@@ -606,6 +654,8 @@ impl Render for SettingsView {
                     .child(Self::section("Appearance", Some("The color theme, from Zed's.")))
                     .child(Self::theme_picker(window, cx)),
             )
+            .child(Divider::horizontal())
+            .child(self.render_learning(cx))
             .child(Divider::horizontal())
             .child(
                 v_flex()

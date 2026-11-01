@@ -57,6 +57,21 @@ pub struct PendingSkillWrite {
     pub summary: String,
     pub operations: Vec<SkillOp>,
     pub created_at: i64,
+    /// Who asked for it, applied when it's approved.
+    #[serde(default)]
+    pub origin: WriteOrigin,
+}
+
+/// Who is writing (Hermes's write origin): the agent in a session, a background review, or the
+/// curator. Skills a review creates are agent-created, so the curator may tidy them; a curator
+/// delete archives the skill instead of removing it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteOrigin {
+    #[default]
+    Foreground,
+    Review,
+    Curator,
 }
 
 fn err(message: impl Into<String>) -> Value {
@@ -296,14 +311,14 @@ impl SkillStore {
         let Some(record) = self.pending().into_iter().find(|r| r.id == id) else {
             return err(format!("No pending skill write {id}."));
         };
-        let result = self.apply_ops(&record.operations);
+        let result = self.apply_ops(&record.operations, record.origin);
         if result["success"] == json!(true) {
             self.discard(id);
         }
         result
     }
 
-    fn stage(&self, ops: Vec<SkillOp>) -> Value {
+    fn stage(&self, ops: Vec<SkillOp>, origin: WriteOrigin) -> Value {
         let gist: Vec<String> = ops
             .iter()
             .map(|op| {
@@ -327,6 +342,7 @@ impl SkillStore {
             summary: gist.join("\n"),
             operations: ops,
             created_at: chrono::Utc::now().timestamp_millis(),
+            origin,
         };
         let dir = self.pending_dir();
         let saved = std::fs::create_dir_all(&dir).and_then(|()| {
@@ -349,6 +365,11 @@ impl SkillStore {
 
     /// The `skill_manage` tool: the `operations` batch shape, or Hermes's legacy flat shape.
     pub fn manage_tool(&self, args: &Value) -> Value {
+        self.manage_with(args, WriteOrigin::Foreground)
+    }
+
+    /// `skill_manage` for a writer other than the session's agent.
+    pub fn manage_with(&self, args: &Value, origin: WriteOrigin) -> Value {
         let ops: Vec<SkillOp> = match args.get("operations").filter(|o| !o.is_null()) {
             Some(Value::Array(items)) => {
                 let default_name = args.get("name").and_then(Value::as_str).unwrap_or_default();
@@ -385,9 +406,9 @@ impl SkillStore {
             return err(error);
         }
         if self.config().write_approval {
-            return self.stage(ops);
+            return self.stage(ops, origin);
         }
-        self.apply_ops(&ops)
+        self.apply_ops(&ops, origin)
     }
 
     /// Checks with no side effects, so a misfiled op never applies its siblings first.
@@ -442,7 +463,7 @@ impl SkillStore {
     }
 
     /// Applies every op or none: touched skill folders are snapshotted and restored on failure.
-    fn apply_ops(&self, ops: &[SkillOp]) -> Value {
+    fn apply_ops(&self, ops: &[SkillOp], origin: WriteOrigin) -> Value {
         let _guard = self.write_lock.lock();
         let Ok(backup) = tempfile::Builder::new()
             .prefix("hermes-skill-batch")
@@ -470,7 +491,7 @@ impl SkillStore {
                 }
                 snapshots.push((dir, snapshot));
             }
-            let result = self.apply_op(op);
+            let result = self.apply_op(op, origin);
             if result["success"] != json!(true) {
                 for (dir, snapshot) in snapshots.iter().rev() {
                     let _ = std::fs::remove_dir_all(dir);
@@ -492,6 +513,9 @@ impl SkillStore {
             }
             results.push(result);
         }
+        for op in ops {
+            self.record_write(op, origin);
+        }
         let summary: Vec<String> = ops
             .iter()
             .map(|op| format!("{} {}", op.action, op.name))
@@ -507,7 +531,7 @@ impl SkillStore {
         })
     }
 
-    fn apply_op(&self, op: &SkillOp) -> Value {
+    fn apply_op(&self, op: &SkillOp, origin: WriteOrigin) -> Value {
         if let Some(e) = validate_name(
             Path::new(&op.name)
                 .file_name()
@@ -524,6 +548,7 @@ impl SkillStore {
             },
             "write_file" => self.write_file(op),
             "remove_file" => self.remove_file(op),
+            "delete" if origin == WriteOrigin::Curator => self.archive_for_curator(op),
             "delete" => self.delete(op),
             other => err(format!("Unknown action '{other}'.")),
         }

@@ -4,12 +4,15 @@
 //! persistent shell, background processes, todo list and the file-read state that guards
 //! `write_file`. Tool results are JSON text, like Hermes's.
 
+mod bundles;
 mod clarify;
+pub mod curator;
 mod files;
 mod job;
 mod paths;
 mod process;
 mod recall;
+mod review;
 mod search;
 mod shell;
 mod skill_manage;
@@ -27,12 +30,14 @@ use rmcp::model::{
 };
 use serde_json::{Value, json};
 
+pub use bundles::{Bundle, describe_bundle_invocation};
 pub use clarify::{
     ClarifyAnswer, ClarifyOutcome, ClarifyQuestion, ClarifyRequest, ClarifyResponse,
 };
 pub use process::ProcessNotice;
+pub use review::ReviewTools;
 pub use shell::{ShellKind, detect_shell};
-pub use skill_manage::{PendingSkillWrite, SkillOp};
+pub use skill_manage::{PendingSkillWrite, SkillOp, WriteOrigin};
 pub use skills::{SkillCommit, SkillEntry, SkillStore, SkillsConfig};
 pub use todo::{TodoItem, TodoStatus};
 
@@ -42,6 +47,9 @@ pub use todo::{TodoItem, TodoStatus};
 pub trait UserBridge: Send + Sync {
     async fn clarify(&self, session_id: &str, request: ClarifyRequest) -> ClarifyOutcome;
     fn process_finished(&self, session_id: &str, notice: ProcessNotice);
+    /// A background review of the session finished: what it changed (Hermes's "Self-improvement
+    /// review" summary). `requested` is true for `/refine`, which reports even when nothing changed.
+    fn review_finished(&self, _session_id: &str, _actions: Vec<String>, _requested: bool) {}
 }
 
 pub struct SessionToolsConfig {

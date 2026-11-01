@@ -90,6 +90,8 @@ pub struct ChatView {
     slash_matches: Vec<(String, String)>,
     /// A steer the turn ended before delivering: Hermes sends it as the next message.
     next_message: Option<String>,
+    /// Background-review notes shown under the thread until the next turn (Hermes prints them).
+    notices: Vec<String>,
     effort_menu: PopoverMenuHandle<ContextMenu>,
     model_menu: PopoverMenuHandle<ModelPicker>,
     pub usage: TurnUsage,
@@ -153,6 +155,7 @@ impl ChatView {
             editing: None,
             slash_matches: Vec::new(),
             next_message: None,
+            notices: Vec::new(),
             effort_menu: PopoverMenuHandle::default(),
             model_menu: PopoverMenuHandle::default(),
             usage: TurnUsage {
@@ -274,19 +277,34 @@ impl ChatView {
             .filter(|q| !q.contains(char::is_whitespace))
             .map(str::to_lowercase);
         let matches = match query {
-            Some(query) => backend(cx)
-                .runtime
-                .skills()
-                .catalog()
-                .into_iter()
-                .filter(|s| s.name.contains(&query))
+            Some(query) => BUILTIN_COMMANDS
+                .iter()
+                .filter(|(name, _)| name.contains(query.as_str()))
+                .map(|(name, description)| (name.to_string(), description.to_string()))
+                .chain(
+                    backend(cx)
+                        .runtime
+                        .skills()
+                        .bundles()
+                        .into_iter()
+                        .filter(|b| b.slug.contains(&query))
+                        .map(|b| (b.slug, format!("Bundle: {}", b.description))),
+                )
+                .chain(
+                    backend(cx)
+                        .runtime
+                        .skills()
+                        .catalog()
+                        .into_iter()
+                        .filter(|s| s.name.contains(&query))
+                        .map(|s| {
+                            (
+                                s.name,
+                                hermes_tools::skills::clip_description(&s.description),
+                            )
+                        }),
+                )
                 .take(6)
-                .map(|s| {
-                    (
-                        s.name,
-                        hermes_tools::skills::clip_description(&s.description),
-                    )
-                })
                 .collect(),
             None => Vec::new(),
         };
@@ -353,8 +371,38 @@ impl ChatView {
             return;
         };
         let backend = backend(cx);
-        // `/skill-name instruction` sends the message that loads the skill.
+        // Hermes's `/refine [focus]` reviews the conversation in the background instead of
+        // starting a turn; `/learn <request>` starts one with the learn prompt.
+        if let Some(focus) = text.as_deref().and_then(|t| command_arg(t, "refine")) {
+            let focus = (!focus.is_empty()).then(|| focus.to_string());
+            let started = {
+                let _guard = backend.tokio.enter();
+                backend
+                    .runtime
+                    .refine(&self.session_id, &provider, options, focus.clone())
+            };
+            match started {
+                Ok(()) => {
+                    let focus = focus.map(|f| format!(" (focus: {f})")).unwrap_or_default();
+                    self.notices.push(format!(
+                        "Reviewing this conversation in the background{focus} — any memory/skill updates will be reported when done."
+                    ));
+                    self.error = None;
+                    self.trailer_changed(cx);
+                }
+                Err(error) => {
+                    self.error = Some(format!("{error:#}"));
+                    cx.notify();
+                }
+            }
+            return;
+        }
         let text = match text {
+            Some(text) if command_arg(&text, "learn").is_some() => {
+                let request = command_arg(&text, "learn").unwrap_or_default();
+                Some(hermes_prompts::review::learn_message(request))
+            }
+            // `/skill-name instruction` sends the message that loads the skill.
             Some(text) if text.starts_with('/') => match backend.runtime.skill_command(&text) {
                 Some(message) => Some(message),
                 None => {
@@ -364,7 +412,7 @@ impl ChatView {
                         .unwrap_or_default()
                         .to_string();
                     self.error = Some(format!(
-                        "There is no skill named '{name}'. Open Skills (Ctrl+Shift+K) to see them."
+                        "There is no skill or bundle named '{name}'. Open Skills (Ctrl+Shift+K) to see them."
                     ));
                     cx.notify();
                     return;
@@ -394,6 +442,7 @@ impl ChatView {
             }
         };
         self.error = None;
+        self.notices.clear();
         self.running = Some(turn.cancel.clone());
         self.composer.update(cx, |composer, cx| {
             composer.set_placeholder(STEER_PLACEHOLDER, cx)
@@ -546,6 +595,24 @@ impl ChatView {
         });
         cx.emit(ChatEvent::NeedsInput);
         cx.notify();
+    }
+
+    /// Hermes's "Self-improvement review" line: what a background review (or `/refine`) changed.
+    pub fn review_finished(
+        &mut self,
+        actions: Vec<String>,
+        requested: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let summary = if actions.is_empty() {
+            debug_assert!(requested);
+            "nothing to save.".to_string()
+        } else {
+            actions.join(" · ")
+        };
+        self.notices
+            .push(format!("Self-improvement review: {summary}"));
+        self.trailer_changed(cx);
     }
 
     /// Whether the agent waits on a question for the user (Zed's "waiting for confirmation").
@@ -724,6 +791,8 @@ impl ChatView {
         let Some(&message_index) = self.entries.get(index) else {
             return if self.running.is_some() {
                 self.render_generating().into_any_element()
+            } else if !self.notices.is_empty() {
+                self.render_notices().into_any_element()
             } else {
                 Empty.into_any_element()
             };
@@ -831,10 +900,7 @@ impl ChatView {
     ) -> AnyElement {
         let text = message.as_concat_text();
         // A skill command: show what was typed, not the skill it loaded.
-        let shown = match hermes_tools::skills::describe_invocation(&text) {
-            Some((skill, instruction)) => format!("/{skill} {instruction}").trim_end().to_string(),
-            None => text.clone(),
-        };
+        let shown = typed_command(&text).unwrap_or_else(|| text.clone());
         let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
         let body = self.markdown_block((message_index, 0, MarkdownKind::User), &shown, style, cx);
         let colors = cx.theme().colors();
@@ -1564,6 +1630,28 @@ impl ChatView {
                 )
             })
             .into_any_element()
+    }
+
+    /// Background-review notes, under the thread like Hermes's review lines.
+    fn render_notices(&self) -> impl IntoElement {
+        v_flex()
+            .px(rems_from_px(22_f32))
+            .py_2()
+            .gap_1()
+            .children(self.notices.iter().map(|notice| {
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Sparkle)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(notice.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+            }))
     }
 
     /// Zed's `render_generating`: the spinner under the thread while a turn runs (sand and
@@ -2611,4 +2699,34 @@ fn shimmer(id: SharedString, text: &'static str, cx: &App) -> AnyElement {
             },
         )
         .into_any_element()
+}
+
+/// The argument of a built-in slash command (`/name arg`), or `None` when `text` isn't one.
+fn command_arg<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let rest = text.trim().strip_prefix('/')?.strip_prefix(name)?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
+}
+
+/// Hermes's built-in commands offered in the slash suggestions, before skills.
+const BUILTIN_COMMANDS: &[(&str, &str)] = &[
+    (
+        "refine",
+        "Review this conversation now and save lessons to memory/skills",
+    ),
+    (
+        "learn",
+        "Learn a reusable skill from anything you describe (dirs, URLs, this chat, notes)",
+    ),
+];
+
+/// What the user typed to produce a message that loads a skill, a bundle or the learn prompt
+/// (`/name instruction`); `None` for an ordinary message. Those messages are long, so the chat
+/// shows (and titles) them by the command.
+pub fn typed_command(text: &str) -> Option<String> {
+    let (command, argument) = hermes_tools::describe_bundle_invocation(text)
+        .or_else(|| hermes_tools::skills::describe_invocation(text))
+        .or_else(|| {
+            hermes_prompts::review::learn_request(text).map(|request| ("learn".into(), request))
+        })?;
+    Some(format!("/{command} {argument}").trim_end().to_string())
 }

@@ -109,6 +109,10 @@ struct Harness {
 }
 
 async fn harness(replies: Vec<String>) -> Harness {
+    harness_with(replies, Arc::new(Bridge)).await
+}
+
+async fn harness_with(replies: Vec<String>, bridge: Arc<dyn UserBridge>) -> Harness {
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
@@ -121,7 +125,7 @@ async fn harness(replies: Vec<String>) -> Harness {
         .await;
     let data = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
-    let runtime = runtime_in(data.path());
+    let runtime = runtime_with(data.path(), bridge);
     let provider = ProviderConfig {
         id: "mock".into(),
         base_url: format!("{}/v1", server.uri()),
@@ -138,6 +142,10 @@ async fn harness(replies: Vec<String>) -> Harness {
 }
 
 fn runtime_in(data_dir: &Path) -> Runtime {
+    runtime_with(data_dir, Arc::new(Bridge))
+}
+
+fn runtime_with(data_dir: &Path, bridge: Arc<dyn UserBridge>) -> Runtime {
     Runtime::new(
         RuntimeConfig {
             data_dir: data_dir.to_path_buf(),
@@ -146,7 +154,7 @@ fn runtime_in(data_dir: &Path) -> Runtime {
             memory: Default::default(),
             skills: Default::default(),
         },
-        Arc::new(Bridge),
+        bridge,
     )
     .unwrap()
 }
@@ -1154,4 +1162,237 @@ async fn unbalanced_arguments_ending_in_a_bracket_are_retried_not_refused() {
         "x"
     );
     assert_eq!(last_text(&h, &session), "written");
+}
+
+/// Records what background reviews report.
+struct ReviewBridge(tokio::sync::mpsc::UnboundedSender<(Vec<String>, bool)>);
+
+#[async_trait]
+impl UserBridge for ReviewBridge {
+    async fn clarify(&self, _session_id: &str, _request: ClarifyRequest) -> ClarifyOutcome {
+        ClarifyOutcome::Undelivered
+    }
+    fn process_finished(&self, _session_id: &str, _notice: ProcessNotice) {}
+    fn review_finished(&self, _session_id: &str, actions: Vec<String>, requested: bool) {
+        let _ = self.0.send((actions, requested));
+    }
+}
+
+#[tokio::test]
+async fn refine_reviews_a_copy_of_the_conversation_and_reports_its_changes() {
+    let skill = "---\nname: greet-users\ndescription: Greet the user by their name.\n---\n\n# Greet\n\nSay hello by name.\n";
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let h = harness_with(
+        vec![
+            text_reply("Hello Sam!"),
+            tool_reply(&[(
+                "call_r1",
+                "skill_manage",
+                json!({"operations": [{"action": "create", "name": "greet-users", "content": skill}]}),
+            )]),
+            text_reply("Saved a greeting skill."),
+        ],
+        Arc::new(ReviewBridge(tx)),
+    )
+    .await;
+    let session = h
+        .runtime
+        .create_session(&h.provider, "test-model", None, h.work.path())
+        .unwrap();
+    let events = run_turn(&h, &session.id, "Greet me, I'm Sam.").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+
+    h.runtime
+        .refine(
+            &session.id,
+            &h.provider,
+            TurnOptions::default(),
+            Some("greetings".into()),
+        )
+        .unwrap();
+    let (actions, requested) = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(requested);
+    assert_eq!(actions, vec!["Skill 'greet-users' created"]);
+    assert!(h.runtime.skills().find("greet-users").is_some());
+
+    // The review replayed the conversation with the same frozen prompt, then its own message...
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1]["messages"][0], requests[0]["messages"][0]);
+    let review_message =
+        requests[1]["messages"].as_array().unwrap().last().unwrap()["content"].to_string();
+    assert!(review_message.contains("Review the conversation above and update two things"));
+    assert!(review_message.contains("following focus"));
+    // ...but none of it joined the session.
+    assert_eq!(h.runtime.messages(&session.id).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn ten_model_calls_without_skill_manage_start_a_skill_review() {
+    let skill = "---\nname: list-files\ndescription: List a folder's files with read tools.\n---\n\n# List\n\nUse search_files.\n";
+    let mut replies: Vec<String> = (0..9)
+        .map(|i| tool_reply(&[(&format!("call_{i}"), "todo_list", json!({}))]))
+        .collect();
+    replies.push(text_reply("Done."));
+    replies.push(tool_reply(&[(
+        "call_review",
+        "skill_manage",
+        json!({"operations": [{"action": "create", "name": "list-files", "content": skill}]}),
+    )]));
+    replies.push(text_reply("Captured the listing workflow."));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let h = harness_with(replies, Arc::new(ReviewBridge(tx))).await;
+    let session = h
+        .runtime
+        .create_session(&h.provider, "test-model", None, h.work.path())
+        .unwrap();
+    let events = run_turn(&h, &session.id, "Check the task list a few times.").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let (actions, requested) = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!requested);
+    assert_eq!(actions, vec!["Skill 'list-files' created"]);
+    let review = h.requests.lock()[10].clone();
+    let last = review["messages"].as_array().unwrap().last().unwrap()["content"].to_string();
+    // Skills only: the memory counter isn't due after one user turn.
+    assert!(last.contains("update the skill library"));
+    assert!(last.contains("You can only call skill management tools"));
+}
+
+#[tokio::test]
+async fn the_curator_archives_an_absorbed_skill_and_reports() {
+    let h = harness(vec![
+        tool_reply(&[(
+            "call_c1",
+            "skill_manage",
+            json!({"operations": [{"action": "delete", "name": "deploy-staging", "absorbed_into": "deploy"}]}),
+        )]),
+        text_reply("Merged deploy-staging into deploy.\n\n## Structured summary (required)\n```yaml\nconsolidations:\n  - from: deploy-staging\n    into: deploy\n    reason: same workflow\nprunings: []\n```"),
+    ])
+    .await;
+    let skills = h.runtime.skills();
+    for name in ["deploy", "deploy-staging"] {
+        let content = format!(
+            "---\nname: {name}\ndescription: Deploy step {name}.\n---\n\n# {name}\n\nRun it.\n"
+        );
+        let created = skills.manage_with(
+            &json!({"operations": [{"action": "create", "name": name, "content": content}]}),
+            hermes_tools::WriteOrigin::Review,
+        );
+        assert_eq!(created["success"], true, "{created}");
+    }
+    let outcome = h
+        .runtime
+        .run_curator(Some(hermes_runtime::CuratorModel {
+            provider: h.provider.clone(),
+            model: "test-model".into(),
+            options: TurnOptions::default(),
+        }))
+        .await
+        .unwrap();
+    assert!(
+        outcome
+            .summary
+            .starts_with("auto: no changes; llm: Merged deploy-staging into deploy."),
+        "{}",
+        outcome.summary
+    );
+    assert!(skills.find("deploy-staging").is_none());
+    assert_eq!(skills.archived()[0].name, "deploy-staging");
+    let report = std::fs::read_to_string(outcome.report.unwrap()).unwrap();
+    assert!(report.contains("Archived or merged away:\n- deploy-staging"));
+    assert_eq!(skills.curator_state().run_count, 1);
+    // The pass sees only the skill tools, and its prompt lists the candidates.
+    let request = h.requests.lock()[0].clone();
+    let tools: Vec<String> = request["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(tools.len(), 3, "{tools:?}");
+    let prompt = request["messages"].as_array().unwrap().last().unwrap()["content"].to_string();
+    assert!(prompt.contains("Agent-created skills (2)"));
+}
+
+#[tokio::test]
+async fn without_consolidation_the_curator_only_applies_transitions() {
+    let h = harness(vec![]).await;
+    let outcome = h.runtime.run_curator(None).await.unwrap();
+    assert_eq!(
+        outcome.summary,
+        "auto: no changes; llm: skipped (consolidation off)"
+    );
+    assert!(h.requests.lock().is_empty());
+}
+
+/// A live check against a real endpoint (not run by default):
+/// `HERMES_LIVE_BASE_URL=http://localhost:11434/v1 HERMES_LIVE_MODEL=<model> cargo test -p hermes_runtime --test turns live_ -- --ignored --nocapture`
+#[tokio::test]
+#[ignore]
+async fn live_refine_saves_something() {
+    let (Ok(base_url), Ok(model)) = (
+        std::env::var("HERMES_LIVE_BASE_URL"),
+        std::env::var("HERMES_LIVE_MODEL"),
+    ) else {
+        panic!("set HERMES_LIVE_BASE_URL and HERMES_LIVE_MODEL");
+    };
+    let data = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let runtime = runtime_with(data.path(), Arc::new(ReviewBridge(tx)));
+    let provider = ProviderConfig {
+        id: "live".into(),
+        base_url,
+        api_key: None,
+    };
+    let options = TurnOptions {
+        context_length: Some(32768),
+        effort: None,
+    };
+    let session = runtime
+        .create_session(&provider, &model, Some(32768), work.path())
+        .unwrap();
+    let mut turn = runtime
+        .start_turn(
+            &session.id,
+            &provider,
+            options.clone(),
+            "From now on, in this repo always run the tests with `cargo nextest run`, never `cargo test` — the plain runner hangs on our integration tests. Just acknowledge, no tools needed.",
+        )
+        .unwrap();
+    while let Some(event) = turn.events.recv().await {
+        if let RuntimeEvent::TurnFinished(status) = event {
+            println!("turn: {status:?}");
+            break;
+        }
+    }
+    for message in runtime.messages(&session.id).unwrap() {
+        println!("{:?}: {}", message.role, message.as_concat_text());
+    }
+    runtime
+        .refine(&session.id, &provider, options, None)
+        .unwrap();
+    let (actions, requested) = tokio::time::timeout(Duration::from_secs(900), rx.recv())
+        .await
+        .expect("the review took too long")
+        .unwrap();
+    println!("review (requested={requested}): {actions:?}");
+    println!(
+        "MEMORY.md: {:?}",
+        std::fs::read_to_string(data.path().join("memories").join("MEMORY.md")).ok()
+    );
+    let created: Vec<_> = runtime
+        .skills()
+        .catalog()
+        .into_iter()
+        .filter(|s| runtime.skills().record(&s.name).created_by.is_some())
+        .map(|s| s.name)
+        .collect();
+    println!("skills created: {created:?}");
 }

@@ -23,6 +23,12 @@ pub enum UiRequest {
         session_id: String,
         notice: ProcessNotice,
     },
+    /// A background review (or `/refine`) of a session finished.
+    ReviewFinished {
+        session_id: String,
+        actions: Vec<String>,
+        requested: bool,
+    },
 }
 
 struct UiBridge {
@@ -49,6 +55,14 @@ impl UserBridge for UiBridge {
         let _ = self.requests.send(UiRequest::ProcessFinished {
             session_id: session_id.to_string(),
             notice,
+        });
+    }
+
+    fn review_finished(&self, session_id: &str, actions: Vec<String>, requested: bool) {
+        let _ = self.requests.send(UiRequest::ReviewFinished {
+            session_id: session_id.to_string(),
+            actions,
+            requested,
         });
     }
 }

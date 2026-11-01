@@ -313,7 +313,32 @@ M4 part 1 status (2026-11-01): the skills system, in `crates/tools/src/skills.rs
   restore, approval switch).
 - Also fixed: M2.5 refused arguments as "truncated" whenever brackets didn't balance; Hermes's rule
   (truncated only if they don't end in `}` or `]`) now decides, so a stray bracket is retried.
-- Part 2 (next): background review after turns, `/refine`, `/learn`, the curator, skill bundles.
+M4 part 2 status (2026-11-01): done. Verified live with Ollama (`nemotron-3-nano`): `/refine`
+after one turn saved the user's test-runner rule to memory and the user profile, and patched the
+skill that governs it (after reading it first).
+- Background review (`crates/runtime/src/review.rs`, prompts in `crates/prompts/src/review.rs`):
+  Hermes's nudge counters (memory every 10 user turns, hydrated from history; skills after 10
+  model calls without `skill_manage`), a cache-parity fork after a turn that ended with an answer
+  (same frozen prompt and tool list, 16 calls, messages never saved, usage recorded to the
+  session), cancelled by the next live turn. `ReviewTools` (`crates/tools/src/review.rs`) is the
+  dispatch-side whitelist (skill tools, `read_file`/`search_files`, `memory` only when memory is
+  under review), the read-before-write guard, no skill deletes, and unattended memory
+  patches/removals staged for approval. The summary ("Self-improvement review: …") shows under the
+  thread. On/off switch in Settings → Learning.
+- `/refine [focus]` (attended: full memory operations, reports even "nothing to save") and
+  `/learn <request>` (Hermes's learn prompt as a normal turn, shown as `/learn …`); both in the
+  slash suggestions.
+- Skill bundles (`crates/tools/src/bundles.rs`): YAML in `skill-bundles/`, `/<bundle>` loads every
+  member with Hermes's scaffold (bundles win over skills); managed in the Skills screen.
+- Curator (`crates/tools/src/curator.rs`, `crates/runtime/src/curator.rs`): per-skill lifecycle
+  records (uses/views/patches, created_by, pinned, state); only review-created or user-adopted
+  skills are managed; 14 days idle → stale, 30 → `.archive/` (restorable); scheduled weekly when
+  idle 2 h (first run deferred one interval), or Run Now; the optional consolidation pass (off by
+  default, as in Hermes) runs Hermes's curator prompt with only the skill tools, where a delete
+  archives a skill it absorbed; a REPORT.md per run. Skills screen: curator status, pause,
+  report, archive with restore, pin and "let the curator manage it" per skill.
+- Not ported: the routed/cheaper review model and token caps (B13), cron references, curator
+  backups beyond the skills git history, `/journey`.
 
 **M5: Breadth.** Compression, delegation, MCP, web search/extract, vision and image paste,
 context files + subdirectory hints, `@` references, checkpoints/`/rollback`, `/diff`, steer/queue,

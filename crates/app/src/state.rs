@@ -42,6 +42,9 @@ impl AppState {
             write_approval: config.skill_write_approval,
             ..skills.config()
         });
+        backend(cx)
+            .runtime
+            .set_background_review(config.background_review);
         let registry = theme::ThemeRegistry::global(cx);
         hermes_themes::load_bundled_themes(&registry);
         let name = config.theme.as_deref().unwrap_or(theme::DEFAULT_DARK_THEME);
@@ -180,4 +183,47 @@ impl AppState {
 /// A provider can be called when it has a key, or runs on this machine and needs none.
 pub fn provider_ready(provider: &ProviderSettings) -> bool {
     provider.is_local() || config::api_key(provider).is_some()
+}
+
+impl AppState {
+    /// The model the curator's consolidation pass runs on: the default model, when consolidation
+    /// is on and a provider serves it.
+    pub fn curator_model(&self) -> Option<hermes_runtime::CuratorModel> {
+        if !self.config.curator_consolidate {
+            return None;
+        }
+        let model = self.config.model.clone()?;
+        let provider = self.provider_for_model(&model)?;
+        Some(hermes_runtime::CuratorModel {
+            provider: config::runtime_provider(provider),
+            options: hermes_runtime::TurnOptions {
+                context_length: self.context_length(&model),
+                effort: self.config.efforts.get(&model).cloned(),
+            },
+            model,
+        })
+    }
+}
+
+/// Runs the curator in the background; `done` gets the outcome on the UI thread.
+pub fn run_curator<T: 'static>(
+    model: Option<hermes_runtime::CuratorModel>,
+    cx: &mut gpui::Context<T>,
+    done: impl FnOnce(&mut T, Result<hermes_runtime::CuratorOutcome, String>, &mut gpui::Context<T>)
+    + 'static,
+) {
+    let runtime = backend(cx).runtime.clone();
+    let task = backend(cx).spawn(async move { runtime.run_curator(model).await });
+    cx.spawn(async move |this, cx| {
+        let outcome = match task.await {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(error)) => Err(format!("{error:#}")),
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = &outcome {
+            tracing::warn!("curator run failed: {error}");
+        }
+        this.update(cx, |this, cx| done(this, outcome, cx)).ok();
+    })
+    .detach();
 }

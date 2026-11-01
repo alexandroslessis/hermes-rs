@@ -39,7 +39,6 @@ const EXCLUDED_DIRS: &[&str] = &[
 /// Support directories of a skill package: loaded through `skill_view(name, file_path)`.
 pub const SUPPORT_DIRS: &[&str] = &["references", "templates", "scripts", "assets"];
 const MANIFEST: &str = ".bundled_manifest.json";
-const USAGE: &str = ".usage.json";
 
 /// Hermes's skills bundled with the app (the ones that run on Windows).
 #[derive(RustEmbed)]
@@ -83,18 +82,13 @@ pub struct SkillCommit {
     pub message: String,
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct Usage {
-    views: u64,
-    uses: u64,
-    last_used: Option<String>,
-}
-
 pub struct SkillStore {
     root: PathBuf,
     config: Mutex<SkillsConfig>,
     /// Serializes writes (one `skill_manage` batch at a time).
     pub(crate) write_lock: Mutex<()>,
+    /// Serializes changes to `.usage.json`.
+    pub(crate) usage_lock: Mutex<()>,
 }
 
 /// `(frontmatter, body)` of a SKILL.md; the frontmatter is empty when absent or unparseable.
@@ -245,6 +239,7 @@ impl SkillStore {
             root: root.into(),
             config: Mutex::new(config),
             write_lock: Mutex::new(()),
+            usage_lock: Mutex::new(()),
         }
     }
 
@@ -559,14 +554,26 @@ impl SkillStore {
     /// The message a `/skill-name instruction` command sends (Hermes's `_build_skill_message`).
     pub fn invocation_message(&self, name: &str, instruction: &str) -> Option<String> {
         let skill = self.find(name)?;
+        let note = format!(
+            "[IMPORTANT: The user has invoked the \"{}\" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]",
+            skill.name
+        );
+        self.skill_block(&skill, &note, instruction)
+    }
+
+    /// One loaded skill (Hermes's `_render_skill_block`): the activation `note`, SKILL.md, its
+    /// directory and supporting files, and the user's instruction when there is one.
+    pub(crate) fn skill_block(
+        &self,
+        skill: &SkillEntry,
+        note: &str,
+        instruction: &str,
+    ) -> Option<String> {
         let content = std::fs::read_to_string(skill.skill_md()).ok()?;
         self.bump(&skill.name, true);
         let dir = skill.dir.display().to_string();
         let mut parts = vec![
-            format!(
-                "[IMPORTANT: The user has invoked the \"{}\" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]",
-                skill.name
-            ),
+            note.to_string(),
             String::new(),
             content.trim().to_string(),
             String::new(),
@@ -606,27 +613,25 @@ impl SkillStore {
 
     /// Records a view (and, for whole-skill loads, a use) for the Skills screen and the curator.
     fn bump(&self, name: &str, used: bool) {
-        let path = self.root.join(USAGE);
-        let mut usage: HashMap<String, Usage> = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
-        let entry = usage.entry(name.to_string()).or_default();
-        entry.views += 1;
-        if used {
-            entry.uses += 1;
-            entry.last_used = Some(chrono::Utc::now().to_rfc3339());
-        }
-        let _ = std::fs::write(&path, serde_json::to_vec_pretty(&usage).unwrap_or_default());
+        let now = crate::curator::now_string();
+        self.update_record(name, |record| {
+            record.views += 1;
+            record.last_viewed = Some(now.clone());
+            if used {
+                record.uses += 1;
+                record.last_used = Some(now);
+            }
+            // Using a stale skill makes it active again.
+            if record.state == crate::curator::SkillState::Stale {
+                record.state = crate::curator::SkillState::Active;
+            }
+        });
     }
 
     /// `(views, uses)` of a skill.
     pub fn usage(&self, name: &str) -> (u64, u64) {
-        std::fs::read(self.root.join(USAGE))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<HashMap<String, Usage>>(&b).ok())
-            .and_then(|mut usage| usage.remove(name))
-            .map_or((0, 0), |u| (u.views, u.uses))
+        let record = self.record(name);
+        (record.views, record.uses)
     }
 
     /// Copies the bundled skills in: new ones always, updated ones only when the user hasn't
@@ -699,7 +704,10 @@ impl SkillStore {
         }
         let _ = std::fs::write(
             self.root.join(".gitignore"),
-            format!("{USAGE}\n{MANIFEST}\n.pending/\n"),
+            format!(
+                "{}\n{MANIFEST}\n.pending/\n.curator_state\n",
+                crate::curator::USAGE
+            ),
         );
         true
     }

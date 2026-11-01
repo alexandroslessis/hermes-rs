@@ -1,13 +1,16 @@
 //! The agent runtime the desktop app talks to: create and open sessions, start a turn and
 //! receive its events, cancel it, list a provider's models.
 
+mod curator;
 mod guards;
 mod ops;
+mod review;
 mod session;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context as _, Result};
 use hermes_agent::events::AgentEvent;
@@ -32,6 +35,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+pub use curator::{CuratorModel, CuratorOutcome};
 pub use hermes_tools::{
     ClarifyAnswer, ClarifyOutcome, ClarifyQuestion, ClarifyRequest, ClarifyResponse, ProcessNotice,
 };
@@ -167,6 +171,11 @@ pub struct Runtime {
     bridge: Arc<dyn UserBridge>,
     windows_version: String,
     sessions: Mutex<HashMap<String, Arc<OpenSession>>>,
+    /// Hermes's `background_review.enabled`: review memory and skills after turns.
+    background_review: Arc<AtomicBool>,
+    /// When a turn last started or ended: the curator waits for the app to be idle.
+    last_activity: Arc<Mutex<std::time::Instant>>,
+    curator_running: AtomicBool,
 }
 
 impl Runtime {
@@ -183,6 +192,9 @@ impl Runtime {
             config,
             bridge,
             sessions: Mutex::new(HashMap::new()),
+            background_review: Arc::new(AtomicBool::new(true)),
+            last_activity: Arc::new(Mutex::new(std::time::Instant::now())),
+            curator_running: AtomicBool::new(false),
         })
     }
 
@@ -196,11 +208,19 @@ impl Runtime {
     }
 
     /// Hermes's skill slash commands: `/skill-name instruction` becomes the message that loads
-    /// the skill. `None` when `text` isn't a command for an existing skill.
+    /// the skill, and `/bundle-name instruction` the one that loads a bundle's skills (a bundle
+    /// wins over a skill of the same name). `None` when `text` names neither.
     pub fn skill_command(&self, text: &str) -> Option<String> {
         let rest = text.trim().strip_prefix('/')?;
         let (name, instruction) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-        self.skills.invocation_message(name, instruction)
+        self.skills
+            .bundle_message(name, instruction)
+            .or_else(|| self.skills.invocation_message(name, instruction))
+    }
+
+    /// Turns automatic background reviews (memory and skills, after turns) on or off.
+    pub fn set_background_review(&self, enabled: bool) {
+        self.background_review.store(enabled, Ordering::Relaxed);
     }
 
     /// The memory store every session shares (the Memory screen edits it too).
@@ -261,6 +281,19 @@ impl Runtime {
         context_length: Option<usize>,
         cwd: &Path,
     ) -> Result<String> {
+        self.system_prompt_with(provider, model, context_length, cwd, true)
+    }
+
+    /// The frozen prompt; `with_memory` false leaves the memory snapshot out (Hermes's curator
+    /// runs with `skip_memory`).
+    fn system_prompt_with(
+        &self,
+        provider: &str,
+        model: &str,
+        context_length: Option<usize>,
+        cwd: &Path,
+        with_memory: bool,
+    ) -> Result<String> {
         let home = dirs::home_dir().context("no home directory")?;
         let soul = std::fs::read_to_string(self.config.data_dir.join("SOUL.md")).ok();
         let tool_names = SessionTools::tool_names();
@@ -270,7 +303,8 @@ impl Runtime {
         let memory = [snapshot.memory, snapshot.user]
             .into_iter()
             .flatten()
-            .reduce(|a, b| format!("{a}\n\n{b}"));
+            .reduce(|a, b| format!("{a}\n\n{b}"))
+            .filter(|_| with_memory);
         // The scratch dir is per session but the prompt must name it before the id exists, so
         // sessions share the scratch root in the prompt and get their own subdirectory below.
         let scratch_root = self.config.data_dir.join("scratch");
@@ -320,12 +354,24 @@ impl Runtime {
             history: Some(self.store.clone()),
             skills: Some(self.skills.clone()),
         });
+        let user_turns = conversation
+            .messages()
+            .iter()
+            .filter(|m| m.role == rmcp::model::Role::User)
+            .filter(|m| {
+                m.content
+                    .iter()
+                    .any(|c| matches!(c, MessageContent::Text(_)))
+            })
+            .count();
         let open = Arc::new(OpenSession {
             record: Mutex::new(record),
             conversation: Mutex::new(conversation),
             tools: Arc::new(tools),
             running: Mutex::new(None),
             turn_state: Mutex::new(None),
+            review: Mutex::new(None),
+            nudges: Mutex::new(review::Nudges::resumed(user_turns)),
         });
         Ok(self
             .sessions
@@ -431,6 +477,23 @@ impl Runtime {
             session: open.clone(),
             store: self.store.clone(),
             state: state.clone(),
+            persist: true,
+            record_usage: true,
+        };
+        // A live turn supersedes a review still running from the last one (Hermes cancels it so
+        // the two don't compete for the model).
+        if let Some(review) = open.review.lock().take() {
+            review.cancel();
+        }
+        let review_memory = text.is_some() && open.nudges.lock().tick_memory();
+        let review_setup = ReviewSetup {
+            store: self.store.clone(),
+            bridge: self.bridge.clone(),
+            llm: llm.clone(),
+            model: model.clone(),
+            context_length,
+            effort_params: effort_params.clone(),
+            enabled: self.background_review.clone(),
         };
         let first_event = match text {
             Some(text) => {
@@ -453,6 +516,9 @@ impl Runtime {
                 return Err(error);
             }
         };
+        let turn_start = open.conversation.lock().messages().len();
+        *self.last_activity.lock() = std::time::Instant::now();
+        let last_activity = self.last_activity.clone();
 
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let _ = events_tx.send(RuntimeEvent::Agent(first_event));
@@ -474,6 +540,7 @@ impl Runtime {
                 .collect();
             let tools: Arc<dyn ToolProvider<TurnSession>> = Arc::new(ops::GuardedTools {
                 inner: runtime.session.tools.clone(),
+                scratch_dir: runtime.session.tools.scratch_dir().to_path_buf(),
                 state: state.clone(),
                 result_limit: ops::result_size_limit(context_length),
             });
@@ -523,12 +590,50 @@ impl Runtime {
                     TurnStatus::Failed(format!("{error:#}"))
                 }
             };
+            *last_activity.lock() = std::time::Instant::now();
+            let finished = status == TurnStatus::Completed;
             let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
+            review_setup.after_turn(&runtime.session, turn_start, review_memory, finished);
         });
         Ok(Turn {
             events: events_rx,
             cancel,
         })
+    }
+
+    /// Hermes's `/refine [focus]`: reviews the conversation now, in the background, saving
+    /// lessons to memory and skills. The result arrives through the bridge's `review_finished`.
+    pub fn refine(
+        &self,
+        session_id: &str,
+        provider: &ProviderConfig,
+        options: TurnOptions,
+        focus: Option<String>,
+    ) -> Result<()> {
+        let open = self.open(session_id)?;
+        anyhow::ensure!(
+            open.running.lock().is_none(),
+            "a turn is running in this session; refine it when it ends"
+        );
+        anyhow::ensure!(
+            !open.conversation.lock().messages().is_empty(),
+            "Nothing to refine yet — send a message first."
+        );
+        let setup = ReviewSetup {
+            store: self.store.clone(),
+            bridge: self.bridge.clone(),
+            llm: provider.provider()?,
+            model: open.record.lock().model.clone(),
+            context_length: options.context_length,
+            effort_params: options
+                .effort
+                .as_deref()
+                .map(|effort| effort_request_params(&provider.base_url, effort)),
+            enabled: self.background_review.clone(),
+        };
+        let skills = SessionTools::tool_names().contains(&"skill_manage");
+        setup.start(&open, true, skills, focus, true);
+        Ok(())
     }
 
     /// Hermes's `/steer`: a message for the running turn, delivered to the model right after its
@@ -634,5 +739,78 @@ fn windows_version() -> String {
         Some(build) if build >= 22000 => format!("11 (build {build})"),
         Some(build) => format!("10 (build {build})"),
         None => "unknown version".into(),
+    }
+}
+
+/// What a turn needs to start a background review when it ends.
+struct ReviewSetup {
+    store: Arc<Store>,
+    bridge: Arc<dyn UserBridge>,
+    llm: Arc<dyn Provider>,
+    model: String,
+    context_length: Option<usize>,
+    effort_params: Option<HashMap<String, serde_json::Value>>,
+    enabled: Arc<AtomicBool>,
+}
+
+impl ReviewSetup {
+    /// Hermes's turn finalizer: counts the turn toward the skill nudge, then reviews memory
+    /// and/or skills when one is due, the turn ended with an answer, and reviews are on.
+    fn after_turn(
+        self,
+        session: &Arc<OpenSession>,
+        turn_start: usize,
+        review_memory: bool,
+        finished: bool,
+    ) {
+        let (review_skills, answered) = {
+            let conversation = session.conversation.lock();
+            let messages = conversation.messages();
+            let turn = messages.get(turn_start..).unwrap_or_default();
+            let review_skills = session.nudges.lock().finish_turn(turn);
+            let answered = messages.last().is_some_and(|last| {
+                last.role == rmcp::model::Role::Assistant
+                    && last.error_kind().is_none()
+                    && last.content.iter().any(|content| {
+                        matches!(content, MessageContent::Text(text) if !text.text.trim().is_empty())
+                    })
+            });
+            (review_skills, answered)
+        };
+        if !finished || !answered || !(review_memory || review_skills) {
+            return;
+        }
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.start(session, review_memory, review_skills, None, false);
+    }
+
+    fn start(
+        self,
+        session: &Arc<OpenSession>,
+        memory: bool,
+        skills: bool,
+        focus: Option<String>,
+        requested: bool,
+    ) {
+        let cancel = CancellationToken::new();
+        if let Some(previous) = session.review.lock().replace(cancel.clone()) {
+            previous.cancel();
+        }
+        tokio::spawn(review::run(review::ReviewJob {
+            session: session.clone(),
+            store: self.store,
+            bridge: self.bridge,
+            llm: self.llm,
+            model: self.model,
+            context_length: self.context_length,
+            effort_params: self.effort_params,
+            memory,
+            skills,
+            focus,
+            requested,
+            cancel,
+        }));
     }
 }

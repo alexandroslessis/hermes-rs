@@ -4,6 +4,7 @@
 mod appearance;
 mod assets;
 mod backend;
+mod bundle_dialog;
 mod chat;
 mod chat_ui;
 mod config;

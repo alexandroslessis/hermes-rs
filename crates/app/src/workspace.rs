@@ -74,6 +74,8 @@ pub struct Workspace {
     notice: Option<String>,
     focus_handle: FocusHandle,
     _requests: Task<()>,
+    /// Checks every few minutes whether the curator is due (Hermes runs it on idle ticks).
+    _curator: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -132,6 +134,19 @@ impl Workspace {
             notice: None,
             focus_handle: cx.focus_handle(),
             _requests: requests_task,
+            _curator: cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(15 * 60))
+                        .await;
+                    if this
+                        .update(cx, |this, cx| this.maybe_run_curator(cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }),
             _subscriptions: vec![
                 cx.observe(&state, |_, _, cx| cx.notify()),
                 // Coming back to the window counts as seeing the session on screen.
@@ -186,6 +201,20 @@ impl Workspace {
             .list_sessions(200)
             .unwrap_or_default();
         cx.notify();
+    }
+
+    /// Hermes's `maybe_run_curator`: a scheduled run when it's due and the app is idle.
+    fn maybe_run_curator(&mut self, cx: &mut Context<Self>) {
+        if !backend(cx).runtime.curator_due() {
+            return;
+        }
+        let model = AppState::global(cx).read(cx).curator_model();
+        crate::state::run_curator(model, cx, |this: &mut Self, outcome, cx| {
+            if let Ok(outcome) = outcome {
+                tracing::info!("curator: {}", outcome.summary);
+            }
+            this.skills.update(cx, |skills, cx| skills.refresh(cx));
+        });
     }
 
     fn reload_projects(&mut self, cx: &mut Context<Self>) {
@@ -256,6 +285,15 @@ impl Workspace {
             UiRequest::ProcessFinished { session_id, notice } => {
                 if let Some(chat) = self.chats.get(&session_id) {
                     chat.update(cx, |chat, cx| chat.process_finished(notice, window, cx));
+                }
+            }
+            UiRequest::ReviewFinished {
+                session_id,
+                actions,
+                requested,
+            } => {
+                if let Some(chat) = self.chats.get(&session_id) {
+                    chat.update(cx, |chat, cx| chat.review_finished(actions, requested, cx));
                 }
             }
         }
@@ -429,10 +467,7 @@ impl Workspace {
             {
                 let text = first.as_concat_text();
                 // A skill command's message is the whole skill: title it with what was typed.
-                let title = match hermes_tools::skills::describe_invocation(&text) {
-                    Some((skill, instruction)) => title_from(&format!("/{skill} {instruction}")),
-                    None => title_from(&text),
-                };
+                let title = title_from(&crate::chat::typed_command(&text).unwrap_or(text));
                 if !title.is_empty() {
                     let _ = backend.runtime.store().set_title(&session_id, &title);
                 }

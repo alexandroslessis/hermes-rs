@@ -83,6 +83,10 @@ pub struct OpenSession {
     pub running: Mutex<Option<CancellationToken>>,
     /// The running turn's loop state (where `/steer` text waits for delivery).
     pub turn_state: Mutex<Option<Arc<Mutex<TurnState>>>>,
+    /// The background review running after the last turn; a new turn cancels it.
+    pub review: Mutex<Option<CancellationToken>>,
+    /// Hermes's nudge counters, which decide when a turn is followed by a review.
+    pub nudges: Mutex<crate::review::Nudges>,
 }
 
 impl OpenSession {
@@ -102,6 +106,11 @@ pub struct TurnRuntime {
     pub session: Arc<OpenSession>,
     pub store: Arc<Store>,
     pub state: Arc<Mutex<TurnState>>,
+    /// Whether messages are saved to the session's history. A background review's aren't: it
+    /// runs on a copy of the conversation, and only its token usage is recorded.
+    pub persist: bool,
+    /// Whether token usage is recorded against the session (not for the curator, which has none).
+    pub record_usage: bool,
 }
 
 impl TurnRuntime {
@@ -125,6 +134,9 @@ impl TurnRuntime {
                 None => return Ok(()),
             }
         };
+        if !self.persist {
+            return Ok(());
+        }
         self.store.upsert_message(&session_id, index, &stored)
     }
 
@@ -164,6 +176,9 @@ impl TurnRuntime {
             change(&mut messages[index]);
             (index, messages[index].clone())
         };
+        if !self.persist {
+            return Ok(());
+        }
         self.store.upsert_message(&session_id, index, &stored)
     }
 }
@@ -195,8 +210,10 @@ impl EffectHandler<TurnSession, HermesEffect> for TurnRuntime {
                     conversation,
                 )) => {
                     let session_id = self.session.record.lock().id.clone();
-                    self.store
-                        .replace_messages(&session_id, conversation.messages())?;
+                    if self.persist {
+                        self.store
+                            .replace_messages(&session_id, conversation.messages())?;
+                    }
                     *self.session.conversation.lock() = conversation.clone();
                     emit.emit(AgentEvent::HistoryReplaced(conversation.clone()));
                 }
@@ -267,8 +284,10 @@ impl EffectHandler<TurnSession, HermesEffect> for TurnRuntime {
                     emit.emit(AgentEvent::HistoryReplaced(conversation));
                 }
                 HermesEffect::RecordUsage(usage) => {
-                    let session_id = self.session.record.lock().id.clone();
-                    self.store.record_usage(&session_id, usage)?;
+                    if self.record_usage {
+                        let session_id = self.session.record.lock().id.clone();
+                        self.store.record_usage(&session_id, usage)?;
+                    }
                     emit.emit(AgentEvent::Usage(usage.clone()));
                 }
             }
