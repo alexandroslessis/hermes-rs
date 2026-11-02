@@ -1556,7 +1556,8 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tab_bar = (self.tabs.len() > 1).then(|| self.render_tabs(cx).into_any_element());
+        window.set_rem_size(crate::appearance::rem_size(cx));
+        let tab_bar =(self.tabs.len() > 1).then(|| self.render_tabs(cx).into_any_element());
         let colors = cx.theme().colors();
         let main: AnyElement = match self.main {
             Main::Settings => self.settings.clone().into_any_element(),

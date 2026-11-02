@@ -89,6 +89,9 @@ pub struct AppConfig {
     /// The session sidebar's width, set by dragging its edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar_width: Option<f32>,
+    /// The interface and code fonts; unset parts use the bundled defaults.
+    #[serde(default)]
+    pub fonts: FontSettings,
     /// Models starred in the model selector (Zed's favorite models).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub favorite_models: Vec<FavoriteModel>,
@@ -127,6 +130,7 @@ impl Default for AppConfig {
             aux_models: AuxModelSettings::default(),
             mcp_servers: Default::default(),
             sidebar_width: None,
+            fonts: FontSettings::default(),
         }
     }
 }
@@ -248,6 +252,19 @@ pub enum BusyInput {
     Steer,
     Queue,
     Interrupt,
+}
+
+/// Font families and sizes (Zed's `ui_font_*` and `buffer_font_*`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct FontSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_size: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_size: Option<f32>,
 }
 
 /// A model on a particular provider.

@@ -278,6 +278,161 @@ impl SettingsView {
         DropdownMenu::new("theme-picker", current, menu)
     }
 
+    /// The interface and code fonts: a family dropdown and a size stepper each.
+    fn render_fonts(window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::appearance::{
+            DEFAULT_CODE_FONT, DEFAULT_CODE_SIZE, DEFAULT_UI_FONT, DEFAULT_UI_SIZE, MAX_FONT_SIZE,
+            MIN_FONT_SIZE,
+        };
+        let fonts = AppState::global(cx).read(cx).config.fonts.clone();
+        // Families worth offering that are on this PC (plus the bundled ones).
+        let installed = cx.text_system().all_font_names();
+        let available = |candidates: &[&str], bundled: &str| -> Vec<String> {
+            std::iter::once(bundled.to_string())
+                .chain(
+                    candidates
+                        .iter()
+                        .filter(|name| installed.iter().any(|i| i == *name))
+                        .map(|name| name.to_string()),
+                )
+                .collect()
+        };
+        let ui_families = available(
+            &["Segoe UI", "Segoe UI Variable", "Inter", "Arial", "Calibri", "Verdana", "Tahoma"],
+            DEFAULT_UI_FONT,
+        );
+        let code_families = available(
+            &[
+                "Cascadia Code",
+                "Cascadia Mono",
+                "Consolas",
+                "JetBrains Mono",
+                "Fira Code",
+                "Source Code Pro",
+                "Courier New",
+            ],
+            DEFAULT_CODE_FONT,
+        );
+        type Set = fn(&mut config::FontSettings, Option<String>);
+        type SetSize = fn(&mut config::FontSettings, Option<f32>);
+        let family_picker = |id: &'static str,
+                             current: Option<String>,
+                             families: Vec<String>,
+                             bundled: &'static str,
+                             set: Set,
+                             window: &mut Window,
+                             cx: &mut Context<Self>| {
+            let shown = |name: &str| {
+                if name == bundled {
+                    format!("{} (default)", &bundled[1..])
+                } else {
+                    name.to_string()
+                }
+            };
+            let selected = current.clone().unwrap_or(bundled.to_string());
+            let label = shown(&selected);
+            let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+                for family in &families {
+                    let value = (family != bundled).then(|| family.clone());
+                    menu = menu.toggleable_entry(
+                        shown(family),
+                        *family == selected,
+                        IconPosition::Start,
+                        None,
+                        move |_, cx| {
+                            let value = value.clone();
+                            AppState::global(cx).update(cx, |state, cx| {
+                                let mut fonts = state.config.fonts.clone();
+                                set(&mut fonts, value);
+                                state.set_fonts(fonts, cx);
+                            });
+                        },
+                    );
+                }
+                menu
+            });
+            DropdownMenu::new(id, label, menu)
+        };
+        let stepper = |id: &'static str, size: Option<f32>, default: f32, set: SetSize| {
+            let current = size.unwrap_or(default);
+            let step = move |delta: f32| {
+                move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                    let next = (current + delta).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+                    AppState::global(cx).update(cx, |state, cx| {
+                        let mut fonts = state.config.fonts.clone();
+                        set(&mut fonts, (next != default).then_some(next));
+                        state.set_fonts(fonts, cx);
+                    });
+                }
+            };
+            h_flex()
+                .gap_1()
+                .child(
+                    IconButton::new(SharedString::from(format!("{id}-smaller")), IconName::Dash)
+                        .icon_size(IconSize::Small)
+                        .disabled(current <= MIN_FONT_SIZE)
+                        .on_click(step(-1.)),
+                )
+                .child(
+                    div()
+                        .w(rems(2.5))
+                        .flex()
+                        .justify_center()
+                        .child(Label::new(format!("{current}"))),
+                )
+                .child(
+                    IconButton::new(SharedString::from(format!("{id}-larger")), IconName::Plus)
+                        .icon_size(IconSize::Small)
+                        .disabled(current >= MAX_FONT_SIZE)
+                        .on_click(step(1.)),
+                )
+        };
+        let ui_picker = family_picker(
+            "ui-font",
+            fonts.ui_family.clone(),
+            ui_families,
+            DEFAULT_UI_FONT,
+            |fonts, value| fonts.ui_family = value,
+            window,
+            cx,
+        );
+        let code_picker = family_picker(
+            "code-font",
+            fonts.code_family.clone(),
+            code_families,
+            DEFAULT_CODE_FONT,
+            |fonts, value| fonts.code_family = value,
+            window,
+            cx,
+        );
+        let row = |title: &'static str, picker: AnyElement, stepper: AnyElement| {
+            h_flex()
+                .justify_between()
+                .child(Label::new(title))
+                .child(h_flex().gap_3().child(picker).child(stepper))
+        };
+        v_flex()
+            .gap_2()
+            .child(Self::section(
+                "Fonts",
+                Some("The interface font, and the font for code, commands and tool output."),
+            ))
+            .child(row(
+                "Interface",
+                ui_picker.into_any_element(),
+                stepper("ui-size", fonts.ui_size, DEFAULT_UI_SIZE, |f, v| f.ui_size = v)
+                    .into_any_element(),
+            ))
+            .child(row(
+                "Code",
+                code_picker.into_any_element(),
+                stepper("code-size", fonts.code_size, DEFAULT_CODE_SIZE, |f, v| {
+                    f.code_size = v
+                })
+                .into_any_element(),
+            ))
+    }
+
     fn section(title: &'static str, description: Option<&'static str>) -> impl IntoElement {
         // Takes the room the controls beside it leave, so a long description wraps.
         v_flex()
@@ -1184,6 +1339,7 @@ impl Render for SettingsView {
                     .child(Self::section("Appearance", Some("The color theme, from Zed's.")))
                     .child(Self::theme_picker(window, cx)),
             )
+            .child(Self::render_fonts(window, cx))
             .child(Divider::horizontal())
             .child(Self::render_busy_input(cx))
             .child(Divider::horizontal())

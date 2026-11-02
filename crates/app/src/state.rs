@@ -62,6 +62,10 @@ impl AppState {
             let _guard = backend.tokio.enter();
             backend.runtime.mcp().configure(config.mcp_servers.clone());
         }
+        theme::set_theme_settings_provider(
+            Box::new(crate::appearance::Appearance::new(&config.fonts)),
+            cx,
+        );
         let registry = theme::ThemeRegistry::global(cx);
         hermes_themes::load_bundled_themes(&registry);
         let name = config.theme.as_deref().unwrap_or(theme::DEFAULT_DARK_THEME);
@@ -153,6 +157,17 @@ impl AppState {
         self.languages = hermes_highlight::language_registry(theme.syntax());
         theme::GlobalTheme::update_theme(cx, theme);
         self.config.theme = Some(name.to_string());
+        self.save(cx);
+        cx.refresh_windows();
+    }
+
+    /// Saves the font settings and redraws with them.
+    pub fn set_fonts(&mut self, fonts: config::FontSettings, cx: &mut Context<Self>) {
+        theme::set_theme_settings_provider(
+            Box::new(crate::appearance::Appearance::new(&fonts)),
+            cx,
+        );
+        self.config.fonts = fonts;
         self.save(cx);
         cx.refresh_windows();
     }
