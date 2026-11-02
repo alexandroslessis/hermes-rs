@@ -244,7 +244,7 @@ fn write_text(path: &Path, content: &str) -> Result<(), String> {
     std::fs::write(path, content).map_err(|e| format!("Could not write {}: {e}", path.display()))
 }
 
-fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
@@ -259,7 +259,7 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// A threat scan of everything a skill holds (it re-enters prompts when loaded).
-fn scan_skill(dir: &Path) -> Option<String> {
+pub(crate) fn scan_skill(dir: &Path) -> Option<String> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
         for entry in std::fs::read_dir(&current).ok()?.flatten() {

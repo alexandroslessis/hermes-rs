@@ -7,7 +7,7 @@ use gpui::{
     App, Context, Entity, FocusHandle, Focusable, KeyDownEvent, Subscription, Window, prelude::*,
 };
 use ui::{
-    Chip, ContextMenu, Divider, DropdownMenu, PopoverMenu, Switch, TintColor, ToggleState, Tooltip,
+    Callout, Chip, ContextMenu, Divider, DropdownMenu, PopoverMenu, Switch, TintColor, ToggleState, Tooltip,
     prelude::*,
 };
 
@@ -41,6 +41,8 @@ pub struct SettingsView {
     mcp_error: Option<String>,
     /// Re-renders while a server is still connecting.
     mcp_poll: Option<gpui::Task<()>>,
+    /// What the last Import from Hermes did, and whether anything failed.
+    import_report: Option<(String, bool)>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -75,6 +77,7 @@ impl SettingsView {
             mcp_editor: None,
             mcp_error: None,
             mcp_poll: None,
+            import_report: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
@@ -276,6 +279,47 @@ impl SettingsView {
             menu
         });
         DropdownMenu::new("theme-picker", current, menu)
+    }
+
+    /// Import from Hermes: memory, skills and SOUL.md from `~/.hermes`.
+    fn render_import(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let found = crate::hermes_import::hermes_home();
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_start()
+                    .gap_4()
+                    .child(Self::section(
+                        "Import from Hermes",
+                        Some("Copies Hermes's memory entries, the skills you made or installed, and SOUL.md (when you have none here). Hermes's files are left as they are."),
+                    ))
+                    .child(
+                        Button::new("import-hermes-all", "Import")
+                            .style(ButtonStyle::Outlined)
+                            .disabled(found.is_none())
+                            .tooltip(Tooltip::text(match &found {
+                                Some(home) => format!("From {}", home.display()),
+                                None => "No Hermes install found (~/.hermes or HERMES_HOME)".into(),
+                            }))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.import_report = Some(crate::hermes_import::import_all(cx));
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when_some(self.import_report.clone(), |this, (report, failed)| {
+                this.child(
+                    Callout::new()
+                        .severity(if failed {
+                            Severity::Warning
+                        } else {
+                            Severity::Success
+                        })
+                        .title(report),
+                )
+            })
     }
 
     /// The interface and code fonts: a family dropdown and a size stepper each.
@@ -1350,6 +1394,8 @@ impl Render for SettingsView {
             .child(self.render_safety(cx))
             .child(Divider::horizontal())
             .child(self.render_mcp(cx))
+            .child(Divider::horizontal())
+            .child(self.render_import(cx))
             .child(Divider::horizontal())
             .child(
                 v_flex()

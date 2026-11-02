@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use gpui::{App, Context, Entity, FocusHandle, Focusable, Subscription, Window, prelude::*};
-use hermes_memory::{ENTRY_DELIMITER, MemoryStore, Operation, PendingWrite, Target, TurnFailures};
+use hermes_memory::{MemoryStore, Operation, PendingWrite, Target, TurnFailures};
 use std::sync::Arc;
 use ui::{Callout, Checkbox, Divider, ToggleState, Tooltip, prelude::*};
 
@@ -34,13 +34,9 @@ fn slot(target: Target) -> usize {
     }
 }
 
-/// Where Hermes keeps its memories (`HERMES_HOME`, else `~/.hermes`).
+/// Hermes's home, when it has memories to import.
 fn hermes_memories() -> Option<PathBuf> {
-    let home = std::env::var_os("HERMES_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".hermes")))?;
-    let dir = home.join("memories");
-    dir.is_dir().then_some(dir)
+    crate::hermes_import::hermes_home().filter(|home| home.join("memories").is_dir())
 }
 
 impl MemoryView {
@@ -177,50 +173,18 @@ impl MemoryView {
 
     /// One-way import of Hermes's `MEMORY.md` / `USER.md` (entries already here are skipped).
     fn import_from_hermes(&mut self, cx: &mut Context<Self>) {
-        let Some(dir) = hermes_memories() else {
+        let Some(home) = hermes_memories() else {
             return;
         };
-        let store = Self::store(cx);
-        let mut added = 0;
-        let mut problems = Vec::new();
-        for target in TARGETS {
-            let Ok(raw) = std::fs::read_to_string(dir.join(target.file_name())) else {
-                continue;
-            };
-            let existing = store.entries(target);
-            let ops: Vec<Operation> = raw
-                .trim_start_matches('\u{feff}')
-                .split(ENTRY_DELIMITER)
-                .map(str::trim)
-                .filter(|entry| !entry.is_empty() && !existing.iter().any(|e| e == entry))
-                .map(|entry| Operation {
-                    action: "add".into(),
-                    content: Some(entry.to_string()),
-                    ..Default::default()
-                })
-                .collect();
-            if ops.is_empty() {
-                continue;
-            }
-            let result = store.apply(target, &ops, &mut TurnFailures::default());
-            if result["success"] == serde_json::json!(true) {
-                added += ops.len();
-            } else {
-                problems.push(format!(
-                    "{}: {}",
-                    target.file_name(),
-                    result["error"].as_str().unwrap_or("failed")
-                ));
-            }
-        }
-        self.notice = Some(if problems.is_empty() {
-            (
-                Severity::Success,
-                format!("Imported {added} entries from Hermes."),
-            )
-        } else {
-            (Severity::Warning, problems.join("\n"))
-        });
+        self.notice = Some(
+            match crate::hermes_import::import_memory(&home, &Self::store(cx)) {
+                Ok(added) => (
+                    Severity::Success,
+                    format!("Imported {added} entries from Hermes."),
+                ),
+                Err(problems) => (Severity::Warning, problems.join("\n")),
+            },
+        );
         self.refresh(cx);
     }
 

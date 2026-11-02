@@ -8,6 +8,7 @@ mod bundle_dialog;
 mod chat;
 mod chat_ui;
 mod config;
+mod hermes_import;
 mod memory_view;
 mod model_picker;
 mod notification;
