@@ -12,6 +12,7 @@ mod memory_view;
 mod model_picker;
 mod notification;
 mod onboarding;
+mod palette;
 mod project_dialog;
 mod scroll;
 mod settings;
@@ -34,8 +35,8 @@ use crate::assets::Assets;
 use crate::backend::{Backend, BackendGlobal};
 use crate::state::AppState;
 use crate::workspace::{
-    CloseTab, NewSession, NextTab, OpenMemory, OpenSettings, OpenSkills, PreviousTab,
-    ToggleSidebar, Workspace,
+    CloseTab, GoToSession, NewSession, NextTab, OpenMemory, OpenSettings, OpenSkills, PreviousTab,
+    ToggleCommandPalette, ToggleSidebar, Workspace,
 };
 
 fn main() {
@@ -72,6 +73,9 @@ fn main() {
                 KeyBinding::new("ctrl-,", OpenSettings, None),
                 KeyBinding::new("ctrl-shift-m", OpenMemory, None),
                 KeyBinding::new("ctrl-shift-k", OpenSkills, None),
+                KeyBinding::new("ctrl-shift-p", ToggleCommandPalette, None),
+                KeyBinding::new("f1", ToggleCommandPalette, None),
+                KeyBinding::new("ctrl-p", GoToSession, None),
                 // Copy the text selected in a chat message.
                 KeyBinding::new("ctrl-c", markdown::Copy, Some("Markdown")),
             ]);

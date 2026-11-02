@@ -89,7 +89,7 @@ fn cost_info(model: &DiscoveredModel) -> Option<SharedString> {
 }
 
 /// Whether `query`'s characters appear in `text` in order (Zed's fuzzy match, without scores).
-fn fuzzy_matches(text: &str, query: &str) -> bool {
+pub(crate) fn fuzzy_matches(text: &str, query: &str) -> bool {
     let mut chars = text.chars();
     query
         .chars()

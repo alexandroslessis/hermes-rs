@@ -237,6 +237,17 @@ impl ChatView {
         self.composer.clone()
     }
 
+    /// A slash command from the command palette: sent at once when `run`, else left in the
+    /// composer for its arguments.
+    pub fn run_command(&mut self, name: &str, run: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.set_text(format!("/{name} "), cx));
+        self.composer.focus_handle(cx).focus(window, cx);
+        if run {
+            self.submit(window, cx);
+        }
+    }
+
     /// The list's rows: one per entry, plus the trailer that shows the turn running.
     fn list_len(&self) -> usize {
         self.entries.len() + 1
@@ -3673,7 +3684,7 @@ fn command_arg<'a>(text: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Hermes's built-in commands offered in the slash suggestions, before skills.
-const BUILTIN_COMMANDS: &[(&str, &str)] = &[
+pub(crate) const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     (
         "refine",
         "Review this conversation now and save lessons to memory/skills",

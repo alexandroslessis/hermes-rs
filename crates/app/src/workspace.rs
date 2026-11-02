@@ -20,6 +20,7 @@ use crate::backend::{UiRequest, backend};
 use crate::chat::{ChatEvent, ChatView};
 use crate::memory_view::MemoryView;
 use crate::notification::{AgentNotification, AgentNotificationEvent};
+use crate::palette::{Palette, PaletteItem, PalettePicked};
 use crate::project_dialog::{ProjectDialog, ProjectDialogEvent};
 use crate::settings::SettingsView;
 use crate::sidebar::{ProjectGroup, folder_name, group_sessions, project_root};
@@ -38,7 +39,9 @@ actions!(
         PreviousTab,
         OpenSettings,
         OpenMemory,
-        OpenSkills
+        OpenSkills,
+        ToggleCommandPalette,
+        GoToSession
     ]
 );
 
@@ -83,6 +86,8 @@ pub struct Workspace {
     project_roots: RefCell<HashMap<String, PathBuf>>,
     sidebar_scroll: ScrollHandle,
     project_dialog: Option<(Entity<ProjectDialog>, Vec<Subscription>)>,
+    /// The open command palette or session switcher, and what had focus before it.
+    palette: Option<(Entity<Palette>, Option<FocusHandle>, Vec<Subscription>)>,
     /// Sessions whose turn finished while you weren't looking (Zed's blue dot).
     unseen: HashSet<String>,
     notifications: Vec<Notification>,
@@ -155,6 +160,7 @@ impl Workspace {
             project_roots: RefCell::default(),
             sidebar_scroll: ScrollHandle::new(),
             project_dialog: None,
+            palette: None,
             unseen: HashSet::new(),
             notifications: Vec::new(),
             notice: None,
@@ -746,6 +752,117 @@ impl Workspace {
                 self.notice = Some(format!("{error:#}"));
                 cx.notify();
             }
+        }
+    }
+
+    /// Ctrl+Shift+P: the actions available where focus is, then the active chat's commands.
+    fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.take().is_some() {
+            cx.notify();
+            return;
+        }
+        let mut actions: Vec<PaletteItem> = window
+            .available_actions(cx)
+            .into_iter()
+            .filter(|action| {
+                let name = action.name();
+                name.starts_with("workspace::") || name.starts_with("chat::")
+            })
+            .filter(|action| !action.as_any().is::<ToggleCommandPalette>())
+            .map(|action| PaletteItem::Action {
+                label: crate::palette::humanize_action_name(action.name()).into(),
+                action,
+            })
+            .collect();
+        actions.sort_by_key(|item| match item {
+            PaletteItem::Action { label, .. } => label.clone(),
+            _ => SharedString::default(),
+        });
+        let in_chat = matches!(self.main, Main::Chat) && self.active.is_some();
+        if in_chat {
+            actions.extend(crate::chat::BUILTIN_COMMANDS.iter().map(|(name, description)| {
+                PaletteItem::Command {
+                    name,
+                    description,
+                    // These need their arguments typed.
+                    run: !matches!(*name, "learn" | "steer" | "queue"),
+                }
+            }));
+        }
+        self.open_palette("Execute a command…", actions, window, cx);
+    }
+
+    /// Ctrl+P: jump to a session by title or project.
+    fn toggle_session_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.take().is_some() {
+            cx.notify();
+            return;
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let items = self
+            .sessions
+            .iter()
+            .map(|session| PaletteItem::Session {
+                id: session.id.clone(),
+                title: session
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "New session".into())
+                    .into(),
+                detail: format!(
+                    "{} · {}",
+                    folder_name(Path::new(&session.cwd)),
+                    crate::sidebar::relative_time(session.updated_at, now)
+                )
+                .into(),
+            })
+            .collect();
+        self.open_palette("Go to a session…", items, window, cx);
+    }
+
+    fn open_palette(
+        &mut self,
+        placeholder: &str,
+        items: Vec<PaletteItem>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = window.focused(cx);
+        let palette = cx.new(|cx| Palette::new(placeholder, items, window, cx));
+        let subscriptions = vec![
+            cx.subscribe_in(&palette, window, |this, _, PalettePicked(item), window, cx| {
+                this.palette_picked(item, window, cx)
+            }),
+            cx.subscribe_in(&palette, window, |this, _, _: &gpui::DismissEvent, window, cx| {
+                this.close_palette(window, cx)
+            }),
+        ];
+        palette.focus_handle(cx).focus(window, cx);
+        self.palette = Some((palette, previous, subscriptions));
+        cx.notify();
+    }
+
+    /// Closes the palette and gives focus back to what had it.
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_, previous, _)) = self.palette.take() {
+            previous
+                .unwrap_or_else(|| self.focus_handle.clone())
+                .focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn palette_picked(&mut self, item: &PaletteItem, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_palette(window, cx);
+        match item {
+            // Dispatched where focus was, as if its key had been pressed there.
+            PaletteItem::Action { action, .. } => window.dispatch_action(action.boxed_clone(), cx),
+            PaletteItem::Command { name, run, .. } => {
+                if let Some(chat) = self.active.as_ref().and_then(|id| self.chats.get(id)) {
+                    chat.update(cx, |chat, cx| chat.run_command(name, *run, window, cx));
+                }
+            }
+            PaletteItem::Session { id, .. } => self.open_session(id.clone(), window, cx),
         }
     }
 
@@ -1484,6 +1601,7 @@ impl Render for Workspace {
             .project_dialog
             .as_ref()
             .map(|(dialog, _)| dialog.clone());
+        let palette = self.palette.as_ref().map(|(palette, _, _)| palette.clone());
         v_flex()
             .relative()
             .size_full()
@@ -1514,6 +1632,12 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenSkills, window, cx| {
                 this.toggle_main(Main::Skills, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
+                this.toggle_command_palette(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &GoToSession, window, cx| {
+                this.toggle_session_switcher(window, cx)
             }))
             .font(theme::theme_settings(cx).ui_font(cx).clone())
             .text_color(colors.text)
@@ -1634,6 +1758,25 @@ impl Render for Workspace {
                             }),
                         )
                         .child(dialog),
+                )
+            })
+            // Zed's modal layer: the palette near the top; a click elsewhere closes it.
+            .when_some(palette, |this, palette| {
+                this.child(
+                    div()
+                        .id("palette-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(64.))
+                        .occlude()
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|this, _, window, cx| this.close_palette(window, cx)),
+                        )
+                        .child(palette),
                 )
             })
     }
