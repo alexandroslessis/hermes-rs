@@ -117,7 +117,8 @@ impl ModelPicker {
                     TextAreaEvent::PastedImage(_)
                     | TextAreaEvent::PastedPaths(_)
                     | TextAreaEvent::HistoryPrev
-                    | TextAreaEvent::HistoryNext => {}
+                    | TextAreaEvent::HistoryNext
+                    | TextAreaEvent::MentionClicked(_) => {}
                 },
             ),
         ];

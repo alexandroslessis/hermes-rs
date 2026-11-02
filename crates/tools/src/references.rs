@@ -166,38 +166,49 @@ fn strip_wrappers(value: &str) -> &str {
 
 /// `parse_context_references`.
 pub fn parse(message: &str) -> Vec<Reference> {
+    spans(message).into_iter().map(|(_, r)| r).collect()
+}
+
+/// [`parse`] with where each reference sits in `message` (byte range of its `raw` token).
+pub fn spans(message: &str) -> Vec<(std::ops::Range<usize>, Reference)> {
     REFERENCE
         .captures_iter(message)
         .filter_map(Result::ok)
         .map(|captures| {
-            let whole = captures.get(0).map_or("", |m| m.as_str());
-            if let Some(simple) = captures.name("simple") {
-                return Reference {
-                    raw: whole.to_string(),
-                    kind: simple.as_str().to_string(),
-                    target: String::new(),
-                    line_start: None,
-                    line_end: None,
-                };
-            }
-            let kind = captures.name("kind").map_or("", |m| m.as_str()).to_string();
-            let raw_value = captures.name("value").map_or("", |m| m.as_str());
-            let value = strip_trailing_punctuation(raw_value);
-            let raw = whole[..whole.len() - (raw_value.len() - value.len())].to_string();
-            let (target, line_start, line_end) = if kind == "file" {
-                parse_file_value(value)
-            } else {
-                (strip_wrappers(value).to_string(), None, None)
-            };
-            Reference {
-                raw,
-                kind,
-                target,
-                line_start,
-                line_end,
-            }
+            let start = captures.get(0).map_or(0, |m| m.start());
+            let reference = reference_from(&captures);
+            (start..start + reference.raw.len(), reference)
         })
         .collect()
+}
+
+fn reference_from(captures: &fancy_regex::Captures<'_>) -> Reference {
+    let whole = captures.get(0).map_or("", |m| m.as_str());
+    if let Some(simple) = captures.name("simple") {
+        return Reference {
+            raw: whole.to_string(),
+            kind: simple.as_str().to_string(),
+            target: String::new(),
+            line_start: None,
+            line_end: None,
+        };
+    }
+    let kind = captures.name("kind").map_or("", |m| m.as_str()).to_string();
+    let raw_value = captures.name("value").map_or("", |m| m.as_str());
+    let value = strip_trailing_punctuation(raw_value);
+    let raw = whole[..whole.len() - (raw_value.len() - value.len())].to_string();
+    let (target, line_start, line_end) = if kind == "file" {
+        parse_file_value(value)
+    } else {
+        (strip_wrappers(value).to_string(), None, None)
+    };
+    Reference {
+        raw,
+        kind,
+        target,
+        line_start,
+        line_end,
+    }
 }
 
 fn parse_file_value(value: &str) -> (String, Option<usize>, Option<usize>) {

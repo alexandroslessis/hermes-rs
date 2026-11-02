@@ -1,7 +1,9 @@
 //! One session's conversation: the message list, the composer, and the running turn.
 //! Layout and card styling follow Zed's `agent_ui` thread view (GPL-3.0-or-later).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,10 +108,17 @@ pub struct ChatView {
     editing: Option<usize>,
     /// Skills matching a `/command` being typed: (name, short description).
     slash_matches: Vec<Suggestion>,
+    /// The suggestion Tab (or Enter) takes; ↑/↓ move it.
+    suggestion_selected: usize,
+    /// Commands, skills and bundles by name, for the composer's `/command` chips (filled when a
+    /// `/` is first typed): name → what clicking the chip opens.
+    known_commands: Rc<RefCell<HashMap<String, String>>>,
     /// Which earlier message ↑ recalled (0 = the latest), while the composer shows it.
     history_index: Option<usize>,
     /// Prompts waiting for the running turn to end (Hermes's `/queue`).
     queued: Vec<String>,
+    /// Whether the queue panel over the composer is unfolded.
+    queue_expanded: bool,
     /// Images waiting to go with the next message (pasted, dropped or picked).
     attachments: Vec<Arc<gpui::Image>>,
     /// Each running `delegate_task` call'"'"'s subagents and what they last started, by tool call id.
@@ -162,16 +171,33 @@ impl ChatView {
             .ok()
             .flatten()
             .map(|session| session.cwd);
-        let composer = cx.new(|cx| TextArea::new(COMPOSER_PLACEHOLDER, cx));
+        let known_commands: Rc<RefCell<HashMap<String, String>>> = Rc::default();
+        let composer = cx.new(|cx| {
+            TextArea::new(COMPOSER_PLACEHOLDER, cx)
+                .with_decorations(composer_decorations(known_commands.clone()))
+        });
         let subscription = cx.subscribe_in(
             &composer,
             window,
             |this: &mut Self, _, event, window, cx| match event {
-                TextAreaEvent::Submit => this.submit(window, cx),
+                TextAreaEvent::Submit => {
+                    if !this.enter_takes_suggestion(window, cx) {
+                        this.submit(window, cx)
+                    }
+                }
                 TextAreaEvent::PastedImage(image) => this.attach_bytes(image.bytes.clone(), cx),
                 TextAreaEvent::PastedPaths(paths) => this.attach_paths(paths.clone(), cx),
-                TextAreaEvent::HistoryPrev => this.step_history(true, cx),
-                TextAreaEvent::HistoryNext => this.step_history(false, cx),
+                TextAreaEvent::HistoryPrev => {
+                    if !this.move_suggestion(false, cx) {
+                        this.step_history(true, cx)
+                    }
+                }
+                TextAreaEvent::HistoryNext => {
+                    if !this.move_suggestion(true, cx) {
+                        this.step_history(false, cx)
+                    }
+                }
+                TextAreaEvent::MentionClicked(target) => this.open_mention(target, cx),
                 TextAreaEvent::Changed => {
                     // Typing over a recalled message leaves the history.
                     if let Some(index) = this.history_index {
@@ -205,9 +231,12 @@ impl ChatView {
             steering: None,
             editing: None,
             slash_matches: Vec::new(),
+            suggestion_selected: 0,
+            known_commands,
             file_index: None,
             attachments: Vec::new(),
             queued: Vec::new(),
+            queue_expanded: true,
             history_index: None,
             message_images: HashMap::new(),
             subagent_progress: HashMap::new(),
@@ -673,47 +702,233 @@ impl ChatView {
         })
     }
 
-    /// The queued prompts over the composer, each removable.
+    /// Takes a waiting message out of the queue (or withdraws the undelivered steer).
+    fn take_pending(&mut self, entry: PendingEntry, cx: &mut Context<Self>) -> Option<String> {
+        match entry {
+            PendingEntry::Steer => {
+                let text = self.steering.take()?;
+                backend(cx).runtime.set_steer(&self.session_id, None);
+                Some(text)
+            }
+            PendingEntry::Queued(index) => {
+                (index < self.queued.len()).then(|| self.queued.remove(index))
+            }
+        }
+    }
+
+    /// Zed's Edit: the message goes back into the composer to be changed and sent again.
+    fn edit_pending(&mut self, entry: PendingEntry, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.take_pending(entry, cx) else {
+            return;
+        };
+        self.composer.update(cx, |composer, cx| {
+            let current = composer.text().trim().to_string();
+            let merged = if current.is_empty() {
+                text
+            } else {
+                format!("{text}\n{current}")
+            };
+            composer.set_text(merged, cx);
+        });
+        self.composer.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    /// Zed's Steer toggle: a queued message is delivered after the running tool call instead of
+    /// after the turn, or the other way round.
+    fn toggle_steer(&mut self, entry: PendingEntry, cx: &mut Context<Self>) {
+        match entry {
+            PendingEntry::Steer => {
+                if let Some(text) = self.take_pending(entry, cx) {
+                    self.queued.insert(0, text);
+                }
+            }
+            PendingEntry::Queued(index) => {
+                let Some(text) = self.queued.get(index).cloned() else {
+                    return;
+                };
+                if backend(cx).runtime.steer(&self.session_id, &text) {
+                    self.queued.remove(index);
+                    self.steering = Some(match self.steering.take() {
+                        Some(earlier) => format!("{earlier}\n\n{text}"),
+                        None => text,
+                    });
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Zed's Send Now: stops the running turn and sends this message instead.
+    fn send_pending_now(&mut self, entry: PendingEntry, cx: &mut Context<Self>) {
+        let Some(text) = self.take_pending(entry, cx) else {
+            return;
+        };
+        if self.running.is_some() {
+            self.next_message = Some(text);
+            self.stop(cx);
+        } else {
+            self.begin(Some(text), cx);
+        }
+        cx.notify();
+    }
+
+    /// Zed's message queue over the composer: a summary that folds the list, then each waiting
+    /// message (the undelivered steer first) with Remove, Edit, Steer and Send Now.
     fn render_queue(&self, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
+        let entries: Vec<(PendingEntry, String)> = self
+            .steering
+            .iter()
+            .map(|text| (PendingEntry::Steer, text.clone()))
+            .chain(
+                self.queued
+                    .iter()
+                    .enumerate()
+                    .map(|(index, text)| (PendingEntry::Queued(index), text.clone())),
+            )
+            .collect();
+        let count = entries.len();
+        let title = if count == 1 {
+            "1 Queued Message".to_string()
+        } else {
+            format!("{count} Queued Messages")
+        };
         v_flex()
-            .gap_0p5()
-            .children(self.queued.iter().enumerate().map(|(index, text)| {
-                let line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            .w_full()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.editor_background)
+            .overflow_hidden()
+            .child(
                 h_flex()
-                    .gap_2()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(colors.element_background)
+                    .p_1()
+                    .w_full()
+                    .gap_1()
+                    .justify_between()
+                    .when(self.queue_expanded, |this| {
+                        this.border_b_1().border_color(colors.border)
+                    })
                     .child(
-                        Icon::new(IconName::QueueMessage)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
+                        h_flex()
+                            .id("queue_summary")
+                            .gap_1()
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(colors.ghost_element_hover))
+                            .child(Disclosure::new("queue_disclosure", self.queue_expanded))
+                            .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.queue_expanded = !this.queue_expanded;
+                                cx.notify();
+                            })),
                     )
                     .child(
-                        div().flex_1().min_w_0().child(
-                            Label::new(format!("Queued {}: {line}", index + 1))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .truncate(),
-                        ),
-                    )
-                    .child(
-                        IconButton::new(
-                            SharedString::from(format!("unqueue-{index}")),
-                            IconName::Close,
-                        )
-                        .icon_size(IconSize::XSmall)
-                        .icon_color(Color::Muted)
-                        .tooltip(Tooltip::text("Remove from Queue"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if index < this.queued.len() {
-                                this.queued.remove(index);
-                            }
-                            cx.notify();
+                        Button::new("clear_queue", "Clear All")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.queued.clear();
+                                this.take_pending(PendingEntry::Steer, cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when(self.queue_expanded, |this| {
+                this.child(
+                    v_flex()
+                        .id("message_queue_list")
+                        .max_h_40()
+                        .overflow_y_scroll()
+                        .children(entries.into_iter().enumerate().map(|(row, (entry, text))| {
+                            let is_next = row == 0;
+                            let steer_on = entry == PendingEntry::Steer;
+                            let line: String =
+                                text.split_whitespace().collect::<Vec<_>>().join(" ");
+                            let (icon_color, tooltip) = if steer_on {
+                                (Color::Accent, "Delivered after the running tool call")
+                            } else if is_next {
+                                (Color::Accent, "Next in Queue")
+                            } else {
+                                (Color::Muted, "In Queue")
+                            };
+                            h_flex()
+                                .group("queue_entry")
+                                .w_full()
+                                .p_1p5()
+                                .gap_1()
+                                .when(row + 1 < count, |this| {
+                                    this.border_b_1().border_color(colors.border_variant)
+                                })
+                                .child(
+                                    div()
+                                        .id(("next_in_queue", row))
+                                        .flex_none()
+                                        .child(
+                                            Icon::new(IconName::Circle)
+                                                .size(IconSize::Small)
+                                                .color(icon_color),
+                                        )
+                                        .tooltip(Tooltip::text(tooltip)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(Label::new(line).size(LabelSize::Small).truncate()),
+                                )
+                                .child(
+                                    h_flex()
+                                        .when(!is_next, |this| this.visible_on_hover("queue_entry"))
+                                        .gap_1()
+                                        .flex_none()
+                                        .child(
+                                            IconButton::new(("delete", row), IconName::Trash)
+                                                .icon_size(IconSize::Small)
+                                                .tooltip(Tooltip::text("Remove Message from Queue"))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.take_pending(entry, cx);
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            IconButton::new(("edit", row), IconName::Pencil)
+                                                .icon_size(IconSize::Small)
+                                                .tooltip(Tooltip::text("Edit"))
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.edit_pending(entry, window, cx)
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new(("steer", row), "Steer")
+                                                .label_size(LabelSize::Small)
+                                                .toggle_state(steer_on)
+                                                .selected_style(ButtonStyle::Tinted(
+                                                    TintColor::Accent,
+                                                ))
+                                                .disabled(self.running.is_none())
+                                                .tooltip(Tooltip::text(
+                                                    "Deliver this message right after the agent's current tool call. When off, it waits for the turn to finish.",
+                                                ))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.toggle_steer(entry, cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new(("send_now", row), "Send Now")
+                                                .label_size(LabelSize::Small)
+                                                .style(ButtonStyle::Outlined)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.send_pending_now(entry, cx)
+                                                })),
+                                        ),
+                                )
                         })),
-                    )
-            }))
+                )
+            })
     }
 
     pub fn start_turn(&mut self, text: String, _window: &mut Window, cx: &mut Context<Self>) {
@@ -848,18 +1063,49 @@ impl ChatView {
         if !token.starts_with('@') {
             return None;
         }
-        let complete = |reference: String| Suggestion {
-            label: reference.clone(),
-            description: String::new(),
-            text: format!("{before}{reference} "),
-        };
-        let (kind, partial) = match token.split_once(':') {
-            Some((kind @ ("@file" | "@folder"), partial)) => (kind, partial),
+        // `@file:x` / `@folder:x` look among that kind; a bare `@x` among folders, then files,
+        // then Hermes's other reference kinds.
+        let (only, partial) = match token.split_once(':') {
+            Some(("@file", partial)) => (Some(false), partial),
+            Some(("@folder", partial)) => (Some(true), partial),
             Some(_) => return Some(Vec::new()),
-            None => {
-                let kinds = MENTION_KINDS
+            None => (None, &token[1..]),
+        };
+        let query = partial.trim_start_matches(['`', '"', '\'']).to_lowercase();
+        let mut suggestions: Vec<Suggestion> = match self.cwd.clone() {
+            Some(cwd) => {
+                let index = self.file_index.get_or_insert_with(|| {
+                    hermes_tools::references::workspace_entries(std::path::Path::new(&cwd), 20_000)
+                });
+                rank_entries(index, &query, only)
+                    .into_iter()
+                    .take(10)
+                    .map(|(path, is_dir)| {
+                        let kind = if is_dir { "@folder" } else { "@file" };
+                        Suggestion {
+                            label: path.clone(),
+                            description: String::new(),
+                            text: format!(
+                                "{before}{kind}:{} ",
+                                hermes_tools::references::format_value(&path)
+                            ),
+                            icon: Some(if is_dir {
+                                IconName::Folder
+                            } else {
+                                IconName::File
+                            }),
+                        }
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        if only.is_none() {
+            suggestions.extend(
+                MENTION_KINDS
                     .iter()
-                    .filter(|(name, _)| name.starts_with(token))
+                    .filter(|(name, _)| !matches!(*name, "@file:" | "@folder:"))
+                    .filter(|(name, _)| name[1..].starts_with(&query))
                     .map(|(name, description)| Suggestion {
                         label: name.to_string(),
                         description: description.to_string(),
@@ -868,47 +1114,104 @@ impl ChatView {
                         } else {
                             format!("{before}{name} ")
                         },
-                    })
-                    .collect();
-                return Some(kinds);
-            }
-        };
-        let cwd = self.cwd.clone()?;
-        let index = self.file_index.get_or_insert_with(|| {
-            hermes_tools::references::workspace_entries(std::path::Path::new(&cwd), 20_000)
-        });
-        let query = partial.trim_start_matches(['`', '"', '\'']).to_lowercase();
-        let folders = kind == "@folder";
-        let mut matches: Vec<(u8, &String)> = index
-            .iter()
-            .filter(|(_, is_dir)| *is_dir == folders)
-            .filter_map(|(path, _)| {
-                let lower = path.to_lowercase();
-                let name = lower.rsplit('/').next().unwrap_or(&lower);
-                if query.is_empty() || name.starts_with(&query) {
-                    Some((0, path))
-                } else if lower.contains(&query) {
-                    Some((1, path))
-                } else {
-                    None
+                        icon: Some(IconName::AtSign),
+                    }),
+            );
+        }
+        Some(suggestions)
+    }
+
+    /// Opens what a composer chip names: a file or folder with Windows, a skill's SKILL.md.
+    fn open_mention(&mut self, target: &str, cx: &mut Context<Self>) {
+        let path = match target.split_once(':') {
+            Some(("file" | "folder", path)) => {
+                let path = std::path::PathBuf::from(path);
+                match &self.cwd {
+                    Some(cwd) if path.is_relative() => std::path::Path::new(cwd).join(path),
+                    _ => path,
                 }
-            })
-            .collect();
-        matches.sort_by_key(|(rank, path)| (*rank, path.len()));
-        Some(
-            matches
-                .into_iter()
-                .take(8)
-                .map(|(_, path)| {
-                    let mut suggestion = complete(format!(
-                        "{kind}:{}",
-                        hermes_tools::references::format_value(path)
-                    ));
-                    suggestion.label = format!("{kind}:{path}");
-                    suggestion
-                })
-                .collect(),
-        )
+            }
+            Some(("skill", name)) => match backend(cx).runtime.skills().find(name) {
+                Some(skill) => skill.skill_md(),
+                None => return,
+            },
+            _ => return,
+        };
+        if path.exists() {
+            cx.open_with_system(&path);
+        } else {
+            self.error = Some(format!("{} doesn't exist", path.display()));
+            cx.notify();
+        }
+    }
+
+    /// Tab (or Enter on an `@` mention): the highlighted suggestion goes into the composer.
+    fn accept_suggestion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(suggestion) = self.slash_matches.get(self.suggestion_selected).cloned() else {
+            return;
+        };
+        self.composer.update(cx, |composer, cx| {
+            let len = composer.text().len();
+            composer.replace_range(0..len, &suggestion.text, cx);
+        });
+        self.composer.focus_handle(cx).focus(window, cx);
+        // A kind like `@file:` opens the next list; anything finished closes it.
+        self.update_slash_matches(cx);
+        if suggestion.text.ends_with(' ') {
+            self.slash_matches.clear();
+        }
+        cx.notify();
+    }
+
+    /// Keys while suggestions show: ↑/↓ pick, Tab takes, Escape closes; Enter takes an `@`
+    /// mention or an unfinished command (a finished one is sent as typed).
+    fn suggestion_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Up, Down and Enter are the text area's own bindings, which run before key listeners;
+        // they arrive as its HistoryPrev / HistoryNext / Submit events instead.
+        if self.slash_matches.is_empty() || event.keystroke.modifiers.modified() {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "tab" => self.accept_suggestion(window, cx),
+            "escape" => self.slash_matches.clear(),
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// ↑ / ↓ while suggestions show: the highlight moves (wrapping). `false` when none show.
+    fn move_suggestion(&mut self, down: bool, cx: &mut Context<Self>) -> bool {
+        let count = self.slash_matches.len();
+        if count == 0 {
+            return false;
+        }
+        self.suggestion_selected = if down {
+            (self.suggestion_selected + 1) % count
+        } else {
+            (self.suggestion_selected + count - 1) % count
+        };
+        cx.notify();
+        true
+    }
+
+    /// Enter while suggestions show takes the highlighted one, except on a finished command
+    /// (`/usage` typed in full is sent). `false` when Enter should send.
+    fn enter_takes_suggestion(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(chosen) = self.slash_matches.get(self.suggestion_selected) else {
+            return false;
+        };
+        let text = self.composer.read(cx).text().trim().to_string();
+        if text.starts_with('/') && chosen.label == text {
+            return false;
+        }
+        self.accept_suggestion(window, cx);
+        true
     }
 
     /// While the composer holds a bare `/word`, the skills whose name contains it.
@@ -921,11 +1224,25 @@ impl ChatView {
         if let Some(mentions) = self.mention_matches(&text) {
             if mentions != self.slash_matches {
                 self.slash_matches = mentions;
+                self.suggestion_selected = 0;
                 cx.notify();
             }
             return;
         }
         self.file_index = None;
+        if text.starts_with('/') && self.known_commands.borrow().is_empty() {
+            let skills = backend(cx).runtime.skills();
+            let mut known = self.known_commands.borrow_mut();
+            for (name, _) in BUILTIN_COMMANDS {
+                known.insert(name.to_string(), format!("command:{name}"));
+            }
+            for bundle in skills.bundles() {
+                known.insert(bundle.slug.clone(), format!("bundle:{}", bundle.slug));
+            }
+            for skill in skills.catalog() {
+                known.insert(skill.name.clone(), format!("skill:{}", skill.name));
+            }
+        }
         let matches: Vec<Suggestion> = match query {
             Some(query) => BUILTIN_COMMANDS
                 .iter()
@@ -959,12 +1276,14 @@ impl ChatView {
                     label: format!("/{name}"),
                     description,
                     text: format!("/{name} "),
+                    icon: None,
                 })
                 .collect(),
             None => Vec::new(),
         };
         if matches != self.slash_matches {
             self.slash_matches = matches;
+            self.suggestion_selected = 0;
             cx.notify();
         }
     }
@@ -3557,6 +3876,7 @@ impl ChatView {
             .py_2()
             .bg(colors.editor_background)
             .justify_center()
+            .capture_key_down(cx.listener(Self::suggestion_key))
             .when(has_messages, |this| {
                 this.border_t_1().border_color(colors.border)
             })
@@ -3573,40 +3893,59 @@ impl ChatView {
                     .min_w_0()
                     .px_2()
                     .gap_2()
-                    .when(!self.queued.is_empty(), |this| {
+                    .when(!self.queued.is_empty() || self.steering.is_some(), |this| {
                         this.child(self.render_queue(cx))
                     })
                     .when(!self.attachments.is_empty(), |this| {
                         this.child(self.render_attachments(cx))
                     })
                     .children((!self.slash_matches.is_empty()).then(|| {
-                        v_flex().children(self.slash_matches.iter().map(|suggestion| {
-                            let command = suggestion.text.clone();
-                            h_flex()
-                                .id(SharedString::from(format!(
-                                    "suggestion-{}",
-                                    suggestion.label
-                                )))
-                                .gap_2()
-                                .px_1()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(colors.ghost_element_hover))
-                                .child(Label::new(suggestion.label.clone()).size(LabelSize::Small))
-                                .child(
-                                    Label::new(suggestion.description.clone())
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .truncate(),
-                                )
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.composer
-                                        .update(cx, |c, cx| c.set_text(command.clone(), cx));
-                                    this.composer.focus_handle(cx).focus(window, cx);
-                                    this.slash_matches.clear();
-                                    cx.notify();
-                                }))
-                        }))
+                        v_flex().children(self.slash_matches.iter().enumerate().map(
+                            |(index, suggestion)| {
+                                let selected = index == self.suggestion_selected;
+                                h_flex()
+                                    .id(SharedString::from(format!(
+                                        "suggestion-{}",
+                                        suggestion.label
+                                    )))
+                                    .gap_2()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .when(selected, |this| {
+                                        this.bg(colors.ghost_element_selected)
+                                    })
+                                    .hover(|style| style.bg(colors.ghost_element_hover))
+                                    .when_some(suggestion.icon, |this, icon| {
+                                        this.child(
+                                            Icon::new(icon)
+                                                .size(IconSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                    })
+                                    .child(
+                                        Label::new(suggestion.label.clone())
+                                            .size(LabelSize::Small),
+                                    )
+                                    .child(
+                                        Label::new(suggestion.description.clone())
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    )
+                                    .when(selected, |this| {
+                                        this.child(div().flex_1()).child(
+                                            Label::new("Tab")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.suggestion_selected = index;
+                                        this.accept_suggestion(window, cx);
+                                    }))
+                            },
+                        ))
                     }))
                     .when(self.editing.is_some(), |this| {
                         this.child(
@@ -3635,23 +3974,6 @@ impl ChatView {
                                             this.composer.update(cx, |c, cx| c.set_text("", cx));
                                             cx.notify();
                                         })),
-                                ),
-                        )
-                    })
-                    .when_some(self.steering.clone(), |this, steering| {
-                        this.child(
-                            h_flex()
-                                .gap_1()
-                                .child(
-                                    Icon::new(IconName::QueueMessage)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Accent),
-                                )
-                                .child(
-                                    Label::new(format!("Steering: {steering}"))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .truncate(),
                                 ),
                         )
                     })
@@ -3957,6 +4279,36 @@ fn shimmer(id: SharedString, text: &'static str, cx: &App) -> AnyElement {
 }
 
 /// The argument of a built-in slash command (`/name arg`), or `None` when `text` isn't one.
+/// How the composer styles what's typed: `code` and "quotes" as markdown would, and `@file:` /
+/// `@folder:` references and a finished `/command` as chips that open what they name.
+fn composer_decorations(known: Rc<RefCell<HashMap<String, String>>>) -> crate::text_area::Decorate {
+    use crate::text_area::{Span, SpanKind};
+    Rc::new(move |text: &str| {
+        let mut spans = crate::text_area::markdown_spans(text);
+        for (range, reference) in hermes_tools::references::spans(text) {
+            let target = match reference.kind.as_str() {
+                "file" | "folder" => format!("{}:{}", reference.kind, reference.target),
+                kind => format!("ref:{kind}"),
+            };
+            spans.push(Span {
+                range,
+                kind: SpanKind::Mention(target),
+            });
+        }
+        if let Some(rest) = text.strip_prefix('/') {
+            if let Some(len) = rest.find(char::is_whitespace) {
+                if let Some(target) = known.borrow().get(&rest[..len]) {
+                    spans.push(Span {
+                        range: 0..len + 1,
+                        kind: SpanKind::Mention(target.clone()),
+                    });
+                }
+            }
+        }
+        spans
+    })
+}
+
 /// Where `query` (already lowercase) occurs in `text`, ignoring ASCII case, as byte ranges.
 fn find_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
     if query.is_empty() {
@@ -4050,6 +4402,47 @@ struct Suggestion {
     label: String,
     description: String,
     text: String,
+    icon: Option<IconName>,
+}
+
+/// The project's entries for an `@` mention, best first: the name starting with what's typed,
+/// then containing it, then the path containing it, then its letters in order; folders before
+/// files, then shallower and shorter paths. `only` keeps folders (true) or files (false).
+fn rank_entries(entries: &[(String, bool)], query: &str, only: Option<bool>) -> Vec<(String, bool)> {
+    let mut ranked: Vec<(u8, bool, usize, usize, &String)> = entries
+        .iter()
+        .filter(|(_, is_dir)| only.is_none_or(|folders| *is_dir == folders))
+        .filter_map(|(path, is_dir)| {
+            let lower = path.to_lowercase();
+            let name = lower.rsplit('/').next().unwrap_or(&lower);
+            let rank = if query.is_empty() || name.starts_with(query) {
+                0
+            } else if name.contains(query) {
+                1
+            } else if lower.contains(query) {
+                2
+            } else if fuzzy_subsequence(&lower, query) {
+                3
+            } else {
+                return None;
+            };
+            let depth = path.matches('/').count();
+            // Shorter paths are closer matches; with nothing typed, the list is alphabetical.
+            let len = if query.is_empty() { 0 } else { path.len() };
+            Some((rank, !*is_dir, depth, len, path))
+        })
+        .collect();
+    ranked.sort();
+    ranked
+        .into_iter()
+        .map(|(_, is_file, _, _, path)| (path.clone(), !is_file))
+        .collect()
+}
+
+/// Whether `query`'s characters appear in `text` in order.
+fn fuzzy_subsequence(text: &str, query: &str) -> bool {
+    let mut chars = text.chars();
+    query.chars().all(|q| chars.any(|c| c == q))
 }
 
 /// `queue.usage`.
@@ -4094,4 +4487,66 @@ fn image_format(bytes: &[u8]) -> Option<gpui::ImageFormat> {
     } else {
         return None;
     })
+}
+
+/// A message waiting over the composer: the undelivered steer, or a queued prompt by index.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingEntry {
+    Steer,
+    Queued(usize),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mentions_list_folders_first_then_better_matches() {
+        let entries: Vec<(String, bool)> = [
+            ("src", true),
+            ("src/main.rs", false),
+            ("docs", true),
+            ("docs/main-notes.md", false),
+            ("README.md", false),
+            ("src/maintenance", true),
+        ]
+        .into_iter()
+        .map(|(p, d)| (p.to_string(), d))
+        .collect();
+        // Nothing typed: folders, shallow first, then files.
+        let all = rank_entries(&entries, "", None);
+        assert_eq!(all[0], ("docs".to_string(), true));
+        assert_eq!(all[1], ("src".to_string(), true));
+        assert!(all.iter().position(|e| !e.1).unwrap() > 2);
+        // "main": names starting with it, the folder first.
+        let main = rank_entries(&entries, "main", None);
+        assert_eq!(main[0], ("src/maintenance".to_string(), true));
+        assert_eq!(main[1], ("src/main.rs".to_string(), false));
+        // Letters in order still find it.
+        assert!(rank_entries(&entries, "rdme", Some(false))
+            .iter()
+            .any(|e| e.0 == "README.md"));
+    }
+
+    #[test]
+    fn the_composer_styles_code_quotes_and_references() {
+        use crate::text_area::SpanKind;
+        let known: Rc<RefCell<HashMap<String, String>>> = Rc::default();
+        known
+            .borrow_mut()
+            .insert("usage".into(), "command:usage".into());
+        let decorate = composer_decorations(known);
+        let text = "/usage then `cargo test` on \"x y\" and @file:src/main.rs";
+        let kinds: Vec<(String, SpanKind)> = decorate(text)
+            .into_iter()
+            .map(|s| (text[s.range].to_string(), s.kind))
+            .collect();
+        assert!(kinds.contains(&("`cargo test`".into(), SpanKind::Code)));
+        assert!(kinds.contains(&("\"x y\"".into(), SpanKind::Quote)));
+        assert!(kinds.contains(&(
+            "@file:src/main.rs".into(),
+            SpanKind::Mention("file:src/main.rs".into())
+        )));
+        assert!(kinds.contains(&("/usage".into(), SpanKind::Mention("command:usage".into()))));
+    }
 }

@@ -250,6 +250,7 @@ impl Render for ReviewPane {
             None => "".into(),
         };
         let revertible = source == Some(ChangesSource::Session);
+        let has_note = note.is_some();
         v_flex()
             .size_full()
             .bg(colors.panel_background)
@@ -314,7 +315,7 @@ impl Render for ReviewPane {
                         this.child(Label::new(note).size(LabelSize::Small).color(Color::Muted))
                     })
                     .when(
-                        self.changes.is_some() && files.is_empty() && self.error.is_none(),
+                        self.changes.is_some() && files.is_empty() && self.error.is_none() && !has_note,
                         |this| {
                             this.child(
                                 Label::new("No changes.")

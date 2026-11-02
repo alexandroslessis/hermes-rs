@@ -1356,6 +1356,21 @@ impl Runtime {
         true
     }
 
+    /// Replaces the running turn's undelivered steer (`None` withdraws it). `false` when no turn
+    /// is running.
+    pub fn set_steer(&self, session_id: &str, text: Option<&str>) -> bool {
+        let state = self
+            .sessions
+            .lock()
+            .get(session_id)
+            .and_then(|open| open.turn_state.lock().clone());
+        let Some(state) = state else {
+            return false;
+        };
+        state.lock().pending_steer = text.map(str::to_string);
+        true
+    }
+
     pub fn cancel(&self, session_id: &str) {
         if let Some(open) = self.sessions.lock().get(session_id) {
             if let Some(cancel) = open.running.lock().as_ref() {

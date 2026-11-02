@@ -92,6 +92,64 @@ pub enum TextAreaEvent {
     /// Up on the first line / Down on the last: the owner may step through earlier input.
     HistoryPrev,
     HistoryNext,
+    /// A mention chip was clicked; carries the span's target.
+    MentionClicked(String),
+}
+
+/// How a stretch of the text is drawn (markdown-ish, as the owner decides).
+#[derive(Clone, Debug, PartialEq)]
+pub enum SpanKind {
+    /// `code`: the code font on a tinted background.
+    Code,
+    /// "quoted": the theme's string color.
+    Quote,
+    /// A file, folder or skill reference: drawn as a chip; clicking it reports the target.
+    Mention(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Span {
+    pub range: Range<usize>,
+    pub kind: SpanKind,
+}
+
+/// Finds the spans to style in the text.
+pub type Decorate = Rc<dyn Fn(&str) -> Vec<Span>>;
+
+/// Inline `code` and "quoted" spans, as markdown would show them.
+pub fn markdown_spans(text: &str) -> Vec<Span> {
+    let mut spans = Vec::new();
+    for (delimiter, kind) in [('`', SpanKind::Code), ('"', SpanKind::Quote)] {
+        let mut open: Option<usize> = None;
+        for (index, c) in text.char_indices() {
+            if c == '\n' {
+                open = None;
+            } else if c == delimiter {
+                match open.take() {
+                    Some(start) if index > start + 1 => spans.push(Span {
+                        range: start..index + 1,
+                        kind: kind.clone(),
+                    }),
+                    Some(_) => {}
+                    None => open = Some(index),
+                }
+            }
+        }
+    }
+    spans
+}
+
+/// Spans sorted by start, with any span overlapping an earlier one dropped.
+fn non_overlapping(mut spans: Vec<Span>, len: usize) -> Vec<Span> {
+    spans.retain(|s| s.range.start < s.range.end && s.range.end <= len);
+    spans.sort_by_key(|s| (s.range.start, std::cmp::Reverse(s.range.end)));
+    let mut kept: Vec<Span> = Vec::new();
+    for span in spans {
+        if kept.last().is_none_or(|last| span.range.start >= last.range.end) {
+            kept.push(span);
+        }
+    }
+    kept
 }
 
 struct LayoutLine {
@@ -171,6 +229,8 @@ pub struct TextArea {
     blink_epoch: usize,
     blinking: bool,
     last_caret: Option<(usize, usize)>,
+    /// Styles stretches of the text (code, quotes, mention chips).
+    decorate: Option<Decorate>,
 }
 
 /// Zed's `CURSOR_BLINK_INTERVAL`.
@@ -198,6 +258,7 @@ impl TextArea {
             blink_epoch: 0,
             blinking: false,
             last_caret: None,
+            decorate: None,
         }
     }
 
@@ -264,6 +325,35 @@ impl TextArea {
     }
 
     /// A one-line field: Enter submits, long text scrolls instead of growing.
+    /// Styles stretches of the text with `decorate` (re-run whenever the text is drawn).
+    pub fn with_decorations(mut self, decorate: Decorate) -> Self {
+        self.decorate = Some(decorate);
+        self
+    }
+
+    /// The styled spans of the current text, sorted and non-overlapping.
+    fn spans(&self) -> Vec<Span> {
+        match &self.decorate {
+            Some(decorate) if !self.content.is_empty() => {
+                non_overlapping(decorate(&self.content), self.content.len())
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Replaces `range` with `text` and puts the caret after it (completions).
+    pub fn replace_range(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        let range = self.clamp(range.start)..self.clamp(range.end);
+        self.content.replace_range(range.clone(), text);
+        let caret = range.start + text.len();
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        cx.emit(TextAreaEvent::Changed);
+        cx.notify();
+    }
+
+
     pub fn single_line(mut self) -> Self {
         self.max_lines = 1;
         self
@@ -608,9 +698,16 @@ impl TextArea {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.is_selecting = true;
         self.goal_x = None;
         let index = self.index_for_mouse_position(event.position);
+        // A plain click on a mention chip opens what it names.
+        if event.click_count == 1 && !event.modifiers.shift {
+            if let Some(target) = self.mention_at(event.position) {
+                cx.emit(TextAreaEvent::MentionClicked(target));
+                return;
+            }
+        }
+        self.is_selecting = true;
         if event.modifiers.shift {
             self.select_to(index, window, cx);
         } else if event.click_count == 2 {
@@ -621,6 +718,22 @@ impl TextArea {
         } else {
             self.move_to(index, window, cx);
         }
+    }
+
+    /// The mention chip under `position`, if any (its drawn bounds, not just the nearest index).
+    fn mention_at(&self, position: Point<Pixels>) -> Option<String> {
+        let bounds = self.last_bounds?;
+        let origin = point(bounds.left(), bounds.top() - self.scroll_top);
+        let layout = self.layout.borrow();
+        self.spans().into_iter().find_map(|span| {
+            let SpanKind::Mention(target) = span.kind else {
+                return None;
+            };
+            chip_bounds(&layout, &span.range, origin)
+                .iter()
+                .any(|b| b.contains(&position))
+                .then_some(target)
+        })
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
@@ -804,6 +917,8 @@ struct TextAreaElement {
 struct PrepaintState {
     selections: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
+    /// Mention chips: their background and the hitbox that shows a pointer over them.
+    chips: Vec<(PaintQuad, gpui::Hitbox)>,
 }
 
 impl IntoElement for TextAreaElement {
@@ -812,6 +927,69 @@ impl IntoElement for TextAreaElement {
     fn into_element(self) -> Self::Element {
         self
     }
+}
+
+/// Where a mention chip is drawn: its text's box, padded a little (only when it fits one row).
+fn chip_bounds(layout: &TextLayout, range: &Range<usize>, origin: Point<Pixels>) -> Vec<Bounds<Pixels>> {
+    let start = layout.position_for_index(range.start);
+    let end = layout.position_for_index(range.end);
+    if start.y != end.y || end.x <= start.x {
+        return Vec::new();
+    }
+    vec![Bounds::from_corners(
+        origin + point(start.x - px(2.), start.y + px(1.)),
+        origin + point(end.x + px(2.), end.y + layout.line_height - px(1.)),
+    )]
+}
+
+/// The text's runs with the spans styled: code in the code font on a tint, quotes in the
+/// string color, mentions in the accent color (their chip is painted separately).
+fn styled_runs(text_len: usize, spans: &[Span], base: TextRun, cx: &App) -> Vec<TextRun> {
+    let colors = cx.theme().colors();
+    let quote = cx
+        .theme()
+        .syntax()
+        .style_for_name("string")
+        .and_then(|style| style.color)
+        .unwrap_or(colors.text_accent);
+    let code_font = theme::theme_settings(cx).buffer_font(cx).clone();
+    let mut runs = Vec::new();
+    let mut at = 0;
+    for span in spans {
+        if span.range.start > at {
+            runs.push(TextRun {
+                len: span.range.start - at,
+                ..base.clone()
+            });
+        }
+        let len = span.range.end - span.range.start;
+        runs.push(match &span.kind {
+            SpanKind::Code => TextRun {
+                len,
+                font: code_font.clone(),
+                background_color: Some(colors.editor_foreground.opacity(0.08)),
+                ..base.clone()
+            },
+            SpanKind::Quote => TextRun {
+                len,
+                color: quote,
+                ..base.clone()
+            },
+            SpanKind::Mention(_) => TextRun {
+                len,
+                color: colors.text_accent,
+                ..base.clone()
+            },
+        });
+        at = span.range.end;
+    }
+    if text_len > at {
+        runs.push(TextRun {
+            len: text_len - at,
+            ..base
+        });
+    }
+    runs
 }
 
 fn runs_for(text_len: usize, marked: Option<&Range<usize>>, run: TextRun) -> Vec<TextRun> {
@@ -883,8 +1061,11 @@ impl Element for TextAreaElement {
         };
         let runs = if input.content.is_empty() {
             vec![run]
-        } else {
+        } else if input.marked_range.is_some() {
+            // Composing with an IME: its underline, nothing else.
             runs_for(text.len(), input.marked_range.as_ref(), run)
+        } else {
+            styled_runs(text.len(), &input.spans(), run, cx)
         };
         let shared = input.layout.clone();
         let max_height = line_height * input.max_lines as f32;
@@ -1003,8 +1184,22 @@ impl Element for TextAreaElement {
                 player.cursor,
             )
         });
-        let _ = window;
-        PrepaintState { selections, cursor }
+        let chip_color = cx.theme().colors().element_selected;
+        let spans = self.input.read(cx).spans();
+        let chips = spans
+            .iter()
+            .filter(|span| matches!(span.kind, SpanKind::Mention(_)))
+            .flat_map(|span| chip_bounds(&layout, &span.range, origin))
+            .map(|chip| {
+                let hitbox = window.insert_hitbox(chip, gpui::HitboxBehavior::Normal);
+                (fill(chip, chip_color).corner_radii(px(4.)), hitbox)
+            })
+            .collect();
+        PrepaintState {
+            selections,
+            cursor,
+            chips,
+        }
     }
 
     fn paint(
@@ -1046,6 +1241,10 @@ impl Element for TextAreaElement {
             cx,
         );
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            for (chip, hitbox) in prepaint.chips.drain(..) {
+                window.paint_quad(chip);
+                window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
+            }
             for selection in prepaint.selections.drain(..) {
                 window.paint_quad(selection);
             }
@@ -1072,7 +1271,10 @@ impl Element for TextAreaElement {
 
 impl Render for TextArea {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let focus = self.focus_handle.clone();
+        let has_selection = !self.selected_range.is_empty();
+        let has_text = !self.content.is_empty();
+        let field = div()
             .id("text-area")
             .w_full()
             .key_context(CONTEXT)
@@ -1107,7 +1309,21 @@ impl Render for TextArea {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll(cx.listener(Self::on_scroll))
-            .child(TextAreaElement { input: cx.entity() })
+            .child(TextAreaElement { input: cx.entity() });
+        // Zed's editor menu: the clipboard actions, run on this field.
+        ui::right_click_menu("text-area-menu")
+            .trigger(move |_, _, _| field)
+            .menu(move |window, cx| {
+                let focus = focus.clone();
+                ui::ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.context(focus)
+                        .action_disabled_when(!has_selection, "Cut", Box::new(Cut))
+                        .action_disabled_when(!has_selection, "Copy", Box::new(Copy))
+                        .action("Paste", Box::new(Paste))
+                        .separator()
+                        .action_disabled_when(!has_text, "Select All", Box::new(SelectAll))
+                })
+            })
     }
 }
 
