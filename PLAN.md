@@ -519,8 +519,48 @@ M5 part 9 status (2026-11-01): queue and auxiliary model routing, done. M5 compl
   MCP, skills hub, …), the auto chain (`free_only`, OpenRouter fallback), per-task timeouts and
   extra_body, the compact-digest replay for a non-main review model.
 
+v1 gaps status (2026-11-02): closed before M6, each live-checked in the app or on Ollama
+`qwen3.5:9b`.
+- Sidebar: search (FTS over titles and messages), rename, pin (schema v4 `pinned`), delete from a
+  right-click menu. Composer: ↑/↓ message history, dropped files become `@` references.
+- `/undo [N]`, `/usage` (tokens, cost, context breakdown), `/insights [--days N]`.
+- Session titles from a model (Hermes's title prompt, the Session titles aux model). Tabs for
+  open sessions (Ctrl+T, Ctrl+W, Ctrl+Tab, Ctrl+Shift+Tab).
+- The threat scan (`_scan_context_content`) on startup context files and subdirectory hints.
+- Smart approvals (an aux model approves, denies or escalates flagged commands) and `/yolo`.
+- Post-write syntax checks on `write_file` / `patch` (JSON, YAML, TOML in-process; Python and
+  JavaScript when installed), reporting only errors the edit introduced.
+- First-run onboarding: provider (OpenRouter, Ollama, LM Studio, OpenAI, any compatible
+  address) → key → model; the model step lists only that provider's models.
+
 **M6: Polish.** Command palette (Tier 2 `picker`), find in transcript, themes and fonts, diff
 review pane, import from `~/.hermes`, installer (MSI), auto-update.
+
+M6 status (2026-11-02): done except building and publishing the MSI.
+- Command palette: Ctrl+Shift+P (or F1) lists the workspace and chat actions available where focus
+  is, with their key bindings, plus the chat's slash commands (ones without arguments run at
+  once). Ctrl+P jumps to a session by title or project. A picker of our own over Zed's list
+  components rather than a copy of `picker`.
+- Find in conversation (Ctrl+F): matches highlighted in the rendered markdown through the
+  markdown crate's search highlights, the current one in the active color; Enter / Shift+Enter /
+  F3 step and scroll; Escape closes. Counts come from message text, so matches inside collapsed
+  tool output aren't highlighted until it's expanded.
+- Fonts: interface and code family (bundled ones plus common installed Windows fonts) and size in
+  Settings, applied live. The window's rem follows the interface size so Zed's widgets scale.
+- Review pane (Ctrl+Shift+D or the title-bar button): every changed file with its diff, since the
+  session's first checkpoint when checkpoints are on, else git's working tree vs HEAD with new
+  files. With checkpoints, a file can be reverted (a file the session created is removed) after a
+  snapshot, so `/rollback` can undo it. Refreshes when a turn ends.
+- Import from Hermes (Settings): memory entries, the skills the user made or installed (Hermes's
+  stock skills, other platforms' skills and names already here are skipped; each copy passes the
+  threat scan), and SOUL.md when there's none here.
+- Updates (Settings): the version, a daily check of the latest GitHub release (on by default), and
+  for a newer release with an `.msi`, Download and Install (Windows Installer runs, the app quits).
+- Installer: `installer/hermes-rs.wxs` (WiX v4, per-user so no admin rights, Start menu shortcut,
+  major upgrades by a fixed UpgradeCode) and `scripts/build-msi.ps1`. Not built yet: WiX isn't
+  installed on the dev machine. To ship: install WiX (`dotnet tool install --global wix`), run the
+  script, and attach the `.msi` to a GitHub release tagged `v<version>`.
+- Not done: an app icon (exe and installer), code signing, and a release pipeline.
 
 Rough effort: M0 a few days, M1 1–2 weeks, M2 3–5 weeks (the UI is the largest piece), M3 1–2
 weeks, M4 2–3 weeks, M5 2–4 weeks, M6 2–3 weeks.
