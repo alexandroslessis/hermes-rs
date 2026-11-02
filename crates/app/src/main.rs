@@ -11,6 +11,7 @@ mod config;
 mod memory_view;
 mod model_picker;
 mod notification;
+mod onboarding;
 mod project_dialog;
 mod scroll;
 mod settings;

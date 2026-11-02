@@ -43,6 +43,8 @@ pub struct ModelPicker {
     /// Hide models the provider says can't call tools (the agent needs them).
     tools_only: bool,
     free_only: bool,
+    /// Only this provider's models (onboarding).
+    only_provider: Option<String>,
     /// (provider id, model id) of the current model.
     selected: Option<(String, String)>,
     entries: Vec<Entry>,
@@ -123,6 +125,7 @@ impl ModelPicker {
             search,
             tools_only: true,
             free_only: false,
+            only_provider: None,
             selected,
             entries: Vec::new(),
             focused: 0,
@@ -141,6 +144,13 @@ impl ModelPicker {
     pub fn in_popover(mut self, on_configure: OnConfigure) -> Self {
         self.in_popover = true;
         self.on_configure = Some(on_configure);
+        self
+    }
+
+    /// Lists only one provider's models.
+    pub fn only_provider(mut self, provider: String, cx: &mut Context<Self>) -> Self {
+        self.only_provider = Some(provider);
+        self.update_entries(cx);
         self
     }
 
@@ -168,7 +178,9 @@ impl ModelPicker {
             haystack.contains(&query) || fuzzy_matches(&haystack, &query)
         };
         let mut groups: Vec<(SharedString, Vec<ModelInfo>)> = Vec::new();
-        for provider in state.config.providers.iter().filter(|p| provider_ready(p)) {
+        for provider in state.config.providers.iter().filter(|p| {
+            provider_ready(p) && self.only_provider.as_ref().is_none_or(|only| *only == p.id)
+        }) {
             let Some(list) = state.provider_models.get(&provider.id) else {
                 continue;
             };

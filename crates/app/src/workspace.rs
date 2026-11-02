@@ -48,6 +48,8 @@ enum Main {
     Settings,
     Memory,
     Skills,
+    /// The first-run wizard.
+    Onboarding,
 }
 
 /// An open notification pop-up and the session it's about.
@@ -61,6 +63,8 @@ pub struct Workspace {
     sessions: Vec<SessionRecord>,
     projects: Vec<Project>,
     chats: HashMap<String, Entity<ChatView>>,
+    /// The first-run wizard, while it shows.
+    onboarding: Option<(Entity<crate::onboarding::OnboardingView>, Subscription)>,
     /// Open sessions, in tab order.
     tabs: Vec<String>,
     active: Option<String>,
@@ -136,6 +140,7 @@ impl Workspace {
             projects: Vec::new(),
             chats: HashMap::new(),
             tabs: Vec::new(),
+            onboarding: None,
             active: None,
             main: Main::Chat,
             settings,
@@ -189,7 +194,21 @@ impl Workspace {
             !state.has_api_key() || state.config.model.is_none()
         };
         if needs_setup {
-            this.main = Main::Settings;
+            // No provider that can be called, or no model: the wizard (it can hand over to Settings).
+            let view = cx.new(crate::onboarding::OnboardingView::new);
+            let subscription = cx.subscribe_in(&view, window, |this, _, event, window, cx| {
+                this.onboarding = None;
+                match event {
+                    crate::onboarding::OnboardingEvent::Done => {
+                        this.main = Main::Chat;
+                        this.new_session(window, cx);
+                    }
+                    crate::onboarding::OnboardingEvent::Skip => this.main = Main::Settings,
+                }
+                cx.notify();
+            });
+            this.onboarding = Some((view, subscription));
+            this.main = Main::Onboarding;
         }
         this
     }
@@ -212,6 +231,7 @@ impl Workspace {
                 self.mark_active_seen(cx);
             }
             Main::Settings => {}
+            Main::Onboarding => {}
         }
         cx.notify();
     }
@@ -1425,6 +1445,10 @@ impl Render for Workspace {
             Main::Settings => self.settings.clone().into_any_element(),
             Main::Memory => self.memory.clone().into_any_element(),
             Main::Skills => self.skills.clone().into_any_element(),
+            Main::Onboarding => match &self.onboarding {
+                Some((view, _)) => view.clone().into_any_element(),
+                None => self.settings.clone().into_any_element(),
+            },
             Main::Chat => match self.active.as_ref().and_then(|id| self.chats.get(id)) {
                 Some(chat) => v_flex()
                     .size_full()

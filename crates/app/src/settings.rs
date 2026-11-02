@@ -279,7 +279,10 @@ impl SettingsView {
     }
 
     fn section(title: &'static str, description: Option<&'static str>) -> impl IntoElement {
+        // Takes the room the controls beside it leave, so a long description wraps.
         v_flex()
+            .flex_1()
+            .min_w_0()
             .gap_0p5()
             .child(Label::new(title).size(LabelSize::Large))
             .when_some(description, |this, description| {
@@ -1056,7 +1059,7 @@ impl SettingsView {
 }
 
 /// The provider's name, or one made from its address.
-fn name_or(name: &str, base_url: &str) -> String {
+pub(crate) fn name_or(name: &str, base_url: &str) -> String {
     if !name.is_empty() {
         return name.to_string();
     }
@@ -1070,7 +1073,7 @@ fn name_or(name: &str, base_url: &str) -> String {
 }
 
 /// A provider id from its name: lowercase letters, digits and dashes, unique in `providers`.
-fn unique_id(name: &str, providers: &[ProviderSettings]) -> String {
+pub(crate) fn unique_id(name: &str, providers: &[ProviderSettings]) -> String {
     let base: String = name
         .to_lowercase()
         .chars()
