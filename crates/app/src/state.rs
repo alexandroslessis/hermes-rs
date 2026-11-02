@@ -16,6 +16,8 @@ pub struct AppState {
     pub data_dir: PathBuf,
     /// Each provider's discovered models, by provider id.
     pub provider_models: HashMap<String, ProviderModels>,
+    /// Whether a newer release is out (Settings → Updates).
+    pub update: crate::update::UpdateStatus,
 }
 
 #[derive(Default)]
@@ -82,8 +84,10 @@ impl AppState {
                 languages,
                 data_dir,
                 provider_models: HashMap::new(),
+                update: Default::default(),
             };
             state.refresh_models(cx);
+            state.check_for_updates(false, cx);
             state
         });
         cx.set_global(AppStateGlobal(state.clone()));
@@ -211,6 +215,71 @@ impl AppState {
                     Err(error) => list.error = Some(error.to_string()),
                 }
                 cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Looks for a newer release: when asked (`manual`), else at most once a day while
+    /// automatic checks are on.
+    pub fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
+        use crate::update::{CHECK_INTERVAL_MS, UpdateStatus};
+        if matches!(self.update, UpdateStatus::Checking | UpdateStatus::Downloading(_)) {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let due = self
+            .config
+            .last_update_check
+            .is_none_or(|last| now - last >= CHECK_INTERVAL_MS);
+        if !manual && !(self.config.check_updates && due) {
+            return;
+        }
+        self.update = UpdateStatus::Checking;
+        let task = backend(cx).spawn(crate::update::check());
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.update = match result {
+                    Ok(Ok(Some(release))) => UpdateStatus::Available(release),
+                    Ok(Ok(None)) => UpdateStatus::UpToDate,
+                    Ok(Err(error)) => UpdateStatus::Failed(format!("{error:#}")),
+                    Err(error) => UpdateStatus::Failed(error.to_string()),
+                };
+                this.config.last_update_check = Some(now);
+                this.save(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Downloads the available release's installer, starts it and quits.
+    pub fn install_update(&mut self, cx: &mut Context<Self>) {
+        use crate::update::UpdateStatus;
+        let UpdateStatus::Available(release) = self.update.clone() else {
+            return;
+        };
+        self.update = UpdateStatus::Downloading(release.clone());
+        let download = release.clone();
+        let task = backend(cx).spawn(async move { crate::update::download(&download).await });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let started = match result {
+                Ok(Ok(path)) => crate::update::run_installer(&path),
+                Ok(Err(error)) => Err(error),
+                Err(error) => Err(anyhow::anyhow!(error.to_string())),
+            };
+            this.update(cx, |this, cx| match started {
+                Ok(()) => cx.quit(),
+                Err(error) => {
+                    this.update = UpdateStatus::Failed(format!("{error:#}"));
+                    cx.notify();
+                }
             })
             .ok();
         })

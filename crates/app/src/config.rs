@@ -89,6 +89,12 @@ pub struct AppConfig {
     /// The session sidebar's width, set by dragging its edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar_width: Option<f32>,
+    /// Look for a newer release on GitHub once a day.
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
+    /// When updates were last looked for (ms since the epoch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_update_check: Option<i64>,
     /// The interface and code fonts; unset parts use the bundled defaults.
     #[serde(default)]
     pub fonts: FontSettings,
@@ -130,6 +136,8 @@ impl Default for AppConfig {
             aux_models: AuxModelSettings::default(),
             mcp_servers: Default::default(),
             sidebar_width: None,
+            check_updates: true,
+            last_update_check: None,
             fonts: FontSettings::default(),
         }
     }

@@ -1,0 +1,50 @@
+<!--
+  The Windows installer (WiX Toolset v4+). Built by scripts/build-msi.ps1, which passes:
+    Version  the app version (crates/app/Cargo.toml)
+    Exe      the release build of hermes-rs.exe
+  Per-user, so installing and updating need no administrator rights: the app goes to
+  %LOCALAPPDATA%\Programs\Hermes with a Start menu shortcut. The UpgradeCode never changes, so a
+  newer MSI replaces the installed version (the in-app updater relies on that).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Hermes"
+    Manufacturer="hermes-rs"
+    Version="$(var.Version)"
+    UpgradeCode="084059BD-6456-4D4E-947D-859457C310F7"
+    Scope="perUser"
+    Language="1033">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Hermes is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Hermes" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <!-- Per-user components are keyed by a registry value, as Windows Installer requires. -->
+    <Component Id="App" Directory="INSTALLFOLDER" Guid="*">
+      <File Id="HermesExe" Name="hermes-rs.exe" Source="$(var.Exe)" />
+      <File Id="License" Name="LICENSE.txt" Source="LICENSE" />
+      <File Id="Notices" Name="THIRD_PARTY_NOTICES.md" Source="THIRD_PARTY_NOTICES.md" />
+      <RegistryValue Root="HKCU" Key="Software\hermes-rs" Name="InstallFolder" Type="string"
+        Value="[INSTALLFOLDER]" KeyPath="yes" />
+      <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+      <RemoveFolder Id="RemoveProgramsFolder" Directory="ProgramsFolder" On="uninstall" />
+    </Component>
+
+    <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder" Guid="*">
+      <Shortcut Id="HermesShortcut" Name="Hermes" Description="Hermes agent"
+        Target="[INSTALLFOLDER]hermes-rs.exe" WorkingDirectory="INSTALLFOLDER" />
+      <RegistryValue Root="HKCU" Key="Software\hermes-rs" Name="StartMenuShortcut" Type="integer"
+        Value="1" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="Main">
+      <ComponentRef Id="App" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>

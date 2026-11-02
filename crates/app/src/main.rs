@@ -23,6 +23,7 @@ mod skills_view;
 mod state;
 mod text_area;
 mod title_bar;
+mod update;
 mod workspace;
 
 use std::sync::Arc;

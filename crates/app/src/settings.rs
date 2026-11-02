@@ -281,6 +281,97 @@ impl SettingsView {
         DropdownMenu::new("theme-picker", current, menu)
     }
 
+    /// This build's version, the daily check switch, and the newest release.
+    fn render_updates(cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::update::{CURRENT_VERSION, UpdateStatus};
+        let (status, auto) = {
+            let state = AppState::global(cx).read(cx);
+            (state.update.clone(), state.config.check_updates)
+        };
+        let (line, color): (String, Color) = match &status {
+            UpdateStatus::Unknown => (String::new(), Color::Muted),
+            UpdateStatus::Checking => ("Checking…".into(), Color::Muted),
+            UpdateStatus::UpToDate => ("You have the latest version.".into(), Color::Muted),
+            UpdateStatus::Available(release) => (
+                format!("Version {} is available.", release.version),
+                Color::Accent,
+            ),
+            UpdateStatus::Downloading(release) => (
+                format!("Downloading {}…", release.version),
+                Color::Muted,
+            ),
+            UpdateStatus::Failed(error) => (format!("Couldn't check: {error}"), Color::Error),
+        };
+        let action = match &status {
+            UpdateStatus::Available(release) if release.installer.is_some() => {
+                Button::new("install-update", "Download and Install")
+                    .style(ButtonStyle::Filled)
+                    .tooltip(Tooltip::text("Hermes closes while the installer runs"))
+                    .on_click(|_, _, cx| {
+                        AppState::global(cx).update(cx, |state, cx| state.install_update(cx))
+                    })
+                    .into_any_element()
+            }
+            UpdateStatus::Available(release) => {
+                let page = release.page.clone();
+                Button::new("open-release", "Open Release Page")
+                    .on_click(move |_, _, cx| cx.open_url(&page))
+                    .into_any_element()
+            }
+            _ => Button::new("check-updates", "Check Now")
+                .style(ButtonStyle::Outlined)
+                .disabled(matches!(
+                    status,
+                    UpdateStatus::Checking | UpdateStatus::Downloading(_)
+                ))
+                .on_click(|_, _, cx| {
+                    AppState::global(cx).update(cx, |state, cx| state.check_for_updates(true, cx))
+                })
+                .into_any_element(),
+        };
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_start()
+                    .gap_4()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Label::new("Updates").size(LabelSize::Large))
+                            .child(
+                                Label::new(format!("hermes-rs {CURRENT_VERSION}"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .when(!line.is_empty(), |this| {
+                                this.child(Label::new(line).size(LabelSize::Small).color(color))
+                            }),
+                    )
+                    .child(action),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(
+                        Label::new("Check for updates once a day")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Switch::new("check-updates-switch", auto.into()).on_click(|state, _, cx| {
+                            let on = *state == ToggleState::Selected;
+                            AppState::global(cx).update(cx, |app, cx| {
+                                app.config.check_updates = on;
+                                app.save(cx);
+                            });
+                        }),
+                    ),
+            )
+    }
+
     /// Import from Hermes: memory, skills and SOUL.md from `~/.hermes`.
     fn render_import(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let found = crate::hermes_import::hermes_home();
@@ -1396,6 +1487,8 @@ impl Render for SettingsView {
             .child(self.render_mcp(cx))
             .child(Divider::horizontal())
             .child(self.render_import(cx))
+            .child(Divider::horizontal())
+            .child(Self::render_updates(cx))
             .child(Divider::horizontal())
             .child(
                 v_flex()

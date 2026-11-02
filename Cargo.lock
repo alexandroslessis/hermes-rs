@@ -2266,6 +2266,7 @@ dependencies = [
  "hermes_tools",
  "keyring",
  "markdown",
+ "reqwest",
  "rmcp",
  "rust-embed",
  "serde",
