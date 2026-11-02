@@ -10,8 +10,8 @@ Hermes wording for it.
 | `todo_list` | none |
 | `clarify` | none |
 | `read_file` | No document extraction (Office, PDF, notebooks, SQLite) yet: feature C24. `vision_analyze` mention restored (M5). |
-| `write_file` | No post-write syntax checks / lint yet. "this task" → "this session". |
-| `patch` | Fuzzy matching is exact → whitespace/indentation/line-ending tolerant instead of Hermes's 9 strategies. No post-edit syntax checks yet. |
+| `write_file` | Lint covers JSON/YAML/TOML in-process and .py/.js when python/node are installed (no LSP). "this task" → "this session". |
+| `patch` | Fuzzy matching is exact → whitespace/indentation/line-ending tolerant instead of Hermes's 9 strategies. Syntax checks as `write_file`. |
 | `search_files` | Walks with the `ignore` crate instead of ripgrep; wording about ripgrep removed, gitignore/hidden/binary behavior stated. |
 | `terminal` | No `pty`, `heartbeat`, `persist_on_release`; `notify` is boolean only (no line patterns); no automatic promotion to background above 600 s. Timeout restart behavior stated. |
 | `process_manage` | No `handoff` (subagents arrive later); no cross-conversation result retention. |

@@ -2488,6 +2488,7 @@ dependencies = [
  "similar",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "unicode-normalization",
  "url",

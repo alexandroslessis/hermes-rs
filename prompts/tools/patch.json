@@ -1,6 +1,6 @@
 {
   "name": "patch",
-  "description": "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. Tries an exact match first, then tolerates differences in trailing whitespace, indentation and line endings, so minor formatting differences won't break it. Returns a unified diff. Finds a unique string and replaces it.",
+  "description": "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. Tries an exact match first, then tolerates differences in trailing whitespace, indentation and line endings, so minor formatting differences won't break it. Returns a unified diff. Auto-runs syntax checks after editing. Finds a unique string and replaces it.",
   "parameters": {
     "type": "object",
     "properties": {

@@ -31,6 +31,7 @@ fancy-regex = "0.14"
 unicode-normalization = "0.1"
 rust-embed.workspace = true
 serde_yaml = "0.9"
+toml = "0.9"
 tempfile.workspace = true
 rmcp.workspace = true
 serde.workspace = true

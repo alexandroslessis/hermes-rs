@@ -12,6 +12,7 @@ pub mod curator;
 mod files;
 mod hints;
 mod job;
+pub mod lint;
 mod paths;
 mod process;
 mod recall;

@@ -234,6 +234,7 @@ pub async fn write_file(tools: &SessionTools, args: Value) -> ToolOutput {
     if path.is_dir() {
         return ToolOutput::error(format!("{} is a directory.", display_path(&path)));
     }
+    let mut previous: Option<String> = None;
     if path.exists() {
         let on_disk = match tokio::fs::read(&path).await {
             Ok(bytes) => bytes,
@@ -247,6 +248,7 @@ pub async fn write_file(tools: &SessionTools, args: Value) -> ToolOutput {
         if let Err(message) = tools.files.check_current(&path, &on_disk) {
             return ToolOutput::error(message);
         }
+        previous = String::from_utf8(on_disk).ok();
     }
     let dirs_created = match path.parent() {
         Some(parent) if !parent.exists() => {
@@ -271,6 +273,10 @@ pub async fn write_file(tools: &SessionTools, args: Value) -> ToolOutput {
             });
             if dirs_created {
                 result["dirs_created"] = json!(true);
+            }
+            // Hermes's post-write syntax check.
+            if let Some(lint) = crate::lint::delta(&path, previous.as_deref(), &args.content) {
+                result["lint"] = lint;
             }
             ToolOutput::ok(result)
         })
@@ -582,6 +588,9 @@ pub async fn patch(tools: &SessionTools, args: Value) -> ToolOutput {
     });
     if strategy != Strategy::Exact {
         result["match"] = json!(strategy.name());
+    }
+    if let Some(lint) = crate::lint::delta(&path, Some(&content), &updated) {
+        result["lint"] = lint;
     }
     ToolOutput::ok(result)
 }
