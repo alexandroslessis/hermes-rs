@@ -76,6 +76,7 @@ fn main() {
                 KeyBinding::new("ctrl-shift-p", ToggleCommandPalette, None),
                 KeyBinding::new("f1", ToggleCommandPalette, None),
                 KeyBinding::new("ctrl-p", GoToSession, None),
+                KeyBinding::new("ctrl-f", chat::Find, Some("Chat")),
                 // Copy the text selected in a chat message.
                 KeyBinding::new("ctrl-c", markdown::Copy, Some("Markdown")),
             ]);

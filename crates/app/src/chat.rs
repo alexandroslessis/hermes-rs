@@ -37,6 +37,8 @@ use crate::model_picker::ModelPicker;
 use crate::state::AppState;
 use crate::text_area::{TextArea, TextAreaEvent};
 
+gpui::actions!(chat, [Find]);
+
 const MAX_RESULT_CHARS: usize = 6000;
 
 pub enum ChatEvent {
@@ -49,6 +51,19 @@ pub enum ChatEvent {
     NeedsInput,
     /// A command waits for the user's approval.
     NeedsApproval,
+}
+
+/// Zed's buffer search bar over the transcript (Ctrl+F).
+struct FindBar {
+    query: Entity<TextArea>,
+    /// (list entry, matches in its message) for each entry with a match.
+    hits: Vec<(usize, usize)>,
+    total: usize,
+    /// The match Enter moves from, counting across the whole transcript.
+    current: usize,
+    /// The conversation length the hits were found in.
+    seen: usize,
+    _subscription: Subscription,
 }
 
 struct ClarifyForm {
@@ -74,6 +89,7 @@ pub struct ChatView {
     conversation: Conversation,
     /// Indices into the conversation of the messages that render as list entries.
     entries: Vec<usize>,
+    find: Option<FindBar>,
     list_state: ListState,
     composer: Entity<TextArea>,
     running: Option<CancellationToken>,
@@ -178,6 +194,7 @@ impl ChatView {
             cwd,
             conversation: Conversation::new_unvalidated(messages),
             entries: Vec::new(),
+            find: None,
             list_state,
             composer,
             running: None,
@@ -246,6 +263,223 @@ impl ChatView {
         if run {
             self.submit(window, cx);
         }
+    }
+
+    /// Ctrl+F: opens the find bar (or puts focus back in it).
+    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            let query = cx.new(|cx| TextArea::new("Find in conversation…", cx).single_line());
+            let subscription = cx.subscribe_in(
+                &query,
+                window,
+                |this: &mut Self, _, event, _, cx| match event {
+                    TextAreaEvent::Changed => {
+                        if let Some(find) = &mut this.find {
+                            find.current = 0;
+                        }
+                        this.update_find(cx);
+                        this.reveal_match(cx);
+                    }
+                    TextAreaEvent::Submit => this.step_find(true, cx),
+                    _ => {}
+                },
+            );
+            self.find = Some(FindBar {
+                query,
+                hits: Vec::new(),
+                total: 0,
+                current: 0,
+                seen: 0,
+                _subscription: subscription,
+            });
+        }
+        if let Some(find) = &self.find {
+            find.query.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find = None;
+        for markdown in self.markdown.values() {
+            markdown.update(cx, |markdown, cx| markdown.clear_search_highlights(cx));
+        }
+        self.composer.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    /// The query as matched: case-insensitive (ASCII, so byte offsets stay put).
+    fn find_query(&self, cx: &App) -> Option<String> {
+        let find = self.find.as_ref()?;
+        let query = find.query.read(cx).text().to_ascii_lowercase();
+        (!query.is_empty()).then_some(query)
+    }
+
+    /// Finds the matches again: per message, in the order the list shows them.
+    fn update_find(&mut self, cx: &mut Context<Self>) {
+        let query = self.find_query(cx);
+        let messages = self.conversation.messages();
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        find.hits = match &query {
+            Some(query) => self
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(entry, &message)| {
+                    let count = find_ranges(&shown_user_text(&messages[message]), query).len();
+                    (count > 0).then_some((entry, count))
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        find.total = find.hits.iter().map(|(_, count)| count).sum();
+        find.current = find.current.min(find.total.saturating_sub(1));
+        find.seen = messages.len();
+        cx.notify();
+    }
+
+    /// The list entry of the current match and which match it is within its message.
+    fn current_match(&self) -> Option<(usize, usize)> {
+        let find = self.find.as_ref()?;
+        let mut left = find.current;
+        for &(entry, count) in &find.hits {
+            if left < count {
+                return Some((entry, left));
+            }
+            left -= count;
+        }
+        None
+    }
+
+    fn reveal_match(&mut self, cx: &mut Context<Self>) {
+        if let Some((entry, _)) = self.current_match() {
+            self.list_state.scroll_to_reveal_item(entry);
+        }
+        cx.notify();
+    }
+
+    /// Enter / Shift+Enter: the next or previous match, wrapping around.
+    fn step_find(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        if find.total == 0 {
+            return;
+        }
+        find.current = if forward {
+            (find.current + 1) % find.total
+        } else {
+            (find.current + find.total - 1) % find.total
+        };
+        self.reveal_match(cx);
+    }
+
+    /// Highlights the query in a markdown block as it renders; the current match is the one
+    /// whose position in its message (counting this message's earlier blocks) is `current`.
+    fn highlight_matches(&self, key: MarkdownKey, markdown: &Entity<Markdown>, cx: &mut App) {
+        let Some(query) = self.find_query(cx) else {
+            markdown.update(cx, |markdown, cx| markdown.clear_search_highlights(cx));
+            return;
+        };
+        let ranges = find_ranges(markdown.read(cx).source(), &query);
+        let active = self
+            .current_match()
+            .filter(|(entry, _)| self.entries.get(*entry) == Some(&key.0))
+            .and_then(|(_, ordinal)| {
+                let before: usize = self
+                    .markdown
+                    .iter()
+                    .filter(|(k, _)| k.0 == key.0 && (k.1, k.2) < (key.1, key.2))
+                    .map(|(_, m)| find_ranges(m.read(cx).source(), &query).len())
+                    .sum();
+                ordinal.checked_sub(before)
+            });
+        markdown.update(cx, |markdown, cx| {
+            // Only on change: setting notifies, and notifying re-renders this.
+            if markdown.search_highlights() != ranges.as_slice() {
+                markdown.set_search_highlights(ranges, active, cx);
+            } else {
+                markdown.set_active_search_highlight(active, cx);
+            }
+        });
+    }
+
+    fn render_find_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let find = self.find.as_ref()?;
+        let colors = cx.theme().colors();
+        let has_query = !find.query.read(cx).text().is_empty();
+        let count = if find.total == 0 {
+            if has_query { "No results".to_string() } else { String::new() }
+        } else {
+            format!("{} of {}", find.current + 1, find.total)
+        };
+        Some(
+            h_flex()
+                .key_context("FindBar")
+                .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    let keystroke = &event.keystroke;
+                    match keystroke.key.as_str() {
+                        "escape" => this.close_find(window, cx),
+                        "enter" if keystroke.modifiers.shift => this.step_find(false, cx),
+                        "f3" => this.step_find(!keystroke.modifiers.shift, cx),
+                        _ => return,
+                    }
+                    cx.stop_propagation();
+                }))
+                .px_3()
+                .py_1()
+                .gap_2()
+                .border_b_1()
+                .border_color(colors.border_variant)
+                .bg(colors.toolbar_background)
+                .child(Icon::new(IconName::MagnifyingGlass).size(IconSize::Small).color(Color::Muted))
+                .child(
+                    div()
+                        .flex_1()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(if has_query && find.total == 0 {
+                            colors.border_disabled
+                        } else {
+                            colors.border
+                        })
+                        .bg(colors.editor_background)
+                        .child(find.query.clone()),
+                )
+                .child(
+                    Label::new(count)
+                        .size(LabelSize::Small)
+                        .color(if has_query && find.total == 0 {
+                            Color::Error
+                        } else {
+                            Color::Muted
+                        }),
+                )
+                .child(
+                    IconButton::new("find-previous", IconName::ChevronUp)
+                        .icon_size(IconSize::Small)
+                        .disabled(find.total == 0)
+                        .tooltip(Tooltip::text("Previous Match (Shift+Enter)"))
+                        .on_click(cx.listener(|this, _, _, cx| this.step_find(false, cx))),
+                )
+                .child(
+                    IconButton::new("find-next", IconName::ChevronDown)
+                        .icon_size(IconSize::Small)
+                        .disabled(find.total == 0)
+                        .tooltip(Tooltip::text("Next Match (Enter)"))
+                        .on_click(cx.listener(|this, _, _, cx| this.step_find(true, cx))),
+                )
+                .child(
+                    IconButton::new("find-close", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Close (Escape)"))
+                        .on_click(cx.listener(|this, _, window, cx| this.close_find(window, cx))),
+                ),
+        )
     }
 
     /// The list's rows: one per entry, plus the trailer that shows the turn running.
@@ -1740,6 +1974,7 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let markdown = self.markdown_for(key, text, cx);
+        self.highlight_matches(key, &markdown, cx);
         div()
             .id(SharedString::from(format!(
                 "markdown-{}-{}-{:?}",
@@ -3556,12 +3791,24 @@ impl Focusable for ChatView {
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
         let empty = self.entries.is_empty();
         let list_state = self.list_state.clone();
+        // New messages since the matches were counted.
+        if self
+            .find
+            .as_ref()
+            .is_some_and(|find| find.seen != self.conversation.messages().len())
+        {
+            self.update_find(cx);
+        }
+        let find_bar = self.render_find_bar(cx);
+        let colors = cx.theme().colors();
         v_flex()
+            .key_context("Chat")
+            .on_action(cx.listener(|this, _: &Find, window, cx| this.open_find(window, cx)))
             .size_full()
             .bg(colors.panel_background)
+            .children(find_bar)
             .child(if empty {
                 v_flex()
                     .flex_1()
@@ -3622,7 +3869,7 @@ fn tool_output(content: &MessageContent) -> String {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum MarkdownKind {
     Text,
     Thinking,
@@ -3678,6 +3925,17 @@ fn shimmer(id: SharedString, text: &'static str, cx: &App) -> AnyElement {
 }
 
 /// The argument of a built-in slash command (`/name arg`), or `None` when `text` isn't one.
+/// Where `query` (already lowercase) occurs in `text`, ignoring ASCII case, as byte ranges.
+fn find_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    text.to_ascii_lowercase()
+        .match_indices(query)
+        .map(|(start, found)| start..start + found.len())
+        .collect()
+}
+
 fn command_arg<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     let rest = text.trim().strip_prefix('/')?.strip_prefix(name)?;
     (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
