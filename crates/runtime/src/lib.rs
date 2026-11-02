@@ -119,6 +119,53 @@ pub struct AuxModel {
 pub struct AuxModels {
     pub compression: Option<AuxModel>,
     pub review: Option<AuxModel>,
+    /// Judges flagged commands under smart approvals (`auxiliary.approval`).
+    pub approval: Option<AuxModel>,
+}
+
+/// Hermes's smart-approval reviewer (`_smart_approve`): one word from a model, reasoning off.
+struct SmartGuard {
+    llm: Arc<dyn Provider>,
+    model: String,
+    base_url: String,
+}
+
+#[async_trait::async_trait]
+impl hermes_tools::approval::ApprovalGuard for SmartGuard {
+    async fn assess(&self, command: &str, description: &str) -> hermes_tools::approval::Verdict {
+        use hermes_tools::approval::{self, Verdict};
+        let config = ModelConfig::new(&self.model)
+            .with_max_tokens(Some(64))
+            .with_temperature(Some(0.0))
+            .with_merged_request_params(effort_request_params(&self.base_url, "none"));
+        let request =
+            [Message::user().with_text(approval::smart_user_prompt(command, description))];
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.llm
+                .complete(&config, approval::SMART_SYSTEM_PROMPT, &request, &[]),
+        )
+        .await;
+        match reply {
+            Ok(Ok((message, _))) => {
+                let text: String = message
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        MessageContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let verdict = approval::parse_verdict(&text);
+                tracing::info!("smart approval: {verdict:?} for {description}");
+                verdict
+            }
+            _ => {
+                tracing::warn!("smart approval: reviewer failed or timed out, escalating");
+                Verdict::Escalate
+            }
+        }
+    }
 }
 
 /// Who writes compaction summaries: the auxiliary compression model, else the session's.
@@ -683,6 +730,24 @@ impl Runtime {
         *open.turn_state.lock() = Some(state.clone());
         open.tools.begin_turn();
         open.tools.set_vision(supports_vision);
+        // Smart approvals judge with the approval model, else the turn's.
+        let guard: Option<Arc<dyn hermes_tools::approval::ApprovalGuard>> = match &aux.approval {
+            Some(aux) => aux.provider.provider().ok().map(|llm| {
+                Arc::new(SmartGuard {
+                    llm,
+                    model: aux.model.clone(),
+                    base_url: aux.provider.base_url.clone(),
+                }) as Arc<dyn hermes_tools::approval::ApprovalGuard>
+            }),
+            None => provider.provider().ok().map(|llm| {
+                Arc::new(SmartGuard {
+                    llm,
+                    model: open.record.lock().model.clone(),
+                    base_url: provider.base_url.clone(),
+                }) as Arc<dyn hermes_tools::approval::ApprovalGuard>
+            }),
+        };
+        open.tools.set_guard(guard);
         let runtime = TurnRuntime {
             session: open.clone(),
             store: self.store.clone(),
@@ -1050,6 +1115,21 @@ impl Runtime {
     /// The MCP servers (Settings configures them; their tools join every turn).
     pub fn mcp(&self) -> Arc<mcp::McpManager> {
         self.mcp.clone()
+    }
+
+    /// Hermes's `/yolo`: turns approval prompts off (or on) for one session. Returns the new state.
+    pub fn toggle_yolo(&self, session_id: &str) -> Result<bool> {
+        let open = self.open(session_id)?;
+        let on = !open.tools.yolo();
+        open.tools.set_yolo(on);
+        Ok(on)
+    }
+
+    pub fn yolo(&self, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .get(session_id)
+            .is_some_and(|open| open.tools.yolo())
     }
 
     /// The filesystem checkpoints (Settings turns them on and off).
@@ -1527,4 +1607,20 @@ impl ReviewSetup {
             cancel,
         }));
     }
+}
+
+/// The smart-approval verdict `model` gives for a flagged command (for checks and tests).
+pub async fn smart_review(
+    provider: &ProviderConfig,
+    model: &str,
+    command: &str,
+    description: &str,
+) -> Result<hermes_tools::approval::Verdict> {
+    use hermes_tools::approval::ApprovalGuard as _;
+    let guard = SmartGuard {
+        llm: provider.provider()?,
+        model: model.to_string(),
+        base_url: provider.base_url.clone(),
+    };
+    Ok(guard.assess(command, description).await)
 }

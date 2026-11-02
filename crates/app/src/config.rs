@@ -67,6 +67,9 @@ pub struct AppConfig {
     /// off by default).
     #[serde(default)]
     pub checkpoints: bool,
+    /// Hermes's `approvals.mode: smart`: a reviewer model judges flagged commands first.
+    #[serde(default)]
+    pub smart_approvals: bool,
     /// What Enter does while a turn runs (Hermes's `busy_input_mode`).
     #[serde(default)]
     pub busy_input_mode: BusyInput,
@@ -119,6 +122,7 @@ impl Default for AppConfig {
             curator_consolidate: false,
             ask_dangerous_commands: true,
             checkpoints: false,
+            smart_approvals: false,
             busy_input_mode: BusyInput::default(),
             aux_models: AuxModelSettings::default(),
             mcp_servers: Default::default(),
@@ -265,6 +269,9 @@ pub struct AuxModelSettings {
     /// Consolidates skills (`auxiliary.curator`).
     #[serde(default)]
     pub curator: Option<ModelChoice>,
+    /// Judges flagged commands under smart approvals (`auxiliary.approval`).
+    #[serde(default)]
+    pub approval: Option<ModelChoice>,
     /// Names sessions from their opening message (`auxiliary.title_generation`).
     #[serde(default)]
     pub titles: Option<ModelChoice>,

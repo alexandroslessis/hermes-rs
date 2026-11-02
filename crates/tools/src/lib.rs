@@ -119,6 +119,10 @@ pub struct SessionTools {
     web: Option<Arc<web::Web>>,
     /// Projects already checkpointed this turn (one snapshot per project per turn).
     turn_checkpoints: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Hermes's `/yolo`: flagged commands run without asking (hardline ones never do).
+    yolo: std::sync::atomic::AtomicBool,
+    /// The smart-approval reviewer for this turn's model.
+    guard: parking_lot::Mutex<Option<Arc<dyn approval::ApprovalGuard>>>,
     /// Whether the session's model accepts images (set per turn; `vision_analyze` needs it).
     vision: std::sync::atomic::AtomicBool,
 }
@@ -144,6 +148,8 @@ impl SessionTools {
             web: config.web,
             turn_checkpoints: Default::default(),
             vision: Default::default(),
+            yolo: Default::default(),
+            guard: Default::default(),
             session_approved: Default::default(),
         }
     }
@@ -180,6 +186,20 @@ impl SessionTools {
             }
             _ => None,
         }
+    }
+
+    /// `/yolo` for this session.
+    pub fn set_yolo(&self, on: bool) {
+        self.yolo.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn yolo(&self) -> bool {
+        self.yolo.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The reviewer smart approvals use (set per turn, for its model).
+    pub fn set_guard(&self, guard: Option<Arc<dyn approval::ApprovalGuard>>) {
+        *self.guard.lock() = guard;
     }
 
     /// Whether the model of the coming turn accepts images.
@@ -424,6 +444,22 @@ impl SessionTools {
             approval::Gate::Ask(request) => request,
         };
         let key = request.description.clone();
+        if self.yolo() {
+            return Ok(None);
+        }
+        // Smart approvals: the reviewer decides first; only an uncertain verdict reaches the user.
+        let guard = self.guard.lock().clone();
+        if let Some(guard) = guard.filter(|_| store.smart()) {
+            match guard.assess(&request.command, &request.description).await {
+                approval::Verdict::Approve => return Ok(Some(key)),
+                approval::Verdict::Deny => {
+                    return Err(blocked(approval::smart_denied_message(
+                        &request.description,
+                    )));
+                }
+                approval::Verdict::Escalate => {}
+            }
+        }
         let answer = tokio::time::timeout(
             APPROVAL_TIMEOUT,
             self.bridge.approve_command(&self.session_id, request),

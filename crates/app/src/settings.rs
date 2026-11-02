@@ -447,6 +447,14 @@ impl SettingsView {
                 cx,
             ))
             .child(row(
+                "approval",
+                "Smart approvals",
+                "Judges flagged commands before you are asked (when smart approvals are on).",
+                aux.approval,
+                |aux, choice| aux.approval = choice,
+                cx,
+            ))
+            .child(row(
                 "titles",
                 "Session titles",
                 "Names a session from its first message.",
@@ -725,6 +733,7 @@ impl SettingsView {
 
     fn render_safety(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ask = AppState::global(cx).read(cx).config.ask_dangerous_commands;
+        let smart = AppState::global(cx).read(cx).config.smart_approvals;
         let checkpoints = AppState::global(cx).read(cx).config.checkpoints;
         let always = backend(cx).runtime.approvals().always_allowed();
         let colors = cx.theme().colors();
@@ -738,9 +747,13 @@ impl SettingsView {
                     .gap_4()
                     .child(Self::section(
                         "Safety",
-                        Some("Commands that match a dangerous pattern (recursive deletes, force pushes, piping downloads into a shell, inline scripts…) wait for your approval on their card. Commands that could wreck the system never run through the agent."),
+                        Some("Commands that match a dangerous pattern (recursive deletes, force pushes, piping downloads into a shell, inline scripts…) wait for your approval on their card. Commands that could wreck the system never run through the agent. With smart approvals a model judges each flagged command first: clearly safe ones run, clearly dangerous ones are blocked, only uncertain ones are asked about. /yolo stops asking for one session."),
                     ))
                     .child(
+                        v_flex()
+                            .gap_2()
+                            .items_end()
+                            .child(
                         Switch::new("ask-dangerous", ask.into())
                             .label("Ask before dangerous commands")
                             .on_click(cx.listener(|_, state: &ToggleState, _, cx| {
@@ -751,6 +764,20 @@ impl SettingsView {
                                 });
                                 backend(cx).runtime.approvals().set_ask(ask);
                             })),
+                            )
+                            .child(
+                                Switch::new("smart-approvals", smart.into())
+                                    .label("Smart approvals")
+                                    .disabled(!ask)
+                                    .on_click(cx.listener(|_, state: &ToggleState, _, cx| {
+                                        let smart = *state == ToggleState::Selected;
+                                        AppState::global(cx).update(cx, |state, cx| {
+                                            state.config.smart_approvals = smart;
+                                            state.save(cx);
+                                        });
+                                        backend(cx).runtime.approvals().set_smart(smart);
+                                    })),
+                            ),
                     ),
             )
             .child(

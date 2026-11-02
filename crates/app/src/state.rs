@@ -51,6 +51,10 @@ impl AppState {
             .set_ask(config.ask_dangerous_commands);
         backend(cx)
             .runtime
+            .approvals()
+            .set_smart(config.smart_approvals);
+        backend(cx)
+            .runtime
             .checkpoints()
             .set_enabled(config.checkpoints);
         {
@@ -233,6 +237,7 @@ impl AppState {
         hermes_runtime::AuxModels {
             compression: self.aux_model(&self.config.aux_models.compression),
             review: self.aux_model(&self.config.aux_models.review),
+            approval: self.aux_model(&self.config.aux_models.approval),
         }
     }
 

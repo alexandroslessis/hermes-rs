@@ -785,6 +785,24 @@ impl ChatView {
         let backend = backend(cx);
         // Hermes's `/refine [focus]` reviews the conversation in the background instead of
         // starting a turn; `/learn <request>` starts one with the learn prompt.
+        // Hermes's `/yolo`: approval prompts off (or back on) for this session.
+        if text
+            .as_deref()
+            .and_then(|t| command_arg(t, "yolo"))
+            .is_some()
+        {
+            match backend.runtime.toggle_yolo(&self.session_id) {
+                Ok(true) => self
+                    .notices
+                    .push("⚡ YOLO mode ON — all commands auto-approved. Use with caution.".into()),
+                Ok(false) => self
+                    .notices
+                    .push("⚠ YOLO mode OFF — dangerous commands will require approval.".into()),
+                Err(error) => self.error = Some(format!("{error:#}")),
+            }
+            self.trailer_changed(cx);
+            return;
+        }
         // Hermes's `/queue` manages prompts waiting for the running turn.
         let text = match text.as_deref().and_then(|t| command_arg(t, "queue")) {
             Some(args) => match self.queue_command(args) {
@@ -3388,6 +3406,21 @@ impl ChatView {
                                     .min_w_0()
                                     .flex_wrap()
                                     .gap_1()
+                                    .when(backend(cx).runtime.yolo(&self.session_id), |this| {
+                                        this.child(
+                                            div()
+                                                .id("yolo")
+                                                .mr_1()
+                                                .tooltip(Tooltip::text(
+                                                    "YOLO: commands run without asking (hardline ones never do). /yolo turns it off.",
+                                                ))
+                                                .child(
+                                                    Label::new("YOLO")
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Warning),
+                                                ),
+                                        )
+                                    })
                                     .children(self.render_token_usage(cx))
                                     .child(self.render_model_button(cx))
                                     .child(self.render_send_button(cx)),
@@ -3668,6 +3701,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     (
         "insights",
         "Usage across sessions: /insights --days N (default 30)",
+    ),
+    (
+        "yolo",
+        "Run flagged commands without asking in this session (hardline ones never run)",
     ),
     (
         "queue",
