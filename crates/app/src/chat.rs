@@ -104,8 +104,9 @@ pub struct ChatView {
     clarify: Option<ClarifyForm>,
     /// `/steer` text waiting for the agent's next tool call to finish.
     steering: Option<String>,
-    /// The user message being edited in the composer; sending rewinds the conversation there.
-    editing: Option<usize>,
+    /// A sent message being edited where it is (Zed's editing_message), or a waiting one in the
+    /// queue panel.
+    inline_edit: Option<InlineEdit>,
     /// Skills matching a `/command` being typed: (name, short description).
     slash_matches: Vec<Suggestion>,
     /// The suggestion Tab (or Enter) takes; ↑/↓ move it.
@@ -229,7 +230,7 @@ impl ChatView {
             markdown: HashMap::new(),
             clarify: None,
             steering: None,
-            editing: None,
+            inline_edit: None,
             slash_matches: Vec::new(),
             suggestion_selected: 0,
             known_commands,
@@ -556,14 +557,6 @@ impl ChatView {
         if text.is_empty() && (self.attachments.is_empty() || self.running.is_some()) {
             return;
         }
-        if self.running.is_none() {
-            if let Some(index) = self.editing.take() {
-                self.composer
-                    .update(cx, |composer, cx| composer.set_text("", cx));
-                self.resend(index, Some(text), cx);
-                return;
-            }
-        }
         // Mid-turn, Enter steers the running turn (Hermes's `/steer`), queues the message for after
         // it, or stops it and sends this instead (Settings, Hermes's `busy_input_mode`).
         // `/steer <text>` steers whatever the setting says; with nothing running it's a message.
@@ -704,6 +697,7 @@ impl ChatView {
 
     /// Takes a waiting message out of the queue (or withdraws the undelivered steer).
     fn take_pending(&mut self, entry: PendingEntry, cx: &mut Context<Self>) -> Option<String> {
+        self.drop_pending_edit();
         match entry {
             PendingEntry::Steer => {
                 let text = self.steering.take()?;
@@ -716,22 +710,26 @@ impl ChatView {
         }
     }
 
-    /// Zed's Edit: the message goes back into the composer to be changed and sent again.
+    /// Zed's queue editing: the waiting message turns into an editor where it is; Enter saves.
     fn edit_pending(&mut self, entry: PendingEntry, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = self.take_pending(entry, cx) else {
-            return;
+        let text = match entry {
+            PendingEntry::Steer => self.steering.clone(),
+            PendingEntry::Queued(index) => self.queued.get(index).cloned(),
         };
-        self.composer.update(cx, |composer, cx| {
-            let current = composer.text().trim().to_string();
-            let merged = if current.is_empty() {
-                text
-            } else {
-                format!("{text}\n{current}")
-            };
-            composer.set_text(merged, cx);
-        });
-        self.composer.focus_handle(cx).focus(window, cx);
-        cx.notify();
+        if let Some(text) = text {
+            self.start_inline_edit(EditTarget::Pending(entry), text, window, cx);
+        }
+    }
+
+    /// The queue's positions shift when an entry leaves it: an open edit of one is dropped.
+    fn drop_pending_edit(&mut self) {
+        if self
+            .inline_edit
+            .as_ref()
+            .is_some_and(|e| matches!(e.target, EditTarget::Pending(_)))
+        {
+            self.inline_edit = None;
+        }
     }
 
     /// Zed's Steer toggle: a queued message is delivered after the running tool call instead of
@@ -748,6 +746,7 @@ impl ChatView {
                     return;
                 };
                 if backend(cx).runtime.steer(&self.session_id, &text) {
+                    self.drop_pending_edit();
                     self.queued.remove(index);
                     self.steering = Some(match self.steering.take() {
                         Some(earlier) => format!("{earlier}\n\n{text}"),
@@ -872,12 +871,38 @@ impl ChatView {
                                         )
                                         .tooltip(Tooltip::text(tooltip)),
                                 )
-                                .child(
-                                    div()
+                                // Zed's queue entries are editors: click the text to change it,
+                                // Enter saves, Escape (or leaving it unchanged) cancels.
+                                .child(match self.inline_editor(EditTarget::Pending(entry)) {
+                                    Some(editor) => div()
                                         .flex_1()
                                         .min_w_0()
-                                        .child(Label::new(line).size(LabelSize::Small).truncate()),
-                                )
+                                        .px_1()
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(colors.border_focused)
+                                        .text_sm()
+                                        .on_key_down(cx.listener(
+                                            |this, event: &gpui::KeyDownEvent, window, cx| {
+                                                if event.keystroke.key == "escape" {
+                                                    this.finish_inline_edit(false, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        ))
+                                        .child(editor)
+                                        .into_any_element(),
+                                    None => div()
+                                        .id(("queued-text", row))
+                                        .flex_1()
+                                        .min_w_0()
+                                        .cursor_text()
+                                        .child(Label::new(line).size(LabelSize::Small).truncate())
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.edit_pending(entry, window, cx)
+                                        }))
+                                        .into_any_element(),
+                                })
                                 .child(
                                     h_flex()
                                         .when(!is_next, |this| this.visible_on_hover("queue_entry"))
@@ -1309,14 +1334,114 @@ impl ChatView {
         self.begin(Some(text), cx);
     }
 
-    /// Puts a user message in the composer; sending it rewinds the conversation there.
+    /// Zed's in-place editing: the sent message becomes an editor where it is.
     fn edit_message(&mut self, message_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running.is_some() {
+            return;
+        }
         let text = shown_user_text(&self.conversation.messages()[message_index]);
-        self.composer
-            .update(cx, |composer, cx| composer.set_text(text, cx));
-        self.composer.focus_handle(cx).focus(window, cx);
-        self.editing = Some(message_index);
+        self.start_inline_edit(EditTarget::Sent(message_index), text, window, cx);
+    }
+
+    /// Opens an in-place editor on a sent or waiting message, the caret at the end.
+    fn start_inline_edit(
+        &mut self,
+        target: EditTarget,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.inline_edit.as_ref().is_some_and(|e| e.target == target) {
+            if let Some(edit) = &self.inline_edit {
+                edit.editor.focus_handle(cx).focus(window, cx);
+            }
+            return;
+        }
+        let editor = cx.new(|cx| {
+            let mut editor = TextArea::new("", cx)
+                .with_decorations(composer_decorations(self.known_commands.clone()));
+            editor.set_text(text.clone(), cx);
+            editor
+        });
+        let focus = editor.focus_handle(cx);
+        let subscriptions = vec![
+            cx.subscribe_in(&editor, window, |this, _, event, window, cx| match event {
+                TextAreaEvent::Submit => this.finish_inline_edit(true, window, cx),
+                TextAreaEvent::MentionClicked(target) => this.open_mention(target, cx),
+                _ => {
+                    // The editor grows as it's typed in: its list row is measured again.
+                    if let Some(EditTarget::Sent(index)) = this.inline_edit.as_ref().map(|e| e.target)
+                    {
+                        if let Some(row) = this.entries.iter().position(|&m| m == index) {
+                            this.list_state.remeasure_items(row..row + 1);
+                        }
+                    }
+                    cx.notify()
+                }
+            }),
+            // Zed: leaving an unchanged message ends its editing; a changed one stays open.
+            cx.on_focus_out(&focus, window, |this, _, window, cx| {
+                let unchanged = this
+                    .inline_edit
+                    .as_ref()
+                    .is_some_and(|e| e.editor.read(cx).text() == e.original);
+                if unchanged {
+                    this.finish_inline_edit(false, window, cx);
+                } else {
+                    cx.notify();
+                }
+            }),
+        ];
+        focus.focus(window, cx);
+        self.inline_edit = Some(InlineEdit {
+            target,
+            editor,
+            original: text,
+            _subscriptions: subscriptions,
+        });
+        self.list_state.remeasure_items(0..self.list_len());
         cx.notify();
+    }
+
+    /// Ends in-place editing: `apply` sends the edited message again (a sent one restarts the
+    /// thread from it) or saves a waiting one; otherwise the edit is dropped.
+    fn finish_inline_edit(&mut self, apply: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.inline_edit.take() else {
+            return;
+        };
+        let text = edit.editor.read(cx).text().trim().to_string();
+        self.list_state.remeasure_items(0..self.list_len());
+        if apply && !text.is_empty() {
+            match edit.target {
+                EditTarget::Sent(index) => {
+                    if self.running.is_none() {
+                        self.resend(index, Some(text), cx);
+                    }
+                }
+                EditTarget::Pending(PendingEntry::Steer) => {
+                    if self.steering.is_some()
+                        && backend(cx).runtime.set_steer(&self.session_id, Some(&text))
+                    {
+                        self.steering = Some(text);
+                    }
+                }
+                EditTarget::Pending(PendingEntry::Queued(index)) => {
+                    if let Some(queued) = self.queued.get_mut(index) {
+                        *queued = text;
+                    }
+                }
+            }
+        }
+        self.composer.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    /// The in-place editor, when it's open on `target`.
+    fn inline_editor(&self, target: EditTarget) -> Option<Entity<TextArea>> {
+        self.inline_edit
+            .as_ref()
+            .filter(|e| e.target == target)
+            .map(|e| e.editor.clone())
     }
 
     /// Hermes's `/retry`: run the failed turn again.
@@ -1672,6 +1797,7 @@ impl ChatView {
                 // The chat's copy of a delivered steer: shown to the user, not sent to the model.
                 if message.role == Role::User && !message.is_agent_visible() {
                     self.steering = None;
+                    self.drop_pending_edit();
                 }
                 self.conversation.push(message);
                 self.entries_changed(cx);
@@ -1720,6 +1846,7 @@ impl ChatView {
             }
             RuntimeEvent::Agent(_) => {}
             RuntimeEvent::SteerUndelivered(text) => {
+                self.drop_pending_edit();
                 self.steering = None;
                 self.next_message = Some(text);
             }
@@ -1736,6 +1863,7 @@ impl ChatView {
                     && !self.queued.is_empty())
                 .then(|| self.queued.remove(0));
                 if queued.is_some() {
+                    self.drop_pending_edit();
                     self.next_message = queued;
                 }
                 let continues = self.next_message.is_some();
@@ -2161,9 +2289,31 @@ impl ChatView {
                 .tooltip(Tooltip::text(tooltip))
         };
         let copy_text = shown.clone();
+        let editor = self.inline_editor(EditTarget::Sent(message_index));
+        let editor_focused = editor
+            .as_ref()
+            .is_some_and(|e| e.focus_handle(cx).is_focused(window));
+        let editing = editor.is_some();
+        // Zed's user message: the bubble is the editor; clicking it starts editing there.
+        let content = match editor {
+            // The message's own text size, so editing doesn't change how it looks.
+            Some(editor) => div()
+                .text_size(theme::theme_settings(cx).ui_font_size(cx))
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.finish_inline_edit(false, window, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .child(editor)
+                .into_any_element(),
+            None => body,
+        };
+        // The first message leaves room above it for the toolbar that sits on its top edge.
+        let first = self.entries.first() == Some(&message_index);
         v_flex()
             .id(("user_message", message_index))
-            .pt_2()
+            .map(|this| if first { this.pt_4() } else { this.pt_2() })
             .pb_3()
             .px_2()
             .gap_1p5()
@@ -2174,15 +2324,32 @@ impl ChatView {
                     .group(group.clone())
                     .child(
                         div()
+                            .id(("user_message_bubble", message_index))
                             .py_3()
                             .px_2()
                             .rounded_md()
                             .bg(colors.editor_background)
                             .border_1()
                             .border_color(colors.border)
-                            .shadow_md()
-                            .hover(|style| style.border_color(focus_border.opacity(0.8)))
-                            .child(body)
+                            .map(|this| {
+                                if editing && editor_focused {
+                                    this.border_color(focus_border)
+                                } else if editing {
+                                    this.border_dashed()
+                                } else if running {
+                                    this.shadow_md()
+                                } else {
+                                    this.shadow_md()
+                                        .cursor_text()
+                                        .hover(|style| {
+                                            style.border_color(focus_border.opacity(0.8))
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.edit_message(message_index, window, cx)
+                                        }))
+                                }
+                            })
+                            .child(content)
                             .when(!images.is_empty(), |this| {
                                 this.child(h_flex().pt_2().gap_2().flex_wrap().children(
                                     images.into_iter().map(|image| {
@@ -2201,7 +2368,48 @@ impl ChatView {
                                 ))
                             }),
                     )
-                    .child(
+                    // Zed's editing toolbar: cancel, or send the edit (restarting from here).
+                    .when(editing, |this| {
+                        this.child(
+                            h_flex()
+                                .absolute()
+                                .top_neg_3p5()
+                                .right_3()
+                                .gap_1()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(colors.border)
+                                .bg(colors.editor_background)
+                                .overflow_hidden()
+                                .child(
+                                    IconButton::new(
+                                        SharedString::from(format!("cancel-edit-{message_index}")),
+                                        IconName::Close,
+                                    )
+                                    .icon_color(Color::Error)
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(Tooltip::text("Cancel Editing (Escape)"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.finish_inline_edit(false, window, cx)
+                                    })),
+                                )
+                                .child(
+                                    IconButton::new(
+                                        SharedString::from(format!("regenerate-{message_index}")),
+                                        IconName::Return,
+                                    )
+                                    .icon_color(Color::Muted)
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(Tooltip::text(
+                                        "Editing will restart the thread from this point.",
+                                    ))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.finish_inline_edit(true, window, cx)
+                                    })),
+                                ),
+                        )
+                    })
+                    .when(!editing, |this| this.child(
                         h_flex()
                             .absolute()
                             .top_neg_3p5()
@@ -2238,7 +2446,7 @@ impl ChatView {
                                     move |this, _, _, cx| this.resend(message_index, None, cx),
                                 )),
                             ),
-                    ),
+                    )),
             )
             .into_any_element()
     }
@@ -2457,7 +2665,6 @@ impl ChatView {
                     .pr_1()
                     .rounded_sm()
                     .cursor_pointer()
-                    .hover(|style| style.bg(colors.ghost_element_hover))
                     .child(
                         h_flex()
                             .h(window.line_height() - px(2.))
@@ -2546,7 +2753,6 @@ impl ChatView {
                     .pr_1()
                     .rounded_sm()
                     .cursor_pointer()
-                    .hover(|style| style.bg(colors.ghost_element_hover))
                     .child(
                         h_flex()
                             .h(window.line_height() - px(2.))
@@ -2697,7 +2903,6 @@ impl ChatView {
             .child(div().flex_1())
             .when(!is_edit, |this| this.child(gradient_overlay));
         let toggle_key = key.clone();
-        let hover_bg = cx.theme().colors().ghost_element_hover;
         let header = h_flex()
             .id(SharedString::from(format!("{key}-header")))
             .group(card_header.clone())
@@ -2709,7 +2914,6 @@ impl ChatView {
             .when(use_card_layout, |this| {
                 this.p_0p5().rounded_t(rems_from_px(5_f32)).bg(header_bg)
             })
-            .hover(move |style| style.bg(hover_bg))
             .child(label_row)
             .child(
                 h_flex()
@@ -2917,7 +3121,6 @@ impl ChatView {
             .justify_between()
             .rounded_t_md()
             .cursor_pointer()
-            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
             .child(
                 h_flex()
                     .flex_1()
@@ -3742,7 +3945,6 @@ impl ChatView {
                         .gap_2()
                         .cursor_pointer()
                         .rounded_sm()
-                        .hover(|style| style.bg(colors.ghost_element_hover))
                         .child(
                             Icon::new(IconName::ListTodo)
                                 .size(IconSize::Small)
@@ -3947,36 +4149,6 @@ impl ChatView {
                             },
                         ))
                     }))
-                    .when(self.editing.is_some(), |this| {
-                        this.child(
-                            h_flex()
-                                .gap_1()
-                                .child(
-                                    Icon::new(IconName::Pencil)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Accent),
-                                )
-                                .child(
-                                    Label::new(
-                                        "Editing a message: sending restarts the thread from it",
-                                    )
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                                )
-                                .child(div().flex_1())
-                                .child(
-                                    IconButton::new("cancel-edit", IconName::Close)
-                                        .icon_color(Color::Error)
-                                        .icon_size(IconSize::XSmall)
-                                        .tooltip(Tooltip::text("Cancel Editing"))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.editing = None;
-                                            this.composer.update(cx, |c, cx| c.set_text("", cx));
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                    })
                     .child(
                         v_flex()
                             .relative()
@@ -4549,4 +4721,21 @@ mod tests {
         )));
         assert!(kinds.contains(&("/usage".into(), SpanKind::Mention("command:usage".into()))));
     }
+}
+
+/// What an in-place editor is changing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditTarget {
+    /// A sent user message, by conversation index.
+    Sent(usize),
+    /// A message waiting in the queue panel.
+    Pending(PendingEntry),
+}
+
+struct InlineEdit {
+    target: EditTarget,
+    editor: Entity<TextArea>,
+    /// The text before editing: leaving it unchanged ends the edit.
+    original: String,
+    _subscriptions: Vec<Subscription>,
 }

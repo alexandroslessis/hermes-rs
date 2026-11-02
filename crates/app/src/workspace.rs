@@ -57,6 +57,27 @@ enum Main {
     Onboarding,
 }
 
+/// The tab keys of the screens that open as tabs (session tabs are keyed by session id).
+const SCREEN_TABS: [(Main, &str); 3] = [
+    (Main::Settings, "screen:settings"),
+    (Main::Memory, "screen:memory"),
+    (Main::Skills, "screen:skills"),
+];
+
+fn screen_tab(screen: Main) -> Option<&'static str> {
+    SCREEN_TABS
+        .iter()
+        .find(|(s, _)| *s == screen)
+        .map(|(_, key)| *key)
+}
+
+fn tab_screen(key: &str) -> Option<Main> {
+    SCREEN_TABS
+        .iter()
+        .find(|(_, k)| *k == key)
+        .map(|(screen, _)| *screen)
+}
+
 /// An open notification pop-up and the session it's about.
 struct Notification {
     session_id: String,
@@ -224,7 +245,10 @@ impl Workspace {
                         this.main = Main::Chat;
                         this.new_session(window, cx);
                     }
-                    crate::onboarding::OnboardingEvent::Skip => this.main = Main::Settings,
+                    crate::onboarding::OnboardingEvent::Skip => {
+                        this.main = Main::Chat;
+                        this.open_screen(Main::Settings, window, cx)
+                    }
                 }
                 cx.notify();
             });
@@ -235,26 +259,37 @@ impl Workspace {
     }
 
     /// Shows `screen`, or goes back to the chat when it is already showing.
-    fn toggle_main(&mut self, screen: Main, window: &mut Window, cx: &mut Context<Self>) {
-        self.main = if self.main == screen {
-            Main::Chat
-        } else {
-            screen
+    /// Settings, Memory and Skills open as tabs beside the sessions; asking again focuses the
+    /// open tab instead of adding another.
+    fn open_screen(&mut self, screen: Main, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(key) = screen_tab(screen) else {
+            return;
         };
-        match self.main {
+        if !self.tabs.iter().any(|t| t == key) {
+            let at = self
+                .active
+                .as_ref()
+                .and_then(|active| self.tabs.iter().position(|t| t == active))
+                .map_or(self.tabs.len(), |i| i + 1);
+            self.tabs.insert(at, key.to_string());
+        }
+        self.active = Some(key.to_string());
+        self.main = screen;
+        match screen {
             Main::Memory => self.memory.update(cx, |memory, cx| memory.refresh(cx)),
             Main::Skills => self.skills.update(cx, |skills, cx| skills.refresh(cx)),
-            Main::Chat => {
-                if let Some(chat) = self.active.as_ref().and_then(|id| self.chats.get(id)) {
-                    let composer = chat.read(cx).composer();
-                    composer.focus_handle(cx).focus(window, cx);
-                }
-                self.mark_active_seen(cx);
-            }
-            Main::Settings => {}
-            Main::Onboarding => {}
+            _ => {}
         }
+        self.focus_handle.focus(window, cx);
         cx.notify();
+    }
+
+    /// Shows a tab: a screen or a session.
+    fn activate_tab(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
+        match tab_screen(&key) {
+            Some(screen) => self.open_screen(screen, window, cx),
+            None => self.open_session(key, window, cx),
+        }
     }
 
     fn reload_sessions(&mut self, cx: &mut Context<Self>) {
@@ -752,7 +787,7 @@ impl Workspace {
         };
         let (Some(provider), Some(model)) = (provider, model) else {
             self.notice = Some("Pick a provider and a model in Settings first.".into());
-            self.main = Main::Settings;
+            self.open_screen(Main::Settings, window, cx);
             cx.notify();
             return;
         };
@@ -937,19 +972,19 @@ impl Workspace {
             return;
         };
         self.tabs.remove(index);
-        let running = backend(cx).runtime.is_running(id);
-        if !running {
+        if tab_screen(id).is_none() && !backend(cx).runtime.is_running(id) {
             self.chats.remove(id);
         }
         if self.active.as_deref() == Some(id) {
             self.active = None;
+            self.main = Main::Chat;
             let next = self
                 .tabs
                 .get(index)
                 .or_else(|| index.checked_sub(1).and_then(|i| self.tabs.get(i)))
                 .cloned();
             if let Some(next) = next {
-                self.open_session(next, window, cx);
+                self.activate_tab(next, window, cx);
             }
         }
         cx.notify();
@@ -971,7 +1006,7 @@ impl Workspace {
             (current + self.tabs.len() - 1) % self.tabs.len()
         };
         let id = self.tabs[next].clone();
-        self.open_session(id, window, cx);
+        self.activate_tab(id, window, cx);
     }
 
     /// Zed's tab bar over the chat: one tab per open session, with its status and a close button.
@@ -983,12 +1018,25 @@ impl Workspace {
             .and_then(|id| self.tabs.iter().position(|t| t == id))
             .unwrap_or(0);
         TabBar::new("session-tabs").children(self.tabs.iter().enumerate().map(|(index, id)| {
-            let title = self
-                .sessions
-                .iter()
-                .find(|s| &s.id == id)
-                .and_then(|s| s.title.clone())
-                .unwrap_or_else(|| "New session".into());
+            let screen = tab_screen(id);
+            let title = match screen {
+                Some(Main::Settings) => "Settings".to_string(),
+                Some(Main::Memory) => "Memory".to_string(),
+                Some(Main::Skills) => "Skills".to_string(),
+                _ => self
+                    .sessions
+                    .iter()
+                    .find(|s| &s.id == id)
+                    .and_then(|s| s.title.clone())
+                    .unwrap_or_else(|| "New session".into()),
+            };
+            let screen_icon = match screen {
+                Some(Main::Settings) => Some(IconName::Settings),
+                Some(Main::Memory) => Some(IconName::Notepad),
+                Some(Main::Skills) => Some(IconName::Book),
+                _ => None,
+            };
+            let middle_close_id = id.clone();
             let position = if index == 0 {
                 TabPosition::First
             } else if index + 1 == count {
@@ -1001,13 +1049,30 @@ impl Workspace {
             Tab::new(SharedString::from(format!("tab-{id}")))
                 .position(position)
                 .toggle_state(index == active)
-                .start_slot::<AnyElement>(running.then(|| {
-                    Icon::new(IconName::LoadCircle)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted)
-                        .with_rotate_animation(2)
-                        .into_any_element()
-                }))
+                .start_slot::<AnyElement>(if running {
+                    Some(
+                        Icon::new(IconName::LoadCircle)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted)
+                            .with_rotate_animation(2)
+                            .into_any_element(),
+                    )
+                } else {
+                    screen_icon.map(|icon| {
+                        Icon::new(icon)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted)
+                            .into_any_element()
+                    })
+                })
+                // A middle click anywhere on the tab closes it, as in Zed and browsers.
+                .on_mouse_down(
+                    gpui::MouseButton::Middle,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_tab(&middle_close_id, window, cx)
+                    }),
+                )
                 .end_slot(
                     IconButton::new(
                         SharedString::from(format!("close-tab-{id}")),
@@ -1022,7 +1087,7 @@ impl Workspace {
                     })),
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_session(open_id.clone(), window, cx)
+                    this.activate_tab(open_id.clone(), window, cx)
                 }))
                 .child(
                     div()
@@ -1105,6 +1170,7 @@ impl Workspace {
             .group(header_group.clone())
             .cursor_pointer()
             .h(px(32.))
+            .flex_none()
             .mt_1()
             .w_full()
             .px_1p5()
@@ -1354,21 +1420,42 @@ impl Workspace {
             cx.notify();
         }))
         .when(hovered, |this| {
+            let rename_id = session.id.clone();
             this.action_slot(
-                IconButton::new(
-                    SharedString::from(format!("delete-{}", session.id)),
-                    IconName::Trash,
-                )
-                .icon_size(IconSize::Small)
-                .icon_color(Color::Muted)
-                // The row behind it is already hovered: Zed's row buttons use these to stand out.
-                .hover_background(button_hover)
-                .active_background(button_active)
-                .tooltip(Tooltip::text("Delete session"))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.delete_session(delete_id.clone(), window, cx)
-                })),
+                h_flex()
+                    .gap_0p5()
+                    .child(
+                        IconButton::new(
+                            SharedString::from(format!("rename-{}", session.id)),
+                            IconName::Pencil,
+                        )
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .hover_background(button_hover)
+                        .active_background(button_active)
+                        .tooltip(Tooltip::text("Rename session"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.start_rename(rename_id.clone(), window, cx)
+                        })),
+                    )
+                    .child(
+                        IconButton::new(
+                            SharedString::from(format!("delete-{}", session.id)),
+                            IconName::Trash,
+                        )
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        // The row behind it is already hovered: Zed's row buttons use these to
+                        // stand out.
+                        .hover_background(button_hover)
+                        .active_background(button_active)
+                        .tooltip(Tooltip::text("Delete session"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.delete_session(delete_id.clone(), window, cx)
+                        })),
+                    ),
             )
         })
         .on_click(cx.listener(move |this, _, window, cx| this.open_session(id.clone(), window, cx)))
@@ -1536,7 +1623,7 @@ impl Workspace {
                     .child(
                         div().flex_1().child(
                             Button::new("new-session", "New Session")
-                                .style(ButtonStyle::Tinted(TintColor::Accent))
+                                .style(ButtonStyle::Outlined)
                                 .full_width()
                                 .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
                                 .tooltip(Tooltip::text(new_session_tooltip))
@@ -1587,9 +1674,9 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_rem_size(crate::appearance::rem_size(cx));
-        let tab_bar =(self.tabs.len() > 1).then(|| self.render_tabs(cx).into_any_element());
+        let tab_bar = (!self.tabs.is_empty()).then(|| self.render_tabs(cx).into_any_element());
         let colors = cx.theme().colors();
-        let main: AnyElement = match self.main {
+        let content: AnyElement = match self.main {
             Main::Settings => self.settings.clone().into_any_element(),
             Main::Memory => self.memory.clone().into_any_element(),
             Main::Skills => self.skills.clone().into_any_element(),
@@ -1598,11 +1685,7 @@ impl Render for Workspace {
                 None => self.settings.clone().into_any_element(),
             },
             Main::Chat => match self.active.as_ref().and_then(|id| self.chats.get(id)) {
-                Some(chat) => v_flex()
-                    .size_full()
-                    .children(tab_bar)
-                    .child(div().flex_1().min_h_0().child(chat.clone()))
-                    .into_any_element(),
+                Some(chat) => chat.clone().into_any_element(),
                 None => v_flex()
                     .size_full()
                     .items_center()
@@ -1624,6 +1707,16 @@ impl Render for Workspace {
                     )
                     .into_any_element(),
             },
+        };
+        // Every tab's content sits under the tab bar (the first-run wizard has none).
+        let main: AnyElement = if matches!(self.main, Main::Onboarding) {
+            content
+        } else {
+            v_flex()
+                .size_full()
+                .children(tab_bar)
+                .child(div().flex_1().min_h_0().child(content))
+                .into_any_element()
         };
         let settings_open = matches!(self.main, Main::Settings);
         let memory_open = matches!(self.main, Main::Memory);
@@ -1657,15 +1750,14 @@ impl Render for Workspace {
                 this.sidebar_open = !this.sidebar_open;
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
-                this.main = Main::Settings;
-                cx.notify();
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.open_screen(Main::Settings, window, cx)
             }))
             .on_action(cx.listener(|this, _: &OpenMemory, window, cx| {
-                this.toggle_main(Main::Memory, window, cx)
+                this.open_screen(Main::Memory, window, cx)
             }))
             .on_action(cx.listener(|this, _: &OpenSkills, window, cx| {
-                this.toggle_main(Main::Skills, window, cx)
+                this.open_screen(Main::Skills, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
                 this.toggle_command_palette(window, cx)
@@ -1710,6 +1802,8 @@ impl Render for Workspace {
                             .tooltip(Tooltip::text("Review Changes (Ctrl+Shift+D)"))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_review(cx))),
                     )
+                    // The review pane toggles beside the chat; the buttons after open tabs.
+                    .right(div().mx_1().h_4().w_px().bg(review_border))
                     .right(
                         IconButton::new("open-skills", IconName::Book)
                             .icon_color(if skills_open {
@@ -1719,7 +1813,7 @@ impl Render for Workspace {
                             })
                             .tooltip(Tooltip::text("Skills (Ctrl+Shift+K)"))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_main(Main::Skills, window, cx)
+                                this.open_screen(Main::Skills, window, cx)
                             })),
                     )
                     .right(
@@ -1731,7 +1825,7 @@ impl Render for Workspace {
                             })
                             .tooltip(Tooltip::text("Memory (Ctrl+Shift+M)"))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_main(Main::Memory, window, cx)
+                                this.open_screen(Main::Memory, window, cx)
                             })),
                     )
                     .right(
@@ -1743,7 +1837,7 @@ impl Render for Workspace {
                             })
                             .tooltip(Tooltip::text("Settings (Ctrl+,)"))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_main(Main::Settings, window, cx)
+                                this.open_screen(Main::Settings, window, cx)
                             })),
                     ),
             )

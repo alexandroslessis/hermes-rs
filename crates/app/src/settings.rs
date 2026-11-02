@@ -278,7 +278,7 @@ impl SettingsView {
             }
             menu
         });
-        DropdownMenu::new("theme-picker", current, menu)
+        DropdownMenu::new("theme-picker", current, menu).style(ui::DropdownStyle::Outlined)
     }
 
     /// This build's version, the daily check switch, and the newest release.
@@ -479,7 +479,7 @@ impl SettingsView {
                 }
                 menu
             });
-            DropdownMenu::new(id, label, menu)
+            DropdownMenu::new(id, label, menu).style(ui::DropdownStyle::Outlined)
         };
         let stepper = |id: &'static str, size: Option<f32>, default: f32, set: SetSize| {
             let current = size.unwrap_or(default);
@@ -582,20 +582,20 @@ impl SettingsView {
     fn render_busy_input(cx: &mut Context<Self>) -> impl IntoElement {
         use crate::config::BusyInput;
         let current = AppState::global(cx).read(cx).config.busy_input_mode;
+        // Zed's segmented control: one outlined group, the chosen mode filled in.
         let choice = |mode: BusyInput, label: &'static str, tip: &'static str| {
-            Button::new(SharedString::from(format!("busy-{label}")), label)
-                .style(if mode == current {
-                    ButtonStyle::Filled
-                } else {
-                    ButtonStyle::Subtle
-                })
-                .tooltip(Tooltip::text(tip))
-                .on_click(move |_, _, cx| {
-                    AppState::global(cx).update(cx, |state, cx| {
-                        state.config.busy_input_mode = mode;
-                        state.save(cx);
-                    });
-                })
+            ui::ToggleButtonSimple::new(label, move |_, _, cx| {
+                AppState::global(cx).update(cx, |state, cx| {
+                    state.config.busy_input_mode = mode;
+                    state.save(cx);
+                });
+            })
+            .tooltip(Tooltip::text(tip))
+        };
+        let selected = match current {
+            BusyInput::Steer => 0,
+            BusyInput::Queue => 1,
+            BusyInput::Interrupt => 2,
         };
         h_flex()
             .justify_between()
@@ -606,16 +606,26 @@ impl SettingsView {
                 Some("What sending a message does while the agent is working. /queue and /steer work either way."),
             ))
             .child(
-                h_flex()
-                    .gap_1()
-                    .flex_none()
-                    .child(choice(BusyInput::Steer, "Steer", "Delivered to the agent after its current tool call"))
-                    .child(choice(BusyInput::Queue, "Queue", "Sent when the running turn ends"))
-                    .child(choice(BusyInput::Interrupt, "Interrupt", "Stops the running turn and sends this instead")),
+                div().flex_none().child(
+                    ui::ToggleButtonGroup::single_row(
+                        "busy-input",
+                        [
+                            choice(BusyInput::Steer, "Steer", "Delivered to the agent after its current tool call"),
+                            choice(BusyInput::Queue, "Queue", "Sent when the running turn ends"),
+                            choice(BusyInput::Interrupt, "Interrupt", "Stops the running turn and sends this instead"),
+                        ],
+                    )
+                    .style(ui::ToggleButtonGroupStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .auto_width()
+                    .selected_index(selected),
+                ),
             )
     }
 
     /// Hermes's `auxiliary.*`: the models side jobs run on, each defaulting to the chat's model.
+    /// Not shown for now (the settings still apply from config.json); the UI comes back later.
+    #[allow(dead_code)]
     fn render_aux(cx: &mut Context<Self>) -> impl IntoElement {
         let aux = AppState::global(cx).read(cx).config.aux_models.clone();
         let row = |id: &'static str,
@@ -1483,8 +1493,6 @@ impl Render for SettingsView {
             .child(Self::render_busy_input(cx))
             .child(Self::divider(cx))
             .child(self.render_learning(cx))
-            .child(Self::divider(cx))
-            .child(Self::render_aux(cx))
             .child(Self::divider(cx))
             .child(self.render_safety(cx))
             .child(Self::divider(cx))
