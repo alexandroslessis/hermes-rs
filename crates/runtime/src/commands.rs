@@ -299,7 +299,7 @@ fn render(
 
 /// git in the user's repository with its config's code-running hooks off; `None` when git can't
 /// start. Exit status 1 counts as success for `diff --no-index`.
-fn git<S: AsRef<str>>(args: &[S], cwd: &Path) -> Option<(bool, String)> {
+pub(crate) fn git<S: AsRef<str>>(args: &[S], cwd: &Path) -> Option<(bool, String)> {
     use std::os::windows::process::CommandExt as _;
     let mut child = std::process::Command::new("git")
         .args([

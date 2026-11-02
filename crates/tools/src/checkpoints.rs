@@ -647,6 +647,33 @@ impl Checkpoints {
         })
     }
 
+    /// Puts one file back as it was at a checkpoint; a file the checkpoint doesn't have (made
+    /// since) is deleted. A snapshot is taken first either way, so `/rollback` can undo it.
+    pub fn revert_file(&self, workdir: &Path, hash: &str, file: &str) -> Result<(), String> {
+        let canonical_dir = canonical(workdir).unwrap_or_else(|| workdir.to_path_buf());
+        let existed = {
+            let _guard = self.lock.lock();
+            self.known_commit(&canonical_dir, hash)?;
+            let spec = format!("{hash}:{}", file.replace('\\', "/"));
+            self.git(&["cat-file", "-e", &spec], &canonical_dir, None).0
+        };
+        if existed {
+            return self.restore(workdir, hash, Some(file), false).map(|_| ());
+        }
+        let path = Path::new(file);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!("File path must be relative to the project: {file:?}"));
+        }
+        let _guard = self.lock.lock();
+        self.take(&canonical_dir, &format!("pre-revert snapshot (removing {file})"))
+            .ok();
+        std::fs::remove_file(canonical_dir.join(path)).map_err(|e| format!("{file}: {e}"))
+    }
+
     /// `session_diff`: everything changed since the oldest kept checkpoint (the state before
     /// Hermes's first recorded edit); `None` when there are no checkpoints.
     pub fn session_diff(&self, workdir: &Path) -> Option<Result<Diff, String>> {
@@ -1019,6 +1046,22 @@ mod tests {
                 .reason
                 .starts_with("pre-rollback snapshot")
         );
+    }
+
+    #[test]
+    fn reverting_one_file_restores_or_removes_it() {
+        let (_data, project, checkpoints) = setup();
+        let dir = project.path();
+        checkpoints.ensure(dir, "before write_file", &home(), &mut HashSet::new());
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "new\n").unwrap();
+        let hash = checkpoints.list(dir).pop().unwrap().hash;
+        checkpoints.revert_file(dir, &hash, "a.txt").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+        // Made after the checkpoint: reverting removes it.
+        checkpoints.revert_file(dir, &hash, "b.txt").unwrap();
+        assert!(!dir.join("b.txt").exists());
+        assert!(checkpoints.revert_file(dir, &hash, "../x.txt").is_err());
     }
 
     #[test]

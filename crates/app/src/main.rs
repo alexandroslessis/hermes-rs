@@ -15,6 +15,7 @@ mod notification;
 mod onboarding;
 mod palette;
 mod project_dialog;
+mod review_pane;
 mod scroll;
 mod settings;
 mod sidebar;
@@ -37,7 +38,7 @@ use crate::backend::{Backend, BackendGlobal};
 use crate::state::AppState;
 use crate::workspace::{
     CloseTab, GoToSession, NewSession, NextTab, OpenMemory, OpenSettings, OpenSkills, PreviousTab,
-    ToggleCommandPalette, ToggleSidebar, Workspace,
+    ToggleCommandPalette, ToggleReview, ToggleSidebar, Workspace,
 };
 
 fn main() {
@@ -77,6 +78,7 @@ fn main() {
                 KeyBinding::new("ctrl-shift-p", ToggleCommandPalette, None),
                 KeyBinding::new("f1", ToggleCommandPalette, None),
                 KeyBinding::new("ctrl-p", GoToSession, None),
+                KeyBinding::new("ctrl-shift-d", ToggleReview, None),
                 KeyBinding::new("ctrl-f", chat::Find, Some("Chat")),
                 // Copy the text selected in a chat message.
                 KeyBinding::new("ctrl-c", markdown::Copy, Some("Markdown")),

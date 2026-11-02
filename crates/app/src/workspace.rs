@@ -21,6 +21,7 @@ use crate::chat::{ChatEvent, ChatView};
 use crate::memory_view::MemoryView;
 use crate::notification::{AgentNotification, AgentNotificationEvent};
 use crate::palette::{Palette, PaletteItem, PalettePicked};
+use crate::review_pane::{ReviewEvent, ReviewPane};
 use crate::project_dialog::{ProjectDialog, ProjectDialogEvent};
 use crate::settings::SettingsView;
 use crate::sidebar::{ProjectGroup, folder_name, group_sessions, project_root};
@@ -41,7 +42,8 @@ actions!(
         OpenMemory,
         OpenSkills,
         ToggleCommandPalette,
-        GoToSession
+        GoToSession,
+        ToggleReview
     ]
 );
 
@@ -88,6 +90,9 @@ pub struct Workspace {
     project_dialog: Option<(Entity<ProjectDialog>, Vec<Subscription>)>,
     /// The open command palette or session switcher, and what had focus before it.
     palette: Option<(Entity<Palette>, Option<FocusHandle>, Vec<Subscription>)>,
+    /// The review pane beside the chat, and whether it shows.
+    review: Entity<ReviewPane>,
+    review_open: bool,
     /// Sessions whose turn finished while you weren't looking (Zed's blue dot).
     unseen: HashSet<String>,
     notifications: Vec<Notification>,
@@ -121,6 +126,13 @@ impl Workspace {
         let settings = cx.new(|cx| SettingsView::new(window, cx));
         let memory = cx.new(|cx| MemoryView::new(window, cx));
         let skills = cx.new(SkillsView::new);
+        let review = cx.new(|_| ReviewPane::new());
+        let review_subscription = cx.subscribe(&review, |this: &mut Self, _, event, cx| match event {
+            ReviewEvent::Close => {
+                this.review_open = false;
+                cx.notify();
+            }
+        });
         let search = cx.new(|cx| TextArea::new("Search sessions…", cx).single_line());
         let search_subscription = cx.subscribe(&search, |this: &mut Self, _, event, cx| {
             if matches!(event, TextAreaEvent::Changed) {
@@ -161,6 +173,8 @@ impl Workspace {
             sidebar_scroll: ScrollHandle::new(),
             project_dialog: None,
             palette: None,
+            review,
+            review_open: false,
             unseen: HashSet::new(),
             notifications: Vec::new(),
             notice: None,
@@ -182,6 +196,7 @@ impl Workspace {
             _subscriptions: vec![
                 cx.observe(&state, |_, _, cx| cx.notify()),
                 search_subscription,
+                review_subscription,
                 // Coming back to the window counts as seeing the session on screen.
                 cx.observe_window_activation(window, |this, window, cx| {
                     if window.is_window_active() {
@@ -450,6 +465,10 @@ impl Workspace {
                                 ("New message", IconName::Sparkle)
                             };
                             let id = chat.read(cx).session_id.clone();
+                            // The turn may have edited files.
+                            if this.review_open && this.active.as_ref() == Some(&id) {
+                                this.review.update(cx, |review, cx| review.reload(cx));
+                            }
                             this.session_needs_attention(id, caption, icon, window, cx);
                         }
                         ChatEvent::NeedsInput => {
@@ -489,6 +508,10 @@ impl Workspace {
         }
         self.active = Some(id.clone());
         self.main = Main::Chat;
+        if self.review_open {
+            let active = self.active.clone();
+            self.review.update(cx, |review, cx| review.show(active, cx));
+        }
         if let Some(record) = self.sessions.iter().find(|s| s.id == id) {
             let key = self.group_key_for(&record.cwd);
             self.select_group(key, cx);
@@ -753,6 +776,16 @@ impl Workspace {
                 cx.notify();
             }
         }
+    }
+
+    /// Ctrl+Shift+D: the review pane beside the chat.
+    fn toggle_review(&mut self, cx: &mut Context<Self>) {
+        self.review_open = !self.review_open;
+        if self.review_open {
+            let active = self.active.clone();
+            self.review.update(cx, |review, cx| review.show(active, cx));
+        }
+        cx.notify();
     }
 
     /// Ctrl+Shift+P: the actions available where focus is, then the active chat's commands.
@@ -1603,6 +1636,9 @@ impl Render for Workspace {
             .as_ref()
             .map(|(dialog, _)| dialog.clone());
         let palette = self.palette.as_ref().map(|(palette, _, _)| palette.clone());
+        let review_border = cx.theme().colors().border;
+        let review_shown =
+            self.review_open && matches!(self.main, Main::Chat) && self.active.is_some();
         v_flex()
             .relative()
             .size_full()
@@ -1640,6 +1676,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &GoToSession, window, cx| {
                 this.toggle_session_switcher(window, cx)
             }))
+            .on_action(cx.listener(|this, _: &ToggleReview, _, cx| this.toggle_review(cx)))
             .font(theme::theme_settings(cx).ui_font(cx).clone())
             .text_color(colors.text)
             .bg(colors.background)
@@ -1665,6 +1702,16 @@ impl Render for Workspace {
                         Label::new("Hermes")
                             .size(LabelSize::Small)
                             .color(Color::Muted),
+                    )
+                    .right(
+                        IconButton::new("toggle-review", IconName::Diff)
+                            .icon_color(if review_shown {
+                                Color::Accent
+                            } else {
+                                Color::Muted
+                            })
+                            .tooltip(Tooltip::text("Review Changes (Ctrl+Shift+D)"))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_review(cx))),
                     )
                     .right(
                         IconButton::new("open-skills", IconName::Book)
@@ -1735,7 +1782,18 @@ impl Render for Workspace {
                                 ))
                             })
                             .child(main),
-                    ),
+                    )
+                    .when(review_shown, |this| {
+                        this.child(
+                            div()
+                                .w(px(480.))
+                                .flex_none()
+                                .h_full()
+                                .border_l_1()
+                                .border_color(review_border)
+                                .child(self.review.clone()),
+                        )
+                    }),
             )
             // The project dialog over a dimmed window; clicking outside it cancels.
             .when_some(dialog, |this, dialog| {

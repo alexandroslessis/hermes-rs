@@ -1,6 +1,7 @@
 //! The agent runtime the desktop app talks to: create and open sessions, start a turn and
 //! receive its events, cancel it, list a provider's models.
 
+pub mod changes;
 mod commands;
 pub mod compress;
 mod curator;
@@ -1171,6 +1172,22 @@ impl Runtime {
         let home = dirs::home_dir().context("no home directory")?;
         let output = commands::diff(&self.checkpoints, &cwd, &home, args);
         self.add_command_output(&open, "diff", &output)
+    }
+
+    /// The review pane: what changed in the session's folder, per file.
+    pub fn changes(&self, session_id: &str) -> Result<changes::Changes> {
+        let open = self.open(session_id)?;
+        let cwd = PathBuf::from(&open.record.lock().cwd);
+        let home = dirs::home_dir().context("no home directory")?;
+        Ok(changes::changes(&self.checkpoints, &cwd, &home))
+    }
+
+    /// The review pane's Revert: one file back to how it was before the session's first edit.
+    pub fn revert_file(&self, session_id: &str, file: &str) -> Result<()> {
+        let open = self.idle_session(session_id)?;
+        let cwd = PathBuf::from(&open.record.lock().cwd);
+        let home = dirs::home_dir().context("no home directory")?;
+        changes::revert_file(&self.checkpoints, &cwd, &home, file).map_err(anyhow::Error::msg)
     }
 
     /// Hermes's `/undo [N]`: removes the last N exchanges (default 1). Returns the conversation
