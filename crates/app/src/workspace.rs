@@ -1104,7 +1104,8 @@ impl Workspace {
             .id(SharedString::from(format!("project-header-{key}")))
             .group(header_group.clone())
             .cursor_pointer()
-            .h(px(28.))
+            .h(px(32.))
+            .mt_1()
             .w_full()
             .px_1p5()
             .justify_between()
@@ -1129,12 +1130,8 @@ impl Workspace {
                     )
                     .child(
                         Label::new(group.name.clone())
-                            .size(LabelSize::Small)
-                            .color(if selected {
-                                Color::Default
-                            } else {
-                                Color::Muted
-                            })
+                            .size(LabelSize::Default)
+                            .weight(gpui::FontWeight::SEMIBOLD)
                             .truncate(),
                     )
                     .when(collapsed && running, |this| {

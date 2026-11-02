@@ -474,6 +474,17 @@ impl Runtime {
             .build(provider, model, context_length, cwd, with_memory)
     }
 
+    /// Builds a throwaway system prompt on a background thread, so what's set up on first use
+    /// (the threat-scan patterns, the skills index) is ready before the first new session.
+    pub fn warm_up(&self) {
+        let source = self.prompt_source();
+        std::thread::spawn(move || {
+            if let Some(home) = dirs::home_dir() {
+                let _ = source.build("warm-up", "warm-up", None, &home, true);
+            }
+        });
+    }
+
     fn prompt_source(&self) -> PromptSource {
         PromptSource {
             data_dir: self.config.data_dir.clone(),
@@ -1174,20 +1185,29 @@ impl Runtime {
         self.add_command_output(&open, "diff", &output)
     }
 
-    /// The review pane: what changed in the session's folder, per file.
+    /// The review pane: what this session changed, per file.
     pub fn changes(&self, session_id: &str) -> Result<changes::Changes> {
         let open = self.open(session_id)?;
-        let cwd = PathBuf::from(&open.record.lock().cwd);
+        let (cwd, started_ms) = {
+            let record = open.record.lock();
+            (PathBuf::from(&record.cwd), record.created_at)
+        };
         let home = dirs::home_dir().context("no home directory")?;
-        Ok(changes::changes(&self.checkpoints, &cwd, &home))
+        let files = changes::session_files(open.conversation.lock().messages(), &cwd);
+        let scope = changes::SessionScope { files, started_ms };
+        Ok(changes::changes(&self.checkpoints, &cwd, &home, &scope))
     }
 
     /// The review pane's Revert: one file back to how it was before the session's first edit.
     pub fn revert_file(&self, session_id: &str, file: &str) -> Result<()> {
         let open = self.idle_session(session_id)?;
-        let cwd = PathBuf::from(&open.record.lock().cwd);
+        let (cwd, started_ms) = {
+            let record = open.record.lock();
+            (PathBuf::from(&record.cwd), record.created_at)
+        };
         let home = dirs::home_dir().context("no home directory")?;
-        changes::revert_file(&self.checkpoints, &cwd, &home, file).map_err(anyhow::Error::msg)
+        changes::revert_file(&self.checkpoints, &cwd, &home, file, started_ms)
+            .map_err(anyhow::Error::msg)
     }
 
     /// Hermes's `/undo [N]`: removes the last N exchanges (default 1). Returns the conversation

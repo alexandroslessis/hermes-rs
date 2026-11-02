@@ -2,7 +2,7 @@
 //! GPL-3.0-or-later) that the chat reuses as they are: the generating spinner, the token
 //! count format, and the context-usage tooltip.
 
-use gpui::{App, Context, Window, prelude::*};
+use gpui::{App, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, Window, prelude::*};
 use ui::{SpinnerLabel, SpinnerVariant, prelude::*};
 
 /// Zed's `GeneratingSpinner`: a view, so the spinner's animation keeps its frame across
@@ -84,6 +84,15 @@ pub struct TokenUsageTooltip {
     pub breakdown: Vec<(SharedString, SharedString)>,
     /// When automatic compression starts, e.g. "150k".
     pub compress_at: Option<SharedString>,
+    pub focus_handle: FocusHandle,
+}
+
+impl EventEmitter<DismissEvent> for TokenUsageTooltip {}
+
+impl Focusable for TokenUsageTooltip {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 }
 
 impl Render for TokenUsageTooltip {
@@ -96,7 +105,16 @@ impl Render for TokenUsageTooltip {
             self.cost.clone(),
         );
         let (breakdown, compress_at) = (self.breakdown.clone(), self.compress_at.clone());
-        ui::tooltip_container(cx, move |container, cx| {
+        // Opened by a click (a popover, not a hover tooltip): a click elsewhere or Escape closes.
+        let wrapper = div()
+            .track_focus(&self.focus_handle)
+            .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
+            .on_key_down(cx.listener(|_, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    cx.emit(DismissEvent);
+                }
+            }));
+        let popover = ui::tooltip_container(cx, move |container, cx| {
             container
                 .min_w_40()
                 .child(
@@ -162,7 +180,8 @@ impl Render for TokenUsageTooltip {
                             .child(Label::new(cost)),
                     )
                 })
-        })
+        });
+        wrapper.child(popover)
     }
 }
 

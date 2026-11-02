@@ -1,14 +1,95 @@
-//! The review pane's data: what changed in a session's folder, per file. With checkpoints on it's
-//! everything since Hermes's first recorded edit (and a file can be put back); otherwise it's
-//! git's view of the working tree (staged and unstaged, new files included).
+//! The review pane's data: what one session changed, per file. Only the files its own
+//! `write_file` / `patch` calls touched count, so sessions sharing a folder each see their own
+//! edits. With checkpoints on, a file is compared with the first checkpoint taken after the session
+//! started (and can be put back); otherwise with git's HEAD.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use hermes_llm::conversation::message::{Message, MessageContent};
 use hermes_tools::checkpoints::Checkpoints;
 
 use crate::commands::git;
 
 const MAX_UNTRACKED_FILES: usize = 50;
+
+/// A session: the files its tool calls wrote and when it started.
+pub struct SessionScope {
+    /// Absolute paths.
+    pub files: Vec<PathBuf>,
+    pub started_ms: i64,
+}
+
+/// The files the session's `write_file` and `patch` calls wrote, as absolute paths.
+pub fn session_files(messages: &[Message], cwd: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut add = |path: &str| {
+        let path = path.trim();
+        if path.is_empty() {
+            return;
+        }
+        let path = PathBuf::from(path.replace('/', "\\"));
+        let path = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        if !files.iter().any(|f| same_path(f, &path)) {
+            files.push(path);
+        }
+    };
+    for message in messages {
+        for content in &message.content {
+            let MessageContent::ToolRequest(request) = content else {
+                continue;
+            };
+            let Ok(call) = &request.tool_call else {
+                continue;
+            };
+            if !matches!(call.name.as_ref(), "write_file" | "patch") {
+                continue;
+            }
+            let Some(args) = &call.arguments else {
+                continue;
+            };
+            if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
+                add(path);
+            }
+            // A multi-file patch names its files inside the patch text.
+            if let Some(patch) = args.get("patch").and_then(|p| p.as_str()) {
+                for line in patch.lines() {
+                    for marker in ["*** Update File:", "*** Add File:", "*** Delete File:"] {
+                        if let Some(path) = line.trim().strip_prefix(marker) {
+                            add(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    files
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+/// A path as a git pathspec.
+fn pathspec(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// The session's baseline: the oldest checkpoint taken after it started.
+fn baseline(checkpoints: &Checkpoints, workdir: &Path, started_ms: i64) -> Option<String> {
+    checkpoints
+        .list(workdir)
+        .into_iter()
+        .filter(|c| {
+            chrono::DateTime::parse_from_rfc3339(&c.timestamp)
+                .is_ok_and(|t| t.timestamp_millis() >= started_ms - 1000)
+        })
+        .last()
+        .map(|c| c.hash)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangesSource {
@@ -37,48 +118,60 @@ pub struct Changes {
     pub note: Option<String>,
 }
 
-/// The changes in `cwd`, from checkpoints when they're on and exist, else from git.
-pub fn changes(checkpoints: &Checkpoints, cwd: &Path, home: &Path) -> Changes {
+/// What the session changed: from its first checkpoint when checkpoints are on and one exists,
+/// else from git.
+pub fn changes(checkpoints: &Checkpoints, cwd: &Path, home: &Path, scope: &SessionScope) -> Changes {
+    if scope.files.is_empty() {
+        return Changes {
+            source: None,
+            files: Vec::new(),
+            note: Some("This session hasn't edited any files yet.".into()),
+        };
+    }
+    let specs: Vec<String> = scope.files.iter().map(|f| pathspec(f)).collect();
     if checkpoints.enabled() {
         let workdir = checkpoints.working_dir_for(cwd, home);
-        match checkpoints.session_diff(&workdir) {
-            Some(Ok(diff)) => {
-                return Changes {
+        if let Some(hash) = baseline(checkpoints, &workdir, scope.started_ms) {
+            return match checkpoints.diff_paths(&workdir, &hash, &specs) {
+                Ok(diff) => Changes {
                     source: Some(ChangesSource::Session),
                     files: parse_unified(&diff.diff),
                     note: None,
-                };
-            }
-            Some(Err(error)) => {
-                return Changes {
+                },
+                Err(error) => Changes {
                     source: Some(ChangesSource::Session),
                     files: Vec::new(),
                     note: Some(error),
-                };
-            }
-            // No checkpoint yet: git can still say what's changed.
-            None => {}
+                },
+            };
         }
+        // No checkpoint from this session: git can still say what's changed.
     }
     match git(&["rev-parse", "--is-inside-work-tree"], cwd) {
         None => return note("git is not installed or not on PATH."),
         Some((false, _)) => {
             return note(if checkpoints.enabled() {
-                "Not a git repository, and no checkpoints here yet: they start with the agent's first edit in this folder."
+                "Not a git repository, and this session took no checkpoint (they start with its first edit after checkpoints were turned on)."
             } else {
                 "Not a git repository. Turn on checkpoints (Settings → Safety) to review the agent's edits anywhere."
             });
         }
         Some((true, _)) => {}
     }
+    let with_specs = |args: &[&str]| -> Vec<String> {
+        let mut all: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        all.push("--".into());
+        all.extend(specs.iter().cloned());
+        all
+    };
     let base = ["diff", "--no-ext-diff", "--no-textconv", "--no-color"];
     // Against HEAD (staged and unstaged); a repository without commits has no HEAD.
-    let mut body = git(&[&base[..], &["HEAD"]].concat(), cwd)
+    let mut body = git(&with_specs(&[&base[..], &["HEAD"]].concat()), cwd)
         .filter(|(ok, _)| *ok)
-        .or_else(|| git(&base, cwd))
+        .or_else(|| git(&with_specs(&base), cwd))
         .map(|(_, out)| out)
         .unwrap_or_default();
-    let untracked: Vec<String> = git(&["ls-files", "--others", "--exclude-standard"], cwd)
+    let untracked: Vec<String> = git(&with_specs(&["ls-files", "--others", "--exclude-standard"]), cwd)
         .map(|(_, out)| {
             out.lines()
                 .filter(|l| !l.trim().is_empty())
@@ -194,18 +287,53 @@ pub fn revert_file(
     cwd: &Path,
     home: &Path,
     file: &str,
+    started_ms: i64,
 ) -> Result<(), String> {
     let workdir = checkpoints.working_dir_for(cwd, home);
-    let oldest = checkpoints
-        .list(&workdir)
-        .pop()
-        .ok_or("No checkpoints exist for this folder")?;
-    checkpoints.revert_file(&workdir, &oldest.hash, file)
+    let hash = baseline(checkpoints, &workdir, started_ms)
+        .ok_or("This session has no checkpoint to revert to")?;
+    checkpoints.revert_file(&workdir, &hash, file)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_owns_the_files_its_tools_wrote() {
+        use rmcp::model::CallToolRequestParams;
+        let call = |id: &str, name: &str, args: serde_json::Value| {
+            let params = CallToolRequestParams::new(name.to_string())
+                .with_arguments(args.as_object().cloned().unwrap_or_default());
+            Message::assistant().with_tool_request(id, Ok(params))
+        };
+        let messages = vec![
+            call("1", "read_file", serde_json::json!({"path": "a.txt"})),
+            call("2", "write_file", serde_json::json!({"path": "src/new.rs", "content": "x"})),
+            call("3", "patch", serde_json::json!({"path": "src/new.rs"})),
+            call(
+                "4",
+                "patch",
+                serde_json::json!({"mode": "patch", "patch": "*** Begin Patch\n*** Update File: b.py\n@@\n-x\n+y\n*** End Patch"}),
+            ),
+        ];
+        let cwd = Path::new(r"C:\proj");
+        let files = session_files(&messages, cwd);
+        assert_eq!(
+            files,
+            vec![PathBuf::from(r"C:\proj\src\new.rs"), PathBuf::from(r"C:\proj\b.py")]
+        );
+        let none = changes(
+            &Checkpoints::new(PathBuf::from(r"C:\nonexistent"), false),
+            cwd,
+            Path::new(r"C:\home"),
+            &SessionScope {
+                files: Vec::new(),
+                started_ms: 0,
+            },
+        );
+        assert!(none.note.unwrap().contains("hasn't edited"));
+    }
 
     #[test]
     fn unified_diffs_split_per_file() {

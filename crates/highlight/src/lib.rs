@@ -3,7 +3,8 @@
 //! theme's syntax colors through Zed's `SyntaxTheme`, so code looks the way it does in Zed.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use markdown::language::{HighlightId, Highlighter, Language, LanguageRegistry};
 use syntax_theme::SyntaxTheme;
@@ -48,7 +49,7 @@ const CAPTURES: &[&str] = &[
 ];
 
 struct TreeSitterHighlighter {
-    config: HighlightConfiguration,
+    config: Arc<HighlightConfiguration>,
     /// For each entry of `CAPTURES`, the theme's highlight style index (if the theme styles it).
     theme_ids: Vec<Option<HighlightId>>,
 }
@@ -82,6 +83,31 @@ impl Highlighter for TreeSitterHighlighter {
     }
 }
 
+/// Compiled highlight queries by language: compiling is slow (most of a theme switch in a debug
+/// build) and doesn't depend on the theme, so each language compiles once.
+fn compiled(
+    name: &str,
+    grammar: tree_sitter::Language,
+    highlights: &str,
+    injections: &str,
+    locals: &str,
+) -> Option<Arc<HighlightConfiguration>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<HighlightConfiguration>>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(config) = cache.lock().ok()?.get(name) {
+        return config.clone();
+    }
+    let config = HighlightConfiguration::new(grammar, name, highlights, injections, locals)
+        .ok()
+        .map(|mut config| {
+            config.configure(CAPTURES);
+            Arc::new(config)
+        });
+    cache.lock().ok()?.insert(name.to_string(), config.clone());
+    config
+}
+
 fn language(
     name: &str,
     grammar: tree_sitter::Language,
@@ -90,9 +116,7 @@ fn language(
     locals: &str,
     theme: &SyntaxTheme,
 ) -> Option<Arc<Language>> {
-    let mut config =
-        HighlightConfiguration::new(grammar, name, highlights, injections, locals).ok()?;
-    config.configure(CAPTURES);
+    let config = compiled(name, grammar, highlights, injections, locals)?;
     let theme_ids = CAPTURES
         .iter()
         .map(|capture| theme.highlight_id(capture).map(HighlightId))

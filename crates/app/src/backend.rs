@@ -113,6 +113,7 @@ impl Backend {
             let _guard = tokio.enter();
             Arc::new(Runtime::new(config, Arc::new(UiBridge { requests }))?)
         };
+        runtime.warm_up();
         Ok((
             Self {
                 tokio,

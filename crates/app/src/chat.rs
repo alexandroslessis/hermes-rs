@@ -2136,7 +2136,9 @@ impl ChatView {
                     .group(header_group.clone())
                     .w_full()
                     .pr_1()
-                    .justify_between()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(colors.ghost_element_hover))
                     .child(
                         h_flex()
                             .h(window.line_height() - px(2.))
@@ -2152,14 +2154,14 @@ impl ChatView {
                                     .text_size(rems_from_px(13_f32))
                                     .text_color(colors.text_muted)
                                     .child(label),
+                            )
+                            .child(
+                                Disclosure::new(SharedString::from(format!("{key}-expand")), open)
+                                    .opened_icon(IconName::ChevronUp)
+                                    .closed_icon(IconName::ChevronDown)
+                                    .visible_on_hover(header_group)
+                                    .on_click(cx.listener(move |this, _, _, cx| toggle(this, cx))),
                             ),
-                    )
-                    .child(
-                        Disclosure::new(SharedString::from(format!("{key}-expand")), open)
-                            .opened_icon(IconName::ChevronUp)
-                            .closed_icon(IconName::ChevronDown)
-                            .visible_on_hover(header_group)
-                            .on_click(cx.listener(move |this, _, _, cx| toggle(this, cx))),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| header_toggle(this, cx))),
             )
@@ -2223,7 +2225,9 @@ impl ChatView {
                     .relative()
                     .w_full()
                     .pr_1()
-                    .justify_between()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(colors.ghost_element_hover))
                     .child(
                         h_flex()
                             .h(window.line_height() - px(2.))
@@ -2246,14 +2250,14 @@ impl ChatView {
                                     .text_color(colors.text_muted)
                                     .child("Thinking")
                                     .into_any_element()
-                            }),
-                    )
-                    .child(
-                        Disclosure::new(SharedString::from(format!("{key}-expand")), open)
-                            .opened_icon(IconName::ChevronUp)
-                            .closed_icon(IconName::ChevronDown)
-                            .visible_on_hover(card_header)
-                            .on_click(cx.listener(move |this, _, _, cx| toggle(this, cx))),
+                            })
+                            .child(
+                                Disclosure::new(SharedString::from(format!("{key}-expand")), open)
+                                    .opened_icon(IconName::ChevronUp)
+                                    .closed_icon(IconName::ChevronDown)
+                                    .visible_on_hover(card_header)
+                                    .on_click(cx.listener(move |this, _, _, cx| toggle(this, cx))),
+                            ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| header_toggle(this, cx))),
             )
@@ -2353,9 +2357,28 @@ impl ChatView {
                         .color(Color::Muted),
                 ),
             )
-            .child(h_flex().w_full().whitespace_nowrap().child(label))
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .child(label),
+            )
+            // Zed puts the chevron right after the label.
+            .when(response.is_some(), |this| {
+                this.child(
+                    div().flex_none().child(
+                        Disclosure::new(SharedString::from(format!("{key}-expand")), open)
+                            .opened_icon(IconName::ChevronUp)
+                            .closed_icon(IconName::ChevronDown)
+                            .visible_on_hover(card_header.clone()),
+                    ),
+                )
+            })
+            .child(div().flex_1())
             .when(!is_edit, |this| this.child(gradient_overlay));
         let toggle_key = key.clone();
+        let hover_bg = cx.theme().colors().ghost_element_hover;
         let header = h_flex()
             .id(SharedString::from(format!("{key}-header")))
             .group(card_header.clone())
@@ -2363,22 +2386,16 @@ impl ChatView {
             .w_full()
             .justify_between()
             .cursor_pointer()
+            .rounded_sm()
             .when(use_card_layout, |this| {
                 this.p_0p5().rounded_t(rems_from_px(5_f32)).bg(header_bg)
             })
+            .hover(move |style| style.bg(hover_bg))
             .child(label_row)
             .child(
                 h_flex()
                     .pr_0p5()
                     .gap_1()
-                    .when(response.is_some(), |this| {
-                        this.child(
-                            Disclosure::new(SharedString::from(format!("{key}-expand")), open)
-                                .opened_icon(IconName::ChevronUp)
-                                .closed_icon(IconName::ChevronDown)
-                                .visible_on_hover(card_header.clone()),
-                        )
-                    })
                     .when(failed, |this| {
                         this.child(
                             Icon::new(IconName::Close)
@@ -2581,20 +2598,29 @@ impl ChatView {
             .justify_between()
             .rounded_t_md()
             .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
             .child(
-                div().w_full().min_w_0().overflow_hidden().child(
-                    Label::new(working_dir)
-                        .buffer_font(cx)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .truncate_start(),
-                ),
-            )
-            .child(
-                Disclosure::new(child_id("disclosure"), is_expanded)
-                    .opened_icon(IconName::ChevronUp)
-                    .closed_icon(IconName::ChevronDown)
-                    .visible_on_hover(group.clone()),
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        div().min_w_0().overflow_hidden().child(
+                            Label::new(working_dir)
+                                .buffer_font(cx)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .truncate_start(),
+                        ),
+                    )
+                    .child(
+                        div().flex_none().child(
+                            Disclosure::new(child_id("disclosure"), is_expanded)
+                                .opened_icon(IconName::ChevronUp)
+                                .closed_icon(IconName::ChevronDown)
+                                .visible_on_hover(group.clone()),
+                        ),
+                    ),
             )
             .when(running, |header| {
                 header
@@ -3228,17 +3254,21 @@ impl ChatView {
             let precision = if self.usage.cost < 0.01 { 4 } else { 2 };
             SharedString::from(format!("{:.precision$} USD", self.usage.cost))
         });
+        let ring = CircularProgress::new(used as f32, max as f32, px(16.), cx)
+            .stroke_width(px(2.))
+            .progress_color(progress_color);
         Some(
-            h_flex()
-                .id("circular_progress_tokens")
-                .mt_px()
-                .mr_1()
-                .child(
-                    CircularProgress::new(used as f32, max as f32, px(16.), cx)
-                        .stroke_width(px(2.))
-                        .progress_color(progress_color),
+            PopoverMenu::new("token-usage")
+                .trigger(
+                    ButtonLike::new("circular_progress_tokens")
+                        .child(div().mt_px().child(ring)),
                 )
-                .hoverable_tooltip(move |_, cx| {
+                .anchor(gpui::Anchor::BottomRight)
+                .offset(gpui::Point {
+                    x: px(0.),
+                    y: px(-4.),
+                })
+                .menu(move |_, cx| {
                     let (percentage, used, max, cost) = (
                         percentage.clone(),
                         used_label.clone(),
@@ -3269,15 +3299,15 @@ impl ChatView {
                             .collect()
                         })
                         .unwrap_or_default();
-                    cx.new(|_| chat_ui::TokenUsageTooltip {
+                    Some(cx.new(|cx| chat_ui::TokenUsageTooltip {
                         percentage,
                         used,
                         max,
                         cost,
                         breakdown,
                         compress_at: Some(compress_at.clone()),
-                    })
-                    .into()
+                        focus_handle: cx.focus_handle(),
+                    }))
                 }),
         )
     }
@@ -3392,6 +3422,8 @@ impl ChatView {
                         .id("todos-header")
                         .gap_2()
                         .cursor_pointer()
+                        .rounded_sm()
+                        .hover(|style| style.bg(colors.ghost_element_hover))
                         .child(
                             Icon::new(IconName::ListTodo)
                                 .size(IconSize::Small)
@@ -3401,6 +3433,7 @@ impl ChatView {
                             Label::new(format!("Tasks {done}/{}", todos.len()))
                                 .size(LabelSize::Small),
                         )
+                        .child(Disclosure::new("todos-disclosure", expanded))
                         .when_some(active.filter(|_| !expanded), |this, active| {
                             this.child(
                                 div()
@@ -3415,7 +3448,6 @@ impl ChatView {
                             )
                         })
                         .child(div().flex_1())
-                        .child(Disclosure::new("todos-disclosure", expanded))
                         .on_click(cx.listener(|this, _, _, cx| this.toggle("todos".into(), cx))),
                 )
                 .when(expanded, |this| {

@@ -7,7 +7,7 @@ use gpui::{
     App, Context, Entity, FocusHandle, Focusable, KeyDownEvent, Subscription, Window, prelude::*,
 };
 use ui::{
-    Callout, Chip, ContextMenu, Divider, DropdownMenu, PopoverMenu, Switch, TintColor, ToggleState, Tooltip,
+    Callout, Chip, ContextMenu, DropdownMenu, PopoverMenu, Switch, TintColor, ToggleState, Tooltip,
     prelude::*,
 };
 
@@ -352,24 +352,17 @@ impl SettingsView {
                     )
                     .child(action),
             )
-            .child(
-                h_flex()
-                    .justify_between()
-                    .child(
-                        Label::new("Check for updates once a day")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Switch::new("check-updates-switch", auto.into()).on_click(|state, _, cx| {
-                            let on = *state == ToggleState::Selected;
-                            AppState::global(cx).update(cx, |app, cx| {
-                                app.config.check_updates = on;
-                                app.save(cx);
-                            });
-                        }),
-                    ),
-            )
+            .child(Self::option_row(
+                "Check automatically",
+                "Look for a newer release on GitHub once a day.",
+                Switch::new("check-updates-switch", auto.into()).on_click(|state, _, cx| {
+                    let on = *state == ToggleState::Selected;
+                    AppState::global(cx).update(cx, |app, cx| {
+                        app.config.check_updates = on;
+                        app.save(cx);
+                    });
+                }),
+            ))
     }
 
     /// Import from Hermes: memory, skills and SOUL.md from `~/.hermes`.
@@ -762,42 +755,68 @@ impl SettingsView {
             let config = &AppState::global(cx).read(cx).config;
             (config.background_review, config.curator_consolidate)
         };
-        h_flex()
-            .justify_between()
-            .items_start()
-            .gap_4()
+        v_flex()
+            .gap_3()
             .child(Self::section(
                 "Learning",
-                Some("After some turns, the agent reviews the conversation in the background to save memories and improve its skills. /refine runs a review now; /learn turns anything into a skill. The curator archives skills the agent wrote that go unused for a month (Skills screen)."),
+                Some("/refine runs a review now; /learn turns anything into a skill. The curator archives skills the agent wrote that go unused for a month (Skills screen)."),
             ))
+            .child(Self::option_row(
+                "Review in the background",
+                "After some turns, the agent reviews the conversation to save memories and improve its skills.",
+                Switch::new("background-review", enabled.into()).on_click(cx.listener(
+                    |_, state: &ToggleState, _, cx| {
+                        let enabled = *state == ToggleState::Selected;
+                        AppState::global(cx).update(cx, |state, cx| {
+                            state.config.background_review = enabled;
+                            state.save(cx);
+                        });
+                        backend(cx).runtime.set_background_review(enabled);
+                    },
+                )),
+            ))
+            .child(Self::option_row(
+                "Curator merges overlapping skills",
+                "When the curator runs, skills that cover the same ground are consolidated into one.",
+                Switch::new("curator-consolidate", consolidate.into()).on_click(cx.listener(
+                    |_, state: &ToggleState, _, cx| {
+                        let on = *state == ToggleState::Selected;
+                        AppState::global(cx).update(cx, |state, cx| {
+                            state.config.curator_consolidate = on;
+                            state.save(cx);
+                        });
+                    },
+                )),
+            ))
+    }
+
+    /// The line between sections (Zed's `Divider` is too faint on this background).
+    fn divider(cx: &App) -> impl IntoElement {
+        div().w_full().h_px().flex_none().bg(cx.theme().colors().border)
+    }
+
+    /// One setting: its name and what it does on the left, its switch on the right.
+    fn option_row(
+        title: &'static str,
+        description: &'static str,
+        switch: Switch,
+    ) -> impl IntoElement {
+        h_flex()
+            .justify_between()
+            .items_center()
+            .gap_4()
             .child(
                 v_flex()
-                    .flex_none()
-                    .gap_2()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Label::new(title))
                     .child(
-                        Switch::new("background-review", enabled.into())
-                            .label("Review in the background")
-                            .on_click(cx.listener(|_, state: &ToggleState, _, cx| {
-                                let enabled = *state == ToggleState::Selected;
-                                AppState::global(cx).update(cx, |state, cx| {
-                                    state.config.background_review = enabled;
-                                    state.save(cx);
-                                });
-                                backend(cx).runtime.set_background_review(enabled);
-                            })),
-                    )
-                    .child(
-                        Switch::new("curator-consolidate", consolidate.into())
-                            .label("Curator merges overlapping skills")
-                            .on_click(cx.listener(|_, state: &ToggleState, _, cx| {
-                                let on = *state == ToggleState::Selected;
-                                AppState::global(cx).update(cx, |state, cx| {
-                                    state.config.curator_consolidate = on;
-                                    state.save(cx);
-                                });
-                            })),
+                        Label::new(description)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
                     ),
             )
+            .child(div().flex_none().child(switch))
     }
 
     /// Hermes's command approvals: whether to ask, and the patterns always allowed.
@@ -1033,68 +1052,52 @@ impl SettingsView {
         let (border, background) = (colors.border_variant, colors.editor_background);
         v_flex()
             .gap_3()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_start()
-                    .gap_4()
-                    .child(Self::section(
-                        "Safety",
-                        Some("Commands that match a dangerous pattern (recursive deletes, force pushes, piping downloads into a shell, inline scripts…) wait for your approval on their card. Commands that could wreck the system never run through the agent. With smart approvals a model judges each flagged command first: clearly safe ones run, clearly dangerous ones are blocked, only uncertain ones are asked about. /yolo stops asking for one session."),
-                    ))
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .items_end()
-                            .child(
-                        Switch::new("ask-dangerous", ask.into())
-                            .label("Ask before dangerous commands")
-                            .on_click(cx.listener(|_, state: &ToggleState, _, cx| {
-                                let ask = *state == ToggleState::Selected;
-                                AppState::global(cx).update(cx, |state, cx| {
-                                    state.config.ask_dangerous_commands = ask;
-                                    state.save(cx);
-                                });
-                                backend(cx).runtime.approvals().set_ask(ask);
-                            })),
-                            )
-                            .child(
-                                Switch::new("smart-approvals", smart.into())
-                                    .label("Smart approvals")
-                                    .disabled(!ask)
-                                    .on_click(cx.listener(|_, state: &ToggleState, _, cx| {
-                                        let smart = *state == ToggleState::Selected;
-                                        AppState::global(cx).update(cx, |state, cx| {
-                                            state.config.smart_approvals = smart;
-                                            state.save(cx);
-                                        });
-                                        backend(cx).runtime.approvals().set_smart(smart);
-                                    })),
-                            ),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_start()
-                    .gap_4()
-                    .child(Self::section(
-                        "Checkpoints",
-                        Some("Before Hermes first changes a project's files in a turn (writes, patches, deleting or moving commands), the project is snapshotted to a private store; its own .git is never touched. /rollback lists and restores snapshots, /diff session shows everything changed since the first."),
-                    ))
-                    .child(
-                        Switch::new("checkpoints", checkpoints.into())
-                            .label("Take checkpoints")
-                            .on_click(cx.listener(|_, state: &ToggleState, _, cx| {
-                                let enabled = *state == ToggleState::Selected;
-                                AppState::global(cx).update(cx, |state, cx| {
-                                    state.config.checkpoints = enabled;
-                                    state.save(cx);
-                                });
-                                backend(cx).runtime.checkpoints().set_enabled(enabled);
-                            })),
-                    ),
-            )
+            .child(Self::section(
+                "Safety",
+                Some("Commands that could wreck the system never run through the agent. /yolo stops asking for one session."),
+            ))
+            .child(Self::option_row(
+                "Ask before dangerous commands",
+                "Commands matching a dangerous pattern (recursive deletes, force pushes, piping downloads into a shell, inline scripts…) wait for your approval on their card.",
+                Switch::new("ask-dangerous", ask.into()).on_click(cx.listener(
+                    |_, state: &ToggleState, _, cx| {
+                        let ask = *state == ToggleState::Selected;
+                        AppState::global(cx).update(cx, |state, cx| {
+                            state.config.ask_dangerous_commands = ask;
+                            state.save(cx);
+                        });
+                        backend(cx).runtime.approvals().set_ask(ask);
+                    },
+                )),
+            ))
+            .child(Self::option_row(
+                "Smart approvals",
+                "A model judges each flagged command first: clearly safe ones run, clearly dangerous ones are blocked, only uncertain ones are asked about.",
+                Switch::new("smart-approvals", smart.into())
+                    .disabled(!ask)
+                    .on_click(cx.listener(|_, state: &ToggleState, _, cx| {
+                        let smart = *state == ToggleState::Selected;
+                        AppState::global(cx).update(cx, |state, cx| {
+                            state.config.smart_approvals = smart;
+                            state.save(cx);
+                        });
+                        backend(cx).runtime.approvals().set_smart(smart);
+                    })),
+            ))
+            .child(Self::option_row(
+                "Take checkpoints",
+                "Before Hermes first changes a project's files in a turn, the project is snapshotted to a private store (its own .git is never touched). /rollback restores snapshots, /diff session and the review pane show what changed.",
+                Switch::new("checkpoints", checkpoints.into()).on_click(cx.listener(
+                    |_, state: &ToggleState, _, cx| {
+                        let enabled = *state == ToggleState::Selected;
+                        AppState::global(cx).update(cx, |state, cx| {
+                            state.config.checkpoints = enabled;
+                            state.save(cx);
+                        });
+                        backend(cx).runtime.checkpoints().set_enabled(enabled);
+                    },
+                )),
+            ))
             .child(
                 v_flex()
                     .gap_1()
@@ -1467,29 +1470,30 @@ impl Render for SettingsView {
             .p_6()
             .gap_5()
             .child(Headline::new("Settings").size(HeadlineSize::Large))
-            .child(Divider::horizontal())
+            .child(Self::divider(cx))
             .child(
                 h_flex()
                     .justify_between()
                     .child(Self::section("Appearance", Some("The color theme, from Zed's.")))
                     .child(Self::theme_picker(window, cx)),
             )
+            .child(Self::divider(cx))
             .child(Self::render_fonts(window, cx))
-            .child(Divider::horizontal())
+            .child(Self::divider(cx))
             .child(Self::render_busy_input(cx))
-            .child(Divider::horizontal())
+            .child(Self::divider(cx))
             .child(self.render_learning(cx))
-            .child(Divider::horizontal())
+            .child(Self::divider(cx))
             .child(Self::render_aux(cx))
-            .child(Divider::horizontal())
+            .child(Self::divider(cx))
             .child(self.render_safety(cx))
-            .child(Divider::horizontal())
+            .child(Self::divider(cx))
             .child(self.render_mcp(cx))
-            .child(Divider::horizontal())
+            .child(Self::divider(cx))
             .child(self.render_import(cx))
-            .child(Divider::horizontal())
+            .child(Self::divider(cx))
             .child(Self::render_updates(cx))
-            .child(Divider::horizontal())
+            .child(Self::divider(cx))
             .child(
                 v_flex()
                     .gap_3()
@@ -1517,7 +1521,7 @@ impl Render for SettingsView {
                         )
                     }),
             )
-            .child(Divider::horizontal())
+            .child(Self::divider(cx))
             .child(
                 v_flex()
                     .gap_3()

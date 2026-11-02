@@ -626,16 +626,29 @@ impl Checkpoints {
 
     /// `diff`: a checkpoint against the current files.
     pub fn diff(&self, workdir: &Path, hash: &str) -> Result<Diff, String> {
+        self.diff_paths(workdir, hash, &[])
+    }
+
+    /// A checkpoint against the current files, limited to `paths` (all files when empty).
+    pub fn diff_paths(&self, workdir: &Path, hash: &str, paths: &[String]) -> Result<Diff, String> {
         let workdir = canonical(workdir).unwrap_or_else(|| workdir.to_path_buf());
         let _guard = self.lock.lock();
         self.known_commit(&workdir, hash)?;
+        let with_paths = |args: &[&str]| -> Vec<String> {
+            let mut all: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            if !paths.is_empty() {
+                all.push("--".into());
+                all.extend(paths.iter().cloned());
+            }
+            all
+        };
+        let stat_args = with_paths(&["diff", "--stat", hash, "--cached"]);
+        let diff_args = with_paths(&["diff", hash, "--cached", "--no-color", "--no-ext-diff"]);
+        let stat_args: Vec<&str> = stat_args.iter().map(String::as_str).collect();
+        let diff_args: Vec<&str> = diff_args.iter().map(String::as_str).collect();
         let (stat, diff) = self.with_current_tree(&workdir, |index| {
-            let stat = self.git(&["diff", "--stat", hash, "--cached"], &workdir, Some(index));
-            let diff = self.git(
-                &["diff", hash, "--cached", "--no-color", "--no-ext-diff"],
-                &workdir,
-                Some(index),
-            );
+            let stat = self.git(&stat_args, &workdir, Some(index));
+            let diff = self.git(&diff_args, &workdir, Some(index));
             (stat, diff)
         });
         if !stat.0 && !diff.0 {
