@@ -48,6 +48,8 @@ pub struct Gateway {
     starts: std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
     /// Session id → the provider and model picked while its turn ran, applied when it ends.
     pending_routes: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+    /// Sessions with a turn in flight, counting the queued prompts that follow it.
+    live_turns: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Gateway {
@@ -63,6 +65,7 @@ impl Gateway {
             queued: Default::default(),
             starts: Default::default(),
             pending_routes: Default::default(),
+            live_turns: Default::default(),
         };
         // The runtime keeps the approval policy in memory: Settings' choice applies from the start.
         gateway.apply_approvals_mode(&gateway.rest.config_value("approvals.mode"));
@@ -623,6 +626,21 @@ impl Gateway {
                 self.emit(&id, "session.info", self.session_info(&id));
                 json!({"effort": effort, "status": "applied"})
             }
+            // Restore / edit: drop the named user row and everything after it (the page then
+            // submits the text again).
+            "rewind" => {
+                let row = payload["target_message_id"]
+                    .as_u64()
+                    .ok_or((INVALID_PARAMS, "target_message_id is required".to_string()))?;
+                if self.runtime.is_running(&id) {
+                    return Err((SERVER_ERROR, "session busy".to_string()));
+                }
+                let kept = self
+                    .runtime
+                    .rewind(&id, transcript::kept_before_row(row as usize))
+                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                json!({"status": "applied", "target_message_id": row, "message_count": kept.len()})
+            }
             "archive" => {
                 return Err((
                     SERVER_ERROR,
@@ -692,7 +710,10 @@ impl Gateway {
 
     fn session_info(&self, id: &str) -> Value {
         let record = self.runtime.store().session(id).ok().flatten();
-        let running = self.runtime.is_running(id);
+        // Between a turn and its queued follow-up the runtime is idle, but the page must not see
+        // the turn end.
+        let running = self.runtime.is_running(id)
+            || self.live_turns.lock().is_ok_and(|turns| turns.contains(id));
         match record {
             Some(record) => json!({
                 // A pick made mid-reply shows at once; it takes effect from the next turn.
@@ -892,7 +913,9 @@ impl Gateway {
                 params["truncate_before_row_id"].as_u64(),
                 params["truncate_before_user_ordinal"].as_u64(),
             ) {
-                (Some(row), _) => Some((row as usize).min(messages.len())),
+                (Some(row), _) => {
+                    Some(transcript::kept_before_row(row as usize).min(messages.len()))
+                }
                 (None, Some(ordinal)) => Some(
                     transcript::user_turn_index(&messages, ordinal as usize)
                         .unwrap_or(messages.len()),
@@ -948,6 +971,8 @@ impl Gateway {
             .or(settings.active())
             .ok_or((SERVER_ERROR, "No provider is configured".to_string()))?
             .runtime();
+        // The turn's rows start here (its receipt names them).
+        let first_row = self.runtime.messages(&id).map(|m| m.len()).unwrap_or(0);
         let mut turn = self
             .runtime
             .start_turn(
@@ -975,6 +1000,7 @@ impl Gateway {
             }
             started
         });
+        self.set_live(&id, true);
         let this = self.clone();
         let outbox = outbox.clone();
         let admission = admission_id.clone();
@@ -1004,6 +1030,7 @@ impl Gateway {
                     }
                 };
                 let Some(event) = event else {
+                    this.end_live(&id);
                     break;
                 };
                 match event {
@@ -1022,14 +1049,23 @@ impl Gateway {
                             TurnStatus::Cancelled => ("interrupted", None),
                             TurnStatus::Failed(error) => ("error", Some(error)),
                         };
+                        let stored = this.runtime.messages(&id).unwrap_or_default();
                         this.emit(
                             &id,
                             "message.complete",
-                            json!({"text": stream.text(), "status": status, "error": error}),
+                            json!({
+                                "text": stream.text(),
+                                "status": status,
+                                "error": error,
+                                // The rows this turn wrote, so the page can restore or edit them.
+                                "persisted_turn": transcript::persisted_turn(&stored, first_row, &admission),
+                            }),
                         );
-                        let mut info = this.session_info(&id);
-                        info["running"] = json!(false);
-                        this.emit(&id, "session.info", info);
+                        // With a prompt queued, the session stays live into its turn: a
+                        // `running: false` in between would end the turn on the page.
+                        if !this.has_queued(&id) {
+                            this.end_live(&id);
+                        }
                         if let Some((Some((provider, model)), opening)) = titling {
                             if status == "complete" {
                                 this.title_session(&id, &provider, &model, &opening).await;
@@ -1069,7 +1105,35 @@ impl Gateway {
                 "message.complete",
                 json!({"text": "", "status": "error", "error": error}),
             );
+            self.end_live(id);
         }
+    }
+
+    /// Whether prompts wait behind the session's turn.
+    fn has_queued(&self, id: &str) -> bool {
+        self.queued
+            .lock()
+            .is_ok_and(|queued| queued.get(id).is_some_and(|q| !q.is_empty()))
+    }
+
+    /// Marks the session as having a turn in flight: from the start of a turn through any queued
+    /// prompts that follow it. The page hears `running: false` only when that ends.
+    fn set_live(&self, id: &str, live: bool) {
+        if let Ok(mut turns) = self.live_turns.lock() {
+            if live {
+                turns.insert(id.to_string());
+            } else {
+                turns.remove(id);
+            }
+        }
+    }
+
+    /// The turn (and its queue) is over: the page settles it.
+    fn end_live(&self, id: &str) {
+        self.set_live(id, false);
+        let mut info = self.session_info(id);
+        info["running"] = json!(false);
+        self.emit(id, "session.info", info);
     }
 
     /// Hermes's auto-title: the title model names the session from its opening message, and the
@@ -1185,7 +1249,10 @@ impl Gateway {
             return Some((404, json!({"detail": format!("Session {id} not found")})));
         };
         match method {
-            "GET" => Some((200, self.session_row(&record))),
+            "GET" => {
+                let count = store.message_counts().ok().and_then(|c| c.get(id).copied());
+                Some((200, self.session_row(&record, count.unwrap_or(0))))
+            }
             "PATCH" => {
                 let changes: Value = serde_json::from_slice(body).unwrap_or_default();
                 if changes["archived"] == true {
@@ -1259,8 +1326,9 @@ impl Gateway {
         )
     }
 
-    /// One session as the sidebar lists it (`SessionInfo`).
-    fn session_row(&self, s: &hermes_store::SessionRecord) -> Value {
+    /// One session as the sidebar lists it (`SessionInfo`). `message_count` must be true: the page
+    /// treats a resume that returns no messages for a row it counted as a lost transcript.
+    fn session_row(&self, s: &hermes_store::SessionRecord, message_count: usize) -> Value {
         json!({
             "id": s.id,
             "title": s.title,
@@ -1271,7 +1339,7 @@ impl Gateway {
             "started_at": s.created_at as f64 / 1000.,
             "last_active": s.updated_at as f64 / 1000.,
             "ended_at": null,
-            "message_count": 1,
+            "message_count": message_count,
             "input_tokens": 0,
             "output_tokens": 0,
             "is_active": self.runtime.is_running(&s.id),
@@ -1288,11 +1356,12 @@ impl Gateway {
         let limit = param("limit").unwrap_or(50);
         let offset = param("offset").unwrap_or(0);
         let all = self.runtime.store().list_sessions(1000).unwrap_or_default();
+        let counts = self.runtime.store().message_counts().unwrap_or_default();
         let sessions: Vec<Value> = all
             .iter()
             .skip(offset)
             .take(limit)
-            .map(|s| self.session_row(s))
+            .map(|s| self.session_row(s, counts.get(&s.id).copied().unwrap_or(0)))
             .collect();
         json!({
             "sessions": sessions,

@@ -19,6 +19,9 @@ use crate::gateway::Gateway;
 /// What the page hides of Hermes's interface (`plugins/hermes-rs/hide.css`).
 const HIDE_CSS: &str = include_str!("../plugins/hermes-rs/hide.css");
 
+/// Ctrl+Enter steers (`plugins/hermes-rs/keys.js`).
+const KEYS_JS: &str = include_str!("../plugins/hermes-rs/keys.js");
+
 /// Logs a call this backend doesn't serve, once per call: the page polls several of them every
 /// few seconds, and one line each is enough to know what's missing.
 pub fn log_missing(call: &str, detail: &str) {
@@ -149,9 +152,10 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
                     "d=JSON.parse(localStorage.getItem(k)||'{{}}');",
                     "['hermes-bots','kanban','radio'].forEach(function(i){{if(!(i in d))d[i]=false}});",
                     "localStorage.setItem(k,JSON.stringify(d));}}catch(e){{}}",
-                    "</script><style>{style}</style>"
+                    "{keys}</script><style>{style}</style>"
                 ),
                 style = HIDE_CSS,
+                keys = KEYS_JS,
                 token = serde_json::Value::String(state.token.clone()),
             );
             let html = html.replacen("</head>", &format!("{bootstrap}</head>"), 1);

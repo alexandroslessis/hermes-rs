@@ -15,13 +15,14 @@ pub fn messages(messages: &[Message]) -> Vec<Value> {
     let mut out = Vec::new();
     // Tool results arrive in a later message; they're filled into their call's entry.
     let mut calls: HashMap<String, usize> = HashMap::new();
-    // A message's place in the stored list is its durable row id (`truncate_before_row_id` cuts
-    // there).
-    for (row_id, message) in messages
+    // A message's durable row id is its 1-based place in the stored list (the page takes only
+    // positive ids; `row_id(index)`).
+    for (index, message) in messages
         .iter()
         .enumerate()
         .filter(|(_, m)| m.is_user_visible())
     {
+        let row_id = row_id(index);
         let timestamp = message.created as f64;
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -166,19 +167,58 @@ impl TurnStream {
     }
 }
 
+/// A stored message's durable row id: its 1-based place in the session's list.
+pub fn row_id(index: usize) -> usize {
+    index + 1
+}
+
+/// How many stored messages a cut before `row` keeps.
+pub fn kept_before_row(row: usize) -> usize {
+    row.saturating_sub(1)
+}
+
+/// A typed message: the user's text (tool results ride in user messages and don't count).
+fn is_typed(message: &Message) -> bool {
+    message.role == Role::User
+        && message.is_user_visible()
+        && message
+            .content
+            .iter()
+            .any(|c| matches!(c, MessageContent::Text(t) if !t.text.trim().is_empty()))
+}
+
+/// Hermes's `persisted_turn` receipt for a finished turn: the stored rows it wrote (from index
+/// `start` on), its typed rows (the prompt and steers) and its final reply, so the page can
+/// address them (restore, edit) without reloading the transcript.
+pub fn persisted_turn(messages: &[Message], start: usize, submission_id: &str) -> Value {
+    let rows: Vec<(usize, &Message)> = messages.iter().enumerate().skip(start).collect();
+    let user_rows: Vec<usize> = rows
+        .iter()
+        .filter(|(_, m)| is_typed(m))
+        .map(|(i, _)| row_id(*i))
+        .collect();
+    let final_reply = rows
+        .iter()
+        .rev()
+        .find(|(_, m)| m.role == Role::Assistant && !m.as_concat_text().trim().is_empty())
+        .map(|(i, _)| row_id(*i));
+    json!({
+        "row_ids": rows.iter().map(|(i, _)| row_id(*i)).collect::<Vec<_>>(),
+        "complete": true,
+        "user_row_id": user_rows.first(),
+        "user_row_ids": user_rows,
+        "final_assistant_row_id": final_reply,
+        "submission_id": submission_id,
+    })
+}
+
 /// Where the `ordinal`-th message the user typed (0-based, as the page counts them) sits among
 /// the stored messages; `None` past the end. Tool results ride in user messages and don't count.
 pub fn user_turn_index(messages: &[Message], ordinal: usize) -> Option<usize> {
     messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| {
-            m.role == Role::User
-                && m.is_user_visible()
-                && m.content
-                    .iter()
-                    .any(|c| matches!(c, MessageContent::Text(t) if !t.text.trim().is_empty()))
-        })
+        .filter(|(_, m)| is_typed(m))
         .nth(ordinal)
         .map(|(index, _)| index)
 }
@@ -198,8 +238,13 @@ mod tests {
         let rows = messages(&stored);
         let users: Vec<_> = rows.iter().filter(|r| r["role"] == "user").collect();
         assert_eq!(users[1]["text"], "second");
-        assert_eq!(users[1]["row_id"], 2);
+        assert_eq!(users[1]["row_id"], 3);
         // The page's ordinal for the same message lands on the same row.
-        assert_eq!(user_turn_index(&stored, 1), Some(2));
+        assert_eq!(user_turn_index(&stored, 1).map(row_id), Some(3));
+        // A turn's receipt names its rows: the prompt and the final reply.
+        let turn = persisted_turn(&stored, 2, "s1");
+        assert_eq!(turn["row_ids"], json!([3, 4]));
+        assert_eq!(turn["user_row_ids"], json!([3]));
+        assert_eq!(turn["final_assistant_row_id"], 4);
     }
 }

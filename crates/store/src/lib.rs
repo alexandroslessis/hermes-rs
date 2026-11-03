@@ -214,6 +214,17 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// How many messages each session has stored (sessions without any are absent).
+    pub fn message_counts(&self) -> Result<std::collections::HashMap<String, usize>> {
+        let conn = self.conn.lock();
+        let mut statement =
+            conn.prepare("SELECT session_id, COUNT(*) FROM messages GROUP BY session_id")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Pins or unpins a session (its place in the list by time is kept).
     pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
         self.conn.lock().execute(
@@ -450,7 +461,11 @@ mod tests {
             .unwrap();
         let moved = store.session(&session.id).unwrap().unwrap();
         assert_eq!(
-            (moved.provider.as_str(), moved.model.as_str(), moved.system_prompt.as_str()),
+            (
+                moved.provider.as_str(),
+                moved.model.as_str(),
+                moved.system_prompt.as_str()
+            ),
             ("ollama", "qwen3.5:9b", "rebuilt")
         );
     }
