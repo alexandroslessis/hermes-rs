@@ -3,11 +3,9 @@
 //! and `tui_gateway/ws.py` serve in Hermes). Routes the backend doesn't have answer Hermes's
 //! own "No such API endpoint" 404, which the frontend reads as "this backend lacks the feature".
 
-/// What the page hides of Hermes's interface (`plugins/hermes-rs/hide.css`).
-const HIDE_CSS: &str = include_str!("../plugins/hermes-rs/hide.css");
-
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::Body;
@@ -17,6 +15,25 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 
 use crate::gateway::Gateway;
+
+/// What the page hides of Hermes's interface (`plugins/hermes-rs/hide.css`).
+const HIDE_CSS: &str = include_str!("../plugins/hermes-rs/hide.css");
+
+/// Logs a call this backend doesn't serve, once per call: the page polls several of them every
+/// few seconds, and one line each is enough to know what's missing.
+pub fn log_missing(call: &str, detail: &str) {
+    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let first = SEEN
+        .lock()
+        .map(|mut seen| {
+            seen.get_or_insert_with(HashSet::new)
+                .insert(call.to_string())
+        })
+        .unwrap_or(true);
+    if first {
+        tracing::info!(target: "hermes_desktop::missing", "{call} {detail}");
+    }
+}
 
 pub struct ServerState {
     /// Hermes's built webapp (`apps/desktop/dist-webapp`).
@@ -83,7 +100,7 @@ async fn api(State(state): State<Arc<ServerState>>, request: Request) -> Respons
         )
             .into_response(),
         None => {
-            tracing::info!(target: "hermes_desktop::missing", "REST {method} {}", uri.path());
+            log_missing(&format!("REST {method} {}", uri.path()), "");
             (
                 StatusCode::NOT_FOUND,
                 [(header::CONTENT_TYPE, "application/json")],

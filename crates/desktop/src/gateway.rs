@@ -125,7 +125,17 @@ impl Gateway {
         };
         let id = frame.get("id").cloned();
         let params = frame.get("params").cloned().unwrap_or(Value::Null);
+        if matches!(
+            method,
+            "session.create" | "session.resume" | "session.close"
+        ) {
+            tracing::info!("{method} {}", params["session_id"]);
+        }
+        let began = std::time::Instant::now();
         let result = self.clone().dispatch(method, &params, &outbox).await;
+        if began.elapsed() > std::time::Duration::from_secs(5) {
+            tracing::warn!("RPC {method} took {:.1?}", began.elapsed());
+        }
         let Some(id) = id else {
             return;
         };
@@ -133,7 +143,7 @@ impl Gateway {
             Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
             Err((code, message)) => {
                 if code == METHOD_NOT_FOUND {
-                    tracing::info!(target: "hermes_desktop::missing", "RPC {method} {params}");
+                    crate::server::log_missing(&format!("RPC {method}"), &params.to_string());
                 } else {
                     tracing::warn!("RPC {method} failed: {message}");
                 }
@@ -271,6 +281,14 @@ impl Gateway {
             )),
             // Hermes's wording for "not a command here": the page then tries `command.dispatch`,
             // and reports the slash.exec error when that finds nothing either.
+            // The page polls each session's goal; there are no goals here.
+            "slash.exec"
+                if params["command"]
+                    .as_str()
+                    .is_some_and(|c| c.trim_start_matches('/').starts_with("goal")) =>
+            {
+                Ok(json!({"type": "exec", "output": ""}))
+            }
             "slash.exec" => commands::exec(
                 &self.runtime,
                 params["command"].as_str().unwrap_or_default(),
@@ -351,6 +369,47 @@ impl Gateway {
                     Ok(json!({"status": "rejected", "session_id": id, "text": text}))
                 }
             }
+            // The queue panel: delete a queued prompt, steer it into the running turn, or edit it
+            // (the edit goes to the back, as a new admission).
+            "prompt.cancel" => {
+                let id = session_id(params)?;
+                let admission = params["admission_id"].as_str().unwrap_or_default();
+                let cancelled = self.dequeue(&id, admission).is_some();
+                Ok(json!({"cancelled": cancelled, "admission_id": admission, "session_id": id}))
+            }
+            "prompt.steer_queued" => {
+                let id = session_id(params)?;
+                let admission = params["admission_id"].as_str().unwrap_or_default();
+                if !self.runtime.is_running(&id) {
+                    return Err((SERVER_ERROR, "session_idle".to_string()));
+                }
+                let queued = self
+                    .dequeue(&id, admission)
+                    .ok_or((SERVER_ERROR, "admission_started".to_string()))?;
+                let text = queued["text"].as_str().unwrap_or_default();
+                if !self.runtime.steer(&id, text) {
+                    // The turn ended in between: it runs next after all.
+                    self.enqueue(&id, queued.clone(), true);
+                }
+                Ok(json!({"status": "steered", "admission_id": admission, "session_id": id}))
+            }
+            "prompt.replace_queued" => {
+                let id = session_id(params)?;
+                let admission = params["admission_id"].as_str().unwrap_or_default();
+                self.dequeue(&id, admission)
+                    .ok_or((SERVER_ERROR, "admission_started".to_string()))?;
+                let edited = json!({
+                    "text": params["text"],
+                    "submission_id": params["submission_id"],
+                });
+                let replacement = self.enqueue(&id, edited, false);
+                Ok(json!({
+                    "status": "queued",
+                    "admission_id": replacement,
+                    "replaced": admission,
+                    "ref": {"session_id": id},
+                }))
+            }
             // Interrupt and send this instead: the text runs first once the turn has stopped.
             "session.redirect" => {
                 let id = session_id(params)?;
@@ -358,13 +417,8 @@ impl Gateway {
                 if !self.runtime.is_running(&id) {
                     return Ok(json!({"status": "rejected", "session_id": id, "text": text}));
                 }
-                if let Ok(mut queued) = self.queued.lock() {
-                    queued
-                        .entry(id.clone())
-                        .or_default()
-                        .push_front(json!({"session_id": id, "text": text}));
-                }
                 self.subscribe(&id, outbox);
+                self.enqueue(&id, json!({"text": text}), true);
                 self.runtime.cancel(&id);
                 self.hub.cancel_session(&id);
                 Ok(json!({"status": "redirected", "session_id": id, "text": text}))
@@ -413,7 +467,10 @@ impl Gateway {
     async fn model_options(&self, settings: &Settings, session_id: Option<&str>) -> Value {
         let record = session_id.and_then(|id| self.runtime.store().session(id).ok().flatten());
         let (current_provider, current_model) = match &record {
-            Some(record) => (Some(record.provider.clone()), Some(record.model.clone())),
+            Some(record) => match self.pending_route(&record.id) {
+                Some((provider, model)) => (Some(provider), Some(model)),
+                None => (Some(record.provider.clone()), Some(record.model.clone())),
+            },
             None => (settings.provider.clone(), settings.model.clone()),
         };
         let mut providers = Vec::new();
@@ -474,25 +531,29 @@ impl Gateway {
         let record = params["session_id"]
             .as_str()
             .and_then(|id| self.runtime.store().session(id).ok().flatten());
-        let mut deferred = false;
         if let Some(record) = &record {
-            if record.model != model || record.provider != provider {
-                if self.runtime.is_running(&record.id) {
-                    // Mid-reply: the pick applies from the next turn on (Hermes's deferred pick).
-                    if let Ok(mut picks) = self.pending_routes.lock() {
+            let changes = record.model != model || record.provider != provider;
+            if self.runtime.is_running(&record.id) {
+                // Mid-reply: the pick applies from the next turn on (Hermes's deferred pick); it
+                // shows as the session's model right away. Picking the running model again
+                // withdraws an earlier pick.
+                if let Ok(mut picks) = self.pending_routes.lock() {
+                    if changes {
                         picks.insert(record.id.clone(), (provider.clone(), model.clone()));
+                    } else {
+                        picks.remove(&record.id);
                     }
-                    deferred = true;
-                } else {
-                    self.route_session(&record.id, &provider, &model)?;
                 }
+                self.emit(&record.id, "session.info", self.session_info(&record.id));
+            } else if changes {
+                self.route_session(&record.id, &provider, &model)?;
             }
         }
         if !session_only {
             crate::providers::save_default(&self.data_dir, &provider, &model)
                 .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
         }
-        Ok(json!({"key": "model", "value": model, "provider": provider, "deferred": deferred}))
+        Ok(json!({"key": "model", "value": model, "provider": provider}))
     }
 
     /// Moves a session to `provider` / `model` (refused while a turn runs).
@@ -507,6 +568,11 @@ impl Gateway {
             .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
         self.emit(id, "session.info", self.session_info(id));
         Ok(())
+    }
+
+    /// The provider and model picked while the session's turn runs, if any.
+    fn pending_route(&self, id: &str) -> Option<(String, String)> {
+        self.pending_routes.lock().ok()?.get(id).cloned()
     }
 
     /// A model picked while the last turn ran, applied now that it has finished.
@@ -538,17 +604,13 @@ impl Gateway {
                 let model = payload["model"].as_str().unwrap_or_default();
                 let provider = payload["provider"].as_str().unwrap_or_default();
                 // The canonical pick is session policy: it never rewrites the defaults.
-                let switched = self.switch_model(
+                // Picked mid-reply, it waits for the next turn, but shows as the session's model
+                // at once (no "applies next turn" notice).
+                self.switch_model(
                     &json!({"session_id": id, "value": format!("{model} --provider {provider} --session")}),
                     settings,
                 )?;
-                // Picked mid-reply: the page notes that it applies from the next turn.
-                let status = if switched["deferred"] == true {
-                    "deferred"
-                } else {
-                    "applied"
-                };
-                json!({"model": model, "provider": provider, "status": status})
+                json!({"model": model, "provider": provider, "status": "applied"})
             }
             "reasoning" => {
                 let effort = payload["effort"]
@@ -633,8 +695,9 @@ impl Gateway {
         let running = self.runtime.is_running(id);
         match record {
             Some(record) => json!({
-                "model": record.model,
-                "provider": record.provider,
+                // A pick made mid-reply shows at once; it takes effect from the next turn.
+                "model": self.pending_route(id).map_or(record.model, |(_, model)| model),
+                "provider": self.pending_route(id).map_or(record.provider, |(provider, _)| provider),
                 "cwd": record.cwd,
                 "title": record.title.unwrap_or_default(),
                 "stored_session_id": record.id,
@@ -646,9 +709,67 @@ impl Gateway {
                 "reasoning_effort": self.effort(id),
                 "revision": self.revision(id),
                 "execution_generation": EXECUTION_GENERATION,
+                // The queue panel's rows: prompts waiting for the running turn.
+                "pending": self.pending_rows(id),
             }),
             None => json!({"stored_session_id": id, "running": running}),
         }
+    }
+
+    /// The session's queued prompts as Hermes's pending admissions, in the order they'll run.
+    fn pending_rows(&self, id: &str) -> Vec<Value> {
+        let Ok(queued) = self.queued.lock() else {
+            return Vec::new();
+        };
+        queued
+            .get(id)
+            .map(|queue| {
+                queue
+                    .iter()
+                    .map(|params| {
+                        json!({
+                            "admission_id": params["submission_id"],
+                            "text": params["text"],
+                            "status": "queued",
+                            "controls": ["steer", "replace", "cancel"],
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Queues a prompt behind the running turn (at the front for a redirect or a steer the turn
+    /// missed) and tells the page; returns its admission id.
+    fn enqueue(&self, id: &str, mut params: Value, front: bool) -> String {
+        let admission = admission_id(&params).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        params["session_id"] = json!(id);
+        params["submission_id"] = json!(admission);
+        if let Ok(mut queued) = self.queued.lock() {
+            let queue = queued.entry(id.to_string()).or_default();
+            if front {
+                queue.push_front(params);
+            } else {
+                queue.push_back(params);
+            }
+        }
+        self.emit(id, "session.info", self.session_info(id));
+        admission
+    }
+
+    /// Takes a queued prompt out by its admission id (`None` when it already ran or never was).
+    fn dequeue(&self, id: &str, admission: &str) -> Option<Value> {
+        let taken = self.queued.lock().ok().and_then(|mut queued| {
+            let queue = queued.get_mut(id)?;
+            let index = queue
+                .iter()
+                .position(|params| params["submission_id"] == admission)?;
+            queue.remove(index)
+        });
+        if taken.is_some() {
+            self.emit(id, "session.info", self.session_info(id));
+        }
+        taken
     }
 
     fn subscribe(&self, session_id: &str, outbox: &Outbox) {
@@ -719,6 +840,15 @@ impl Gateway {
             // The page's edit and turn-control fences.
             "revision": self.revision(&id),
             "execution_generation": EXECUTION_GENERATION,
+            // Prompts still queued behind the running turn (the queue panel).
+            "pending_submissions": self
+                .pending_rows(&id)
+                .into_iter()
+                .map(|mut row| {
+                    row["user"] = row["text"].clone();
+                    row
+                })
+                .collect::<Vec<_>>(),
         }))
     }
 
@@ -742,14 +872,9 @@ impl Gateway {
             if params["confirm_truncate"] == true {
                 return Err((SERVER_ERROR, "session busy".to_string()));
             }
-            // Anything else waits its turn (Hermes's queued admission).
-            if let Ok(mut queued) = self.queued.lock() {
-                queued
-                    .entry(id.clone())
-                    .or_default()
-                    .push_back(params.clone());
-            }
+            // Anything else waits its turn (Hermes's queued admission, listed in the panel).
             self.subscribe(&id, outbox);
+            let admission_id = self.enqueue(&id, params.clone(), false);
             return Ok(json!({
                 "status": "queued",
                 "admission_id": admission_id,
@@ -757,14 +882,24 @@ impl Gateway {
             }));
         }
         // Restore / edit / regenerate: drop that user turn and everything after it first.
+        // The cut is a stored row (the transcript's `row_id`), else the n-th typed message.
         if params["confirm_truncate"] == true {
-            if let Some(ordinal) = params["truncate_before_user_ordinal"].as_u64() {
-                let messages = self
-                    .runtime
-                    .messages(&id)
-                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
-                let keep = transcript::user_turn_index(&messages, ordinal as usize)
-                    .unwrap_or(messages.len());
+            let messages = self
+                .runtime
+                .messages(&id)
+                .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+            let keep = match (
+                params["truncate_before_row_id"].as_u64(),
+                params["truncate_before_user_ordinal"].as_u64(),
+            ) {
+                (Some(row), _) => Some((row as usize).min(messages.len())),
+                (None, Some(ordinal)) => Some(
+                    transcript::user_turn_index(&messages, ordinal as usize)
+                        .unwrap_or(messages.len()),
+                ),
+                (None, None) => None,
+            };
+            if let Some(keep) = keep {
                 self.runtime
                     .rewind(&id, keep)
                     .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
@@ -855,14 +990,32 @@ impl Gateway {
                 "message.start",
                 json!({"turn_id": admission, "admission_id": admission}),
             );
-            while let Some(event) = turn.events.recv().await {
+            // While the turn runs, a `running: true` heartbeat (Hermes's backend sends one, and
+            // `gateway.ready` says it does) keeps the page holding the turn as live through quiet
+            // stretches: a long think, a retry, a wait on the provider.
+            let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+            heartbeat.tick().await;
+            loop {
+                let event = tokio::select! {
+                    event = turn.events.recv() => event,
+                    _ = heartbeat.tick() => {
+                        this.emit(&id, "session.info", this.session_info(&id));
+                        continue;
+                    }
+                };
+                let Some(event) = event else {
+                    break;
+                };
                 match event {
                     RuntimeEvent::Agent(event) => {
                         for (name, payload) in stream.agent_event(event) {
                             this.emit(&id, name, payload);
                         }
                     }
-                    RuntimeEvent::SteerUndelivered(_) => {}
+                    // A steer the turn ended before reading: it runs next, as Hermes does.
+                    RuntimeEvent::SteerUndelivered(text) => {
+                        this.enqueue(&id, json!({"text": text}), true);
+                    }
                     RuntimeEvent::TurnFinished(status) => {
                         let (status, error) = match status {
                             TurnStatus::Completed => ("complete", None),

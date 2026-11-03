@@ -15,7 +15,13 @@ pub fn messages(messages: &[Message]) -> Vec<Value> {
     let mut out = Vec::new();
     // Tool results arrive in a later message; they're filled into their call's entry.
     let mut calls: HashMap<String, usize> = HashMap::new();
-    for message in messages.iter().filter(|m| m.is_user_visible()) {
+    // A message's place in the stored list is its durable row id (`truncate_before_row_id` cuts
+    // there).
+    for (row_id, message) in messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.is_user_visible())
+    {
         let timestamp = message.created as f64;
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -71,6 +77,7 @@ pub fn messages(messages: &[Message]) -> Vec<Value> {
             "text": text,
             "reasoning": (!reasoning.is_empty()).then_some(reasoning),
             "timestamp": timestamp,
+            "row_id": row_id,
         }));
     }
     out
@@ -174,4 +181,25 @@ pub fn user_turn_index(messages: &[Message], ordinal: usize) -> Option<usize> {
         })
         .nth(ordinal)
         .map(|(index, _)| index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_ids_are_stored_positions_and_cut_where_restore_asks() {
+        let stored = vec![
+            Message::user().with_text("first"),
+            Message::assistant().with_text("one"),
+            Message::user().with_text("second"),
+            Message::assistant().with_text("two"),
+        ];
+        let rows = messages(&stored);
+        let users: Vec<_> = rows.iter().filter(|r| r["role"] == "user").collect();
+        assert_eq!(users[1]["text"], "second");
+        assert_eq!(users[1]["row_id"], 2);
+        // The page's ordinal for the same message lands on the same row.
+        assert_eq!(user_turn_index(&stored, 1), Some(2));
+    }
 }

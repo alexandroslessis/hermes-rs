@@ -46,8 +46,13 @@ fn main() -> Result<()> {
         .thread_name("hermes-runtime")
         .enable_all()
         .build()?;
-    let config = RuntimeConfig::for_current_user()?;
+    let mut config = RuntimeConfig::for_current_user()?;
     let data_dir = config.data_dir.clone();
+    // The terminal tool runs PowerShell, Windows' own shell; `terminal.shell: "bash"` in
+    // desktop-config.json keeps Git Bash (when installed) instead.
+    if !wants_git_bash(&data_dir) {
+        config.shell = hermes_tools::ShellKind::PowerShell;
+    }
     // The runtime asks the user (approvals, clarify) through the page following the session.
     let hub = Arc::new(hub::Hub::default());
     let runtime = {
@@ -91,6 +96,15 @@ fn main() -> Result<()> {
     tauri::Builder::default()
         .setup(move |app| {
             WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url.parse()?))
+                // A reply keeps streaming while the window is in the background (Hermes's
+                // Electron app lifts throttling during turns; WebView2 takes Chromium's flags).
+                // The first flag is wry's default, which this replaces.
+                .additional_browser_args(concat!(
+                    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection ",
+                    "--disable-background-timer-throttling ",
+                    "--disable-renderer-backgrounding ",
+                    "--disable-backgrounding-occluded-windows"
+                ))
                 .title("Hermes")
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(720.0, 480.0)
@@ -101,4 +115,12 @@ fn main() -> Result<()> {
         .context("running the window")?;
     drop(tokio);
     Ok(())
+}
+
+/// Whether Settings' config record asks for Git Bash (`terminal.shell: "bash"`).
+fn wants_git_bash(data_dir: &std::path::Path) -> bool {
+    std::fs::read(data_dir.join("desktop-config.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|config| config["terminal"]["shell"] == "bash")
 }
