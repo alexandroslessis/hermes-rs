@@ -128,6 +128,7 @@ impl Gateway {
         };
         let id = frame.get("id").cloned();
         let params = frame.get("params").cloned().unwrap_or(Value::Null);
+        tracing::debug!(target: "hermes_desktop::wire", "← {method} {}", params["session_id"]);
         if matches!(
             method,
             "session.create" | "session.resume" | "session.close"

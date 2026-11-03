@@ -54,6 +54,16 @@ impl Hub {
 
     /// Sends a session event to the socket following that session. `false` when none is.
     pub fn emit(&self, session_id: &str, event: &str, payload: Value) -> bool {
+        // The wire log (`RUST_LOG=hermes_desktop::wire=debug`): every event but the streamed
+        // text, with the turn state the page acts on.
+        if !matches!(event, "message.delta" | "reasoning.delta") {
+            tracing::debug!(
+                target: "hermes_desktop::wire",
+                "→ {event} {session_id} running={} status={}",
+                payload["running"],
+                payload["status"],
+            );
+        }
         let Some(outbox) = self.outbox(session_id) else {
             return false;
         };
