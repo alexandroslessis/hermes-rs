@@ -1,0 +1,36 @@
+[package]
+name = "hermes-desktop"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Hermes's own desktop frontend in a Tauri window, backed by the hermes-rs runtime."
+
+[[bin]]
+name = "hermes-desktop"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+chrono = { workspace = true, features = ["clock"] }
+dirs.workspace = true
+futures.workspace = true
+hermes_agent.workspace = true
+hermes_llm.workspace = true
+hermes_runtime.workspace = true
+hermes_store.workspace = true
+hermes_tools.workspace = true
+keyring = { version = "3.6.3", features = ["windows-native"] }
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+uuid = { workspace = true, features = ["v4"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
