@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod gateway;
+mod hub;
 mod providers;
 mod rest;
 mod server;
@@ -15,30 +16,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use async_trait::async_trait;
-use hermes_runtime::{ClarifyOutcome, ClarifyRequest, ProcessNotice, Runtime, RuntimeConfig};
-use hermes_tools::UserBridge;
-use hermes_tools::approval::{ApprovalChoice, CommandApproval};
+use hermes_runtime::{Runtime, RuntimeConfig};
 use tauri::{WebviewUrl, WebviewWindowBuilder};
-
-/// Asking the user isn't wired to the window yet: flagged commands are denied and questions go
-/// unanswered, so the agent carries on safely.
-struct PendingBridge;
-
-#[async_trait]
-impl UserBridge for PendingBridge {
-    async fn clarify(&self, _session_id: &str, _request: ClarifyRequest) -> ClarifyOutcome {
-        ClarifyOutcome::Undelivered
-    }
-
-    fn process_finished(&self, _session_id: &str, _notice: ProcessNotice) {}
-
-    async fn approve_command(&self, _session_id: &str, _request: CommandApproval) -> ApprovalChoice {
-        ApprovalChoice::Deny
-    }
-
-    fn review_finished(&self, _session_id: &str, _actions: Vec<String>, _requested: bool) {}
-}
 
 /// Hermes's built webapp: `HERMES_UI_DIST`, else the prototype's build output.
 fn webapp_dist() -> PathBuf {
@@ -66,11 +45,13 @@ fn main() -> Result<()> {
         .build()?;
     let config = RuntimeConfig::for_current_user()?;
     let data_dir = config.data_dir.clone();
+    // The runtime asks the user (approvals, clarify) through the page following the session.
+    let hub = Arc::new(hub::Hub::default());
     let runtime = {
         let _guard = tokio.enter();
         Arc::new(Runtime::new(
             config,
-            Arc::new(PendingBridge),
+            Arc::new(hub::DesktopBridge { hub: hub.clone() }),
         )?)
     };
     runtime.warm_up();
@@ -86,7 +67,7 @@ fn main() -> Result<()> {
     let address = listener.local_addr()?;
     let state = Arc::new(server::ServerState {
         dist: webapp_dist(),
-        gateway: Arc::new(gateway::Gateway::new(runtime, data_dir)),
+        gateway: Arc::new(gateway::Gateway::new(runtime, hub, data_dir)),
         token: uuid::Uuid::new_v4().simple().to_string(),
     });
     tokio.spawn(async move {

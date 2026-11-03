@@ -5,9 +5,8 @@
 //! A method this backend doesn't implement answers JSON-RPC's -32601, which the frontend treats
 //! as "not supported here" and hides.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use futures::{SinkExt, StreamExt};
@@ -15,6 +14,7 @@ use hermes_runtime::{Runtime, RuntimeEvent, TurnOptions, TurnStatus};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use crate::hub::{Hub, Outbox};
 use crate::providers::Settings;
 use crate::transcript;
 
@@ -31,21 +31,18 @@ pub struct Gateway {
     data_dir: PathBuf,
     /// Changes when the process restarts, so reconnecting clients reset their replay state.
     replay_epoch: String,
-    /// Where each session's events go: the socket that last created or resumed it.
-    subscribers: Mutex<HashMap<String, Outbox>>,
+    /// Event routes and open questions, shared with the runtime's bridge.
+    hub: Arc<Hub>,
 }
 
-/// Where a connection's outgoing frames go.
-type Outbox = mpsc::UnboundedSender<String>;
-
 impl Gateway {
-    pub fn new(runtime: Arc<Runtime>, data_dir: PathBuf) -> Self {
+    pub fn new(runtime: Arc<Runtime>, hub: Arc<Hub>, data_dir: PathBuf) -> Self {
         Self {
             runtime,
             rest: crate::rest::Rest::new(data_dir.clone()),
             data_dir,
             replay_epoch: uuid::Uuid::new_v4().to_string(),
-            subscribers: Mutex::default(),
+            hub,
         }
     }
 
@@ -152,6 +149,21 @@ impl Gateway {
             "session.create" => self.create_session(params, &settings, outbox),
             "session.resume" | "session.history" => self.resume_session(params, outbox),
             "prompt.submit" => self.submit(params, &settings, outbox),
+            // The page's answer to an approval card (`choice`) or a clarify question (`answer`),
+            // named by the prompt id it was shown with.
+            "approval.respond" | "clarify.respond" => {
+                let prompt_id = params["prompt_id"]
+                    .as_str()
+                    .or(params["request_id"].as_str())
+                    .ok_or((INVALID_PARAMS, "prompt_id is required".to_string()))?;
+                let field = if method == "approval.respond" { "choice" } else { "answer" };
+                let answer = params[field].as_str().unwrap_or_default().to_string();
+                if self.hub.answer(prompt_id, answer) {
+                    Ok(json!({"resolved": 1}))
+                } else {
+                    Err((SERVER_ERROR, format!("No pending {} request", method.split('.').next().unwrap_or("prompt"))))
+                }
+            }
             "session.interrupt" => {
                 let id = session_id(params)?;
                 let running = self.runtime.is_running(&id);
@@ -243,9 +255,7 @@ impl Gateway {
     }
 
     fn subscribe(&self, session_id: &str, outbox: &Outbox) {
-        if let Ok(mut subscribers) = self.subscribers.lock() {
-            subscribers.insert(session_id.to_string(), outbox.clone());
-        }
+        self.hub.subscribe(session_id, outbox);
     }
 
     fn create_session(&self, params: &Value, settings: &Settings, outbox: &Outbox) -> RpcResult {
@@ -301,6 +311,8 @@ impl Gateway {
             "messages": transcript,
             "info": self.session_info(&id),
             "running": self.runtime.is_running(&id),
+            // Questions still waiting: the page shows their cards again.
+            "prompts": self.hub.open_prompts(&id),
         }))
     }
 
@@ -388,21 +400,7 @@ impl Gateway {
 
     /// Sends a session event to the socket following that session.
     fn emit(&self, session_id: &str, event: &str, payload: Value) {
-        let outbox = self
-            .subscribers
-            .lock()
-            .ok()
-            .and_then(|s| s.get(session_id).cloned());
-        if let Some(outbox) = outbox {
-            send(
-                &outbox,
-                json!({
-                    "jsonrpc": "2.0",
-                    "method": "event",
-                    "params": {"type": event, "session_id": session_id, "payload": payload},
-                }),
-            );
-        }
+        self.hub.emit(session_id, event, payload);
     }
 
     /// REST routes this backend serves: `(status, body)`, or `None` for Hermes's 404.
