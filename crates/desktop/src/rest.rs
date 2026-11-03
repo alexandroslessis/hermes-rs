@@ -78,7 +78,7 @@ fn config_defaults() -> Value {
         "agent": {"reasoning_effort": ""},
         "display": {
             "show_reasoning": true,
-            "busy_input_mode": "interrupt",
+            "busy_input_mode": "queue",
             "interim_assistant_messages": true,
             "timestamps": false,
             "tool_progress": "all",
@@ -536,7 +536,7 @@ mod tests {
         let (_, config) = rest.handle("GET", "/api/config", None, b"").unwrap();
         assert_eq!(config["display"]["show_reasoning"], false);
         // Untouched defaults stay, and the model is the hermes-rs settings'.
-        assert_eq!(config["display"]["busy_input_mode"], "interrupt");
+        assert_eq!(config["display"]["busy_input_mode"], "queue");
         assert_eq!(config["model"]["default"], "qwen");
         assert_eq!(rest.config_value("approvals.mode"), "manual");
         // Without defaults: only what was saved (plus the model).

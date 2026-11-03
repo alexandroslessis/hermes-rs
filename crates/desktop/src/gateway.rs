@@ -46,11 +46,13 @@ pub struct Gateway {
     queued: std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<Value>>>,
     /// Admission id → the started turn waiting for its `prompt.submit` reply to go out first.
     starts: std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
+    /// Session id → the provider and model picked while its turn ran, applied when it ends.
+    pending_routes: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
 }
 
 impl Gateway {
     pub fn new(runtime: Arc<Runtime>, hub: Arc<Hub>, data_dir: PathBuf) -> Self {
-        Self {
+        let gateway = Self {
             runtime,
             rest: crate::rest::Rest::new(data_dir.clone()),
             data_dir,
@@ -60,7 +62,20 @@ impl Gateway {
             efforts: Default::default(),
             queued: Default::default(),
             starts: Default::default(),
-        }
+            pending_routes: Default::default(),
+        };
+        // The runtime keeps the approval policy in memory: Settings' choice applies from the start.
+        gateway.apply_approvals_mode(&gateway.rest.config_value("approvals.mode"));
+        gateway
+    }
+
+    /// Hermes's `approvals.mode` on the runtime's policy: manual asks, smart has a reviewer model
+    /// judge first, off runs flagged commands (hardline ones never run).
+    fn apply_approvals_mode(&self, mode: &Value) {
+        let approvals = self.runtime.approvals();
+        let mode = mode.as_str().unwrap_or("manual");
+        approvals.set_ask(mode != "off");
+        approvals.set_smart(mode == "smart");
     }
 
     pub async fn connection(self: Arc<Self>, socket: WebSocket) {
@@ -201,6 +216,9 @@ impl Gateway {
                             key
                         };
                         self.rest.set_config_value(key, value.clone());
+                        if key == "approvals.mode" {
+                            self.apply_approvals_mode(&value);
+                        }
                         Ok(json!({"key": key, "value": value, "ok": true}))
                     }
                 }
@@ -328,14 +346,33 @@ impl Gateway {
                 let id = session_id(params)?;
                 let text = params["text"].as_str().unwrap_or_default();
                 if self.runtime.steer(&id, text) {
-                    Ok(json!({"status": "queued", "session_id": id}))
+                    Ok(json!({"status": "queued", "session_id": id, "text": text}))
                 } else {
-                    Err((SERVER_ERROR, "no turn is running".to_string()))
+                    Ok(json!({"status": "rejected", "session_id": id, "text": text}))
                 }
+            }
+            // Interrupt and send this instead: the text runs first once the turn has stopped.
+            "session.redirect" => {
+                let id = session_id(params)?;
+                let text = params["text"].as_str().unwrap_or_default();
+                if !self.runtime.is_running(&id) {
+                    return Ok(json!({"status": "rejected", "session_id": id, "text": text}));
+                }
+                if let Ok(mut queued) = self.queued.lock() {
+                    queued
+                        .entry(id.clone())
+                        .or_default()
+                        .push_front(json!({"session_id": id, "text": text}));
+                }
+                self.subscribe(&id, outbox);
+                self.runtime.cancel(&id);
+                self.hub.cancel_session(&id);
+                Ok(json!({"status": "redirected", "session_id": id, "text": text}))
             }
             "session.interrupt" => {
                 let id = session_id(params)?;
                 let running = self.runtime.is_running(&id);
+                tracing::info!("stop requested in {id} (a turn was running: {running})");
                 self.runtime.cancel(&id);
                 self.hub.cancel_session(&id);
                 Ok(json!({
@@ -437,21 +474,53 @@ impl Gateway {
         let record = params["session_id"]
             .as_str()
             .and_then(|id| self.runtime.store().session(id).ok().flatten());
+        let mut deferred = false;
         if let Some(record) = &record {
             if record.model != model || record.provider != provider {
-                // Refused while a turn runs.
-                let other_provider = (record.provider != provider).then_some(provider.as_str());
-                self.runtime
-                    .set_session_route(&record.id, other_provider, &model, None)
-                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
-                self.emit(&record.id, "session.info", self.session_info(&record.id));
+                if self.runtime.is_running(&record.id) {
+                    // Mid-reply: the pick applies from the next turn on (Hermes's deferred pick).
+                    if let Ok(mut picks) = self.pending_routes.lock() {
+                        picks.insert(record.id.clone(), (provider.clone(), model.clone()));
+                    }
+                    deferred = true;
+                } else {
+                    self.route_session(&record.id, &provider, &model)?;
+                }
             }
         }
         if !session_only {
             crate::providers::save_default(&self.data_dir, &provider, &model)
                 .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
         }
-        Ok(json!({"key": "model", "value": model, "provider": provider}))
+        Ok(json!({"key": "model", "value": model, "provider": provider, "deferred": deferred}))
+    }
+
+    /// Moves a session to `provider` / `model` (refused while a turn runs).
+    fn route_session(&self, id: &str, provider: &str, model: &str) -> Result<(), (i64, String)> {
+        let record = self.runtime.store().session(id).ok().flatten();
+        let other_provider = record
+            .as_ref()
+            .is_some_and(|r| r.provider != provider)
+            .then_some(provider);
+        self.runtime
+            .set_session_route(id, other_provider, model, None)
+            .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+        self.emit(id, "session.info", self.session_info(id));
+        Ok(())
+    }
+
+    /// A model picked while the last turn ran, applied now that it has finished.
+    fn apply_pending_route(&self, id: &str) {
+        let pick = self
+            .pending_routes
+            .lock()
+            .ok()
+            .and_then(|mut picks| picks.remove(id));
+        if let Some((provider, model)) = pick {
+            if let Err((_, error)) = self.route_session(id, &provider, &model) {
+                tracing::warn!("applying the model picked during the turn in {id}: {error}");
+            }
+        }
     }
 
     /// Hermes's canonical `session.mutate`: a session edit presenting the revision the page last
@@ -469,16 +538,22 @@ impl Gateway {
                 let model = payload["model"].as_str().unwrap_or_default();
                 let provider = payload["provider"].as_str().unwrap_or_default();
                 // The canonical pick is session policy: it never rewrites the defaults.
-                self.switch_model(
+                let switched = self.switch_model(
                     &json!({"session_id": id, "value": format!("{model} --provider {provider} --session")}),
                     settings,
                 )?;
-                json!({"model": model, "provider": provider, "status": "applied"})
+                // Picked mid-reply: the page notes that it applies from the next turn.
+                let status = if switched["deferred"] == true {
+                    "deferred"
+                } else {
+                    "applied"
+                };
+                json!({"model": model, "provider": provider, "status": status})
             }
             "reasoning" => {
                 let effort = payload["effort"]
                     .as_str()
-                    .unwrap_or("medium")
+                    .unwrap_or_default()
                     .to_lowercase();
                 if let Ok(mut efforts) = self.efforts.lock() {
                     efforts.insert(id.clone(), effort.clone());
@@ -811,6 +886,7 @@ impl Gateway {
                     }
                 }
             }
+            this.apply_pending_route(&id);
             this.run_queued(&id, &outbox);
         });
         // The canonical protocol's admission receipt: which session took the prompt, under the
@@ -882,6 +958,50 @@ impl Gateway {
     ) -> Option<(u16, Value)> {
         if (method, path) == ("GET", "/api/profiles/sessions") {
             return Some((200, self.session_list(query)));
+        }
+        // Settings ▸ Model ▸ Main model: the default model (the hermes-rs settings').
+        if (method, path) == ("GET", "/api/model/auxiliary") {
+            let settings = Settings::load(&self.data_dir);
+            return Some((
+                200,
+                json!({
+                    "main": {"provider": settings.provider, "model": settings.model},
+                    "tasks": [],
+                }),
+            ));
+        }
+        if (method, path) == ("POST", "/api/model/set") {
+            let body: Value = serde_json::from_slice(body).unwrap_or_default();
+            let (Some(provider), Some(model)) = (body["provider"].as_str(), body["model"].as_str())
+            else {
+                return Some((400, json!({"detail": "provider and model are required"})));
+            };
+            if body["scope"].as_str().is_some_and(|scope| scope != "main") {
+                return Some((
+                    400,
+                    json!({"detail": "Only the main model can be set in hermes-rs"}),
+                ));
+            }
+            if Settings::load(&self.data_dir).provider(provider).is_none() {
+                return Some((
+                    400,
+                    json!({"detail": format!("Unknown provider {provider}")}),
+                ));
+            }
+            return Some(
+                match crate::providers::save_default(&self.data_dir, provider, model) {
+                    Ok(()) => (
+                        200,
+                        json!({"ok": true, "provider": provider, "model": model}),
+                    ),
+                    Err(error) => (500, json!({"detail": format!("{error:#}")})),
+                },
+            );
+        }
+        if (method, path) == ("PUT", "/api/config") {
+            let answer = self.rest.handle(method, path, query, body);
+            self.apply_approvals_mode(&self.rest.config_value("approvals.mode"));
+            return answer;
         }
         if (method, path) == ("GET", "/api/model/options") {
             let settings = Settings::load(&self.data_dir);

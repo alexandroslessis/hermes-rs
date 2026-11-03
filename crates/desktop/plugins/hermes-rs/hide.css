@@ -11,20 +11,51 @@ button:has(.codicon-mic) {
   display: none !important;
 }
 
-/* Settings sections with nothing this backend reads or serves. */
-[data-tour='nav-config:workspace'],
-[data-tour='nav-config:browser'],
-[data-tour='nav-config:memory'],
-[data-tour='nav-config:voice'],
-[data-tour='nav-config:advanced'],
-[data-tour='nav-vault'],
-[data-tour='nav-billing'],
-[data-tour='nav-toggle-billing'],
-[data-tour='nav-providers'],
-[data-tour='nav-toggle-providers'],
-[data-tour='nav-gateway'],
-[data-tour='nav-toggle-gateway'],
-[data-tour='nav-web-access'],
-[data-tour='nav-keys'] {
+/* Settings sections with nothing this backend reads or serves. A section is its row's wrapper
+   (the row and its expand chevron) and its sub-page list, whose id ends in the section id
+   (`overlay-split-layout.tsx`). Clicking a section opens its first sub-page, so one whose
+   sub-pages are all unsupported (About: updates, uninstall) goes whole. */
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-config:workspace']),
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-config:workspace']) + [id$='-config:workspace'],
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-config:browser']),
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-config:browser']) + [id$='-config:browser'],
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-vault']),
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-vault']) + [id$='-vault'],
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-config:memory']),
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-config:memory']) + [id$='-config:memory'],
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-config:voice']),
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-config:voice']) + [id$='-config:voice'],
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-config:advanced']),
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-config:advanced']) + [id$='-config:advanced'],
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-billing']),
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-billing']) + [id$='-billing'],
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-providers']),
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-providers']) + [id$='-providers'],
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-gateway']),
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-gateway']) + [id$='-gateway'],
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-keys']),
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-keys']) + [id$='-keys'],
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-sessions']),
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-sessions']) + [id$='-sessions'],
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-about']),
+[data-tour='overlay-nav'] div:has(> [data-tour='nav-about']) + [id$='-about'] {
+  display: none !important;
+}
+
+/* Sub-pages of kept sections that this backend can't serve:
+   Model — fallbacks, auxiliary models, subagents, mixture of agents (only the main model);
+   Chat — attachments (image input mode); Appearance — the pet;
+   Safety — privacy (secret redaction), checkpoints (only approvals);
+   Keyboard — the HUD gesture and screen capture (native Desktop). */
+[data-tour='overlay-nav'] [data-tour='nav-config:model:fallbacks'],
+[data-tour='overlay-nav'] [data-tour='nav-config:model:auxiliary'],
+[data-tour='overlay-nav'] [data-tour='nav-config:model:delegation'],
+[data-tour='overlay-nav'] [data-tour='nav-config:model:moa'],
+[data-tour='overlay-nav'] [data-tour='nav-config:chat:attachments'],
+[data-tour='overlay-nav'] [data-tour='nav-config:appearance:pet'],
+[data-tour='overlay-nav'] [data-tour='nav-config:safety:privacy'],
+[data-tour='overlay-nav'] [data-tour='nav-config:safety:checkpoints'],
+[data-tour='overlay-nav'] [data-tour='nav-keybinds:hud-gesture'],
+[data-tour='overlay-nav'] [data-tour='nav-keybinds:screen-capture'] {
   display: none !important;
 }
