@@ -32,8 +32,8 @@ debugging.
 Works: startup, the session list, opening a session's transcript, sending a prompt with streamed
 reasoning, text and tool calls, stopping a turn; approval cards for flagged commands and clarify
 questions; titles from the title model; skills and bundles in the `/` menu; rename, delete and pin;
-switching a session's model (within its provider; without "this session only" it also becomes the
-default); Settings' config record (`desktop-config.json` in the data folder).
+switching a session's model (within its provider) and reasoning effort; restore-and-rerun; Settings
+(`desktop-config.json`) and interface preferences (`ui-preferences.json`) in the data folder.
 
 Not here (hidden or answering "off"): messaging, artifacts, scheduled jobs, bots, kanban, radio,
 pets, voice, goals and loops, archiving, Hermes's built-in backend slash commands.
