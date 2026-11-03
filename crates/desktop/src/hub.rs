@@ -67,7 +67,12 @@ impl Hub {
 
     /// Shows a question and waits for the answer; `None` when no page follows the session or
     /// the question was dropped.
-    async fn ask(&self, session_id: &str, kind: &'static str, mut payload: Value) -> Option<String> {
+    async fn ask(
+        &self,
+        session_id: &str,
+        kind: &'static str,
+        mut payload: Value,
+    ) -> Option<String> {
         let prompt_id = uuid::Uuid::new_v4().to_string();
         payload["prompt_id"] = Value::String(prompt_id.clone());
         payload["kind"] = Value::String(kind.to_string());
@@ -174,7 +179,12 @@ impl UserBridge for DesktopBridge {
             "choices": APPROVAL_CHOICES,
         });
         // No page to ask (or the card was dropped): deny, as Hermes does when nobody answers.
-        match self.hub.ask(session_id, "approval", payload).await.as_deref() {
+        match self
+            .hub
+            .ask(session_id, "approval", payload)
+            .await
+            .as_deref()
+        {
             Some("once") => ApprovalChoice::Once,
             Some("session") => ApprovalChoice::Session,
             Some("always") => ApprovalChoice::Always,
@@ -223,7 +233,10 @@ mod tests {
             if let Some(frame) = frames(&mut page).into_iter().next() {
                 assert_eq!(frame["params"]["type"], "approval.request");
                 assert_eq!(frame["params"]["payload"]["command"], "rm -rf build");
-                break frame["params"]["payload"]["prompt_id"].as_str().unwrap().to_string();
+                break frame["params"]["payload"]["prompt_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
             }
             tokio::task::yield_now().await;
         };
@@ -238,12 +251,17 @@ mod tests {
 
     #[tokio::test]
     async fn nobody_to_ask_denies_and_skips() {
-        let bridge = DesktopBridge { hub: Arc::new(Hub::default()) };
+        let bridge = DesktopBridge {
+            hub: Arc::new(Hub::default()),
+        };
         let request = CommandApproval {
             command: "x".into(),
             description: "y".into(),
         };
-        assert!(matches!(bridge.approve_command("none", request).await, ApprovalChoice::Deny));
+        assert!(matches!(
+            bridge.approve_command("none", request).await,
+            ApprovalChoice::Deny
+        ));
         let outcome = bridge
             .clarify(
                 "none",

@@ -27,7 +27,10 @@ pub fn messages(messages: &[Message]) -> Vec<Value> {
                     let (name, args) = match &request.tool_call {
                         Ok(call) => (
                             call.name.to_string(),
-                            call.arguments.clone().map(Value::Object).unwrap_or_default(),
+                            call.arguments
+                                .clone()
+                                .map(Value::Object)
+                                .unwrap_or_default(),
                         ),
                         Err(error) => ("invalid tool call".into(), json!({"error": error.message})),
                     };
@@ -54,7 +57,13 @@ pub fn messages(messages: &[Message]) -> Vec<Value> {
             continue;
         }
         let role = match message.role {
-            Role::User => "user",
+            Role::User => {
+                // A loaded skill shows as the command that loaded it.
+                if let Some(command) = crate::commands::typed_command(&text) {
+                    text = command;
+                }
+                "user"
+            }
             Role::Assistant => "assistant",
         };
         out.push(json!({
@@ -114,7 +123,10 @@ impl TurnStream {
                     let (name, args) = match &request.tool_call {
                         Ok(call) => (
                             call.name.to_string(),
-                            call.arguments.clone().map(Value::Object).unwrap_or_default(),
+                            call.arguments
+                                .clone()
+                                .map(Value::Object)
+                                .unwrap_or_default(),
                         ),
                         Err(_) => ("invalid tool call".to_string(), Value::Null),
                     };

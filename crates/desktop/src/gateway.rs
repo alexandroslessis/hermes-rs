@@ -14,6 +14,7 @@ use hermes_runtime::{Runtime, RuntimeEvent, TurnOptions, TurnStatus};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use crate::commands;
 use crate::hub::{Hub, Outbox};
 use crate::providers::Settings;
 use crate::transcript;
@@ -137,15 +138,114 @@ impl Gateway {
             }]})),
             "projects.tree" => Ok(json!({"projects": []})),
             "session.active_list" => Ok(json!({"sessions": self.active_sessions()})),
-            "model.options" => Ok(self.model_options(&settings).await),
+            "model.options" => Ok(self
+                .model_options(&settings, params["session_id"].as_str())
+                .await),
             "config.get" => Ok(json!({
-                "value": match params["key"].as_str() {
-                    Some("approvals.mode") => "manual",
-                    _ => "",
-                },
+                "value": params["key"]
+                    .as_str()
+                    .map(|key| self.rest.config_value(key))
+                    .filter(|value| !value.is_null())
+                    .unwrap_or(json!("")),
                 "model": settings.model,
                 "provider": settings.provider,
             })),
+            "config.set" if params["key"] == "model" => self.switch_model(params, &settings),
+            // Polled on start and on every focus; features this backend doesn't have answer
+            // "off" so the page stops asking and shows nothing for them.
+            "pet.info" => Ok(json!({"enabled": false})),
+            "session.control.read" => Ok(json!({"control": {"revision": "0", "updated_at": 0}})),
+            "setup.runtime_check" => {
+                let provider = settings.active();
+                let ok = provider.is_some_and(|p| p.ready()) && settings.model.is_some();
+                Ok(json!({
+                    "ok": ok,
+                    "provider": provider.map(|p| p.id.clone()),
+                    "model": settings.model,
+                    "profile": "default",
+                    "error": (!ok).then_some("No model is set up"),
+                }))
+            }
+            "shared_metrics.status" => {
+                Ok(json!({"enabled": false, "send": false, "decided": true}))
+            }
+            "free_tier.status" => Ok(json!({
+                "has_guest": false,
+                "enabled": false,
+                "available": false,
+                "notice_pending": false,
+                "model": "",
+                "label": "",
+            })),
+            "wake.status" => Ok(json!({
+                "listening": false,
+                "owned_by_caller": false,
+                "phrase": "",
+                "provider": "",
+                "configured_surface": "",
+                "input_device": {},
+                "available": false,
+                "hint": "Voice wake isn't available in hermes-rs.",
+                "enabled": false,
+                "audio_silent": true,
+                "capture": "none",
+                "local_input_available": false,
+                "sample_rate": 16000,
+                "frame_length": 512,
+            })),
+            "commands.catalog" => Ok(commands::catalog(&self.runtime.skills())),
+            "complete.slash" => Ok(commands::complete(
+                &self.runtime.skills(),
+                params["text"].as_str().unwrap_or_default(),
+            )),
+            // Hermes's wording for "not a command here": the page then tries `command.dispatch`,
+            // and reports the slash.exec error when that finds nothing either.
+            "slash.exec" => commands::exec(
+                &self.runtime,
+                params["command"].as_str().unwrap_or_default(),
+            )
+            .ok_or((
+                SERVER_ERROR,
+                "not a quick/plugin/bundle/skill command".to_string(),
+            )),
+            "command.dispatch" => commands::dispatch(
+                &self.runtime,
+                params["name"].as_str().unwrap_or_default(),
+                params["arg"].as_str().unwrap_or_default(),
+            )
+            .ok_or((
+                SERVER_ERROR,
+                "not a quick/plugin/bundle/skill command".to_string(),
+            )),
+            "session.title" => {
+                let id = session_id(params)?;
+                if let Some(title) = params["title"].as_str() {
+                    let title = title.trim();
+                    self.runtime
+                        .store()
+                        .set_title(&id, title)
+                        .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                }
+                let title = self
+                    .runtime
+                    .store()
+                    .session(&id)
+                    .ok()
+                    .flatten()
+                    .and_then(|record| record.title)
+                    .unwrap_or_default();
+                Ok(json!({"title": title, "session_key": id}))
+            }
+            "session.delete" => {
+                let id = session_id(params)?;
+                self.runtime
+                    .delete_session(&id)
+                    .await
+                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                Ok(json!({"deleted": id}))
+            }
+            // Nothing to release: a session lives in the store, not in a worker.
+            "session.close" => Ok(json!({"closed": true})),
             "session.create" => self.create_session(params, &settings, outbox),
             "session.resume" | "session.history" => self.resume_session(params, outbox),
             "prompt.submit" => self.submit(params, &settings, outbox),
@@ -156,12 +256,22 @@ impl Gateway {
                     .as_str()
                     .or(params["request_id"].as_str())
                     .ok_or((INVALID_PARAMS, "prompt_id is required".to_string()))?;
-                let field = if method == "approval.respond" { "choice" } else { "answer" };
+                let field = if method == "approval.respond" {
+                    "choice"
+                } else {
+                    "answer"
+                };
                 let answer = params[field].as_str().unwrap_or_default().to_string();
                 if self.hub.answer(prompt_id, answer) {
                     Ok(json!({"resolved": 1}))
                 } else {
-                    Err((SERVER_ERROR, format!("No pending {} request", method.split('.').next().unwrap_or("prompt"))))
+                    Err((
+                        SERVER_ERROR,
+                        format!(
+                            "No pending {} request",
+                            method.split('.').next().unwrap_or("prompt")
+                        ),
+                    ))
                 }
             }
             "session.interrupt" => {
@@ -201,11 +311,17 @@ impl Gateway {
             .collect()
     }
 
-    /// Hermes's model picker: each provider and its models (listed live from the provider).
-    async fn model_options(&self, settings: &Settings) -> Value {
+    /// Hermes's model picker: each provider and its models (listed live from the provider). For
+    /// a session, its own model is the current one.
+    async fn model_options(&self, settings: &Settings, session_id: Option<&str>) -> Value {
+        let record = session_id.and_then(|id| self.runtime.store().session(id).ok().flatten());
+        let (current_provider, current_model) = match &record {
+            Some(record) => (Some(record.provider.clone()), Some(record.model.clone())),
+            None => (settings.provider.clone(), settings.model.clone()),
+        };
         let mut providers = Vec::new();
         for provider in &settings.providers {
-            let current = settings.provider.as_deref() == Some(provider.id.as_str());
+            let current = current_provider.as_deref() == Some(provider.id.as_str());
             let models: Vec<String> = if provider.ready() {
                 provider
                     .runtime()
@@ -229,9 +345,61 @@ impl Gateway {
         }
         json!({
             "providers": providers,
-            "model": settings.model,
-            "provider": settings.provider,
+            "model": current_model,
+            "provider": current_provider,
         })
+    }
+
+    /// The model picker's `config.set model "<model> --provider <id> [--session]"`: switches the
+    /// session's model and, without `--session`, makes it the default for new sessions (as the
+    /// GPUI app's picker does). A session keeps its provider; another one needs a new session.
+    fn switch_model(&self, params: &Value, settings: &Settings) -> RpcResult {
+        let value = params["value"].as_str().unwrap_or_default();
+        let mut words = value.split_whitespace();
+        let model = words
+            .next()
+            .ok_or((INVALID_PARAMS, "a model is required".to_string()))?
+            .to_string();
+        let (mut provider, mut session_only) = (None, false);
+        while let Some(word) = words.next() {
+            match word {
+                "--provider" => provider = words.next().map(str::to_string),
+                "--session" => session_only = true,
+                _ => {}
+            }
+        }
+        let provider = provider
+            .or_else(|| settings.active().map(|p| p.id.clone()))
+            .ok_or((SERVER_ERROR, "No provider is configured".to_string()))?;
+        if settings.provider(&provider).is_none() {
+            return Err((SERVER_ERROR, format!("Unknown provider {provider}")));
+        }
+        let record = params["session_id"]
+            .as_str()
+            .and_then(|id| self.runtime.store().session(id).ok().flatten());
+        if let Some(record) = &record {
+            if record.provider != provider {
+                return Err((
+                    SERVER_ERROR,
+                    format!(
+                        "This session runs on {}; start a new session to use {provider}",
+                        record.provider
+                    ),
+                ));
+            }
+            if record.model != model {
+                // Refused while a turn runs.
+                self.runtime
+                    .set_session_model(&record.id, &model, None)
+                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                self.emit(&record.id, "session.info", self.session_info(&record.id));
+            }
+        }
+        if !session_only {
+            crate::providers::save_default(&self.data_dir, &provider, &model)
+                .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+        }
+        Ok(json!({"key": "model", "value": model, "provider": provider}))
     }
 
     fn session_info(&self, id: &str) -> Value {
@@ -342,9 +510,27 @@ impl Gateway {
             .ok()
             .flatten()
             .ok_or((INVALID_PARAMS, format!("Unknown session {id}")))?;
-        // An untitled session takes its first message's first line as its title.
+        // An untitled session takes its first message's first line as its title until the title
+        // model's arrives (after this turn); a loaded skill counts as the command that loaded it.
+        let shown = commands::typed_command(&text).unwrap_or_else(|| text.clone());
+        let titling = record.title.is_none().then(|| {
+            let chosen = settings.aux_models.titles.as_ref().and_then(|choice| {
+                Some((
+                    settings.provider(&choice.provider)?.runtime(),
+                    choice.model.clone(),
+                ))
+            });
+            let fallback = settings
+                .provider(&record.provider)
+                .map(|p| (p.runtime(), record.model.clone()));
+            (chosen.or(fallback), shown.clone())
+        });
         if record.title.is_none() {
-            let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+            let line = shown
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim();
             let title: String = line.chars().take(60).collect();
             if !title.is_empty() {
                 let _ = self.runtime.store().set_title(&id, &title);
@@ -384,6 +570,11 @@ impl Gateway {
                             "message.complete",
                             json!({"text": stream.text(), "status": status, "error": error}),
                         );
+                        if let Some((Some((provider, model)), opening)) = titling {
+                            if status == "complete" {
+                                this.title_session(&id, &provider, &model, &opening).await;
+                            }
+                        }
                         break;
                     }
                 }
@@ -396,6 +587,25 @@ impl Gateway {
             "admission_id": admission_id,
             "ref": {"session_id": id_for_receipt},
         }))
+    }
+
+    /// Hermes's auto-title: the title model names the session from its opening message, and the
+    /// page hears the new title through `session.info`.
+    async fn title_session(
+        &self,
+        id: &str,
+        provider: &hermes_runtime::ProviderConfig,
+        model: &str,
+        opening: &str,
+    ) {
+        match hermes_runtime::generate_title(provider, model, opening).await {
+            Ok(Some(title)) => {
+                let _ = self.runtime.store().set_title(id, &title);
+                self.emit(id, "session.info", self.session_info(id));
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!("titling {id}: {error:#}"),
+        }
     }
 
     /// Sends a session event to the socket following that session.
@@ -414,7 +624,74 @@ impl Gateway {
         if (method, path) == ("GET", "/api/profiles/sessions") {
             return Some((200, self.session_list(query)));
         }
+        if (method, path) == ("GET", "/api/model/options") {
+            let settings = Settings::load(&self.data_dir);
+            let session = crate::rest::query_param(query, "session_id");
+            return Some((200, self.model_options(&settings, session.as_deref()).await));
+        }
+        if let Some(id) = path.strip_prefix("/api/sessions/") {
+            let id = crate::rest::percent_decode(id);
+            if !id.contains('/') && id != "search" {
+                return self.session_route(method, &id, body).await;
+            }
+        }
         self.rest.handle(method, path, query, body)
+    }
+
+    /// `/api/sessions/{id}`: a session's row, its sidebar flags (`PATCH`), deleting it.
+    async fn session_route(&self, method: &str, id: &str, body: &[u8]) -> Option<(u16, Value)> {
+        let store = self.runtime.store();
+        let Some(record) = store.session(id).ok().flatten() else {
+            return Some((404, json!({"detail": format!("Session {id} not found")})));
+        };
+        match method {
+            "GET" => Some((200, self.session_row(&record))),
+            "PATCH" => {
+                let changes: Value = serde_json::from_slice(body).unwrap_or_default();
+                if changes["archived"] == true {
+                    return Some((
+                        400,
+                        json!({"detail": "Archiving isn't available in hermes-rs; delete the session instead."}),
+                    ));
+                }
+                if let Some(pinned) = changes["pinned"].as_bool() {
+                    if let Err(error) = store.set_pinned(id, pinned) {
+                        return Some((500, json!({"detail": format!("{error:#}")})));
+                    }
+                }
+                if let Some(title) = changes["title"].as_str() {
+                    let _ = store.set_title(id, title.trim());
+                }
+                // `unread` is the page's own bookkeeping; nothing to keep for it.
+                Some((200, json!({"ok": true})))
+            }
+            "DELETE" => match self.runtime.delete_session(id).await {
+                Ok(()) => Some((200, json!({"ok": true}))),
+                Err(error) => Some((500, json!({"detail": format!("{error:#}")}))),
+            },
+            _ => None,
+        }
+    }
+
+    /// One session as the sidebar lists it (`SessionInfo`).
+    fn session_row(&self, s: &hermes_store::SessionRecord) -> Value {
+        json!({
+            "id": s.id,
+            "title": s.title,
+            "cwd": s.cwd,
+            "model": s.model,
+            "source": "desktop",
+            "preview": s.title,
+            "started_at": s.created_at as f64 / 1000.,
+            "last_active": s.updated_at as f64 / 1000.,
+            "ended_at": null,
+            "message_count": 1,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "is_active": self.runtime.is_running(&s.id),
+            "pinned": s.pinned,
+            "profile": "default",
+        })
     }
 
     /// `/api/profiles/sessions`: the sidebar's list (`PaginatedSessions`).
@@ -429,25 +706,7 @@ impl Gateway {
             .iter()
             .skip(offset)
             .take(limit)
-            .map(|s| {
-                json!({
-                    "id": s.id,
-                    "title": s.title,
-                    "cwd": s.cwd,
-                    "model": s.model,
-                    "source": "desktop",
-                    "preview": s.title,
-                    "started_at": s.created_at as f64 / 1000.,
-                    "last_active": s.updated_at as f64 / 1000.,
-                    "ended_at": null,
-                    "message_count": 1,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "is_active": self.runtime.is_running(&s.id),
-                    "pinned": s.pinned,
-                    "profile": "default",
-                })
-            })
+            .map(|s| self.session_row(s))
             .collect();
         json!({
             "sessions": sessions,

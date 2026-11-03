@@ -5,6 +5,7 @@
 // Release builds are GUI-only (no console window); debug builds keep the console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod commands;
 mod gateway;
 mod hub;
 mod providers;
@@ -32,8 +33,7 @@ fn webapp_dist() -> PathBuf {
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 

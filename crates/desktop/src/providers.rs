@@ -18,6 +18,20 @@ pub struct ProviderSettings {
     pub api_key_env: Option<String>,
 }
 
+/// A model on a particular provider (the GPUI app's `ModelChoice`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelChoice {
+    pub provider: String,
+    pub model: String,
+}
+
+/// The side-job models (Settings ▸ Auxiliary models in the GPUI app).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AuxModels {
+    #[serde(default)]
+    pub titles: Option<ModelChoice>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Settings {
     #[serde(default)]
@@ -26,6 +40,8 @@ pub struct Settings {
     pub provider: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub aux_models: AuxModels,
 }
 
 impl Settings {
@@ -47,6 +63,23 @@ impl Settings {
             .and_then(|id| self.provider(id))
             .or(self.providers.first())
     }
+}
+
+/// Makes `model` on `provider` the default for new sessions, keeping the rest of `config.json`
+/// (the GPUI app's settings) as it is.
+pub fn save_default(data_dir: &Path, provider: &str, model: &str) -> anyhow::Result<()> {
+    let path = data_dir.join("config.json");
+    let mut config: serde_json::Value = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let object = config
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("config.json isn't an object"))?;
+    object.insert("provider".into(), provider.into());
+    object.insert("model".into(), model.into());
+    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    Ok(())
 }
 
 impl ProviderSettings {
