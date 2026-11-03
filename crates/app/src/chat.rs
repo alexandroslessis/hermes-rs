@@ -114,6 +114,15 @@ pub struct ChatView {
     /// Commands, skills and bundles by name, for the composer's `/command` chips (filled when a
     /// `/` is first typed): name → what clicking the chip opens.
     known_commands: Rc<RefCell<HashMap<String, String>>>,
+    /// The `/` menu's entries, read when a `/` is typed: (name, description, icon).
+    command_list: Vec<(String, String, IconName)>,
+    /// Mentions picked from the menu: creases even at the end of the text, and never reopen it.
+    confirmed_mentions: Rc<RefCell<HashSet<String>>>,
+    /// Where the token the menu completes starts (the menu opens there), its scroll, and the
+    /// background search filling it.
+    completion_start: usize,
+    completion_scroll: gpui::UniformListScrollHandle,
+    completion_task: Option<Task<()>>,
     /// Which earlier message ↑ recalled (0 = the latest), while the composer shows it.
     history_index: Option<usize>,
     /// Prompts waiting for the running turn to end (Hermes's `/queue`).
@@ -173,9 +182,10 @@ impl ChatView {
             .flatten()
             .map(|session| session.cwd);
         let known_commands: Rc<RefCell<HashMap<String, String>>> = Rc::default();
+        let confirmed_mentions: Rc<RefCell<HashSet<String>>> = Rc::default();
         let composer = cx.new(|cx| {
             TextArea::new(COMPOSER_PLACEHOLDER, cx)
-                .with_decorations(composer_decorations(known_commands.clone()))
+                .with_decorations(composer_decorations(known_commands.clone(), confirmed_mentions.clone()))
         });
         let subscription = cx.subscribe_in(
             &composer,
@@ -234,6 +244,11 @@ impl ChatView {
             slash_matches: Vec::new(),
             suggestion_selected: 0,
             known_commands,
+            command_list: Vec::new(),
+            confirmed_mentions,
+            completion_start: 0,
+            completion_scroll: gpui::UniformListScrollHandle::new(),
+            completion_task: None,
             file_index: None,
             attachments: Vec::new(),
             queued: Vec::new(),
@@ -1078,72 +1093,72 @@ impl ChatView {
         .detach();
     }
 
-    /// While the composer ends in an `@` mention: the reference kinds it could start, or the
-    /// files (folders) whose path contains what follows `@file:` (`@folder:`). `None` otherwise.
-    fn mention_matches(&mut self, text: &str) -> Option<Vec<Suggestion>> {
-        let start = text.rfind(char::is_whitespace).map_or(0, |index| {
-            index + text[index..].chars().next().map_or(1, char::len_utf8)
-        });
-        let (before, token) = text.split_at(start);
-        if !token.starts_with('@') {
-            return None;
-        }
-        // `@file:x` / `@folder:x` look among that kind; a bare `@x` among folders, then files,
-        // then Hermes's other reference kinds.
-        let (only, partial) = match token.split_once(':') {
-            Some(("@file", partial)) => (Some(false), partial),
-            Some(("@folder", partial)) => (Some(true), partial),
-            Some(_) => return Some(Vec::new()),
-            None => (None, &token[1..]),
+    /// The project's files and folders, listed once per mention (Zed searches its worktrees).
+    fn project_entries(&mut self) -> Vec<(String, bool)> {
+        let Some(cwd) = self.cwd.clone() else {
+            return Vec::new();
         };
-        let query = partial.trim_start_matches(['`', '"', '\'']).to_lowercase();
-        let mut suggestions: Vec<Suggestion> = match self.cwd.clone() {
-            Some(cwd) => {
-                let index = self.file_index.get_or_insert_with(|| {
-                    hermes_tools::references::workspace_entries(std::path::Path::new(&cwd), 20_000)
-                });
-                rank_entries(index, &query, only)
-                    .into_iter()
-                    .take(10)
-                    .map(|(path, is_dir)| {
-                        let kind = if is_dir { "@folder" } else { "@file" };
-                        Suggestion {
-                            label: path.clone(),
-                            description: String::new(),
-                            text: format!(
-                                "{before}{kind}:{} ",
-                                hermes_tools::references::format_value(&path)
-                            ),
-                            icon: Some(if is_dir {
-                                IconName::Folder
-                            } else {
-                                IconName::File
-                            }),
-                        }
-                    })
-                    .collect()
+        self.file_index
+            .get_or_insert_with(|| {
+                hermes_tools::references::workspace_entries(std::path::Path::new(&cwd), 20_000)
+            })
+            .clone()
+    }
+
+    /// Zed's recent entries: the files and folders this conversation mentioned, newest first.
+    fn recent_mentions(&self) -> Vec<(String, bool)> {
+        let mut recent: Vec<(String, bool)> = Vec::new();
+        for message in self.conversation.messages().iter().rev() {
+            if message.role != Role::User {
+                continue;
             }
-            None => Vec::new(),
-        };
-        if only.is_none() {
-            suggestions.extend(
-                MENTION_KINDS
-                    .iter()
-                    .filter(|(name, _)| !matches!(*name, "@file:" | "@folder:"))
-                    .filter(|(name, _)| name[1..].starts_with(&query))
-                    .map(|(name, description)| Suggestion {
-                        label: name.to_string(),
-                        description: description.to_string(),
-                        text: if name.ends_with(':') {
-                            format!("{before}{name}")
-                        } else {
-                            format!("{before}{name} ")
-                        },
-                        icon: Some(IconName::AtSign),
-                    }),
-            );
+            for (_, reference) in
+                hermes_tools::references::spans(&shown_user_text(message)).into_iter().rev()
+            {
+                let is_dir = match reference.kind.as_str() {
+                    "file" => false,
+                    "folder" => true,
+                    _ => continue,
+                };
+                if !recent.iter().any(|(path, _)| *path == reference.target) {
+                    recent.push((reference.target, is_dir));
+                }
+                if recent.len() == 6 {
+                    return recent;
+                }
+            }
         }
-        Some(suggestions)
+        recent
+    }
+
+    /// The `/` list: Hermes's commands, then skill bundles and skills (read once per `/`).
+    fn command_candidates(&mut self, cx: &App) -> Vec<(String, String, IconName)> {
+        if self.command_list.is_empty() {
+            let skills = backend(cx).runtime.skills();
+            let mut known = self.known_commands.borrow_mut();
+            for (name, description) in BUILTIN_COMMANDS {
+                known.insert(name.to_string(), format!("command:{name}"));
+                self.command_list
+                    .push((name.to_string(), description.to_string(), IconName::Terminal));
+            }
+            for bundle in skills.bundles() {
+                known.insert(bundle.slug.clone(), format!("bundle:{}", bundle.slug));
+                self.command_list.push((
+                    bundle.slug.clone(),
+                    format!("Bundle: {}", bundle.description),
+                    IconName::Sparkle,
+                ));
+            }
+            for skill in skills.catalog() {
+                known.insert(skill.name.clone(), format!("skill:{}", skill.name));
+                self.command_list.push((
+                    skill.name.clone(),
+                    hermes_tools::skills::clip_description(&skill.description),
+                    IconName::Sparkle,
+                ));
+            }
+        }
+        self.command_list.clone()
     }
 
     /// Opens what a composer chip names: a file or folder with Windows, a skill's SKILL.md.
@@ -1160,6 +1175,15 @@ impl ChatView {
                 Some(skill) => skill.skill_md(),
                 None => return,
             },
+            Some(("url", url)) => {
+                let url = if url.contains("://") {
+                    url.to_string()
+                } else {
+                    format!("https://{url}")
+                };
+                cx.open_url(&url);
+                return;
+            }
             _ => return,
         };
         if path.exists() {
@@ -1175,6 +1199,14 @@ impl ChatView {
         let Some(suggestion) = self.slash_matches.get(self.suggestion_selected).cloned() else {
             return;
         };
+        // A finished mention is remembered: it shows as a crease from now on.
+        if suggestion.text.ends_with(' ') {
+            if let Some(token) = suggestion.text.split_whitespace().last() {
+                if token.starts_with('@') {
+                    self.confirmed_mentions.borrow_mut().insert(token.to_string());
+                }
+            }
+        }
         self.composer.update(cx, |composer, cx| {
             let len = composer.text().len();
             composer.replace_range(0..len, &suggestion.text, cx);
@@ -1221,96 +1253,198 @@ impl ChatView {
         } else {
             (self.suggestion_selected + count - 1) % count
         };
+        self.completion_scroll
+            .scroll_to_item(self.suggestion_selected, gpui::ScrollStrategy::Top);
         cx.notify();
         true
     }
 
-    /// Enter while suggestions show takes the highlighted one, except on a finished command
-    /// (`/usage` typed in full is sent). `false` when Enter should send.
+    /// Enter while the menu shows takes the highlighted entry, as in Zed. `false` when Enter
+    /// should send.
     fn enter_takes_suggestion(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(chosen) = self.slash_matches.get(self.suggestion_selected) else {
-            return false;
-        };
-        let text = self.composer.read(cx).text().trim().to_string();
-        if text.starts_with('/') && chosen.label == text {
+        if self.slash_matches.is_empty() {
             return false;
         }
         self.accept_suggestion(window, cx);
         true
     }
 
-    /// While the composer holds a bare `/word`, the skills whose name contains it.
+    fn set_completions(&mut self, completions: Vec<Suggestion>, start: usize, cx: &mut Context<Self>) {
+        self.slash_matches = completions;
+        self.completion_start = start;
+        self.suggestion_selected = 0;
+        self.completion_scroll
+            .scroll_to_item(0, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// Zed's completion menu for what's typed at the end of the composer: `@` mentions (recent
+    /// ones and the kinds with nothing typed; fuzzy-matched files, folders and kinds otherwise)
+    /// and `/` commands and skills. Matching runs in the background, the latest typing winning.
     fn update_slash_matches(&mut self, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).text().to_string();
-        let query = text
-            .strip_prefix('/')
-            .filter(|q| !q.contains(char::is_whitespace))
-            .map(str::to_lowercase);
-        if let Some(mentions) = self.mention_matches(&text) {
-            if mentions != self.slash_matches {
-                self.slash_matches = mentions;
-                self.suggestion_selected = 0;
+        // Backing up to the end of a picked mention doesn't reopen the menu on it.
+        let query = completion_query(&text).filter(|query| match query {
+            CompletionQuery::Mention { start, .. } => {
+                !self.confirmed_mentions.borrow().contains(&text[*start..])
+            }
+            CompletionQuery::Command { .. } => true,
+        });
+        let Some(query) = query else {
+            self.file_index = None;
+            self.command_list.clear();
+            self.completion_task = None;
+            if !self.slash_matches.is_empty() {
+                self.slash_matches.clear();
                 cx.notify();
             }
             return;
-        }
-        self.file_index = None;
-        if text.starts_with('/') && self.known_commands.borrow().is_empty() {
-            let skills = backend(cx).runtime.skills();
-            let mut known = self.known_commands.borrow_mut();
-            for (name, _) in BUILTIN_COMMANDS {
-                known.insert(name.to_string(), format!("command:{name}"));
-            }
-            for bundle in skills.bundles() {
-                known.insert(bundle.slug.clone(), format!("bundle:{}", bundle.slug));
-            }
-            for skill in skills.catalog() {
-                known.insert(skill.name.clone(), format!("skill:{}", skill.name));
-            }
-        }
-        let matches: Vec<Suggestion> = match query {
-            Some(query) => BUILTIN_COMMANDS
-                .iter()
-                .filter(|(name, _)| name.contains(query.as_str()))
-                .map(|(name, description)| (name.to_string(), description.to_string()))
-                .chain(
-                    backend(cx)
-                        .runtime
-                        .skills()
-                        .bundles()
-                        .into_iter()
-                        .filter(|b| b.slug.contains(&query))
-                        .map(|b| (b.slug, format!("Bundle: {}", b.description))),
-                )
-                .chain(
-                    backend(cx)
-                        .runtime
-                        .skills()
-                        .catalog()
-                        .into_iter()
-                        .filter(|s| s.name.contains(&query))
-                        .map(|s| {
-                            (
-                                s.name,
-                                hermes_tools::skills::clip_description(&s.description),
-                            )
-                        }),
-                )
-                .take(6)
-                .map(|(name, description)| Suggestion {
-                    label: format!("/{name}"),
-                    description,
-                    text: format!("/{name} "),
-                    icon: None,
-                })
-                .collect(),
-            None => Vec::new(),
         };
-        if matches != self.slash_matches {
-            self.slash_matches = matches;
-            self.suggestion_selected = 0;
-            cx.notify();
-        }
+        let (start, needle, candidates) = match query {
+            CompletionQuery::Mention { start, mode, query } => {
+                let before = text[..start].to_string();
+                let entry = |path: &str, is_dir: bool, recent: bool| {
+                    let kind = if is_dir { "@folder" } else { "@file" };
+                    let (dir, name) = match path.trim_end_matches('/').rsplit_once('/') {
+                        Some((dir, name)) => (Some(dir.to_string()), name.to_string()),
+                        None => (None, path.to_string()),
+                    };
+                    let offset = (path.len() - name.len()) as isize;
+                    Candidate {
+                        filter: path.to_string(),
+                        offset,
+                        suggestion: Suggestion {
+                            label: name,
+                            detail: dir,
+                            description: String::new(),
+                            text: format!(
+                                "{before}{kind}:{} ",
+                                hermes_tools::references::format_value(path)
+                            ),
+                            icon: Some(if recent {
+                                IconName::HistoryRerun
+                            } else if is_dir {
+                                IconName::Folder
+                            } else {
+                                IconName::File
+                            }),
+                            positions: Vec::new(),
+                        },
+                    }
+                };
+                let modes = || {
+                    MENTION_MODES.iter().map(|mode| Candidate {
+                        // The label first, so matches in it are the ones highlighted.
+                        filter: format!("{} {}", mode.label, mode.keyword),
+                        offset: 0,
+                        suggestion: Suggestion {
+                            label: mode.label.to_string(),
+                            detail: None,
+                            description: String::new(),
+                            text: format!("{before}{}", mode.insert),
+                            icon: Some(mode.icon),
+                            positions: Vec::new(),
+                        },
+                    })
+                };
+                match (mode, query.is_empty()) {
+                    // Nothing typed: recent mentions, then the kinds.
+                    (None, true) => {
+                        let completions = self
+                            .recent_mentions()
+                            .iter()
+                            .map(|(path, is_dir)| entry(path, *is_dir, true).suggestion)
+                            .chain(modes().map(|c| c.suggestion))
+                            .collect();
+                        self.set_completions(completions, start, cx);
+                        return;
+                    }
+                    // A kind and nothing yet: its entries, folders and shallow paths first.
+                    (Some(folders), true) => {
+                        let completions = rank_entries(&self.project_entries(), "", Some(folders))
+                            .iter()
+                            .take(50)
+                            .map(|(path, is_dir)| entry(path, *is_dir, false).suggestion)
+                            .collect();
+                        self.set_completions(completions, start, cx);
+                        return;
+                    }
+                    (mode, false) => {
+                        let mut candidates: Vec<Candidate> = self
+                            .project_entries()
+                            .iter()
+                            .filter(|(_, is_dir)| mode.is_none_or(|folders| *is_dir == folders))
+                            .map(|(path, is_dir)| entry(path, *is_dir, false))
+                            .collect();
+                        if mode.is_none() {
+                            candidates.extend(modes());
+                        }
+                        (start, query, candidates)
+                    }
+                }
+            }
+            CompletionQuery::Command { query } => {
+                let candidates: Vec<Candidate> = self
+                    .command_candidates(cx)
+                    .into_iter()
+                    .map(|(name, description, icon)| Candidate {
+                        filter: name.clone(),
+                        // The label has the slash in front.
+                        offset: -1,
+                        suggestion: Suggestion {
+                            label: format!("/{name}"),
+                            detail: None,
+                            description,
+                            text: format!("/{name} "),
+                            icon: Some(icon),
+                            positions: Vec::new(),
+                        },
+                    })
+                    .collect();
+                if query.is_empty() {
+                    let completions = candidates.into_iter().map(|c| c.suggestion).collect();
+                    self.set_completions(completions, 0, cx);
+                    return;
+                }
+                (0, query, candidates)
+            }
+        };
+        let executor = cx.background_executor().clone();
+        let strings: Vec<fuzzy::StringMatchCandidate> = candidates
+            .iter()
+            .enumerate()
+            .map(|(id, candidate)| fuzzy::StringMatchCandidate::new(id, &candidate.filter))
+            .collect();
+        self.completion_task = Some(cx.spawn(async move |this, cx| {
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let matches =
+                fuzzy::match_strings(&strings, &needle, false, true, 100, &cancel, executor).await;
+            this.update(cx, |this, cx| {
+                // Typing moved on: a newer search replaces this one.
+                if this.composer.read(cx).text() != text {
+                    return;
+                }
+                let completions = matches
+                    .into_iter()
+                    .map(|found| {
+                        let candidate = &candidates[found.candidate_id];
+                        let mut suggestion = candidate.suggestion.clone();
+                        suggestion.positions = found
+                            .positions
+                            .iter()
+                            .filter_map(|&position| {
+                                let at = position as isize - candidate.offset;
+                                (at >= 0 && (at as usize) < suggestion.label.len())
+                                    .then_some(at as usize)
+                            })
+                            .collect();
+                        suggestion
+                    })
+                    .collect();
+                this.set_completions(completions, start, cx);
+            })
+            .ok();
+        }));
     }
 
     /// Hermes's edit-and-resend: the conversation rewinds to just before user message
@@ -1359,7 +1493,10 @@ impl ChatView {
         }
         let editor = cx.new(|cx| {
             let mut editor = TextArea::new("", cx)
-                .with_decorations(composer_decorations(self.known_commands.clone()));
+                .with_decorations(composer_decorations(
+                    self.known_commands.clone(),
+                    self.confirmed_mentions.clone(),
+                ));
             editor.set_text(text.clone(), cx);
             editor
         });
@@ -4072,6 +4209,142 @@ impl ChatView {
             })
     }
 
+    /// Zed's completion menu (`editor/src/code_context_menus.rs`): a popover at the start of what's
+    /// being completed, 280–540px wide (sized to its widest entry), 12 rows tall, each row an
+    /// icon, the label with the matched letters in bold, a muted detail, and a description at the
+    /// right edge.
+    fn render_completion_menu(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.slash_matches.is_empty() {
+            return None;
+        }
+        let anchor = self
+            .composer
+            .read(cx)
+            .point_for_offset(self.completion_start)?;
+        let widest = self
+            .slash_matches
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, s)| {
+                s.label.chars().count()
+                    + s.detail.as_ref().map_or(0, |d| d.chars().count() + 1)
+                    + s.description.chars().count()
+            })
+            .map(|(index, _)| index);
+        let detail_color = cx
+            .theme()
+            .syntax()
+            .style_for_name("variable")
+            .and_then(|style| style.color)
+            .unwrap_or(cx.theme().colors().text_muted);
+        let list = gpui::uniform_list(
+            "completions",
+            self.slash_matches.len(),
+            cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
+                let text_style = window.text_style();
+                range
+                    .map(|index| {
+                        let suggestion = &this.slash_matches[index];
+                        let bold = gpui::HighlightStyle {
+                            font_weight: Some(gpui::FontWeight::BOLD),
+                            ..Default::default()
+                        };
+                        let highlights: Vec<_> = suggestion
+                            .positions
+                            .iter()
+                            .filter_map(|&at| {
+                                let c = suggestion.label[at..].chars().next()?;
+                                Some((at..at + c.len_utf8(), bold))
+                            })
+                            .collect();
+                        let label = gpui::StyledText::new(suggestion.label.clone())
+                            .with_default_highlights(&text_style, highlights);
+                        let detail = suggestion.detail.clone().map(|detail| {
+                            gpui::StyledText::new(detail).with_default_highlights(
+                                &gpui::TextStyle {
+                                    color: detail_color,
+                                    ..text_style.clone()
+                                },
+                                Vec::new(),
+                            )
+                        });
+                        let description = (!suggestion.description.is_empty()).then(|| {
+                            Label::new(suggestion.description.clone())
+                                .ml_4()
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                        });
+                        div()
+                            .min_w(px(280.))
+                            .max_w(px(540.))
+                            .child(
+                                ui::ListItem::new(index)
+                                    .inset(true)
+                                    .toggle_state(index == this.suggestion_selected)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.suggestion_selected = index;
+                                        this.accept_suggestion(window, cx);
+                                    }))
+                                    .start_slot::<AnyElement>(suggestion.icon.map(|icon| {
+                                        Icon::new(icon)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted)
+                                            .into_any_element()
+                                    }))
+                                    .child(
+                                        h_flex()
+                                            .flex_grow_1()
+                                            .gap_1()
+                                            .child(div().flex_none().whitespace_nowrap().child(label))
+                                            .when_some(detail, |this, detail| {
+                                                this.child(div().truncate().child(detail))
+                                            }),
+                                    )
+                                    .when_some(description, |this, description| {
+                                        this.child(
+                                            div()
+                                                .flex_shrink(1.0)
+                                                .ml_auto()
+                                                .min_w_0()
+                                                .child(description.truncate()),
+                                        )
+                                    }),
+                            )
+                            .into_any_element()
+                    })
+                    .collect()
+            }),
+        )
+        .occlude()
+        .max_h(window.line_height() * 12.)
+        .track_scroll(&self.completion_scroll)
+        .with_sizing_behavior(gpui::ListSizingBehavior::Infer)
+        .with_width_from_item(widest);
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(anchor)
+                    .anchor(gpui::Anchor::BottomLeft)
+                    .offset(gpui::point(px(-4.), px(-4.)))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        ui::Popover::new().child(
+                            div()
+                                .child(list)
+                                .vertical_scrollbar_for(&self.completion_scroll, window, cx),
+                        ),
+                    ),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
     fn render_composer(&self, has_messages: bool, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         h_flex()
@@ -4101,54 +4374,6 @@ impl ChatView {
                     .when(!self.attachments.is_empty(), |this| {
                         this.child(self.render_attachments(cx))
                     })
-                    .children((!self.slash_matches.is_empty()).then(|| {
-                        v_flex().children(self.slash_matches.iter().enumerate().map(
-                            |(index, suggestion)| {
-                                let selected = index == self.suggestion_selected;
-                                h_flex()
-                                    .id(SharedString::from(format!(
-                                        "suggestion-{}",
-                                        suggestion.label
-                                    )))
-                                    .gap_2()
-                                    .px_1()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .when(selected, |this| {
-                                        this.bg(colors.ghost_element_selected)
-                                    })
-                                    .hover(|style| style.bg(colors.ghost_element_hover))
-                                    .when_some(suggestion.icon, |this, icon| {
-                                        this.child(
-                                            Icon::new(icon)
-                                                .size(IconSize::Small)
-                                                .color(Color::Muted),
-                                        )
-                                    })
-                                    .child(
-                                        Label::new(suggestion.label.clone())
-                                            .size(LabelSize::Small),
-                                    )
-                                    .child(
-                                        Label::new(suggestion.description.clone())
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted)
-                                            .truncate(),
-                                    )
-                                    .when(selected, |this| {
-                                        this.child(div().flex_1()).child(
-                                            Label::new("Tab")
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Muted),
-                                        )
-                                    })
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.suggestion_selected = index;
-                                        this.accept_suggestion(window, cx);
-                                    }))
-                            },
-                        ))
-                    }))
                     .child(
                         v_flex()
                             .relative()
@@ -4328,6 +4553,7 @@ impl Render for ChatView {
             self.update_find(cx);
         }
         let find_bar = self.render_find_bar(cx);
+        let completion_menu = self.render_completion_menu(window, cx);
         let colors = cx.theme().colors();
         v_flex()
             .key_context("Chat")
@@ -4380,6 +4606,7 @@ impl Render for ChatView {
             .children(self.render_clarify(cx))
             .children(self.render_todos(cx))
             .child(self.render_composer(!empty, cx))
+            .children(completion_menu)
     }
 }
 
@@ -4451,20 +4678,75 @@ fn shimmer(id: SharedString, text: &'static str, cx: &App) -> AnyElement {
 }
 
 /// The argument of a built-in slash command (`/name arg`), or `None` when `text` isn't one.
+/// A reference as Zed shows a mention: an icon and a short name (a file's name, a page's host).
+fn reference_crease(reference: &hermes_tools::references::Reference) -> crate::text_area::Crease {
+    let name = |path: &str| {
+        path.trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(path)
+            .to_string()
+    };
+    let (label, icon) = match reference.kind.as_str() {
+        "file" => {
+            let mut label = name(&reference.target);
+            if let (Some(start), Some(end)) = (reference.line_start, reference.line_end) {
+                label = if start == end {
+                    format!("{label} ({start})")
+                } else {
+                    format!("{label} ({start}-{end})")
+                };
+            }
+            (label, IconName::File)
+        }
+        "folder" => (name(&reference.target), IconName::Folder),
+        "url" => {
+            let host = reference
+                .target
+                .split("://")
+                .last()
+                .unwrap_or(&reference.target)
+                .split('/')
+                .next()
+                .unwrap_or(&reference.target)
+                .to_string();
+            (host, IconName::ToolWeb)
+        }
+        "diff" => ("Unstaged Changes".to_string(), IconName::GitBranch),
+        "staged" => ("Staged Changes".to_string(), IconName::GitBranch),
+        "git" => (
+            format!("Last {} Commits", reference.target.trim()),
+            IconName::GitBranch,
+        ),
+        kind => (kind.to_string(), IconName::AtSign),
+    };
+    crate::text_area::Crease {
+        target: format!("{}:{}", reference.kind, reference.target),
+        label: label.into(),
+        icon,
+    }
+}
+
 /// How the composer styles what's typed: `code` and "quotes" as markdown would, and `@file:` /
 /// `@folder:` references and a finished `/command` as chips that open what they name.
-fn composer_decorations(known: Rc<RefCell<HashMap<String, String>>>) -> crate::text_area::Decorate {
+fn composer_decorations(
+    known: Rc<RefCell<HashMap<String, String>>>,
+    confirmed: Rc<RefCell<HashSet<String>>>,
+) -> crate::text_area::Decorate {
     use crate::text_area::{Span, SpanKind};
     Rc::new(move |text: &str| {
         let mut spans = crate::text_area::markdown_spans(text);
         for (range, reference) in hermes_tools::references::spans(text) {
-            let target = match reference.kind.as_str() {
-                "file" | "folder" => format!("{}:{}", reference.kind, reference.target),
-                kind => format!("ref:{kind}"),
-            };
+            // Like Zed, a mention becomes a crease once it's complete: picked from the menu, or
+            // followed by more text. While it's still being typed it stays text.
+            let finished = text[range.end..].starts_with(char::is_whitespace)
+                || confirmed.borrow().contains(&reference.raw);
+            if !finished {
+                continue;
+            }
             spans.push(Span {
                 range,
-                kind: SpanKind::Mention(target),
+                kind: SpanKind::Crease(reference_crease(&reference)),
             });
         }
         if let Some(rest) = text.strip_prefix('/') {
@@ -4567,14 +4849,18 @@ pub fn typed_command(text: &str) -> Option<String> {
     Some(format!("/{command} {argument}").trim_end().to_string())
 }
 
-/// One row under the composer: a `/command` or an `@` mention, and the composer text that
-/// accepting it leaves.
+/// One row of the completion menu: a `/command` or an `@` mention, and the composer text that
+/// accepting it leaves. Laid out like Zed's: the label (matched letters in bold), a muted detail
+/// after it (a file's folder) and a description at the right.
 #[derive(Clone, PartialEq)]
 struct Suggestion {
     label: String,
+    detail: Option<String>,
     description: String,
     text: String,
     icon: Option<IconName>,
+    /// Byte offsets in `label` the query matched.
+    positions: Vec<usize>,
 }
 
 /// The project's entries for an `@` mention, best first: the name starting with what's typed,
@@ -4620,18 +4906,102 @@ fn fuzzy_subsequence(text: &str, query: &str) -> bool {
 /// `queue.usage`.
 const QUEUE_USAGE: &str = "Usage: /queue <prompt> | /queue list | /queue edit N <prompt> | /queue rm N | /queue move FROM TO | /queue clear";
 
-/// Hermes's built-in `@` reference kinds, offered as an `@` mention is typed.
-const MENTION_KINDS: &[(&str, &str)] = &[
-    ("@file:", "Attach a file (add :start-end for lines)"),
-    ("@folder:", "Attach a folder's file listing"),
-    ("@diff", "Attach the unstaged git changes"),
-    ("@staged", "Attach the staged git changes"),
-    (
-        "@git:",
-        "Attach the last N commits with patches, e.g. @git:3",
-    ),
-    ("@url:", "Attach a web page's text"),
+/// One of Hermes's reference kinds, listed in the `@` menu the way Zed lists its context kinds
+/// ("Files & Directories", "Fetch", …).
+struct MentionMode {
+    label: &'static str,
+    /// What typing matches it against.
+    keyword: &'static str,
+    /// What choosing it leaves in the composer (a kind with a value opens its own list).
+    insert: &'static str,
+    icon: IconName,
+}
+
+const MENTION_MODES: &[MentionMode] = &[
+    MentionMode {
+        label: "Files",
+        keyword: "file",
+        insert: "@file:",
+        icon: IconName::File,
+    },
+    MentionMode {
+        label: "Folders",
+        keyword: "folder",
+        insert: "@folder:",
+        icon: IconName::Folder,
+    },
+    MentionMode {
+        label: "Fetch",
+        keyword: "url fetch",
+        insert: "@url:",
+        icon: IconName::ToolWeb,
+    },
+    MentionMode {
+        label: "Unstaged Changes",
+        keyword: "diff",
+        insert: "@diff ",
+        icon: IconName::GitBranch,
+    },
+    MentionMode {
+        label: "Staged Changes",
+        keyword: "staged",
+        insert: "@staged ",
+        icon: IconName::GitBranch,
+    },
+    MentionMode {
+        label: "Recent Commits",
+        keyword: "git commits",
+        insert: "@git:",
+        icon: IconName::GitBranch,
+    },
 ];
+
+/// What the completion menu is for: the `@` mention or `/` command being typed at the end.
+#[derive(Debug, PartialEq)]
+enum CompletionQuery {
+    /// `start` is where the `@` is; `mode` is `@file:` (`Some(false)`) or `@folder:`
+    /// (`Some(true)`); `query` what follows.
+    Mention {
+        start: usize,
+        mode: Option<bool>,
+        query: String,
+    },
+    /// A `/` at the very start, before any space.
+    Command { query: String },
+}
+
+fn completion_query(text: &str) -> Option<CompletionQuery> {
+    if let Some(rest) = text.strip_prefix('/') {
+        return (!rest.contains(char::is_whitespace)).then(|| CompletionQuery::Command {
+            query: rest.to_string(),
+        });
+    }
+    let start = text.rfind(char::is_whitespace).map_or(0, |index| {
+        index + text[index..].chars().next().map_or(1, char::len_utf8)
+    });
+    let token = text[start..].strip_prefix('@')?;
+    let (mode, query) = match token.split_once(':') {
+        Some(("file", query)) => (Some(false), query),
+        Some(("folder", query)) => (Some(true), query),
+        // Other kinds take a value of their own (a URL, a number): no list.
+        Some(_) => return None,
+        None => (None, token),
+    };
+    Some(CompletionQuery::Mention {
+        start,
+        mode,
+        query: query.trim_start_matches(['`', '"', '\'']).to_string(),
+    })
+}
+
+/// A completion with the text the fuzzy matcher sees, and where the label starts in it (match
+/// positions past `offset` highlight the label).
+struct Candidate {
+    filter: String,
+    offset: isize,
+    suggestion: Suggestion,
+}
+
 
 /// A `/rollback` or `/diff` report: shown like a reply, but no turn ends with it.
 fn is_command_output(message: &Message) -> bool {
@@ -4707,8 +5077,13 @@ mod tests {
         known
             .borrow_mut()
             .insert("usage".into(), "command:usage".into());
-        let decorate = composer_decorations(known);
-        let text = "/usage then `cargo test` on \"x y\" and @file:src/main.rs";
+        let confirmed: Rc<RefCell<HashSet<String>>> = Rc::default();
+        let decorate = composer_decorations(known, confirmed.clone());
+        // Still being typed at the end: text, not a crease (until picked from the menu).
+        assert!(decorate("see @file:src/ma").is_empty());
+        confirmed.borrow_mut().insert("@file:src/ma".into());
+        assert_eq!(decorate("see @file:src/ma").len(), 1);
+        let text = "/usage then `cargo test` on \"x y\" and @file:src/main.rs please";
         let kinds: Vec<(String, SpanKind)> = decorate(text)
             .into_iter()
             .map(|s| (text[s.range].to_string(), s.kind))
@@ -4717,9 +5092,41 @@ mod tests {
         assert!(kinds.contains(&("\"x y\"".into(), SpanKind::Quote)));
         assert!(kinds.contains(&(
             "@file:src/main.rs".into(),
-            SpanKind::Mention("file:src/main.rs".into())
+            SpanKind::Crease(crate::text_area::Crease {
+                target: "file:src/main.rs".into(),
+                label: "main.rs".into(),
+                icon: IconName::File,
+            })
         )));
         assert!(kinds.contains(&("/usage".into(), SpanKind::Mention("command:usage".into()))));
+    }
+
+    #[test]
+    fn the_menu_completes_the_token_being_typed() {
+        assert_eq!(
+            completion_query("/us"),
+            Some(CompletionQuery::Command { query: "us".into() })
+        );
+        assert_eq!(completion_query("/usage now"), None);
+        assert_eq!(
+            completion_query("look at @ma"),
+            Some(CompletionQuery::Mention {
+                start: 8,
+                mode: None,
+                query: "ma".into()
+            })
+        );
+        assert_eq!(
+            completion_query("@folder:sr"),
+            Some(CompletionQuery::Mention {
+                start: 0,
+                mode: Some(true),
+                query: "sr".into()
+            })
+        );
+        // A URL or commit count is typed, not picked.
+        assert_eq!(completion_query("@url:exa"), None);
+        assert_eq!(completion_query("no mention"), None);
     }
 }
 

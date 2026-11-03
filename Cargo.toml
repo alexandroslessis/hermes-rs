@@ -23,6 +23,8 @@ hermes_runtime = { path = "crates/runtime" }
 hermes_store = { path = "crates/store" }
 hermes_tools = { path = "crates/tools" }
 markdown = { path = "crates/markdown" }
+# Vendored Zed crates only we use (the generated block lists those Zed crates need).
+fuzzy = { path = "vendor/zed/fuzzy" }
 
 # Our own choices (anything Zed also uses comes from the generated block below).
 # Versions for the Goose-derived crates follow Goose's root Cargo.toml.
@@ -97,6 +99,7 @@ mermaid_render = { path = "vendor/zed/mermaid_render" }
 merman = {version = "=0.8.0-alpha.5", default-features = false}
 palette = {version = "0.7.5", default-features = false, features = ["std"]}
 parking_lot = "0.12.1"
+path = { path = "vendor/zed/path" }
 pollster = "0.4.0"
 postage = {version = "0.5", default-features = false}
 proc-macro2 = "1.0.93"
@@ -128,6 +131,7 @@ syn = {version = "2.0", default-features = false, features = ["proc-macro"]}
 syntax_theme = { path = "vendor/zed/syntax_theme" }
 taffy = {version = "=0.15.0", default-features = false}
 tempfile = "3.20.0"
+tendril = "0.5"
 theme = { path = "vendor/zed/theme" }
 thiserror = "2.0.12"
 tracing = "0.1.40"

@@ -1885,6 +1885,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuzzy"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui_util",
+ "log",
+ "path",
+]
+
+[[package]]
 name = "generational-box"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2253,6 +2263,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "dirs",
+ "fuzzy",
  "gpui",
  "gpui_platform",
  "hermes_agent",
@@ -3922,6 +3933,17 @@ name = "pastey"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
+name = "path"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dunce",
+ "serde",
+ "tempfile",
+ "tendril",
+]
 
 [[package]]
 name = "pem"

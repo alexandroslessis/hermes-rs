@@ -103,8 +103,19 @@ pub enum SpanKind {
     Code,
     /// "quoted": the theme's string color.
     Quote,
-    /// A file, folder or skill reference: drawn as a chip; clicking it reports the target.
+    /// A `/command` or skill: accent text on a chip background; clicking it reports the target.
     Mention(String),
+    /// A reference (file, folder, URL, …): Zed's mention crease, a button with an icon and a
+    /// short label drawn in place of the text, which the cursor moves over as one unit.
+    Crease(Crease),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Crease {
+    /// What clicking it reports (`MentionClicked`).
+    pub target: String,
+    pub label: SharedString,
+    pub icon: ui::IconName,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -159,11 +170,21 @@ struct LayoutLine {
     height: Pixels,
 }
 
+/// A crease's text in the content and the placeholder that stands for it in what's laid out.
+#[derive(Clone)]
+struct Fold {
+    content: Range<usize>,
+    display: Range<usize>,
+    crease: Crease,
+}
+
 #[derive(Default)]
 struct TextLayout {
     lines: Vec<LayoutLine>,
     line_height: Pixels,
     content_height: Pixels,
+    /// Sorted. Lines and their offsets are in display text, where each crease is a placeholder.
+    folds: Vec<Fold>,
 }
 
 impl TextLayout {
@@ -171,8 +192,46 @@ impl TextLayout {
         self.lines.iter().rev().find(|line| line.start <= index)
     }
 
-    /// Top-left of the caret for `index`, in content coordinates.
+    /// A content offset in the laid-out text (inside a crease: after it).
+    fn to_display(&self, offset: usize) -> usize {
+        let mut shift: isize = 0;
+        for fold in &self.folds {
+            if offset >= fold.content.end {
+                shift += fold.display.len() as isize - fold.content.len() as isize;
+            } else if offset > fold.content.start {
+                return fold.display.end;
+            } else {
+                break;
+            }
+        }
+        (offset as isize + shift).max(0) as usize
+    }
+
+    /// A laid-out offset in the content (inside a placeholder: its nearer edge).
+    fn to_content(&self, offset: usize) -> usize {
+        let mut shift: isize = 0;
+        for fold in &self.folds {
+            if offset >= fold.display.end {
+                shift += fold.content.len() as isize - fold.display.len() as isize;
+            } else if offset > fold.display.start {
+                return if offset - fold.display.start < fold.display.end - offset {
+                    fold.content.start
+                } else {
+                    fold.content.end
+                };
+            } else {
+                break;
+            }
+        }
+        (offset as isize + shift).max(0) as usize
+    }
+
+    /// Top-left of the caret for content offset `index`, in content coordinates.
     fn position_for_index(&self, index: usize) -> Point<Pixels> {
+        self.position_for_display(self.to_display(index))
+    }
+
+    fn position_for_display(&self, index: usize) -> Point<Pixels> {
         let Some(line) = self.line_for_index(index) else {
             return Point::default();
         };
@@ -203,7 +262,7 @@ impl TextLayout {
         {
             Ok(index) | Err(index) => index,
         };
-        line.start + index.min(line.wrapped.len())
+        self.to_content(line.start + index.min(line.wrapped.len()))
     }
 }
 
@@ -324,7 +383,6 @@ impl TextArea {
         cx.notify();
     }
 
-    /// A one-line field: Enter submits, long text scrolls instead of growing.
     /// Styles stretches of the text with `decorate` (re-run whenever the text is drawn).
     pub fn with_decorations(mut self, decorate: Decorate) -> Self {
         self.decorate = Some(decorate);
@@ -353,7 +411,40 @@ impl TextArea {
         cx.notify();
     }
 
+    /// Top-left of the text at `offset`, in window coordinates (as last drawn).
+    pub fn point_for_offset(&self, offset: usize) -> Option<Point<Pixels>> {
+        let bounds = self.last_bounds?;
+        let position = self.layout.borrow().position_for_index(offset);
+        Some(point(
+            bounds.left() + position.x,
+            bounds.top() - self.scroll_top + position.y,
+        ))
+    }
 
+    /// Where the creases are: the cursor steps over each as one unit.
+    fn crease_ranges(&self) -> Vec<Range<usize>> {
+        self.spans()
+            .into_iter()
+            .filter(|span| matches!(span.kind, SpanKind::Crease(_)))
+            .map(|span| span.range)
+            .collect()
+    }
+
+    /// An offset moved out of any crease it falls inside (to the nearer edge).
+    fn snap(&self, offset: usize) -> usize {
+        for range in self.crease_ranges() {
+            if range.start < offset && offset < range.end {
+                return if offset - range.start < range.end - offset {
+                    range.start
+                } else {
+                    range.end
+                };
+            }
+        }
+        offset
+    }
+
+    /// A one-line field: Enter submits, long text scrolls instead of growing.
     pub fn single_line(mut self) -> Self {
         self.max_lines = 1;
         self
@@ -385,7 +476,7 @@ impl TextArea {
     }
 
     fn move_to(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let offset = self.clamp(offset);
+        let offset = self.snap(self.clamp(offset));
         self.selected_range = offset..offset;
         self.selection_reversed = false;
         window.notify_text_selection_changed(&self.focus_handle);
@@ -393,7 +484,7 @@ impl TextArea {
     }
 
     fn select_to(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let offset = self.clamp(offset);
+        let offset = self.snap(self.clamp(offset));
         if self.selection_reversed {
             self.selected_range.start = offset;
         } else {
@@ -427,6 +518,14 @@ impl TextArea {
     }
 
     fn previous_boundary(&self, offset: usize) -> usize {
+        // Right after (or inside) a crease, the step back takes all of it.
+        if let Some(range) = self
+            .crease_ranges()
+            .into_iter()
+            .find(|r| r.start < offset && offset <= r.end)
+        {
+            return range.start;
+        }
         self.content
             .grapheme_indices(true)
             .rev()
@@ -435,6 +534,13 @@ impl TextArea {
     }
 
     fn next_boundary(&self, offset: usize) -> usize {
+        if let Some(range) = self
+            .crease_ranges()
+            .into_iter()
+            .find(|r| r.start <= offset && offset < r.end)
+        {
+            return range.end;
+        }
         self.content
             .grapheme_indices(true)
             .find_map(|(index, _)| (index > offset).then_some(index))
@@ -700,6 +806,10 @@ impl TextArea {
     ) {
         self.goal_x = None;
         let index = self.index_for_mouse_position(event.position);
+        // A crease is a button of its own (it opens what it names on click).
+        if self.crease_at(event.position) {
+            return;
+        }
         // A plain click on a mention chip opens what it names.
         if event.click_count == 1 && !event.modifiers.shift {
             if let Some(target) = self.mention_at(event.position) {
@@ -734,6 +844,20 @@ impl TextArea {
                 .any(|b| b.contains(&position))
                 .then_some(target)
         })
+    }
+
+    /// Whether `position` is over a crease button.
+    fn crease_at(&self, position: Point<Pixels>) -> bool {
+        let Some(bounds) = self.last_bounds else {
+            return false;
+        };
+        let origin = point(bounds.left(), bounds.top() - self.scroll_top);
+        let layout = self.layout.borrow();
+        layout
+            .folds
+            .iter()
+            .filter_map(|fold| fold_bounds(&layout, fold, origin))
+            .any(|b| b.contains(&position))
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
@@ -919,6 +1043,8 @@ struct PrepaintState {
     cursor: Option<PaintQuad>,
     /// Mention chips: their background and the hitbox that shows a pointer over them.
     chips: Vec<(PaintQuad, gpui::Hitbox)>,
+    /// Crease buttons, laid out over their placeholders.
+    creases: Vec<gpui::AnyElement>,
 }
 
 impl IntoElement for TextAreaElement {
@@ -944,7 +1070,17 @@ fn chip_bounds(layout: &TextLayout, range: &Range<usize>, origin: Point<Pixels>)
 
 /// The text's runs with the spans styled: code in the code font on a tint, quotes in the
 /// string color, mentions in the accent color (their chip is painted separately).
-fn styled_runs(text_len: usize, spans: &[Span], base: TextRun, cx: &App) -> Vec<TextRun> {
+/// What gets laid out: the content with each crease replaced by a placeholder as wide as its
+/// button (transparent `_`s, which wrap as one word), the runs that style it, and the folds that
+/// map between the two.
+fn display_text(
+    content: &str,
+    spans: &[Span],
+    base: TextRun,
+    font_size: Pixels,
+    window: &mut Window,
+    cx: &App,
+) -> (String, Vec<TextRun>, Vec<Fold>) {
     let colors = cx.theme().colors();
     let quote = cx
         .theme()
@@ -953,16 +1089,43 @@ fn styled_runs(text_len: usize, spans: &[Span], base: TextRun, cx: &App) -> Vec<
         .and_then(|style| style.color)
         .unwrap_or(colors.text_accent);
     let code_font = theme::theme_settings(cx).buffer_font(cx).clone();
+    let filler_width = window
+        .text_system()
+        .shape_line("_".into(), font_size, &[TextRun { len: 1, ..base.clone() }], None)
+        .width
+        .max(px(1.));
+    let mut text = String::with_capacity(content.len());
     let mut runs = Vec::new();
+    let mut folds = Vec::new();
     let mut at = 0;
     for span in spans {
         if span.range.start > at {
+            text.push_str(&content[at..span.range.start]);
             runs.push(TextRun {
                 len: span.range.start - at,
                 ..base.clone()
             });
         }
         let len = span.range.end - span.range.start;
+        if let SpanKind::Crease(crease) = &span.kind {
+            let width = crease_width(&crease.label, window, cx);
+            let count = (width / filler_width).ceil().max(1.) as usize;
+            let start = text.len();
+            text.push_str(&"_".repeat(count));
+            runs.push(TextRun {
+                len: count,
+                color: gpui::transparent_black(),
+                ..base.clone()
+            });
+            folds.push(Fold {
+                content: span.range.clone(),
+                display: start..start + count,
+                crease: crease.clone(),
+            });
+            at = span.range.end;
+            continue;
+        }
+        text.push_str(&content[span.range.clone()]);
         runs.push(match &span.kind {
             SpanKind::Code => TextRun {
                 len,
@@ -980,16 +1143,115 @@ fn styled_runs(text_len: usize, spans: &[Span], base: TextRun, cx: &App) -> Vec<
                 color: colors.text_accent,
                 ..base.clone()
             },
+            SpanKind::Crease(_) => unreachable!("handled above"),
         });
         at = span.range.end;
     }
-    if text_len > at {
+    if content.len() > at {
+        text.push_str(&content[at..]);
         runs.push(TextRun {
-            len: text_len - at,
+            len: content.len() - at,
             ..base
         });
     }
-    runs
+    (text, runs, folds)
+}
+
+/// The code font at Zed's agent buffer size, which creases use.
+fn crease_font(cx: &App) -> (gpui::Font, Pixels) {
+    let settings = theme::theme_settings(cx);
+    (settings.buffer_font(cx).clone(), settings.buffer_font_size(cx))
+}
+
+/// A crease button's width: Zed's compact outlined `ButtonLike` (4px padding each side and a
+/// border) around an extra-small icon, a 4px gap and the label in the code font.
+fn crease_width(label: &SharedString, window: &mut Window, cx: &App) -> Pixels {
+    let (font, size) = crease_font(cx);
+    let label_width = window
+        .text_system()
+        .shape_line(
+            label.clone(),
+            size,
+            &[TextRun {
+                len: label.len(),
+                font,
+                color: gpui::black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }],
+            None,
+        )
+        .width;
+    let rem = window.rem_size() / 16.;
+    label_width + rem * (12. + 4. + 8. + 2. + 2.)
+}
+
+/// Where a crease's button sits: over its placeholder (when that's on one row).
+fn fold_bounds(layout: &TextLayout, fold: &Fold, origin: Point<Pixels>) -> Option<Bounds<Pixels>> {
+    let start = layout.position_for_display(fold.display.start);
+    let end = layout.position_for_display(fold.display.end);
+    (start.y == end.y && end.x > start.x).then(|| {
+        Bounds::from_corners(
+            origin + point(start.x, start.y),
+            origin + point(end.x, end.y + layout.line_height - px(1.)),
+        )
+    })
+}
+
+/// Zed's `MentionCrease`: an outlined compact button with a muted icon and the label in the
+/// code font, tinted while the selection covers it; clicking it reports its target.
+fn crease_element(
+    index: usize,
+    crease: &Crease,
+    selected: bool,
+    size: gpui::Size<Pixels>,
+    input: gpui::WeakEntity<TextArea>,
+    cx: &App,
+) -> gpui::AnyElement {
+    use ui::{
+        ButtonCommon, ButtonLike, ButtonSize, ButtonStyle, Clickable, FixedWidth, Icon, IconSize,
+        SelectableButton, TintColor, Toggleable, Tooltip,
+    };
+    let (width, height) = (size.width, size.height);
+    let (font, size) = crease_font(cx);
+    let target = crease.target.clone();
+    let tooltip = crease
+        .target
+        .split_once(':')
+        .map_or(crease.target.clone(), |(_, rest)| rest.to_string());
+    ButtonLike::new(("crease", index))
+        .style(ButtonStyle::Outlined)
+        .size(ButtonSize::Compact)
+        .height(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(height)))
+        // Exactly over its placeholder, so the text after it doesn't leave a gap.
+        .width(width)
+        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+        .toggle_state(selected)
+        .tooltip(Tooltip::text(tooltip))
+        .on_click(move |_, _, cx| {
+            input
+                .update(cx, |_, cx| {
+                    cx.emit(TextAreaEvent::MentionClicked(target.clone()))
+                })
+                .ok();
+        })
+        .child(
+            gpui::div()
+                .flex()
+                .items_center()
+                .pb_px()
+                .gap_1()
+                .font(font)
+                .text_size(size)
+                .child(
+                    Icon::new(crease.icon)
+                        .size(IconSize::XSmall)
+                        .color(ui::Color::Muted),
+                )
+                .child(crease.label.clone()),
+        )
+        .into_any_element()
 }
 
 fn runs_for(text_len: usize, marked: Option<&Range<usize>>, run: TextRun) -> Vec<TextRun> {
@@ -1059,14 +1321,19 @@ impl Element for TextAreaElement {
             underline: None,
             strikethrough: None,
         };
-        let runs = if input.content.is_empty() {
-            vec![run]
+        let (text, runs, folds): (SharedString, _, _) = if input.content.is_empty() {
+            (text, vec![run], Vec::new())
         } else if input.marked_range.is_some() {
             // Composing with an IME: its underline, nothing else.
-            runs_for(text.len(), input.marked_range.as_ref(), run)
+            let runs = runs_for(text.len(), input.marked_range.as_ref(), run);
+            (text, runs, Vec::new())
         } else {
-            styled_runs(text.len(), &input.spans(), run, cx)
+            let spans = input.spans();
+            let (shown, runs, folds) =
+                display_text(&input.content, &spans, run, font_size, window, cx);
+            (shown.into(), runs, folds)
         };
+
         let shared = input.layout.clone();
         let max_height = line_height * input.max_lines as f32;
         let mut layout_style = Style::default();
@@ -1086,6 +1353,7 @@ impl Element for TextAreaElement {
                     lines: Vec::new(),
                     line_height,
                     content_height: px(0.),
+                    folds: folds.clone(),
                 };
                 let mut start = 0;
                 let mut top = px(0.);
@@ -1195,10 +1463,40 @@ impl Element for TextAreaElement {
                 (fill(chip, chip_color).corner_radii(px(4.)), hitbox)
             })
             .collect();
+        let input = self.input.downgrade();
+        let creases = layout
+            .folds
+            .iter()
+            .enumerate()
+            .filter_map(|(index, fold)| {
+                let chip = fold_bounds(&layout, fold, origin)?;
+                let selected = selection.start < fold.content.end
+                    && fold.content.start < selection.end;
+                let mut element = crease_element(
+                    index,
+                    &fold.crease,
+                    selected,
+                    chip.size,
+                    input.clone(),
+                    cx,
+                );
+                element.prepaint_as_root(
+                    chip.origin,
+                    size(
+                        gpui::AvailableSpace::Definite(chip.size.width),
+                        gpui::AvailableSpace::Definite(chip.size.height),
+                    ),
+                    window,
+                    cx,
+                );
+                Some(element)
+            })
+            .collect();
         PrepaintState {
             selections,
             cursor,
             chips,
+            creases,
         }
     }
 
@@ -1259,6 +1557,9 @@ impl Element for TextAreaElement {
                     window,
                     cx,
                 );
+            }
+            for crease in prepaint.creases.iter_mut() {
+                crease.paint(window, cx);
             }
             if focus_handle.is_focused(window) {
                 if let Some(cursor) = prepaint.cursor.take() {
