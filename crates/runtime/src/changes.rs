@@ -70,7 +70,8 @@ pub fn session_files(messages: &[Message], cwd: &Path) -> Vec<PathBuf> {
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
-    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
 }
 
 /// A path as a git pathspec.
@@ -120,7 +121,12 @@ pub struct Changes {
 
 /// What the session changed: from its first checkpoint when checkpoints are on and one exists,
 /// else from git.
-pub fn changes(checkpoints: &Checkpoints, cwd: &Path, home: &Path, scope: &SessionScope) -> Changes {
+pub fn changes(
+    checkpoints: &Checkpoints,
+    cwd: &Path,
+    home: &Path,
+    scope: &SessionScope,
+) -> Changes {
     if scope.files.is_empty() {
         return Changes {
             source: None,
@@ -171,14 +177,17 @@ pub fn changes(checkpoints: &Checkpoints, cwd: &Path, home: &Path, scope: &Sessi
         .or_else(|| git(&with_specs(&base), cwd))
         .map(|(_, out)| out)
         .unwrap_or_default();
-    let untracked: Vec<String> = git(&with_specs(&["ls-files", "--others", "--exclude-standard"]), cwd)
-        .map(|(_, out)| {
-            out.lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    let untracked: Vec<String> = git(
+        &with_specs(&["ls-files", "--others", "--exclude-standard"]),
+        cwd,
+    )
+    .map(|(_, out)| {
+        out.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default();
     for rel in untracked.iter().take(MAX_UNTRACKED_FILES) {
         if let Some((_, out)) = git(
             &[
@@ -309,7 +318,11 @@ mod tests {
         };
         let messages = vec![
             call("1", "read_file", serde_json::json!({"path": "a.txt"})),
-            call("2", "write_file", serde_json::json!({"path": "src/new.rs", "content": "x"})),
+            call(
+                "2",
+                "write_file",
+                serde_json::json!({"path": "src/new.rs", "content": "x"}),
+            ),
             call("3", "patch", serde_json::json!({"path": "src/new.rs"})),
             call(
                 "4",
@@ -321,7 +334,10 @@ mod tests {
         let files = session_files(&messages, cwd);
         assert_eq!(
             files,
-            vec![PathBuf::from(r"C:\proj\src\new.rs"), PathBuf::from(r"C:\proj\b.py")]
+            vec![
+                PathBuf::from(r"C:\proj\src\new.rs"),
+                PathBuf::from(r"C:\proj\b.py")
+            ]
         );
         let none = changes(
             &Checkpoints::new(PathBuf::from(r"C:\nonexistent"), false),

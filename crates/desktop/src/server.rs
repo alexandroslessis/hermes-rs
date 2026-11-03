@@ -3,6 +3,9 @@
 //! and `tui_gateway/ws.py` serve in Hermes). Routes the backend doesn't have answer Hermes's
 //! own "No such API endpoint" 404, which the frontend reads as "this backend lacks the feature".
 
+/// What the page hides of Hermes's interface (`plugins/hermes-rs/hide.css`).
+const HIDE_CSS: &str = include_str!("../plugins/hermes-rs/hide.css");
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -129,8 +132,9 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
                     "d=JSON.parse(localStorage.getItem(k)||'{{}}');",
                     "['hermes-bots','kanban','radio'].forEach(function(i){{if(!(i in d))d[i]=false}});",
                     "localStorage.setItem(k,JSON.stringify(d));}}catch(e){{}}",
-                    "</script>"
+                    "</script><style>{style}</style>"
                 ),
+                style = HIDE_CSS,
                 token = serde_json::Value::String(state.token.clone()),
             );
             let html = html.replacen("</head>", &format!("{bootstrap}</head>"), 1);

@@ -352,6 +352,14 @@ impl Rest {
         Some(json!({"ok": true}))
     }
 
+    /// One dotted key of the config record (`display.in_app_tips`), as `config.set` writes it.
+    pub fn set_config_value(&self, key: &str, value: Value) {
+        let changes = key
+            .rsplit('.')
+            .fold(value, |inner, part| json!({ part: inner }));
+        let _ = self.save_config(json!({ "config": changes }).to_string().as_bytes());
+    }
+
     /// A string setting from the config record (`display.busy_input_mode`), defaults included.
     pub fn config_value(&self, key: &str) -> Value {
         let record = self.config(None).unwrap_or_default();
@@ -544,23 +552,37 @@ mod tests {
 
     #[test]
     fn ui_preferences_merge_seed_and_survive_a_restart() {
-        let dir = std::env::temp_dir().join(format!("hermes-desktop-prefs-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("hermes-desktop-prefs-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let rest = Rest::new(dir.clone());
-        let (_, empty) = rest.handle("GET", "/api/ui-preferences", None, b"").unwrap();
+        let (_, empty) = rest
+            .handle("GET", "/api/ui-preferences", None, b"")
+            .unwrap();
         assert_eq!(empty["exists"], false);
         let theme = br#"{"values":{"hermes.desktop.theme":"dark","hermes-desktop-mode-v1":"x"}}"#;
-        let (_, written) = rest.handle("PATCH", "/api/ui-preferences", None, theme).unwrap();
+        let (_, written) = rest
+            .handle("PATCH", "/api/ui-preferences", None, theme)
+            .unwrap();
         assert_eq!(written["revision"], 1);
         assert_eq!(written["values"]["hermes.desktop.theme"], "dark");
         // A seed never overwrites; null deletes; foreign keys are refused whole.
         let seed = br#"{"seed":true,"values":{"hermes.desktop.theme":"light"}}"#;
-        rest.handle("PATCH", "/api/ui-preferences", None, seed).unwrap();
+        rest.handle("PATCH", "/api/ui-preferences", None, seed)
+            .unwrap();
         let delete = br#"{"values":{"hermes-desktop-mode-v1":null}}"#;
-        rest.handle("PATCH", "/api/ui-preferences", None, delete).unwrap();
+        rest.handle("PATCH", "/api/ui-preferences", None, delete)
+            .unwrap();
         let bad = br#"{"values":{"other":"1"}}"#;
-        assert_eq!(rest.handle("PATCH", "/api/ui-preferences", None, bad).unwrap().0, 400);
-        let (_, again) = Rest::new(dir.clone()).handle("GET", "/api/ui-preferences", None, b"").unwrap();
+        assert_eq!(
+            rest.handle("PATCH", "/api/ui-preferences", None, bad)
+                .unwrap()
+                .0,
+            400
+        );
+        let (_, again) = Rest::new(dir.clone())
+            .handle("GET", "/api/ui-preferences", None, b"")
+            .unwrap();
         assert_eq!(again["values"], json!({"hermes.desktop.theme": "dark"}));
         assert_eq!(again["generation"], written["generation"]);
         let _ = std::fs::remove_dir_all(dir);
@@ -572,6 +594,9 @@ mod tests {
         assert_eq!(schema["display.busy_input_mode"]["type"], "select");
         assert_eq!(schema["display.show_reasoning"]["type"], "boolean");
         assert_eq!(schema["display.show_reasoning"]["category"], "display");
-        assert_eq!(schema["display.show_reasoning"]["description"], "Display → Show Reasoning");
+        assert_eq!(
+            schema["display.show_reasoning"]["description"],
+            "Display → Show Reasoning"
+        );
     }
 }

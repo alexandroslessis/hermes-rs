@@ -2,6 +2,9 @@
 // hermes-rs doesn't implement, through Hermes's own plugin API (the frontend stays unmodified).
 // The backend writes this file to <data folder>/desktop-plugins/hermes-rs/plugin.js on start.
 //
+// Also: hide.css (voice controls, Settings sections with nothing behind them), injected by the
+// server, for what this API can't hide.
+//
 // Hidden sidebar rows (Hermes's `sidebarNav.prefs` area; Capabilities can't be hidden — it
 // hosts the Plugins tab):
 //   messaging  — Telegram/Discord/Slack bridges (Hermes's gateway platforms)

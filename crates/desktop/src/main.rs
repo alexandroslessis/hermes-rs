@@ -20,6 +20,9 @@ use anyhow::{Context as _, Result};
 use hermes_runtime::{Runtime, RuntimeConfig};
 use tauri::{WebviewUrl, WebviewWindowBuilder};
 
+/// Where the local server listens by default (the page's origin, which its localStorage is kept by).
+const DEFAULT_PORT: u16 = 47_731;
+
 /// Hermes's built webapp: `HERMES_UI_DIST`, else the prototype's build output.
 fn webapp_dist() -> PathBuf {
     std::env::var_os("HERMES_UI_DIST")
@@ -56,13 +59,19 @@ fn main() -> Result<()> {
     };
     runtime.warm_up();
 
-    // A fixed port (HERMES_DESKTOP_PORT) lets a browser open the same page while debugging.
+    // The page keeps some settings in its localStorage, which belongs to its origin, so the
+    // port stays the same between runs (HERMES_DESKTOP_PORT overrides it). When it's taken
+    // (a second instance), any free port: that window starts with empty local settings.
     let port: u16 = std::env::var("HERMES_DESKTOP_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
-        .unwrap_or(0);
-    let listener =
-        std::net::TcpListener::bind(("127.0.0.1", port)).context("binding the local server")?;
+        .unwrap_or(DEFAULT_PORT);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .or_else(|error| {
+            tracing::warn!("port {port} is taken ({error}); local settings won't carry over");
+            std::net::TcpListener::bind(("127.0.0.1", 0))
+        })
+        .context("binding the local server")?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
     let state = Arc::new(server::ServerState {

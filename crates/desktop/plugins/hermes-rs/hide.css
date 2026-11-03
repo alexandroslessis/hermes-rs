@@ -1,0 +1,30 @@
+/* hermes-rs: hides the parts of Hermes's interface whose backend hermes-rs doesn't have and that
+   Hermes's plugin API can't hide. The server injects this into the page; it targets Hermes's
+   own stable hooks (nav rows' data-tour handles, icon classes), so the frontend stays as built. */
+
+/* Voice: the composer's voice-conversation button (wave icon, with its engine menu), the
+   dictation mic and its fan, and the folded voice menu. */
+button:has(> svg.tabler-icon-wave-sine),
+span:has(> button > svg.tabler-icon-wave-sine),
+[data-slot='fan-menu-anchor']:has(.codicon-mic),
+button:has(.codicon-mic) {
+  display: none !important;
+}
+
+/* Settings sections with nothing this backend reads or serves. */
+[data-tour='nav-config:workspace'],
+[data-tour='nav-config:browser'],
+[data-tour='nav-config:memory'],
+[data-tour='nav-config:voice'],
+[data-tour='nav-config:advanced'],
+[data-tour='nav-vault'],
+[data-tour='nav-billing'],
+[data-tour='nav-toggle-billing'],
+[data-tour='nav-providers'],
+[data-tour='nav-toggle-providers'],
+[data-tour='nav-gateway'],
+[data-tour='nav-toggle-gateway'],
+[data-tour='nav-web-access'],
+[data-tour='nav-keys'] {
+  display: none !important;
+}

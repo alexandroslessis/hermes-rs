@@ -240,6 +240,21 @@ impl Store {
         Ok(())
     }
 
+    /// Moves a session to another provider and model (the prompt is rebuilt as for a model switch).
+    pub fn set_provider_model(
+        &self,
+        id: &str,
+        provider: &str,
+        model: &str,
+        system_prompt: &str,
+    ) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE sessions SET provider = ?2, model = ?3, system_prompt = ?4, updated_at = ?5 WHERE id = ?1",
+            params![id, provider, model, system_prompt, now_ms()],
+        )?;
+        Ok(())
+    }
+
     /// Only compaction may rewrite the frozen system prompt (the prompt-cache invariant).
     pub fn set_system_prompt(&self, id: &str, system_prompt: &str) -> Result<()> {
         self.conn.lock().execute(
@@ -425,6 +440,19 @@ mod tests {
         store.delete_session(&older.id).unwrap();
         assert!(store.session(&older.id).unwrap().is_none());
         assert!(store.load_messages(&older.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_session_moves_to_another_provider() {
+        let (store, session) = store_with_session();
+        store
+            .set_provider_model(&session.id, "ollama", "qwen3.5:9b", "rebuilt")
+            .unwrap();
+        let moved = store.session(&session.id).unwrap().unwrap();
+        assert_eq!(
+            (moved.provider.as_str(), moved.model.as_str(), moved.system_prompt.as_str()),
+            ("ollama", "qwen3.5:9b", "rebuilt")
+        );
     }
 
     #[test]

@@ -42,6 +42,10 @@ pub struct Gateway {
     revisions: std::sync::Mutex<std::collections::HashMap<String, u64>>,
     /// Session id → the reasoning effort picked in the composer.
     efforts: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Session id → prompts sent while its turn ran (`prompt.submit` params), run in order.
+    queued: std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<Value>>>,
+    /// Admission id → the started turn waiting for its `prompt.submit` reply to go out first.
+    starts: std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl Gateway {
@@ -54,6 +58,8 @@ impl Gateway {
             hub,
             revisions: Default::default(),
             efforts: Default::default(),
+            queued: Default::default(),
+            starts: Default::default(),
         }
     }
 
@@ -120,6 +126,19 @@ impl Gateway {
             }
         };
         send(&outbox, reply);
+        // A started turn's events follow its admission receipt.
+        if method == "prompt.submit" {
+            if let Some(admission) = admission_id(&params) {
+                let start = self
+                    .starts
+                    .lock()
+                    .ok()
+                    .and_then(|mut s| s.remove(&admission));
+                if let Some(start) = start {
+                    let _ = start.send(());
+                }
+            }
+        }
     }
 
     async fn dispatch(self: Arc<Self>, method: &str, params: &Value, outbox: &Outbox) -> RpcResult {
@@ -161,6 +180,31 @@ impl Gateway {
                 "provider": settings.provider,
             })),
             "config.set" if params["key"] == "model" => self.switch_model(params, &settings),
+            // A session's effort; any other key is a Settings value, kept in the config record.
+            "config.set" => {
+                let key = params["key"].as_str().unwrap_or_default();
+                let value = params["value"].clone();
+                match (key, params["session_id"].as_str()) {
+                    ("reasoning", Some(id)) => {
+                        let effort = value.as_str().unwrap_or_default().to_lowercase();
+                        if let Ok(mut efforts) = self.efforts.lock() {
+                            efforts.insert(id.to_string(), effort.clone());
+                        }
+                        self.emit(id, "session.info", self.session_info(id));
+                        Ok(json!({"key": key, "value": effort, "ok": true}))
+                    }
+                    ("", _) => Err((INVALID_PARAMS, "key is required".to_string())),
+                    _ => {
+                        let key = if key == "reasoning" {
+                            "agent.reasoning_effort"
+                        } else {
+                            key
+                        };
+                        self.rest.set_config_value(key, value.clone());
+                        Ok(json!({"key": key, "value": value, "ok": true}))
+                    }
+                }
+            }
             // Polled on start and on every focus; features this backend doesn't have answer
             // "off" so the page stops asking and shows nothing for them.
             "pet.info" => Ok(json!({"enabled": false})),
@@ -254,7 +298,7 @@ impl Gateway {
             "session.close" => Ok(json!({"closed": true})),
             "session.create" => self.create_session(params, &settings, outbox),
             "session.resume" | "session.history" => self.resume_session(params, outbox),
-            "prompt.submit" => self.submit(params, &settings, outbox),
+            "prompt.submit" => self.submit(params, &settings, outbox, true),
             // The page's answer to an approval card (`choice`) or a clarify question (`answer`),
             // named by the prompt id it was shown with.
             "approval.respond" | "clarify.respond" => {
@@ -394,19 +438,11 @@ impl Gateway {
             .as_str()
             .and_then(|id| self.runtime.store().session(id).ok().flatten());
         if let Some(record) = &record {
-            if record.provider != provider {
-                return Err((
-                    SERVER_ERROR,
-                    format!(
-                        "This session runs on {}; start a new session to use {provider}",
-                        record.provider
-                    ),
-                ));
-            }
-            if record.model != model {
+            if record.model != model || record.provider != provider {
                 // Refused while a turn runs.
+                let other_provider = (record.provider != provider).then_some(provider.as_str());
                 self.runtime
-                    .set_session_model(&record.id, &model, None)
+                    .set_session_route(&record.id, other_provider, &model, None)
                     .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
                 self.emit(&record.id, "session.info", self.session_info(&record.id));
             }
@@ -585,10 +621,14 @@ impl Gateway {
 
     fn resume_session(&self, params: &Value, outbox: &Outbox) -> RpcResult {
         let id = session_id(params)?;
-        let messages = self
-            .runtime
-            .messages(&id)
-            .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+        // Hermes's wording: the page drops an id it doesn't know to a fresh draft.
+        if self.runtime.store().session(&id).ok().flatten().is_none() {
+            return Err((SERVER_ERROR, format!("Session not found: {id}")));
+        }
+        let messages = self.runtime.messages(&id).map_err(|e| {
+            tracing::warn!("resuming {id}: {e:#}");
+            (SERVER_ERROR, format!("{e:#}"))
+        })?;
         let transcript = transcript::messages(&messages);
         self.subscribe(&id, outbox);
         Ok(json!({
@@ -608,20 +648,38 @@ impl Gateway {
     }
 
     /// `prompt.submit`: starts a turn and streams it as Hermes's events.
-    fn submit(self: Arc<Self>, params: &Value, settings: &Settings, outbox: &Outbox) -> RpcResult {
+    /// `gated`: the page awaits this call's reply, which goes out before the turn's events.
+    fn submit(
+        self: Arc<Self>,
+        params: &Value,
+        settings: &Settings,
+        outbox: &Outbox,
+        gated: bool,
+    ) -> RpcResult {
         let id = session_id(params)?;
         let text = match &params["text"] {
             Value::String(text) => text.clone(),
             other => other.to_string(),
         };
-        let admission_id = params["submission_id"]
-            .as_str()
-            .or(params["input_id"].as_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        // Busy: the page steers with `session.steer`; a rewind interrupts and retries on this.
+        let admission_id = admission_id(params).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         if self.runtime.is_running(&id) {
-            return Err((SERVER_ERROR, "session busy".to_string()));
+            // A rewind can't wait behind the turn: the page interrupts and retries on "busy".
+            if params["confirm_truncate"] == true {
+                return Err((SERVER_ERROR, "session busy".to_string()));
+            }
+            // Anything else waits its turn (Hermes's queued admission).
+            if let Ok(mut queued) = self.queued.lock() {
+                queued
+                    .entry(id.clone())
+                    .or_default()
+                    .push_back(params.clone());
+            }
+            self.subscribe(&id, outbox);
+            return Ok(json!({
+                "status": "queued",
+                "admission_id": admission_id,
+                "ref": {"session_id": id},
+            }));
         }
         // Restore / edit / regenerate: drop that user turn and everything after it first.
         if params["confirm_truncate"] == true {
@@ -700,10 +758,28 @@ impl Gateway {
             .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
         self.subscribe(&id, outbox);
         let id_for_receipt = id.clone();
+        let started = gated.then(|| {
+            let (start, started) = tokio::sync::oneshot::channel();
+            if let Ok(mut starts) = self.starts.lock() {
+                starts.insert(admission_id.clone(), start);
+            }
+            started
+        });
         let this = self.clone();
+        let outbox = outbox.clone();
+        let admission = admission_id.clone();
         tokio::spawn(async move {
+            if let Some(started) = started {
+                let _ = started.await;
+            }
             let mut stream = transcript::TurnStream::default();
-            this.emit(&id, "message.start", json!({}));
+            // The page holds the turn as live from `running: true` until `running: false`.
+            this.emit(&id, "session.info", this.session_info(&id));
+            this.emit(
+                &id,
+                "message.start",
+                json!({"turn_id": admission, "admission_id": admission}),
+            );
             while let Some(event) = turn.events.recv().await {
                 match event {
                     RuntimeEvent::Agent(event) => {
@@ -723,6 +799,9 @@ impl Gateway {
                             "message.complete",
                             json!({"text": stream.text(), "status": status, "error": error}),
                         );
+                        let mut info = this.session_info(&id);
+                        info["running"] = json!(false);
+                        this.emit(&id, "session.info", info);
                         if let Some((Some((provider, model)), opening)) = titling {
                             if status == "complete" {
                                 this.title_session(&id, &provider, &model, &opening).await;
@@ -732,6 +811,7 @@ impl Gateway {
                     }
                 }
             }
+            this.run_queued(&id, &outbox);
         });
         // The canonical protocol's admission receipt: which session took the prompt, under the
         // id the page gave this send (it drops its optimistic bubble on any other id or status).
@@ -740,6 +820,27 @@ impl Gateway {
             "admission_id": admission_id,
             "ref": {"session_id": id_for_receipt},
         }))
+    }
+
+    /// Starts the session's next queued prompt, once its turn has finished.
+    fn run_queued(self: &Arc<Self>, id: &str, outbox: &Outbox) {
+        let next = self
+            .queued
+            .lock()
+            .ok()
+            .and_then(|mut queued| queued.get_mut(id).and_then(|q| q.pop_front()));
+        let Some(params) = next else {
+            return;
+        };
+        let settings = Settings::load(&self.data_dir);
+        if let Err((_, error)) = self.clone().submit(&params, &settings, outbox, false) {
+            tracing::warn!("queued prompt in {id}: {error}");
+            self.emit(
+                id,
+                "message.complete",
+                json!({"text": "", "status": "error", "error": error}),
+            );
+        }
     }
 
     /// Hermes's auto-title: the title model names the session from its opening message, and the
@@ -928,6 +1029,14 @@ impl Gateway {
             "profile_totals": {"default": all.len()},
         })
     }
+}
+
+/// The page's id for a `prompt.submit` (its admission id).
+fn admission_id(params: &Value) -> Option<String> {
+    params["submission_id"]
+        .as_str()
+        .or(params["input_id"].as_str())
+        .map(str::to_string)
 }
 
 fn session_id(params: &Value) -> Result<String, (i64, String)> {

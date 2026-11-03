@@ -433,6 +433,18 @@ impl Runtime {
         model: &str,
         context_length: Option<usize>,
     ) -> Result<()> {
+        self.set_session_route(session_id, None, model, context_length)
+    }
+
+    /// Switches a session to another model, on another provider when `provider` names one (the
+    /// next turn is sent there). Rebuilds the frozen prompt like [`Self::set_session_model`].
+    pub fn set_session_route(
+        &self,
+        session_id: &str,
+        provider: Option<&str>,
+        model: &str,
+        context_length: Option<usize>,
+    ) -> Result<()> {
         let open = self.open(session_id)?;
         anyhow::ensure!(
             open.running.lock().is_none(),
@@ -440,11 +452,16 @@ impl Runtime {
         );
         let (provider, cwd) = {
             let record = open.record.lock();
-            (record.provider.clone(), PathBuf::from(&record.cwd))
+            (
+                provider.map_or_else(|| record.provider.clone(), str::to_string),
+                PathBuf::from(&record.cwd),
+            )
         };
         let prompt = self.system_prompt(&provider, model, context_length, &cwd)?;
-        self.store.set_model(session_id, model, &prompt)?;
+        self.store
+            .set_provider_model(session_id, &provider, model, &prompt)?;
         let mut record = open.record.lock();
+        record.provider = provider;
         record.model = model.to_string();
         record.system_prompt = prompt;
         Ok(())
