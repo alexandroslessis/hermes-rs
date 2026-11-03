@@ -75,10 +75,10 @@ pub fn desktop_plugins_dir(data_dir: &Path) -> PathBuf {
 /// `DEFAULT_CONFIG`): what `/api/config/defaults` reports and `/api/config` starts from.
 fn config_defaults() -> Value {
     json!({
-        "agent": {"reasoning_effort": "medium"},
+        "agent": {"reasoning_effort": ""},
         "display": {
             "show_reasoning": true,
-            "busy_input_mode": "queue",
+            "busy_input_mode": "interrupt",
             "interim_assistant_messages": true,
             "timestamps": false,
             "tool_progress": "all",
@@ -111,11 +111,197 @@ fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
+/// Hermes's machine-level UI preferences store (`apps/desktop/electron/ui-preferences.ts`):
+/// `{version, generation, revision, values}` in `ui-preferences.json`. A write merges per key
+/// (null deletes); a `seed` write (a window's first contact) only adds missing keys.
+const UI_PREFERENCES_FILE: &str = "ui-preferences.json";
+const UI_PREFERENCE_PREFIXES: [&str; 3] =
+    ["hermes.desktop.", "hermes-desktop-", "hermes-onboarding-"];
+
+#[derive(Default)]
+struct UiPreferences {
+    exists: bool,
+    generation: String,
+    revision: u64,
+    values: serde_json::Map<String, Value>,
+}
+
+impl UiPreferences {
+    fn read(path: &Path) -> Self {
+        let Some(doc) = read_json(path) else {
+            return Self::default();
+        };
+        Self {
+            exists: true,
+            generation: doc["generation"].as_str().unwrap_or_default().to_string(),
+            revision: doc["revision"].as_u64().unwrap_or(0),
+            values: doc["values"]
+                .as_object()
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter(|(_, v)| v.is_string())
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn snapshot(&self) -> Value {
+        let mut snapshot =
+            json!({"exists": self.exists, "revision": self.revision, "values": self.values});
+        if self.exists {
+            snapshot["generation"] = json!(self.generation);
+        }
+        snapshot
+    }
+
+    fn document(&self) -> String {
+        let doc = json!({"version": 1, "generation": self.generation, "revision": self.revision, "values": self.values});
+        serde_json::to_string_pretty(&doc).unwrap_or_default() + "\n"
+    }
+
+    /// Applies a write; `Ok(false)` when nothing changed. Refused whole when a key or value
+    /// isn't one Hermes accepts.
+    fn write(&mut self, write: &Value) -> Result<bool, String> {
+        let changes = write["values"]
+            .as_object()
+            .ok_or("ui preferences write needs a values object")?;
+        for (key, value) in changes {
+            if !UI_PREFERENCE_PREFIXES.iter().any(|p| key.starts_with(p)) || key.len() > 256 {
+                return Err(format!("unsupported preference key: {key}"));
+            }
+            if !(value.is_null() || value.is_string()) {
+                return Err(format!("unsupported value for {key}"));
+            }
+        }
+        let seed = write["seed"] == true;
+        let mut values = self.values.clone();
+        for (key, value) in changes {
+            if seed {
+                if !value.is_null() && !values.contains_key(key) {
+                    values.insert(key.clone(), value.clone());
+                }
+            } else if value.is_null() {
+                values.remove(key);
+            } else {
+                values.insert(key.clone(), value.clone());
+            }
+        }
+        if values == self.values && (self.exists || values.is_empty()) {
+            return Ok(false);
+        }
+        self.values = values;
+        self.revision += 1;
+        if self.generation.is_empty() {
+            self.generation = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+        }
+        self.exists = true;
+        Ok(true)
+    }
+}
+
+/// Settings' tab order (Hermes's `_CATEGORY_ORDER`); other categories follow alphabetically.
+const CATEGORY_ORDER: [&str; 15] = [
+    "general",
+    "agent",
+    "terminal",
+    "display",
+    "delegation",
+    "memory",
+    "compression",
+    "security",
+    "browser",
+    "voice",
+    "tts",
+    "stt",
+    "logging",
+    "discord",
+    "auxiliary",
+];
+
+/// Hermes's `/api/config/schema` for the keys this backend keeps: each default as a field
+/// (`_build_schema_from_config`: type from the value, category from the first path part),
+/// with Hermes's select options where it has them.
+fn config_schema() -> serde_json::Map<String, Value> {
+    fn walk(prefix: &str, value: &Value, out: &mut serde_json::Map<String, Value>) {
+        if let Some(object) = value.as_object() {
+            for (key, value) in object {
+                let full = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                walk(&full, value, out);
+            }
+            return;
+        }
+        let kind = match value {
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "number",
+            Value::Array(_) => "list",
+            _ => "string",
+        };
+        let description = prefix
+            .replace('.', " → ")
+            .replace('_', " ")
+            .split(' ')
+            .map(|word| {
+                let mut chars = word.chars();
+                chars
+                    .next()
+                    .map(|first| {
+                        first
+                            .to_uppercase()
+                            .chain(chars.flat_map(char::to_lowercase))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<String>>()
+            .join(" ");
+        let category = prefix
+            .split('.')
+            .next()
+            .filter(|_| prefix.contains('.'))
+            .unwrap_or("general");
+        let mut field = json!({"type": kind, "description": description, "category": category});
+        let select = |description: &str, options: &[&str]| json!({"type": "select", "description": description, "options": options});
+        let overrides = match prefix {
+            "display.busy_input_mode" => Some(select(
+                "Input behavior while agent is running",
+                &["interrupt", "queue", "steer"],
+            )),
+            "approvals.mode" => Some(select(
+                "Dangerous command approval mode",
+                &["manual", "smart", "off"],
+            )),
+            "agent.reasoning_effort" => Some(select(
+                "Reasoning effort for thinking models",
+                &["", "none", "minimal", "low", "medium", "high", "xhigh"],
+            )),
+            "display.tool_progress" => Some(select(
+                "Tool progress display",
+                &["off", "new", "all", "verbose"],
+            )),
+            _ => None,
+        };
+        if let (Some(field), Some(overrides)) = (field.as_object_mut(), overrides) {
+            field.extend(overrides.as_object().cloned().unwrap_or_default());
+        }
+        out.insert(prefix.to_string(), field);
+    }
+    let mut out = serde_json::Map::new();
+    walk("", &config_defaults(), &mut out);
+    out
+}
+
 pub struct Rest {
     pub data_dir: PathBuf,
     plugins_dir: PathBuf,
-    /// The Desktop's interface preferences, kept as the frontend writes them.
-    ui_preferences: std::sync::Mutex<Value>,
+    /// The Desktop's interface preferences (theme, layout), in Hermes's store format.
+    ui_preferences: std::sync::Mutex<UiPreferences>,
     /// Hermes's config record as the Settings pages write it (`desktop-config.json`); the
     /// model and provider come from the hermes-rs settings instead.
     config: std::sync::Mutex<Value>,
@@ -123,8 +309,7 @@ pub struct Rest {
 
 impl Rest {
     pub fn new(data_dir: PathBuf) -> Self {
-        let ui_preferences =
-            read_json(&data_dir.join("desktop-ui-preferences.json")).unwrap_or_else(|| json!({}));
+        let ui_preferences = UiPreferences::read(&data_dir.join(UI_PREFERENCES_FILE));
         let config = read_json(&data_dir.join("desktop-config.json")).unwrap_or_else(|| json!({}));
         Self {
             plugins_dir: desktop_plugins_dir(&data_dir),
@@ -283,26 +468,29 @@ impl Rest {
             ("GET", "/api/profiles/active") => {
                 ok(json!({ "name": "default", "profile": self.profile() }))
             }
-            ("GET", "/api/ui-preferences") => ok(self.ui_preferences.lock().ok()?.clone()),
+            ("GET", "/api/ui-preferences") => ok(self.ui_preferences.lock().ok()?.snapshot()),
             ("PATCH", "/api/ui-preferences") => {
-                let patch: Value = serde_json::from_slice(body).unwrap_or_default();
+                let write: Value = serde_json::from_slice(body).unwrap_or_default();
                 let mut preferences = self.ui_preferences.lock().ok()?;
-                if let (Some(target), Some(changes)) =
-                    (preferences.as_object_mut(), patch.as_object())
-                {
-                    for (key, value) in changes {
-                        target.insert(key.clone(), value.clone());
+                match preferences.write(&write) {
+                    Ok(true) => {
+                        let _ = std::fs::write(
+                            self.data_dir.join(UI_PREFERENCES_FILE),
+                            preferences.document(),
+                        );
+                        ok(preferences.snapshot())
                     }
+                    Ok(false) => ok(preferences.snapshot()),
+                    Err(detail) => Some((400, json!({ "detail": detail }))),
                 }
-                let _ = std::fs::write(
-                    self.data_dir.join("desktop-ui-preferences.json"),
-                    preferences.to_string(),
-                );
-                ok(preferences.clone())
             }
             ("GET", "/api/config") => ok(self.config(query)?),
             ("PUT", "/api/config") => ok(self.save_config(body)?),
             ("GET", "/api/config/defaults") => ok(config_defaults()),
+            ("GET", "/api/config/schema") => ok(json!({
+                "fields": config_schema(),
+                "category_order": CATEGORY_ORDER,
+            })),
             // Where a new session starts when none is picked (what `session.create` uses too).
             ("GET", "/api/fs/default-cwd") => ok(json!({
                 "cwd": dirs::home_dir().map(|home| home.display().to_string()),
@@ -340,7 +528,7 @@ mod tests {
         let (_, config) = rest.handle("GET", "/api/config", None, b"").unwrap();
         assert_eq!(config["display"]["show_reasoning"], false);
         // Untouched defaults stay, and the model is the hermes-rs settings'.
-        assert_eq!(config["display"]["busy_input_mode"], "queue");
+        assert_eq!(config["display"]["busy_input_mode"], "interrupt");
         assert_eq!(config["model"]["default"], "qwen");
         assert_eq!(rest.config_value("approvals.mode"), "manual");
         // Without defaults: only what was saved (plus the model).
@@ -352,5 +540,38 @@ mod tests {
         let again = Rest::new(dir.clone());
         assert_eq!(again.config_value("display.show_reasoning"), false);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ui_preferences_merge_seed_and_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("hermes-desktop-prefs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rest = Rest::new(dir.clone());
+        let (_, empty) = rest.handle("GET", "/api/ui-preferences", None, b"").unwrap();
+        assert_eq!(empty["exists"], false);
+        let theme = br#"{"values":{"hermes.desktop.theme":"dark","hermes-desktop-mode-v1":"x"}}"#;
+        let (_, written) = rest.handle("PATCH", "/api/ui-preferences", None, theme).unwrap();
+        assert_eq!(written["revision"], 1);
+        assert_eq!(written["values"]["hermes.desktop.theme"], "dark");
+        // A seed never overwrites; null deletes; foreign keys are refused whole.
+        let seed = br#"{"seed":true,"values":{"hermes.desktop.theme":"light"}}"#;
+        rest.handle("PATCH", "/api/ui-preferences", None, seed).unwrap();
+        let delete = br#"{"values":{"hermes-desktop-mode-v1":null}}"#;
+        rest.handle("PATCH", "/api/ui-preferences", None, delete).unwrap();
+        let bad = br#"{"values":{"other":"1"}}"#;
+        assert_eq!(rest.handle("PATCH", "/api/ui-preferences", None, bad).unwrap().0, 400);
+        let (_, again) = Rest::new(dir.clone()).handle("GET", "/api/ui-preferences", None, b"").unwrap();
+        assert_eq!(again["values"], json!({"hermes.desktop.theme": "dark"}));
+        assert_eq!(again["generation"], written["generation"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_schema_describes_every_default() {
+        let schema = config_schema();
+        assert_eq!(schema["display.busy_input_mode"]["type"], "select");
+        assert_eq!(schema["display.show_reasoning"]["type"], "boolean");
+        assert_eq!(schema["display.show_reasoning"]["category"], "display");
+        assert_eq!(schema["display.show_reasoning"]["description"], "Display → Show Reasoning");
     }
 }

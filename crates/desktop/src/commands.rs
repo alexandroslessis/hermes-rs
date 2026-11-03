@@ -32,8 +32,13 @@ pub fn catalog(skills: &SkillStore) -> Value {
             (name.clone(), json!({"usage": uses, "origin": origin}))
         })
         .collect();
+    // The bare `/` list: every skill and bundle as `[command, description]`.
+    let pairs: Vec<[String; 2]> = entries
+        .iter()
+        .map(|(name, description, _)| [format!("/{name}"), description.clone()])
+        .collect();
     json!({
-        "pairs": [],
+        "pairs": pairs,
         "sub": {},
         "canon": {},
         "commands": {},
@@ -160,6 +165,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(catalog(&store)["skill_count"], 3);
+        assert_eq!(catalog(&store)["pairs"][0][0], "/explain-plan");
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -76,6 +76,8 @@ impl Hub {
         let prompt_id = uuid::Uuid::new_v4().to_string();
         payload["prompt_id"] = Value::String(prompt_id.clone());
         payload["kind"] = Value::String(kind.to_string());
+        // The page answers a card only while its generation is the session's.
+        payload["execution_generation"] = json!(crate::gateway::EXECUTION_GENERATION);
         let (reply, answer) = oneshot::channel();
         self.prompts.lock().ok()?.insert(
             prompt_id.clone(),

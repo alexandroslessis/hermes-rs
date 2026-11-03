@@ -26,6 +26,10 @@ const SERVER_ERROR: i64 = -32000;
 
 type RpcResult = Result<Value, (i64, String)>;
 
+/// Hermes fences turn control and prompt answers by an execution generation. This backend runs
+/// one agent per session in-process, so a single generation serves every turn.
+pub const EXECUTION_GENERATION: u64 = 0;
+
 pub struct Gateway {
     pub runtime: Arc<Runtime>,
     pub rest: crate::rest::Rest,
@@ -34,6 +38,10 @@ pub struct Gateway {
     replay_epoch: String,
     /// Event routes and open questions, shared with the runtime's bridge.
     hub: Arc<Hub>,
+    /// Session id → its edit revision (Hermes's CAS value).
+    revisions: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// Session id → the reasoning effort picked in the composer.
+    efforts: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl Gateway {
@@ -44,6 +52,8 @@ impl Gateway {
             data_dir,
             replay_epoch: uuid::Uuid::new_v4().to_string(),
             hub,
+            revisions: Default::default(),
+            efforts: Default::default(),
         }
     }
 
@@ -219,11 +229,7 @@ impl Gateway {
             "session.title" => {
                 let id = session_id(params)?;
                 if let Some(title) = params["title"].as_str() {
-                    let title = title.trim();
-                    self.runtime
-                        .store()
-                        .set_title(&id, title)
-                        .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                    self.rename(&id, title)?;
                 }
                 let title = self
                     .runtime
@@ -235,6 +241,7 @@ impl Gateway {
                     .unwrap_or_default();
                 Ok(json!({"title": title, "session_key": id}))
             }
+            "session.mutate" => self.mutate(params, &settings),
             "session.delete" => {
                 let id = session_id(params)?;
                 self.runtime
@@ -411,6 +418,105 @@ impl Gateway {
         Ok(json!({"key": "model", "value": model, "provider": provider}))
     }
 
+    /// Hermes's canonical `session.mutate`: a session edit presenting the revision the page last
+    /// saw. Edits here are one user's, so the revision is reported but not enforced.
+    fn mutate(&self, params: &Value, settings: &Settings) -> RpcResult {
+        let id = session_id(params)?;
+        let payload = &params["payload"];
+        let mut receipt = match params["operation"].as_str().unwrap_or_default() {
+            "rename" => {
+                let title = payload["title"].as_str().unwrap_or_default();
+                self.rename(&id, title)?;
+                json!({"title": title.trim()})
+            }
+            "model" => {
+                let model = payload["model"].as_str().unwrap_or_default();
+                let provider = payload["provider"].as_str().unwrap_or_default();
+                // The canonical pick is session policy: it never rewrites the defaults.
+                self.switch_model(
+                    &json!({"session_id": id, "value": format!("{model} --provider {provider} --session")}),
+                    settings,
+                )?;
+                json!({"model": model, "provider": provider, "status": "applied"})
+            }
+            "reasoning" => {
+                let effort = payload["effort"]
+                    .as_str()
+                    .unwrap_or("medium")
+                    .to_lowercase();
+                if let Ok(mut efforts) = self.efforts.lock() {
+                    efforts.insert(id.clone(), effort.clone());
+                }
+                self.emit(&id, "session.info", self.session_info(&id));
+                json!({"effort": effort, "status": "applied"})
+            }
+            "archive" => {
+                return Err((
+                    SERVER_ERROR,
+                    "Archiving isn't available in hermes-rs; delete the session instead.".into(),
+                ));
+            }
+            other => {
+                return Err((
+                    SERVER_ERROR,
+                    format!("{other} isn't available in hermes-rs yet"),
+                ));
+            }
+        };
+        receipt["session_id"] = json!(id);
+        receipt["revision"] = json!(self.bump_revision(&id));
+        receipt["execution_generation"] = json!(EXECUTION_GENERATION);
+        Ok(receipt)
+    }
+
+    /// Renames a session; the page's lists hear it through Hermes's `session.title` event.
+    fn rename(&self, id: &str, title: &str) -> Result<(), (i64, String)> {
+        let title = title.trim();
+        self.runtime
+            .store()
+            .set_title(id, title)
+            .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+        self.emit(
+            id,
+            "session.title",
+            json!({"session_id": id, "title": title}),
+        );
+        Ok(())
+    }
+
+    /// The session's edit counter (Hermes's CAS revision), which the page presents with each edit.
+    fn revision(&self, id: &str) -> u64 {
+        self.revisions
+            .lock()
+            .ok()
+            .and_then(|revisions| revisions.get(id).copied())
+            .unwrap_or(1)
+    }
+
+    fn bump_revision(&self, id: &str) -> u64 {
+        let Ok(mut revisions) = self.revisions.lock() else {
+            return 1;
+        };
+        let revision = revisions.entry(id.to_string()).or_insert(1);
+        *revision += 1;
+        *revision
+    }
+
+    /// The session's reasoning effort: picked in the composer, else Settings' default.
+    fn effort(&self, id: &str) -> String {
+        self.efforts
+            .lock()
+            .ok()
+            .and_then(|efforts| efforts.get(id).cloned())
+            .or_else(|| {
+                self.rest
+                    .config_value("agent.reasoning_effort")
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+    }
+
     fn session_info(&self, id: &str) -> Value {
         let record = self.runtime.store().session(id).ok().flatten();
         let running = self.runtime.is_running(id);
@@ -426,6 +532,9 @@ impl Gateway {
                 // The protocol this backend speaks; the page warns "out of date" without it.
                 "desktop_protocol": "hermes-gateway-v1",
                 "profile_name": "default",
+                "reasoning_effort": self.effort(id),
+                "revision": self.revision(id),
+                "execution_generation": EXECUTION_GENERATION,
             }),
             None => json!({"stored_session_id": id, "running": running}),
         }
@@ -469,6 +578,8 @@ impl Gateway {
             "message_count": 0,
             "messages": [],
             "info": self.session_info(&record.id),
+            "revision": self.revision(&record.id),
+            "execution_generation": EXECUTION_GENERATION,
         }))
     }
 
@@ -490,6 +601,9 @@ impl Gateway {
             "running": self.runtime.is_running(&id),
             // Questions still waiting: the page shows their cards again.
             "prompts": self.hub.open_prompts(&id),
+            // The page's edit and turn-control fences.
+            "revision": self.revision(&id),
+            "execution_generation": EXECUTION_GENERATION,
         }))
     }
 
@@ -554,6 +668,11 @@ impl Gateway {
             let title: String = line.chars().take(60).collect();
             if !title.is_empty() {
                 let _ = self.runtime.store().set_title(&id, &title);
+                self.emit(
+                    &id,
+                    "session.title",
+                    json!({"session_id": id, "title": title}),
+                );
             }
         }
         let provider = settings
@@ -563,7 +682,21 @@ impl Gateway {
             .runtime();
         let mut turn = self
             .runtime
-            .start_turn(&id, &provider, TurnOptions::default(), &text)
+            .start_turn(
+                &id,
+                &provider,
+                TurnOptions {
+                    // Only a picked effort is sent; unset leaves the provider's default (as Hermes).
+                    effort: self
+                        .efforts
+                        .lock()
+                        .ok()
+                        .and_then(|efforts| efforts.get(&id).cloned())
+                        .filter(|e| e != "none"),
+                    ..TurnOptions::default()
+                },
+                &text,
+            )
             .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
         self.subscribe(&id, outbox);
         let id_for_receipt = id.clone();
@@ -621,6 +754,11 @@ impl Gateway {
         match hermes_runtime::generate_title(provider, model, opening).await {
             Ok(Some(title)) => {
                 let _ = self.runtime.store().set_title(id, &title);
+                self.emit(
+                    id,
+                    "session.title",
+                    json!({"session_id": id, "title": title}),
+                );
                 self.emit(id, "session.info", self.session_info(id));
             }
             Ok(None) => {}
@@ -648,6 +786,14 @@ impl Gateway {
             let settings = Settings::load(&self.data_dir);
             let session = crate::rest::query_param(query, "session_id");
             return Some((200, self.model_options(&settings, session.as_deref()).await));
+        }
+        if let Some(id) = path
+            .strip_prefix("/api/sessions/")
+            .and_then(|rest| rest.strip_suffix("/messages"))
+        {
+            if method == "GET" {
+                return Some(self.stored_messages(&crate::rest::percent_decode(id), query));
+            }
         }
         if let Some(id) = path.strip_prefix("/api/sessions/") {
             let id = crate::rest::percent_decode(id);
@@ -691,6 +837,52 @@ impl Gateway {
             },
             _ => None,
         }
+    }
+
+    /// `/api/sessions/{id}/messages`: the stored transcript, a page of it (`SessionMessagesResponse`).
+    fn stored_messages(&self, id: &str, query: Option<&str>) -> (u16, Value) {
+        let messages = match self.runtime.messages(id) {
+            Ok(messages) => transcript::messages(&messages),
+            Err(error) => return (404, json!({"detail": format!("{error:#}")})),
+        };
+        let param = |name: &str| {
+            crate::rest::query_param(query, name).and_then(|v| v.parse::<usize>().ok())
+        };
+        let limit = param("limit").unwrap_or(messages.len().max(1));
+        let offset = param("offset").unwrap_or(0);
+        let latest = crate::rest::query_param(query, "order").as_deref() == Some("latest");
+        // `latest` pages count back from the newest message; the page still reads oldest first.
+        let (start, end) = if latest {
+            let end = messages.len().saturating_sub(offset);
+            (end.saturating_sub(limit), end)
+        } else {
+            (
+                offset.min(messages.len()),
+                (offset + limit).min(messages.len()),
+            )
+        };
+        let page: Vec<Value> = messages[start..end]
+            .iter()
+            .map(|m| {
+                let mut row = m.clone();
+                row["content"] = m["text"].clone();
+                row
+            })
+            .collect();
+        (
+            200,
+            json!({
+                "session_id": id,
+                "profile": "default",
+                "pagination": {
+                    "limit": limit,
+                    "offset": offset,
+                    "order": if latest { "latest" } else { "oldest" },
+                    "returned": page.len(),
+                },
+                "messages": page,
+            }),
+        )
     }
 
     /// One session as the sidebar lists it (`SessionInfo`).
