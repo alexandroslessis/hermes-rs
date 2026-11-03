@@ -154,7 +154,6 @@ impl Gateway {
             // Polled on start and on every focus; features this backend doesn't have answer
             // "off" so the page stops asking and shows nothing for them.
             "pet.info" => Ok(json!({"enabled": false})),
-            "session.control.read" => Ok(json!({"control": {"revision": "0", "updated_at": 0}})),
             "setup.runtime_check" => {
                 let provider = settings.active();
                 let ok = provider.is_some_and(|p| p.ready()) && settings.model.is_some();
@@ -274,10 +273,20 @@ impl Gateway {
                     ))
                 }
             }
+            "session.steer" => {
+                let id = session_id(params)?;
+                let text = params["text"].as_str().unwrap_or_default();
+                if self.runtime.steer(&id, text) {
+                    Ok(json!({"status": "queued", "session_id": id}))
+                } else {
+                    Err((SERVER_ERROR, "no turn is running".to_string()))
+                }
+            }
             "session.interrupt" => {
                 let id = session_id(params)?;
                 let running = self.runtime.is_running(&id);
                 self.runtime.cancel(&id);
+                self.hub.cancel_session(&id);
                 Ok(json!({
                     "status": if running { "interrupted" } else { "not_interrupted" },
                     "interrupted": running,
@@ -496,12 +505,23 @@ impl Gateway {
             .or(params["input_id"].as_str())
             .map(str::to_string)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // Busy: the page steers with `session.steer`; a rewind interrupts and retries on this.
         if self.runtime.is_running(&id) {
-            return if self.runtime.steer(&id, &text) {
-                Ok(json!({"status": "steered"}))
-            } else {
-                Err((SERVER_ERROR, "session busy".to_string()))
-            };
+            return Err((SERVER_ERROR, "session busy".to_string()));
+        }
+        // Restore / edit / regenerate: drop that user turn and everything after it first.
+        if params["confirm_truncate"] == true {
+            if let Some(ordinal) = params["truncate_before_user_ordinal"].as_u64() {
+                let messages = self
+                    .runtime
+                    .messages(&id)
+                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                let keep = transcript::user_turn_index(&messages, ordinal as usize)
+                    .unwrap_or(messages.len());
+                self.runtime
+                    .rewind(&id, keep)
+                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+            }
         }
         let record = self
             .runtime

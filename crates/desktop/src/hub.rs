@@ -112,6 +112,31 @@ impl Hub {
         true
     }
 
+    /// Drops a session's open questions (its turn was stopped): their cards close and the
+    /// runtime hears "no answer" (an approval is denied).
+    pub fn cancel_session(&self, session_id: &str) {
+        let dropped: Vec<(String, &'static str)> = match self.prompts.lock() {
+            Ok(mut prompts) => {
+                let ids: Vec<String> = prompts
+                    .iter()
+                    .filter(|(_, p)| p.session_id == session_id)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                ids.into_iter()
+                    .filter_map(|id| prompts.remove(&id).map(|p| (id, p.kind)))
+                    .collect()
+            }
+            Err(_) => return,
+        };
+        for (prompt_id, kind) in dropped {
+            self.emit(
+                session_id,
+                &format!("{kind}.settled"),
+                json!({"prompt_id": prompt_id, "kind": kind}),
+            );
+        }
+    }
+
     /// A session's open questions, for `session.resume` (its `prompts`).
     pub fn open_prompts(&self, session_id: &str) -> Vec<Value> {
         self.prompts

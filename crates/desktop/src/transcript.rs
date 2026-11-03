@@ -158,3 +158,20 @@ impl TurnStream {
         events
     }
 }
+
+/// Where the `ordinal`-th message the user typed (0-based, as the page counts them) sits among
+/// the stored messages; `None` past the end. Tool results ride in user messages and don't count.
+pub fn user_turn_index(messages: &[Message], ordinal: usize) -> Option<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            m.role == Role::User
+                && m.is_user_visible()
+                && m.content
+                    .iter()
+                    .any(|c| matches!(c, MessageContent::Text(t) if !t.text.trim().is_empty()))
+        })
+        .nth(ordinal)
+        .map(|(index, _)| index)
+}
