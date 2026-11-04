@@ -24,6 +24,18 @@ fn base_name(path: &str) -> String {
         .to_string()
 }
 
+/// A path's identity for grouping (Hermes's `_path_key`): its segments, split on either slash,
+/// case-folded, without a trailing slash. Windows spells one folder `C:\a\b`, `C:/a/b` or
+/// `c:\a\b\` depending on who recorded it (the folder dialog, the page, a terminal); compared as
+/// text they were different folders, and a project showed its folder twice.
+fn path_key(path: &str) -> String {
+    path.split(['/', '\\'])
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// The git repository a folder is in (the nearest folder holding `.git`), if any.
 fn git_root(cwd: &str) -> Option<String> {
     Path::new(cwd)
@@ -77,7 +89,7 @@ fn repos(
             Some(root) => (root, true),
             None => (cwd, false),
         };
-        let key = root.to_lowercase();
+        let key = path_key(&root);
         if !by_root.contains_key(&key) {
             order.push(root.clone());
         }
@@ -90,7 +102,7 @@ fn repos(
     let mut out: Vec<Value> = order
         .iter()
         .map(|root| {
-            let (is_git, rows) = &by_root[&root.to_lowercase()];
+            let (is_git, rows) = &by_root[&path_key(root)];
             let mut rows = rows.clone();
             rows.sort_by(|a, b| b["last_active"].as_f64().partial_cmp(&a["last_active"].as_f64()).unwrap_or(std::cmp::Ordering::Equal));
             json!({
@@ -116,7 +128,7 @@ fn repos(
         if !out.iter().any(|repo| {
             repo["id"]
                 .as_str()
-                .is_some_and(|id| id.eq_ignore_ascii_case(&root))
+                .is_some_and(|id| path_key(id) == path_key(&root))
         }) {
             out.push(json!({"id": root, "label": base_name(&root), "path": root, "groups": [], "sessionCount": 0}));
         }
@@ -208,16 +220,18 @@ pub fn tree(
             .clone()
         {
             Some(root) => {
-                if !auto.contains_key(&root) {
+                // One project per folder however it's spelled; shown as first seen.
+                let key = path_key(&root);
+                if !auto.contains_key(&key) {
                     auto_order.push(root.clone());
                 }
-                auto.entry(root).or_default().push(session);
+                auto.entry(key).or_default().push(session);
             }
             None => homeless.push(session),
         }
     }
     for root in auto_order {
-        let rows = &auto[&root];
+        let rows = &auto[&path_key(&root)];
         scoped.extend(rows.iter().map(|s| s["id"].clone()));
         let repos = repos(rows, &[], hydrate, &mut roots);
         result.push(node(
@@ -306,5 +320,39 @@ mod tests {
         assert_eq!(projects[2]["sessionIds"], json!(["b"]));
         assert_eq!(projects[2]["repos"][0]["groups"][0]["isGit"], true);
         let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn one_folder_is_one_entry_however_it_is_spelled() {
+        // A declared folder with backslashes; sessions recorded with slashes, other case, a
+        // trailing separator: one repo with all of them, not one per spelling.
+        let project = Project {
+            id: "prj_1".into(),
+            name: "Mine".into(),
+            folders: vec![r"C:\work\mine".into()],
+            created_at: 1,
+        };
+        let sessions = vec![
+            json!({"id": "a", "cwd": "C:/work/mine", "last_active": 2.0}),
+            json!({"id": "b", "cwd": r"c:\Work\Mine\", "last_active": 1.0}),
+        ];
+        let built = tree(&[project], &sessions, 3, true);
+        let mine = &built["projects"][0];
+        assert_eq!(mine["label"], "Mine");
+        let repos = mine["repos"].as_array().unwrap();
+        assert_eq!(repos.len(), 1, "{repos:#?}");
+        assert_eq!(repos[0]["sessionCount"], 2);
+
+        // An automatic project (this repository) reached with both kinds of slashes.
+        let repo = env!("CARGO_MANIFEST_DIR");
+        let sessions = vec![
+            json!({"id": "c", "cwd": repo.replace('\\', "/"), "last_active": 2.0}),
+            json!({"id": "d", "cwd": repo.replace('/', r"\"), "last_active": 1.0}),
+        ];
+        let built = tree(&[], &sessions, 3, true);
+        let projects = built["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 1, "{projects:#?}");
+        assert_eq!(projects[0]["repos"].as_array().unwrap().len(), 1);
+        assert_eq!(projects[0]["sessionCount"], 2);
     }
 }
