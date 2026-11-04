@@ -22,9 +22,23 @@ if (-not (Test-Path (Join-Path $node 'node.exe'))) {
 $src = Join-Path $root 'target\hermes-src'
 if (Test-Path $src) { Remove-Item -Recurse -Force $src }
 New-Item -ItemType Directory -Force $src | Out-Null
-# git archive | tar: a clean copy of the commit, nothing written into the Hermes checkout.
-git -C $Hermes archive $Commit | tar -x -C $src
+# git archive, then tar: a clean copy of the commit, nothing written into the Hermes checkout.
+# Through a file, not a pipe: Windows PowerShell pipes text and would corrupt the archive.
+$archive = Join-Path $root 'target\hermes-src.tar'
+git -C $Hermes archive --format=tar -o $archive $Commit
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+tar -x -f $archive -C $src
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Remove-Item $archive
+
+# hermes-rs's few changes to the frontend (crates/desktop/patches, in order). A patch that no
+# longer applies after a Hermes update stops the build: refresh it against the new commit.
+$patches = Join-Path $root 'crates\desktop\patches'
+foreach ($patch in Get-ChildItem $patches -Filter *.patch | Sort-Object Name) {
+    git -C $src apply --whitespace=nowarn $patch.FullName
+    if ($LASTEXITCODE -ne 0) { Write-Error "$($patch.Name) doesn't apply to Hermes $Commit" }
+    Write-Output "Applied $($patch.Name)"
+}
 
 $env:PATH = "$node;$env:PATH"
 Push-Location (Join-Path $src 'apps\desktop')
