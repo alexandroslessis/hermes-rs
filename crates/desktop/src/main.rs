@@ -14,6 +14,7 @@ mod projects;
 mod providers;
 mod rest;
 mod server;
+mod skills;
 mod transcript;
 
 use std::path::PathBuf;

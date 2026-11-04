@@ -1,0 +1,48 @@
+--- a/apps/desktop/src/app/capabilities/index.tsx
++++ b/apps/desktop/src/app/capabilities/index.tsx
+@@ -19,7 +19,6 @@
+ import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
+ 
+ import { syncCatalogArcs } from './catalog/catalog-arc'
+-import { prefetchCatalogWhenIdle } from './catalog/catalog-data'
+ import { ConnectorsTab } from './connectors/connectors-tab'
+ import { PluginsTab } from './plugins/plugins-tab'
+ import { CapabilityScopeSelector, useCapabilityScope } from './scope-selector'
+@@ -33,6 +32,10 @@
+ // links fall back to 'skills' via useRouteEnumParam.
+ const CAPABILITY_MODES = ['skills', 'plugins', 'connectors', 'toolsets'] as const
+ 
++// hermes-rs: its backend has skills, but no agent plugins, MCP connectors or switchable toolsets,
++// so only the Skills tab is shown (other `?tab=` values fall back to it).
++const SHOWN_MODES = ['skills'] as const
++
+ type CapabilityMode = (typeof CAPABILITY_MODES)[number]
+ 
+ interface CapabilitiesViewProps extends React.ComponentProps<'section'> {
+@@ -68,7 +71,7 @@
+   const { t } = useI18n()
+   // Both hooks run unconditionally (rules of hooks); embedded picks the local
+   // one so tab clicks inside a dialog don't rewrite the page URL.
+-  const routeTab = useRouteEnumParam('tab', CAPABILITY_MODES, 'skills')
++  const routeTab = useRouteEnumParam('tab', SHOWN_MODES, 'skills') as [CapabilityMode, (mode: CapabilityMode) => void]
+   const localTab = useState<CapabilityMode>('skills')
+   const [mode, setMode] = embedded ? localTab : routeTab
+   const gateway = useStoreSelector($gateway, g => (mode === 'connectors' ? g : null))
+@@ -98,7 +101,7 @@
+ 
+   // Plugins is small enough to warm from any tab. Skills (~100k rows) only
+   // loads when asked for: an idle parse of it would still block the page.
+-  useEffect(() => (mode === 'plugins' ? undefined : prefetchCatalogWhenIdle('plugins')), [mode])
++  // hermes-rs: no Plugins tab, so no plugin catalog download.
+   useEffect(syncCatalogArcs, [])
+ 
+   // Rotating placeholder nudges from the user's own data — teach that search
+@@ -178,7 +181,7 @@
+         { id: 'plugins', label: t.skills.tabPlugins },
+         { id: 'connectors', label: t.connectorsPage.title },
+         { id: 'toolsets', label: t.skills.tabToolsets, meta: toolsets ? visibleToolsetCount(toolsets) : null }
+-      ]}
++      ].filter(tab => (SHOWN_MODES as readonly string[]).includes(tab.id))}
+       tabsAlign="start"
+     >
+       <div className="flex h-full flex-col">

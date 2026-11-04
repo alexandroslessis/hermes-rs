@@ -411,6 +411,18 @@ impl SkillStore {
         self.apply_ops(&ops, origin)
     }
 
+    /// A write the user makes in the app (create or edit from Capabilities ▸ Skills): applied
+    /// without the write-approval queue, which is for the agent's writes (Hermes's dashboard
+    /// `POST /api/skills` / `PUT /api/skills/content`, "an authenticated dashboard write IS the
+    /// user").
+    pub fn user_write(&self, op: SkillOp) -> Value {
+        let ops = [op];
+        if let Some(error) = self.validate_ops(&ops) {
+            return err(error);
+        }
+        self.apply_ops(&ops, WriteOrigin::Foreground)
+    }
+
     /// Checks with no side effects, so a misfiled op never applies its siblings first.
     fn validate_ops(&self, ops: &[SkillOp]) -> Option<String> {
         if ops.len() > MAX_BATCH_OPS {
@@ -480,7 +492,7 @@ impl SkillStore {
                     .root()
                     .join(op.category.as_deref().map(str::trim).unwrap_or_default())
                     .join(&op.name),
-                _ => self.find(&op.name).map(|s| s.dir).unwrap_or_default(),
+                _ => self.find_any(&op.name).map(|s| s.dir).unwrap_or_default(),
             };
             if !dir.as_os_str().is_empty() && !snapshots.iter().any(|(d, _)| *d == dir) {
                 let snapshot = dir.exists().then(|| backup.path().join(i.to_string()));
@@ -592,7 +604,7 @@ impl SkillStore {
         {
             return err(e);
         }
-        if let Some(existing) = self.find(&op.name) {
+        if let Some(existing) = self.find_any(&op.name) {
             return err(format!(
                 "A skill named '{}' already exists at {}.",
                 op.name,
@@ -642,7 +654,7 @@ impl SkillStore {
         {
             return err(e);
         }
-        let Some(skill) = self.find(name) else {
+        let Some(skill) = self.find_any(name) else {
             return self.not_found(name, "");
         };
         if let Err(e) = self.guarded_write(&skill.dir, &skill.skill_md(), content) {
@@ -652,7 +664,7 @@ impl SkillStore {
     }
 
     fn patch(&self, op: &SkillOp) -> Value {
-        let Some(skill) = self.find(&op.name) else {
+        let Some(skill) = self.find_any(&op.name) else {
             return self.not_found(&op.name, "");
         };
         let label = op.file_path.clone().unwrap_or_else(|| "SKILL.md".into());
@@ -709,7 +721,7 @@ impl SkillStore {
         if let Some(e) = validate_content_size(content, file_path) {
             return err(e);
         }
-        let Some(skill) = self.find(&op.name) else {
+        let Some(skill) = self.find_any(&op.name) else {
             return self.not_found(&op.name, " Create it first with action='create'.");
         };
         let target = skill.dir.join(file_path);
@@ -724,7 +736,7 @@ impl SkillStore {
         if let Some(e) = validate_file_path(file_path) {
             return err(e);
         }
-        let Some(skill) = self.find(&op.name) else {
+        let Some(skill) = self.find_any(&op.name) else {
             return self.not_found(&op.name, "");
         };
         let target = skill.dir.join(file_path);
@@ -745,7 +757,7 @@ impl SkillStore {
     }
 
     fn delete(&self, op: &SkillOp) -> Value {
-        let Some(skill) = self.find(&op.name) else {
+        let Some(skill) = self.find_any(&op.name) else {
             return self.not_found(&op.name, "");
         };
         let absorbed = op
@@ -759,7 +771,7 @@ impl SkillStore {
                     "absorbed_into='{absorbed}' cannot equal the skill being deleted."
                 ));
             }
-            if self.find(absorbed).is_none() {
+            if self.find_any(absorbed).is_none() {
                 return err(format!(
                     "absorbed_into='{absorbed}' does not exist. Create or patch the umbrella skill first, then retry the delete."
                 ));

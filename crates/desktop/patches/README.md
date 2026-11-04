@@ -34,10 +34,19 @@ refresh it against the new Hermes commit (edit the exported file, then diff it a
   eager plugin glob, so they're neither loaded nor listed in Capabilities ▸ Plugins. A new
   bundled plugin is picked up as usual; add it to the exclusion if its backend is missing.
 
+- **0005-skills-only-capabilities.patch** (`app/capabilities/index.tsx`): Capabilities shows only
+  the Skills tab; this backend has no agent plugins, MCP connectors or switchable toolsets (other
+  `?tab=` values fall back to Skills), and the page no longer downloads the plugin catalog. The
+  skills routes are `src/skills.rs`; the hub's are answered empty there (not ported).
+
 Startup bundle (JavaScript reached before the first paint), Hermes `c419cf7c`: 9.3 MB in 145
 files before 0003/0004, 6.6 MB in 109 after.
 
 ## To do
+
+- **Skill hub** (install from Capabilities ▸ Skills ▸ Discover): `tools/skills_hub*.py` and
+  `tools/skills_guard.py` (~4,800 lines: official, GitHub, skills.sh, ClawHub, LobeHub and index
+  sources, plus the install-time security scan). Until then install answers 501.
 
 - **Smaller startup bundle, next candidates** (source-map attribution of what loads before the
   first paint): `@xterm/xterm` + `addon-webgl` (~430 KB, only the terminal needs them),

@@ -53,6 +53,9 @@ pub struct SkillsConfig {
     pub write_approval: bool,
     /// Extra read-only skill folders (Hermes's `skills.external_dirs`).
     pub external_dirs: Vec<PathBuf>,
+    /// Skills switched off (Hermes's `skills.disabled`): left out of everything the agent sees
+    /// (the prompt's index, `skill_view`, slash commands), still listed in the app.
+    pub disabled: std::collections::BTreeSet<String>,
 }
 
 /// One skill in the catalog.
@@ -255,9 +258,17 @@ impl SkillStore {
         *self.config.lock() = config;
     }
 
-    /// Every loadable skill: the app's own folder first, then external folders; the first copy
-    /// of a name wins. Skills for other platforms are left out.
+    /// Every skill the agent may load: [`Self::catalog_all`] minus the disabled ones.
     pub fn catalog(&self) -> Vec<SkillEntry> {
+        let disabled = self.config().disabled;
+        let mut skills = self.catalog_all();
+        skills.retain(|s| !disabled.contains(&s.name));
+        skills
+    }
+
+    /// Every loadable skill, disabled ones included: the app's own folder first, then external
+    /// folders; the first copy of a name wins. Skills for other platforms are left out.
+    pub fn catalog_all(&self) -> Vec<SkillEntry> {
         let mut roots = vec![(self.root.clone(), false)];
         roots.extend(self.config().external_dirs.into_iter().map(|d| (d, true)));
         let mut seen = HashSet::new();
@@ -321,10 +332,20 @@ impl SkillStore {
         skills
     }
 
-    /// A skill by name, or by its relative path (`category/name`).
+    /// An enabled skill by name, or by its relative path (`category/name`): what the agent may
+    /// load.
     pub fn find(&self, name: &str) -> Option<SkillEntry> {
+        self.find_in(&self.catalog(), name)
+    }
+
+    /// A skill by name or relative path, disabled or not: for writes and the app (Hermes's
+    /// `_find_skill`), so a disabled skill stays editable and its name stays taken.
+    pub fn find_any(&self, name: &str) -> Option<SkillEntry> {
+        self.find_in(&self.catalog_all(), name)
+    }
+
+    fn find_in(&self, catalog: &[SkillEntry], name: &str) -> Option<SkillEntry> {
         let name = name.trim().trim_end_matches("/SKILL.md");
-        let catalog = self.catalog();
         catalog
             .iter()
             .find(|s| s.name == name)
@@ -892,7 +913,11 @@ mod tests {
         assert_eq!(report.imported, vec!["deploy-notes"]);
         assert_eq!(report.failed.len(), 1, "{report:?}");
         assert_eq!(report.failed[0].0, "evil");
-        assert!(store.find("deploy-notes").is_some_and(|s| s.category.as_deref() == Some("devops")));
+        assert!(
+            store
+                .find("deploy-notes")
+                .is_some_and(|s| s.category.as_deref() == Some("devops"))
+        );
         // Again: already here.
         let again = store.import_from(source.path());
         assert!(again.imported.is_empty());

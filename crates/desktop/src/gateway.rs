@@ -93,6 +93,8 @@ impl Gateway {
         };
         // The runtime keeps the approval policy in memory: Settings' choice applies from the start.
         gateway.apply_approvals_mode(&gateway.rest.config_value("approvals.mode"));
+        // So are the skills switched off in Capabilities ▸ Skills.
+        crate::skills::apply_config(&gateway.runtime.skills(), &gateway.rest);
         gateway
     }
 
@@ -1632,6 +1634,10 @@ impl Gateway {
     ) -> Option<(u16, Value)> {
         if (method, path) == ("GET", "/api/profiles/sessions") {
             return Some((200, self.session_list(query)));
+        }
+        if path == "/api/skills" || path.starts_with("/api/skills/") {
+            let store = self.runtime.skills();
+            return crate::skills::route(&store, &self.rest, method, path, query, body);
         }
         // Settings ▸ Model ▸ Main model: the default model (the hermes-rs settings').
         if (method, path) == ("GET", "/api/model/auxiliary") {

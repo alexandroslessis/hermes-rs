@@ -356,7 +356,7 @@ impl SkillStore {
             .into_iter()
             .find(|a| a.name == name)
             .ok_or_else(|| format!("'{name}' is not in the archive."))?;
-        if self.find(name).is_some() {
+        if self.find_any(name).is_some() {
             return Err(format!(
                 "A skill named '{name}' exists again; rename or delete it first."
             ));
@@ -403,7 +403,7 @@ impl SkillStore {
         if absorbed == op.name {
             return json!({"success": false, "error": format!("absorbed_into='{absorbed}' cannot equal the skill being deleted.")});
         }
-        if self.find(absorbed).is_none() {
+        if self.find_any(absorbed).is_none() {
             return json!({"success": false, "error": format!("absorbed_into='{absorbed}' does not exist. Create or patch the umbrella skill first, then retry the delete.")});
         }
         match self.archive(&op.name) {

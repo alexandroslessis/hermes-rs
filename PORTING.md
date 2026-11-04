@@ -53,6 +53,7 @@ Not from Hermes, so not in the map:
 | `paths.rs` | `tui_gateway/methods_complete.py` (`@` paths), `/api/fs/list` |
 | `projects.rs` | `tui_gateway/project_tree.py` |
 | `git.rs` | `hermes_cli/web_git.py` |
+| `skills.rs` | `hermes_cli/web_routers/skills.py` (local routes), `hermes_cli/skills_config.py`; the hub (`tools/skills_hub*.py`, `tools/skills_guard.py`) not ported |
 | **Runtime** (`crates/runtime`) | |
 | `commands.rs` | `hermes_cli/cli_commands_mixin.py`, `tools/working_diff.py` |
 | `compress.rs`, `ops.rs` | `agent/context_compressor.py`, `agent/turn_tool_validation.py`, `tools/budget_config.py` |
