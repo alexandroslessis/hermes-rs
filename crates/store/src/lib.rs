@@ -107,6 +107,10 @@ impl Store {
         let conn = Connection::open(path)
             .with_context(|| format!("opening session database {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Under WAL, NORMAL syncs at checkpoints instead of every commit: still consistent after
+        // a crash, and a power cut can lose only the last commits. Per connection, so the GPUI
+        // app sharing this database is unaffected; not a schema change.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         Self::init(conn)
     }
 
@@ -212,6 +216,16 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// How many messages one session has stored (a range of the primary key, not a table scan).
+    pub fn message_count(&self, session_id: &str) -> Result<usize> {
+        let count: i64 = self.conn.lock().query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     /// How many messages each session has stored (sessions without any are absent).
@@ -410,6 +424,25 @@ mod tests {
     }
 
     #[test]
+    fn a_database_file_opens_in_wal_with_normal_sync() {
+        let dir = std::env::temp_dir().join(format!("hermes-store-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&dir.join("sessions.db")).unwrap();
+        {
+            let conn = store.conn.lock();
+            let mode: String = conn
+                .pragma_query_value(None, "journal_mode", |r| r.get(0))
+                .unwrap();
+            let sync: i64 = conn
+                .pragma_query_value(None, "synchronous", |r| r.get(0))
+                .unwrap();
+            assert_eq!(mode, "wal");
+            assert_eq!(sync, 1, "NORMAL");
+        }
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn upsert_replaces_the_row_at_its_position() {
         let (store, session) = store_with_session();
         let first = Message::user().with_text("hi").with_id("m1");
@@ -423,6 +456,8 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].as_concat_text(), "hi");
         assert_eq!(loaded[1].as_concat_text(), "hello");
+        assert_eq!(store.message_count(&session.id).unwrap(), 2);
+        assert_eq!(store.message_count("no-such-session").unwrap(), 0);
     }
 
     #[test]

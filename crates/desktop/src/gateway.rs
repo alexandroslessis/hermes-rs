@@ -1756,8 +1756,8 @@ impl Gateway {
         };
         match method {
             "GET" => {
-                let count = store.message_counts().ok().and_then(|c| c.get(id).copied());
-                Some((200, self.session_row(&record, count.unwrap_or(0))))
+                let count = store.message_count(id).unwrap_or(0);
+                Some((200, self.session_row(&record, count)))
             }
             "PATCH" => {
                 let changes: Value = serde_json::from_slice(body).unwrap_or_default();
