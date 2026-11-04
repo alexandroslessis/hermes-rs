@@ -44,6 +44,20 @@ impl Hub {
         }
     }
 
+    /// The sessions a page is following.
+    pub fn followed(&self) -> Vec<String> {
+        self.subscribers
+            .lock()
+            .map(|subscribers| {
+                subscribers
+                    .iter()
+                    .filter(|(_, outbox)| !outbox.is_closed())
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn outbox(&self, session_id: &str) -> Option<Outbox> {
         let subscribers = self.subscribers.lock().ok()?;
         subscribers
@@ -70,7 +84,9 @@ impl Hub {
         let frame = json!({
             "jsonrpc": "2.0",
             "method": "event",
-            "params": {"type": event, "session_id": session_id, "payload": payload},
+            // The profile the page treats as this backend's (what an unnamed one means anyway);
+            // some updates, like the approval mode, apply only from an event that names it.
+            "params": {"type": event, "session_id": session_id, "profile": "default", "payload": payload},
         });
         outbox.send(frame.to_string()).is_ok()
     }

@@ -1,0 +1,19 @@
+--- a/apps/desktop/src/lib/desktop-fs.ts	2026-11-04 10:44:45.167459800 +0100
++++ b/apps/desktop/src/lib/desktop-fs.ts	2026-11-04 10:44:45.218107800 +0100
+@@ -324,5 +324,16 @@
+     return desktop.selectPaths(localOptions)
+   }
+ 
++  // hermes-rs: its backend runs in the desktop window's own process and opens Windows' folder
++  // dialog. A backend without the route keeps the remote picker.
++  const native = await remoteFsApi<{ paths?: string[] }>('/api/hermes-rs/select-folder', {
++    defaultPath: options.defaultPath ?? '',
++    title: options.title ?? ''
++  }).catch(() => null)
++
++  if (native) {
++    return native.paths ?? []
++  }
++
+   return remotePicker ? remotePicker.selectPaths({ ...options, multiple: false }) : []
+ }

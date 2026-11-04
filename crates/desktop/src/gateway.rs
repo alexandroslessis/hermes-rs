@@ -5,7 +5,7 @@
 //! A method this backend doesn't implement answers JSON-RPC's -32601, which the frontend treats
 //! as "not supported here" and hides.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket};
@@ -101,6 +101,10 @@ impl Gateway {
         let mode = mode.as_str().unwrap_or("manual");
         approvals.set_ask(mode != "off");
         approvals.set_smart(mode == "smart");
+        // The status bar and Settings each change it: open pages hear the new mode at once.
+        for id in self.hub.followed() {
+            self.emit(&id, "session.info", self.session_info(&id));
+        }
     }
 
     pub async fn connection(self: Arc<Self>, socket: WebSocket) {
@@ -521,6 +525,39 @@ impl Gateway {
                     })
                     .collect();
                 Ok(json!({"processes": processes}))
+            }
+            "process.kill" => {
+                let id = session_id(params)?;
+                let process_id = params["process_id"].as_str().unwrap_or_default();
+                let before = self
+                    .runtime
+                    .processes(&id)
+                    .into_iter()
+                    .find(|p| p["session_id"] == process_id);
+                let Some(before) = before else {
+                    return Ok(json!({"status": "not_found", "session_id": process_id}));
+                };
+                if before["status"] != "running" {
+                    return Ok(
+                        json!({"status": "already_exited", "session_id": process_id, "exit_code": before["exit_code"]}),
+                    );
+                }
+                let after = self
+                    .runtime
+                    .kill_process(&id, process_id)
+                    .await
+                    .unwrap_or_default();
+                Ok(json!({
+                    "status": "killed",
+                    "session_id": process_id,
+                    "command": before["command"],
+                    "exit_code": after["exit_code"],
+                    "termination_source": "user",
+                }))
+            }
+            "process.stop" => {
+                let id = session_id(params)?;
+                Ok(json!({"killed": self.runtime.stop_processes(&id).await}))
             }
             // hermes-rs keeps no registry of a turn's subagents yet: none to list.
             "subagent.list" => Ok(json!({"subagents": [], "delegations": []})),
@@ -1103,6 +1140,8 @@ impl Gateway {
                 "pending": self.pending_rows(id),
                 // The status bar's numbers for a session opened before any turn of this run.
                 "usage": self.usage_snapshot(id, None),
+                // The status bar's approval mode (applied from an event naming its profile).
+                "approval_mode": self.rest.config_value("approvals.mode"),
             }),
             None => json!({"stored_session_id": id, "running": running}),
         }
@@ -1635,6 +1674,39 @@ impl Gateway {
             let answer = self.rest.handle(method, path, query, body);
             self.apply_approvals_mode(&self.rest.config_value("approvals.mode"));
             return answer;
+        }
+        // "Choose a folder" (patches/0002): Windows' own folder dialog, opened by this process,
+        // which is the desktop window's. Cancelling answers no paths.
+        if (method, path) == ("POST", "/api/hermes-rs/select-folder") {
+            let body: Value = serde_json::from_slice(body).unwrap_or_default();
+            let title = body["title"].as_str().unwrap_or_default().to_string();
+            let start = body["defaultPath"].as_str().unwrap_or_default().to_string();
+            let picked = tokio::task::spawn_blocking(move || {
+                let mut dialog = rfd::FileDialog::new();
+                if !title.is_empty() {
+                    dialog = dialog.set_title(&title);
+                }
+                if !start.is_empty() && Path::new(&start).is_dir() {
+                    dialog = dialog.set_directory(&start);
+                }
+                dialog.pick_folder()
+            })
+            .await
+            .ok()
+            .flatten();
+            let paths: Vec<String> = picked
+                .map(|p| p.display().to_string())
+                .into_iter()
+                .collect();
+            return Some((200, json!({"paths": paths})));
+        }
+        // The file browser and the web folder picker (`/api/fs/list`).
+        if (method, path) == ("GET", "/api/fs/list") {
+            let folder = crate::rest::query_param(query, "path").unwrap_or_default();
+            let listing = tokio::task::spawn_blocking(move || crate::paths::list_dir(&folder))
+                .await
+                .unwrap_or_else(|_| json!({"entries": [], "error": "read-error"}));
+            return Some((200, listing));
         }
         // The coding rail's git reads (the folder is `path`; a non-repository reads as null).
         if method == "GET" && matches!(path, "/api/git/status" | "/api/git/review/rev-parse") {

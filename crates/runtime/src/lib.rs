@@ -692,6 +692,34 @@ impl Runtime {
             .unwrap_or_default()
     }
 
+    /// Kills one of the session's background processes: its final status (`None` when the
+    /// session isn't open here).
+    pub async fn kill_process(
+        &self,
+        session_id: &str,
+        process_id: &str,
+    ) -> Option<serde_json::Value> {
+        let tools = self
+            .sessions
+            .lock()
+            .get(session_id)
+            .map(|open| open.tools.clone())?;
+        Some(tools.kill_process(process_id).await)
+    }
+
+    /// Kills all of the session's background processes; how many were running.
+    pub async fn stop_processes(&self, session_id: &str) -> usize {
+        let tools = self
+            .sessions
+            .lock()
+            .get(session_id)
+            .map(|open| open.tools.clone());
+        match tools {
+            Some(tools) => tools.kill_all_processes().await,
+            None => 0,
+        }
+    }
+
     pub fn is_running(&self, session_id: &str) -> bool {
         self.sessions
             .lock()

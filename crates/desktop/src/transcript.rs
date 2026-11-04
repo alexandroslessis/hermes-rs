@@ -28,7 +28,7 @@ pub fn messages(messages: &[Message]) -> Vec<Value> {
         let mut reasoning = String::new();
         for content in &message.content {
             match content {
-                MessageContent::Text(t) => text.push_str(&t.text),
+                MessageContent::Text(t) => text.push_str(&without_think_tags(&t.text)),
                 MessageContent::Thinking(t) => reasoning.push_str(&t.thinking),
                 MessageContent::ToolRequest(request) => {
                     let (name, args) = match &request.tool_call {
@@ -121,8 +121,11 @@ impl TurnStream {
         for content in &message.content {
             match (&message.role, content) {
                 (Role::Assistant, MessageContent::Text(t)) if !t.text.is_empty() => {
-                    self.text.push_str(&t.text);
-                    events.push(("message.delta", json!({"text": t.text})));
+                    let text = without_think_tags(&t.text);
+                    if !text.is_empty() {
+                        self.text.push_str(&text);
+                        events.push(("message.delta", json!({"text": text})));
+                    }
                 }
                 (Role::Assistant, MessageContent::Thinking(t)) if !t.thinking.is_empty() => {
                     events.push(("reasoning.delta", json!({"text": t.thinking})));
@@ -246,5 +249,15 @@ mod tests {
         assert_eq!(turn["row_ids"], json!([3, 4]));
         assert_eq!(turn["user_row_ids"], json!([3]));
         assert_eq!(turn["final_assistant_row_id"], 4);
+    }
+}
+
+/// A reply's text without the bare `<think>` / `</think>` tags a reasoning model sometimes leaves
+/// in it (its reasoning arrives separately). Hermes strips them before showing the reply too.
+fn without_think_tags(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains("think>") {
+        std::borrow::Cow::Owned(text.replace("<think>", "").replace("</think>", ""))
+    } else {
+        std::borrow::Cow::Borrowed(text)
     }
 }

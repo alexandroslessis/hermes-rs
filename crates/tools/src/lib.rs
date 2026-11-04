@@ -391,6 +391,23 @@ impl SessionTools {
         self.processes.status_list()
     }
 
+    /// Kills one background process (the `process` tool's `kill`): its final status.
+    pub async fn kill_process(&self, process_id: &str) -> Value {
+        process::process_manage(
+            self,
+            serde_json::json!({"action": "kill", "session_id": process_id}),
+        )
+        .await
+        .value
+    }
+
+    /// Kills every running background process; how many were running.
+    pub async fn kill_all_processes(&self) -> usize {
+        let running = self.processes.running();
+        self.processes.kill_all().await;
+        running
+    }
+
     async fn web_tool(&self, name: &str, args: &Value) -> ToolOutput {
         let Some(web) = &self.web else {
             return ToolOutput::error("Web tools are not available in this session.");

@@ -43,6 +43,59 @@ const HINTS: [(&str, &str); 6] = [
     ("@git:", "git log"),
 ];
 
+/// `/api/fs/list` (Hermes's `fs_list`): a folder's entries, folders first, for the file browser
+/// and the web folder picker. Paths use `/`, which the picker walks up by: `/` lists the drives,
+/// and `~` (or nothing) is the home folder.
+pub fn list_dir(path: &str) -> Value {
+    let path = path.trim();
+    if path == "/" {
+        let drives: Vec<Value> = (b'A'..=b'Z')
+            .map(|letter| format!("{}:/", letter as char))
+            .filter(|root| Path::new(root).is_dir())
+            .map(|root| json!({"name": root.trim_end_matches('/'), "path": root, "isDirectory": true}))
+            .collect();
+        return json!({"entries": drives});
+    }
+    let folder = match path.strip_prefix('~') {
+        Some(rest) => dirs::home_dir()
+            .unwrap_or_default()
+            .join(rest.trim_start_matches(['/', '\\'])),
+        None if path.is_empty() => dirs::home_dir().unwrap_or_default(),
+        // `C:` alone is the drive's current folder to Windows; the page means its root.
+        None if path.len() == 2 && path.ends_with(':') => PathBuf::from(format!("{path}/")),
+        None => PathBuf::from(path),
+    };
+    let read = match std::fs::read_dir(&folder) {
+        Ok(read) => read,
+        Err(error) => {
+            let code = match error.kind() {
+                std::io::ErrorKind::NotFound => "ENOENT",
+                std::io::ErrorKind::PermissionDenied => "EACCES",
+                std::io::ErrorKind::NotADirectory => "ENOTDIR",
+                _ => "read-error",
+            };
+            return json!({"entries": [], "error": code});
+        }
+    };
+    let base = folder.display().to_string().replace('\\', "/");
+    let base = base.trim_end_matches('/');
+    let mut entries: Vec<(bool, String)> = read
+        .flatten()
+        .map(|entry| {
+            (
+                entry.path().is_dir(),
+                entry.file_name().to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    entries.sort_by(|a, b| (!a.0, a.1.to_lowercase()).cmp(&(!b.0, b.1.to_lowercase())));
+    let entries: Vec<Value> = entries
+        .into_iter()
+        .map(|(is_dir, name)| json!({"name": name, "path": format!("{base}/{name}"), "isDirectory": is_dir}))
+        .collect();
+    json!({"entries": entries})
+}
+
 fn item(text: String, meta: &str, display: String) -> Value {
     json!({"text": text, "display": display, "meta": meta})
 }
@@ -76,10 +129,10 @@ pub fn complete(word: &str, root: &Path) -> Vec<Value> {
 /// The entries of the directory `path_part` names, those starting with its last part.
 fn listing(root: &Path, word: &str, path_part: &str, tag: &str, is_context: bool) -> Vec<Value> {
     let typed = path_part.replace('\\', "/");
-    let (dir, prefix) = if typed.is_empty() || typed.ends_with('/') {
-        (typed.as_str(), "")
-    } else {
-        typed.rsplit_once('/').unwrap_or(("", typed.as_str()))
+    // The folder part keeps its trailing `/`: entries are named `{dir}{name}`.
+    let (dir, prefix) = match typed.rfind('/') {
+        Some(slash) => typed.split_at(slash + 1),
+        None => ("", typed.as_str()),
     };
     let home = dirs::home_dir().unwrap_or_default();
     let search = if let Some(rest) = dir.strip_prefix('~') {
@@ -318,6 +371,15 @@ mod tests {
         assert_eq!(
             texts(&complete("@folder:src/", &root)),
             ["@folder:src/app/"]
+        );
+        // A partly typed name under a folder keeps the folder's slash (Tab descends there).
+        assert_eq!(
+            texts(&complete("@src/ap", &root)),
+            ["@folder:src/app/", "@file:src/app_chrome.rs"]
+        );
+        assert_eq!(
+            texts(&complete("@src/app/ma", &root)),
+            ["@file:src/app/main.rs"]
         );
         // A name search finds files deep down and the folders on the way, skipping node_modules.
         let found = texts(&complete("@main", &root));

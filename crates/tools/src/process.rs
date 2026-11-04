@@ -17,6 +17,8 @@ use crate::shell::{ProcessTree, ShellKind, command, command_for_powershell, enco
 use crate::{SessionTools, ToolOutput, display_path, parse_args};
 
 const MAX_BUFFERED_LINES: usize = 5000;
+/// Lines of output a process status list carries (its viewer's tail).
+const STATUS_TAIL_LINES: usize = 200;
 const DEFAULT_LOG_LINES: usize = 200;
 const DEFAULT_WAIT_SECS: u64 = 180;
 const MAX_WAIT_SECS: u64 = 600;
@@ -138,7 +140,33 @@ impl ProcessRegistry {
     pub(crate) fn status_list(&self) -> Vec<Value> {
         let mut list: Vec<_> = self.processes.lock().values().cloned().collect();
         list.sort_by_key(|process| process.started);
-        list.iter().map(|process| process.status_json()).collect()
+        list.iter()
+            .map(|process| {
+                let mut status = process.status_json();
+                // The last lines it printed, for a viewer of the process.
+                let output = process.output.lock();
+                let skip = output.lines.len().saturating_sub(STATUS_TAIL_LINES);
+                status["output_tail"] = json!(
+                    output
+                        .lines
+                        .iter()
+                        .skip(skip)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                status
+            })
+            .collect()
+    }
+
+    /// How many of the processes are still running.
+    pub(crate) fn running(&self) -> usize {
+        self.processes
+            .lock()
+            .values()
+            .filter(|process| process.exit_status().is_none())
+            .count()
     }
 
     pub async fn kill_all(&self) {

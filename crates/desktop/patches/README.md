@@ -15,6 +15,11 @@ refresh it against the new Hermes commit (edit the exported file, then diff it a
   them as cards (`shown`). Tested live 2026-11-04: a queued prompt shows its bubble when its
   turn starts, once (also after a reload); Enter-steer shows once.
 
+- **0002-native-folder-dialog.patch** (`lib/desktop-fs.ts`): choosing a folder (a project's, a
+  session's) asks the backend first, which opens Windows' own folder dialog
+  (`POST /api/hermes-rs/select-folder`, `rfd`); a backend without that route keeps Hermes's web
+  picker (served by `/api/fs/list`).
+
 ## To do
 
 - **Steering a queued card shows the message only after the reply.** `prompt.steer_queued`
