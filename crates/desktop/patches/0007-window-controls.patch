@@ -42,7 +42,19 @@
      remoteKind: 'url',
 --- a/apps/desktop/src/app/shell/wslg-window-controls.tsx
 +++ b/apps/desktop/src/app/shell/wslg-window-controls.tsx
-@@ -27,7 +27,8 @@
+@@ -15,8 +15,10 @@
+ // height is pinned to TITLEBAR_HEIGHT below — NOT var(--titlebar-height), which
+ // the contrib shell zeroes for content subtrees (controller.tsx), collapsing
+ // the buttons if inherited.
++// hermes-rs: styled as Hermes's Windows caption buttons (Electron's overlay): the theme's
++// foreground on the bar's own color, with the theme's hover tint in light and dark themes.
+ const buttonClass =
+-  'grid h-full w-[46px] place-items-center border-0 bg-transparent p-0 text-muted-foreground transition-colors duration-75 select-none [-webkit-app-region:no-drag] focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring hover:bg-white/10 hover:text-foreground active:bg-white/15'
++  'grid h-full w-[46px] place-items-center border-0 bg-transparent p-0 text-foreground transition-colors duration-75 select-none [-webkit-app-region:no-drag] focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring hover:bg-(--ui-control-hover-background) active:bg-(--ui-control-active-background)'
+ 
+ // Match the native titlebar tools: stopPropagation (NOT preventDefault) on
+ // pointerdown. preventDefault on pointerdown suppresses the synthesized click
+@@ -27,7 +29,8 @@
  const stopTitlebarDrag = (event: PointerEvent<HTMLButtonElement>) => event.stopPropagation()
  
  export function WslgWindowControls({ isFullscreen, isMaximized }: WslgWindowControlsProps) {
@@ -52,6 +64,15 @@
  
    if (!controls || isFullscreen) {
      return null
+@@ -41,7 +44,7 @@
+   return (
+     <div
+       aria-label="Window controls"
+-      className="fixed right-0 top-0 z-80 flex items-stretch overflow-hidden bg-(--ui-chat-surface-background) text-[10px]"
++      className="fixed right-0 top-0 z-80 flex items-stretch overflow-hidden bg-transparent text-[10px]"
+       // Pin the real titlebar height: the shared --titlebar-height var is
+       // contextually zeroed inside the contrib shell, so read the constant.
+       style={{ height: `${TITLEBAR_HEIGHT}px` } as CSSProperties}
 --- a/apps/desktop/src/components/pane-shell/geometry.ts
 +++ b/apps/desktop/src/components/pane-shell/geometry.ts
 @@ -63,7 +63,8 @@
@@ -64,3 +85,45 @@
  
    if (!inElectron) {
      return null
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx
+@@ -632,7 +632,9 @@
+             : undefined
+       }
+     >
+-      {wcOverlap && (
++      {/* hermes-rs: its caption buttons are the page's own, under this strip, so no drag
++              strip there (it would take their clicks); the padding still clears them. */}
++          {wcOverlap && !window.hermesRsWindow && (
+         <div
+           aria-hidden="true"
+           className="pointer-events-none absolute z-10 [-webkit-app-region:drag]"
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
+@@ -289,7 +289,9 @@
+             width: `min(${overlayWidth}, 85vw)`
+           }}
+         >
+-          {wcOverlap && (
++          {/* hermes-rs: its caption buttons are the page's own, under this strip, so no drag
++              strip there (it would take their clicks); the padding still clears them. */}
++          {wcOverlap && !window.hermesRsWindow && (
+             <div
+               aria-hidden="true"
+               className="pointer-events-none absolute z-10 [-webkit-app-region:drag]"
+--- a/apps/desktop/src/app/overlays/overlay-view.tsx
++++ b/apps/desktop/src/app/overlays/overlay-view.tsx
+@@ -113,7 +113,12 @@
+           // (see the [data-glass-raised] rules in styles.css). Inert otherwise.
+           data-glass-raised=""
+         >
+-          <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-[calc(var(--titlebar-height)+0.1875rem)] [-webkit-app-region:drag]">
++          {/* hermes-rs: the band stops short of its window's painted caption buttons, which a drag
++              region over them would take the clicks of. */}
++          <div
++            className="pointer-events-none absolute inset-x-0 top-0 z-10 h-[calc(var(--titlebar-height)+0.1875rem)] [-webkit-app-region:drag]"
++            style={window.hermesRsWindow ? { right: 138 } : undefined}
++          >
+             {headerContent && (
+               <div className="pointer-events-auto absolute left-1/2 top-[calc(0.5rem+var(--titlebar-height)/2)] -translate-x-1/2 -translate-y-1/2 [-webkit-app-region:no-drag]">
+                 {headerContent}

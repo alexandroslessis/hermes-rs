@@ -49,7 +49,10 @@ refresh it against the new Hermes commit (edit the exported file, then diff it a
   `components/pane-shell/geometry.ts`, `global.d.ts`): the window is frameless (Hermes's own title
   bar, in the theme's colors, as in its Electron app), so the page paints the min/max/close it
   already has for WSLg (`WslgWindowControls`), reserves their 138px on the right of the title
-  bar, and floating panes dodge them. The buttons call `window.hermesRsWindow`, which the server
+  bar, and floating panes dodge them. The panes' and overlays' drag strips over the controls
+  rectangle are left out (in Electron they sit under native buttons; here they would take the
+  page's buttons' clicks: WebView2 resolves drag regions above the DOM). The buttons are styled
+  as Hermes's Windows overlay: transparent on the bar, the theme's foreground and hover tint. The buttons call `window.hermesRsWindow`, which the server
   injects (`server.rs`, `POST /api/hermes-rs/window`); `window.hermesDesktop` stays undefined,
   since the page reads its presence as "Electron". Dragging and double-click maximize are
   WebView2's own handling of the page's `app-region: drag` areas. Known gap: the maximize glyph
