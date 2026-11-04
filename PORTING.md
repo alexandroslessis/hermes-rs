@@ -108,8 +108,8 @@ grep -rnoE '\b(apps/(desktop|shared)/src|tui_gateway|hermes_cli|agent|gateway|to
 
 Hermes's frontend runs as is, with two kinds of changes, both kept outside Hermes's tree:
 
-- `crates/desktop/patches/*.patch`: small source patches, applied in name order by the webapp
-  build. Each is described in `crates/desktop/patches/README.md`. Keep them few and small: every
+- `crates/desktop/patches/*.patch`: small source patches (fixes and performance changes),
+  applied in name order by the webapp build. Each is described in `crates/desktop/patches/README.md`. Keep them few and small: every
   patch is a merge to redo when Hermes changes that file.
 - `crates/desktop/plugins/hermes-rs/` (`plugin.js`, `hide.css`): a Hermes desktop plugin that hides
   what this backend doesn't implement. Prefer this over a patch when hiding is enough. The CSS

@@ -1,0 +1,118 @@
+--- a/apps/desktop/src/i18n/catalog.ts
++++ b/apps/desktop/src/i18n/catalog.ts
+@@ -1,31 +1,53 @@
+-import { ar } from './ar'
+-import { de } from './de'
+ import { en } from './en'
+-import { es } from './es'
+-import { fr } from './fr'
+-import { ja } from './ja'
+-import { ru } from './ru'
+ import type { BundledLocale, Translations } from './types'
+-import { zh } from './zh'
+-import { zhHant } from './zh-hant'
++
++// hermes-rs: only English is in the startup bundle. The other bundled languages (~1.5 MB of
++// the ~9 MB the window parsed before its first paint) load on first use: `baseCatalog` in
++// `./registry` serves English until the language arrives, then bumps the registry version.
++const LOADERS: Record<Exclude<BundledLocale, 'en'>, () => Promise<Translations>> = {
++  zh: () => import('./zh').then(m => m.zh),
++  'zh-hant': () => import('./zh-hant').then(m => m.zhHant),
++  ja: () => import('./ja').then(m => m.ja),
++  ar: () => import('./ar').then(m => m.ar),
++  ru: () => import('./ru').then(m => m.ru),
++  fr: () => import('./fr').then(m => m.fr),
++  de: () => import('./de').then(m => m.de),
++  es: () => import('./es').then(m => m.es)
++}
+ 
+ /** The catalogs compiled into the app. Runtime-registered languages (plugin
+  *  packs, backend `.desktop.yaml` packs) are NOT here — resolve through
+- *  `resolveTranslations()` in `./registry`, which layers them over these. */
+-export const TRANSLATIONS: Record<BundledLocale, Translations> = {
+-  en,
+-  zh,
+-  'zh-hant': zhHant,
+-  ja,
+-  ar,
+-  ru,
+-  fr,
+-  de,
+-  es
+-}
++ *  `resolveTranslations()` in `./registry`, which layers them over these.
++ *  hermes-rs: holds English, plus each other bundled language once loaded
++ *  (`loadBundledLocale`). */
++export const TRANSLATIONS: Partial<Record<BundledLocale, Translations>> & { en: Translations } = { en }
+ 
+-export const BUNDLED_LOCALES = Object.keys(TRANSLATIONS) as readonly BundledLocale[]
++export const BUNDLED_LOCALES = ['en', ...Object.keys(LOADERS)] as readonly BundledLocale[]
+ 
+ export function isBundledLocale(value: unknown): value is BundledLocale {
+-  return typeof value === 'string' && Object.hasOwn(TRANSLATIONS, value)
++  return typeof value === 'string' && (value === 'en' || Object.hasOwn(LOADERS, value))
++}
++
++const loading = new Map<BundledLocale, Promise<Translations>>()
++
++/** Loads a bundled language into `TRANSLATIONS` (once; later calls share the promise). */
++export function loadBundledLocale(id: BundledLocale): Promise<Translations> {
++  const loaded = TRANSLATIONS[id]
++
++  if (loaded) {
++    return Promise.resolve(loaded)
++  }
++
++  let promise = loading.get(id)
++
++  if (!promise) {
++    promise = LOADERS[id as Exclude<BundledLocale, 'en'>]().then(catalog => {
++      TRANSLATIONS[id] = catalog
++
++      return catalog
++    })
++    loading.set(id, promise)
++  }
++
++  return promise
+ }
+--- a/apps/desktop/src/i18n/registry.ts
++++ b/apps/desktop/src/i18n/registry.ts
+@@ -24,7 +24,7 @@
+ } from '@hermes/shared/i18n'
+ import { atom } from 'nanostores'
+ 
+-import { isBundledLocale, TRANSLATIONS } from './catalog'
++import { isBundledLocale, loadBundledLocale, TRANSLATIONS } from './catalog'
+ import type { Locale, Translations } from './types'
+ 
+ /** Who registered a language: the backend's pack layer, a plugin, or app code. */
+@@ -74,8 +74,27 @@
+   return id.trim().toLowerCase().replace(/_/g, '-')
+ }
+ 
++const requested = new Set<Locale>()
++
+ function baseCatalog(id: Locale): Translations {
+-  return isBundledLocale(id) ? TRANSLATIONS[id] : TRANSLATIONS.en
++  if (!isBundledLocale(id)) {
++    return TRANSLATIONS.en
++  }
++
++  // hermes-rs: bundled languages other than English load on first use (`./catalog`); English
++  // until then, and one version bump when it arrives re-resolves every translator.
++  const loaded = TRANSLATIONS[id]
++
++  if (loaded) {
++    return loaded
++  }
++
++  if (!requested.has(id)) {
++    requested.add(id)
++    loadBundledLocale(id).then(bump, error => console.warn(`[i18n] could not load ${id}`, error))
++  }
++
++  return TRANSLATIONS.en
+ }
+ 
+ function toTree(translations: AppLocaleRegistration['translations'], base: Translations): Record<string, unknown> {

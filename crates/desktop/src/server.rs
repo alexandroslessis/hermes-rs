@@ -166,12 +166,8 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
                     "window.__HERMES_DASHBOARD_PROFILE__=\"default\";",
                     "try{{sessionStorage.setItem('hermes.webapp.session.v1:'",
                     "+JSON.stringify([location.origin,'']),{token});}}catch(e){{}}",
-                    // Bundled plugins whose backend hermes-rs lacks start off; a choice the
-                    // user makes in Capabilities ▸ Plugins is kept (`plugins-store.ts`).
-                    "try{{var k='hermes.desktop.pluginDecisions.v2',",
-                    "d=JSON.parse(localStorage.getItem(k)||'{{}}');",
-                    "['hermes-bots','kanban','radio'].forEach(function(i){{if(!(i in d))d[i]=false}});",
-                    "localStorage.setItem(k,JSON.stringify(d));}}catch(e){{}}",
+                    // (The bundled plugins whose backend hermes-rs lacks aren't built in:
+                    // patches/0004-unbundled-plugins.patch.)
                     "</script><style>{style}</style>"
                 ),
                 style = HIDE_CSS,
