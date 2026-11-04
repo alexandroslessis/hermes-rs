@@ -54,17 +54,18 @@
  
  // Match the native titlebar tools: stopPropagation (NOT preventDefault) on
  // pointerdown. preventDefault on pointerdown suppresses the synthesized click
-@@ -27,7 +29,8 @@
+@@ -27,7 +29,9 @@
  const stopTitlebarDrag = (event: PointerEvent<HTMLButtonElement>) => event.stopPropagation()
  
  export function WslgWindowControls({ isFullscreen, isMaximized }: WslgWindowControlsProps) {
 -  const controls = window.hermesDesktop?.windowControls
-+  // hermes-rs: its window's bridge (`window.hermesRsWindow`, injected by its server).
-+  const controls = window.hermesDesktop?.windowControls ?? window.hermesRsWindow
++  // hermes-rs: its window's bridge (`window.hermesRsWindow`, injected by its server) comes first:
++  // the webapp's own `window.hermesDesktop` shim has `windowControls` that only throw.
++  const controls = window.hermesRsWindow ?? window.hermesDesktop?.windowControls
  
    if (!controls || isFullscreen) {
      return null
-@@ -41,7 +44,7 @@
+@@ -41,7 +45,7 @@
    return (
      <div
        aria-label="Window controls"
@@ -113,17 +114,17 @@
                className="pointer-events-none absolute z-10 [-webkit-app-region:drag]"
 --- a/apps/desktop/src/app/overlays/overlay-view.tsx
 +++ b/apps/desktop/src/app/overlays/overlay-view.tsx
-@@ -113,7 +113,12 @@
-           // (see the [data-glass-raised] rules in styles.css). Inert otherwise.
-           data-glass-raised=""
-         >
--          <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-[calc(var(--titlebar-height)+0.1875rem)] [-webkit-app-region:drag]">
-+          {/* hermes-rs: the band stops short of its window's painted caption buttons, which a drag
-+              region over them would take the clicks of. */}
-+          <div
-+            className="pointer-events-none absolute inset-x-0 top-0 z-10 h-[calc(var(--titlebar-height)+0.1875rem)] [-webkit-app-region:drag]"
-+            style={window.hermesRsWindow ? { right: 138 } : undefined}
-+          >
-             {headerContent && (
-               <div className="pointer-events-auto absolute left-1/2 top-[calc(0.5rem+var(--titlebar-height)/2)] -translate-x-1/2 -translate-y-1/2 [-webkit-app-region:no-drag]">
-                 {headerContent}
+@@ -133,6 +133,13 @@
+                 <TitlebarIcon name="close" />
+               </Button>
+             </div>
++
++            {/* hermes-rs: its window's caption buttons are the page's own, under this drag band.
++                WebView2 lets a later region override an earlier one, so this no-drag corner
++                (the buttons' 138px) gives them their clicks back without moving the band. */}
++            {window.hermesRsWindow && (
++              <div aria-hidden="true" className="absolute right-0 top-0 h-full w-[138px] [-webkit-app-region:no-drag]" />
++            )}
+           </div>
+ 
+           {/* No top padding here: the split-layout columns own their own

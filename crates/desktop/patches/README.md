@@ -46,17 +46,25 @@ refresh it against the new Hermes commit (edit the exported file, then diff it a
   catalog on open fail by design.
 
 - **0007-window-controls.patch** (`lib/browser-connection.ts`, `app/shell/wslg-window-controls.tsx`,
-  `components/pane-shell/geometry.ts`, `global.d.ts`): the window is frameless (Hermes's own title
-  bar, in the theme's colors, as in its Electron app), so the page paints the min/max/close it
-  already has for WSLg (`WslgWindowControls`), reserves their 138px on the right of the title
-  bar, and floating panes dodge them. The panes' and overlays' drag strips over the controls
-  rectangle are left out (in Electron they sit under native buttons; here they would take the
-  page's buttons' clicks: WebView2 resolves drag regions above the DOM). The buttons are styled
-  as Hermes's Windows overlay: transparent on the bar, the theme's foreground and hover tint. The buttons call `window.hermesRsWindow`, which the server
-  injects (`server.rs`, `POST /api/hermes-rs/window`); `window.hermesDesktop` stays undefined,
-  since the page reads its presence as "Electron". Dragging and double-click maximize are
-  WebView2's own handling of the page's `app-region: drag` areas. Known gap: the maximize glyph
-  doesn't switch to "restore" (it reads Electron's `isMaximized`).
+  `components/pane-shell/geometry.ts`, `pane-shell/tree/renderer/{tree-group,narrow-overlays}.tsx`,
+  `app/overlays/overlay-view.tsx`, `global.d.ts`): the window is frameless (Hermes's own title bar,
+  in the theme's colors, as in its Electron app), so the page paints the min/max/close it already
+  has for WSLg (`WslgWindowControls`), reserves their 138px on the right of the title bar, and
+  floating panes dodge them.
+  - The buttons call `window.hermesRsWindow`, which the server injects (`server.rs`,
+    `POST /api/hermes-rs/window`). It comes before `window.hermesDesktop?.windowControls`: the
+    webapp defines `window.hermesDesktop` itself, a shim whose window controls only throw.
+  - Drag regions: WebView2 resolves them above the DOM, a later one overriding an earlier one. The
+    panes' drag strip over the controls rectangle is left out (in Electron it sits under the native
+    buttons; here it took the page's buttons' clicks), and the overlays' full-width band (Settings)
+    gets a no-drag corner over the buttons as its last child, so the band and its close button keep
+    their place.
+  - Styled as Hermes's Windows overlay: transparent on the bar, the theme's foreground and hover
+    tint.
+  - Dragging and double-click maximize are WebView2's own handling of the page's `app-region: drag`
+    areas. Checked 2026-11-04 with real mouse clicks in the window: minimize, maximize, restore,
+    also with Settings open; maximized, the bar isn't clipped.
+  - Known gap: the maximize glyph doesn't switch to "restore" (it reads Electron's `isMaximized`).
 
 Startup bundle (JavaScript reached before the first paint), Hermes `c419cf7c`: 9.3 MB in 145
 files before 0003/0004, 6.6 MB in 109 after.
