@@ -31,6 +31,10 @@ type RpcResult = Result<Value, (i64, String)>;
 /// one agent per session in-process, so a single generation serves every turn.
 pub const EXECUTION_GENERATION: u64 = 0;
 
+/// The window assumed for a model whose provider doesn't list one (Hermes's
+/// `DEFAULT_FALLBACK_CONTEXT`).
+const FALLBACK_CONTEXT: usize = 256_000;
+
 pub struct Gateway {
     pub runtime: Arc<Runtime>,
     pub rest: crate::rest::Rest,
@@ -769,14 +773,13 @@ impl Gateway {
         let record = store.session(id).ok().flatten();
         let context_max = record
             .as_ref()
-            .and_then(|r| {
+            .map(|r| {
                 let key = format!("{}\n{}", r.provider, r.model);
                 self.context_lengths
                     .lock()
-                    .ok()?
-                    .get(&key)
-                    .copied()
-                    .flatten()
+                    .ok()
+                    .and_then(|lengths| lengths.get(&key).copied().flatten())
+                    .unwrap_or(FALLBACK_CONTEXT)
             })
             .unwrap_or(0);
         let used = last_input.unwrap_or(totals.last_input_tokens.max(0) as usize);
@@ -810,9 +813,9 @@ impl Gateway {
         usage
     }
 
-    /// A model's context window, as its provider lists it; asked once per model (`None` when the
-    /// provider doesn't say or can't be reached).
-    async fn context_length(&self, provider: &str, model: &str) -> Option<usize> {
+    /// A model's context window, as its provider lists it (remembered once the provider has
+    /// answered), else Hermes's fallback for an unknown window.
+    async fn context_length(&self, provider: &str, model: &str) -> usize {
         let key = format!("{provider}\n{model}");
         if let Some(known) = self
             .context_lengths
@@ -820,23 +823,26 @@ impl Gateway {
             .ok()
             .and_then(|lengths| lengths.get(&key).copied())
         {
-            return known;
+            return known.unwrap_or(FALLBACK_CONTEXT);
         }
         let settings = Settings::load(&self.data_dir);
-        let length = match settings.provider(provider) {
-            Some(provider) if provider.ready() => provider
-                .runtime()
-                .list_models()
-                .await
-                .ok()
-                .and_then(|models| models.into_iter().find(|m| m.id == model))
-                .and_then(|m| m.context_length),
+        let listed = match settings.provider(provider) {
+            Some(provider) if provider.ready() => provider.runtime().list_models().await.ok(),
             _ => None,
         };
+        // A provider that didn't answer is asked again next time; one that answered without the
+        // model's window is not.
+        let Some(models) = listed else {
+            return FALLBACK_CONTEXT;
+        };
+        let length = models
+            .into_iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.context_length);
         if let Ok(mut lengths) = self.context_lengths.lock() {
             lengths.insert(key, length);
         }
-        length
+        length.unwrap_or(FALLBACK_CONTEXT)
     }
 
     /// The context gauge (`session.context_breakdown`, Hermes's `agent/context_breakdown.py`):
@@ -866,10 +872,7 @@ impl Gateway {
         };
         let (tool_definitions, mcp_tools) = (json_tokens(&builtin), json_tokens(&mcp));
         let estimated_total = system + tool_definitions + mcp_tools + conversation;
-        let context_max = self
-            .context_length(&record.provider, &record.model)
-            .await
-            .unwrap_or(0);
+        let context_max = self.context_length(&record.provider, &record.model).await;
         let measured = self
             .runtime
             .store()
