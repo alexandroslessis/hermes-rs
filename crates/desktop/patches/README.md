@@ -39,6 +39,12 @@ refresh it against the new Hermes commit (edit the exported file, then diff it a
   `?tab=` values fall back to Skills), and the page no longer downloads the plugin catalog. The
   skills routes are `src/skills.rs`; the hub's are answered empty there (not ported).
 
+- **0006-skills-open-on-installed.patch** (`app/capabilities/catalog/`: `use-catalog-filters.ts`,
+  `catalog-browser.tsx`, `catalog-data.ts`): Skills opens with the Installed filter on (the hub
+  can't install yet), and the public catalog (~100k rows) is downloaded only once the filter is
+  off or a search is typed. Hermes's `catalog-browser.test.tsx` cases that expect the full
+  catalog on open fail by design.
+
 Startup bundle (JavaScript reached before the first paint), Hermes `c419cf7c`: 9.3 MB in 145
 files before 0003/0004, 6.6 MB in 109 after.
 

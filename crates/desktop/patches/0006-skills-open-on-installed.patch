@@ -1,0 +1,54 @@
+--- a/apps/desktop/src/app/capabilities/catalog/catalog-data.ts
++++ b/apps/desktop/src/app/capabilities/catalog/catalog-data.ts
+@@ -286,12 +286,14 @@
+     retry: false
+   })
+ 
+-export function useCatalog(kind: CatalogKind) {
++// hermes-rs: `wanted` false skips the download and parse (~100k skill rows) while only the
++// installed entries are shown.
++export function useCatalog(kind: CatalogKind, wanted = true) {
+   return useQuery({
+     ...catalogQuery(kind),
+     // A failed catalog stays parked across remounts (tab switches) until the
+     // user explicitly chooses Try again.
+-    enabled: query => query.state.status !== 'error'
++    enabled: query => wanted && query.state.status !== 'error'
+   })
+ }
+ 
+--- a/apps/desktop/src/app/capabilities/catalog/catalog-browser.tsx
++++ b/apps/desktop/src/app/capabilities/catalog/catalog-browser.tsx
+@@ -328,7 +328,6 @@
+   const { t } = useI18n()
+   const c = t.catalog
+   const cardView = useStore($catalogCardView)
+-  const { data, isPending, error, refetch } = useCatalog(kind)
+   const deferredQuery = useDeferredValue((query ?? '').trim().toLowerCase())
+   const [selectedId, setSelectedId] = useState<string | null>(selectedEntryId ?? null)
+   const [detailOpen, setDetailOpen] = useState(false)
+@@ -342,6 +341,11 @@
+ 
+   const filters = useCatalogFilters(kind, resetSelection)
+   const { facets, sort } = filters
++  // hermes-rs: the public catalog loads once something beyond the installed skills is asked for
++  // (the Installed filter off, or a search).
++  const catalogWanted = !facets.installedOnly || Boolean(deferredQuery)
++  const { data, isPending: catalogPending, error, refetch } = useCatalog(kind, catalogWanted)
++  const isPending = catalogPending && catalogWanted
+ 
+   // Clearing the query only widens results, and a deep link clears it while selecting its target.
+   useEffect(() => {
+--- a/apps/desktop/src/app/capabilities/catalog/use-catalog-filters.ts
++++ b/apps/desktop/src/app/capabilities/catalog/use-catalog-filters.ts
+@@ -11,7 +11,9 @@
+ /** Rail state for one catalog. `onChange` runs after every change so the
+  *  browser can drop paging and selection that no longer apply. */
+ export function useCatalogFilters(kind: CatalogKind, onChange: () => void) {
+-  const [facets, setFacets] = useState(EMPTY_FACETS)
++  // hermes-rs: Skills opens on the installed skills (the hub can't install yet); "Installed"
++  // switches it off to browse the public catalog.
++  const [facets, setFacets] = useState(kind === 'skills' ? { ...EMPTY_FACETS, installedOnly: true } : EMPTY_FACETS)
+   const [sort, setSortState] = useState<CatalogSort>(kind === 'plugins' ? 'stars' : 'discover')
+ 
+   const update = (next: (current: CatalogFacets) => CatalogFacets) => {
