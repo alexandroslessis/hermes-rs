@@ -83,10 +83,14 @@ fn main() -> Result<()> {
         .context("binding the local server")?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
+    // The window, once Tauri has made it: the page's caption buttons act on it through the server.
+    let window = Arc::new(std::sync::OnceLock::new());
     let state = Arc::new(server::ServerState {
         dist: webapp_dist(),
         gateway: Arc::new(gateway::Gateway::new(runtime, hub, data_dir)),
         token: uuid::Uuid::new_v4().simple().to_string(),
+        port: address.port(),
+        window: window.clone(),
     });
     tokio.spawn(async move {
         match tokio::net::TcpListener::from_std(listener) {
@@ -99,7 +103,7 @@ fn main() -> Result<()> {
 
     tauri::Builder::default()
         .setup(move |app| {
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url.parse()?))
+            let built = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url.parse()?))
                 // A reply keeps streaming while the window is in the background (Hermes's
                 // Electron app lifts throttling during turns; WebView2 takes Chromium's flags).
                 // The first flag is wry's default, which this replaces.
@@ -110,9 +114,16 @@ fn main() -> Result<()> {
                     "--disable-backgrounding-occluded-windows"
                 ))
                 .title("Hermes")
+                // No system title bar: Hermes's own, in the theme's colors, with the page's
+                // caption buttons (Hermes's Electron window is frameless too). WebView2 honors the
+                // page's `app-region: drag` areas (wry enables non-client regions), so the bar
+                // drags and double-click maximizes; the shadow keeps the resize edges.
+                .decorations(false)
+                .shadow(true)
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(720.0, 480.0)
                 .build()?;
+            let _ = window.set(built);
             Ok(())
         })
         .run(tauri::generate_context!())

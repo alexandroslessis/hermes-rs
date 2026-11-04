@@ -41,16 +41,103 @@ pub struct ServerState {
     pub gateway: Arc<Gateway>,
     /// This run's session token: the page gets it, REST calls send it back.
     pub token: String,
+    /// The port the page is served on (its origin is `http://127.0.0.1:{port}`).
+    pub port: u16,
+    /// The app's window, once made: the page's caption buttons act on it.
+    pub window: Arc<std::sync::OnceLock<tauri::WebviewWindow>>,
 }
 
 pub async fn serve(listener: tokio::net::TcpListener, state: Arc<ServerState>) {
     let app = Router::new()
         .route("/api/ws", get(websocket))
+        .route("/api/hermes-rs/window", axum::routing::post(window_control))
         .route("/api/{*rest}", any(api))
         .fallback(get(static_file))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            only_this_app,
+        ))
         .with_state(state);
     if let Err(error) = axum::serve(listener, app).await {
         tracing::error!("server stopped: {error}");
+    }
+}
+
+/// Only the app's own page reaches the server. Anything a web page sends to 127.0.0.1 would
+/// otherwise run here: a site open in the user's browser could open the gateway socket and
+/// submit prompts (which run commands), or post to the REST routes. Browsers always send `Origin`
+/// on a WebSocket handshake and on a cross-site request, so a foreign one is refused; and a
+/// `Host` other than this machine's loopback names refuses DNS rebinding, where a site's own name
+/// is pointed at 127.0.0.1 to make its requests same-origin.
+async fn only_this_app(
+    State(state): State<Arc<ServerState>>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let host = header_text(&request, header::HOST);
+    let origin = header_text(&request, header::ORIGIN);
+    if !from_this_app(state.port, host.as_deref(), origin.as_deref()) {
+        tracing::warn!(
+            "refused a request from outside the app (host {host:?}, origin {origin:?}): {}",
+            request.uri().path()
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            "This server only serves the Hermes window.",
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// The `Host` names this machine's loopback on the app's port, and `Origin`, when sent, is the
+/// app's own page.
+fn from_this_app(port: u16, host: Option<&str>, origin: Option<&str>) -> bool {
+    let ours = |value: &str| {
+        let value = value.trim_end_matches('/');
+        value == format!("127.0.0.1:{port}") || value == format!("localhost:{port}")
+    };
+    host.is_some_and(ours)
+        && origin.is_none_or(|origin| origin.strip_prefix("http://").is_some_and(ours))
+}
+
+fn header_text(request: &Request, name: header::HeaderName) -> Option<String> {
+    request
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+/// `POST /api/hermes-rs/window` `{"action": "minimize" | "toggleMaximize" | "close"}`: the page's
+/// caption buttons (patches/0007-window-controls.patch), the frameless window having none.
+async fn window_control(
+    State(state): State<Arc<ServerState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let action = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["action"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let Some(window) = state.window.get() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let result = match action.as_str() {
+        "minimize" => window.minimize(),
+        "toggleMaximize" => match window.is_maximized() {
+            Ok(true) => window.unmaximize(),
+            _ => window.maximize(),
+        },
+        "close" => window.close(),
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    match result {
+        Ok(()) => (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({"maximized": window.is_maximized().unwrap_or(false)}).to_string(),
+        )
+            .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
 
@@ -166,8 +253,14 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
                     "window.__HERMES_DASHBOARD_PROFILE__=\"default\";",
                     "try{{sessionStorage.setItem('hermes.webapp.session.v1:'",
                     "+JSON.stringify([location.origin,'']),{token});}}catch(e){{}}",
-                    // (The bundled plugins whose backend hermes-rs lacks aren't built in:
-                    // patches/0004-unbundled-plugins.patch.)
+                    // The frameless window's caption buttons (patches/0007-window-controls.patch
+                    // paints them; `window_control` acts on the window).
+                    "window.hermesRsWindow={{custom:true,",
+                    "minimize:function(){{hermesRsWindowDo('minimize')}},",
+                    "toggleMaximize:function(){{hermesRsWindowDo('toggleMaximize')}},",
+                    "close:function(){{hermesRsWindowDo('close')}}}};",
+                    "function hermesRsWindowDo(a){{fetch('/api/hermes-rs/window',{{method:'POST',",
+                    "headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:a}})}})}}",
                     "</script><style>{style}</style>"
                 ),
                 style = HIDE_CSS,
@@ -234,8 +327,36 @@ fn content_type(path: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::cache_policy;
+    use super::{cache_policy, from_this_app};
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn only_the_apps_own_page_gets_in() {
+        let port = 47731;
+        // The window's page, and requests without an Origin (same-origin GETs, the page's assets).
+        assert!(from_this_app(
+            port,
+            Some("127.0.0.1:47731"),
+            Some("http://127.0.0.1:47731")
+        ));
+        assert!(from_this_app(port, Some("localhost:47731"), None));
+        // A site open in the user's browser, by socket or form post.
+        assert!(!from_this_app(
+            port,
+            Some("127.0.0.1:47731"),
+            Some("https://example.com")
+        ));
+        assert!(!from_this_app(port, Some("127.0.0.1:47731"), Some("null")));
+        // Another local port's page.
+        assert!(!from_this_app(
+            port,
+            Some("127.0.0.1:47731"),
+            Some("http://127.0.0.1:3000")
+        ));
+        // DNS rebinding: the site's own name, resolved to 127.0.0.1.
+        assert!(!from_this_app(port, Some("evil.example:47731"), None));
+        assert!(!from_this_app(port, None, None));
+    }
 
     #[test]
     fn hashed_assets_are_kept_the_rest_revalidated() {

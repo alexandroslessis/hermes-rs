@@ -45,6 +45,16 @@ refresh it against the new Hermes commit (edit the exported file, then diff it a
   off or a search is typed. Hermes's `catalog-browser.test.tsx` cases that expect the full
   catalog on open fail by design.
 
+- **0007-window-controls.patch** (`lib/browser-connection.ts`, `app/shell/wslg-window-controls.tsx`,
+  `components/pane-shell/geometry.ts`, `global.d.ts`): the window is frameless (Hermes's own title
+  bar, in the theme's colors, as in its Electron app), so the page paints the min/max/close it
+  already has for WSLg (`WslgWindowControls`), reserves their 138px on the right of the title
+  bar, and floating panes dodge them. The buttons call `window.hermesRsWindow`, which the server
+  injects (`server.rs`, `POST /api/hermes-rs/window`); `window.hermesDesktop` stays undefined,
+  since the page reads its presence as "Electron". Dragging and double-click maximize are
+  WebView2's own handling of the page's `app-region: drag` areas. Known gap: the maximize glyph
+  doesn't switch to "restore" (it reads Electron's `isMaximized`).
+
 Startup bundle (JavaScript reached before the first paint), Hermes `c419cf7c`: 9.3 MB in 145
 files before 0003/0004, 6.6 MB in 109 after.
 

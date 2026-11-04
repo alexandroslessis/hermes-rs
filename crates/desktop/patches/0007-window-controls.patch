@@ -1,0 +1,66 @@
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -33,6 +33,7 @@
+ 
+ declare global {
+   interface Window {
++    hermesRsWindow?: HermesRsWindowBridge
+     hermesDesktop: {
+       // Resolve a backend connection. Omit `profile` (or pass the primary) for
+       // the window's backend; pass a named profile to dial/reuse that profile's
+@@ -1082,6 +1083,14 @@
+   targetProfile: string
+ }
+ 
++/** hermes-rs: its frameless window's caption buttons (injected by its server). */
++export interface HermesRsWindowBridge {
++  custom: true
++  minimize: () => void
++  toggleMaximize: () => void
++  close: () => void
++}
++
+ export interface HermesConnection {
+   baseUrl: string
+   customWindowControls?: boolean
+--- a/apps/desktop/src/lib/browser-connection.ts
++++ b/apps/desktop/src/lib/browser-connection.ts
+@@ -41,10 +41,13 @@
+   return {
+     authMode: bootstrap.authRequired ? 'oauth' : 'token',
+     baseUrl,
++    // hermes-rs: its frameless window has no native caption buttons; the page paints its own
++    // (WslgWindowControls, three 46px buttons) and the title bar tools make room for them.
++    customWindowControls: Boolean(window.hermesRsWindow),
+     isFullscreen: Boolean(document.fullscreenElement),
+     logs: [],
+     mode: 'remote',
+-    nativeOverlayWidth: 0,
++    nativeOverlayWidth: window.hermesRsWindow ? 138 : 0,
+     profile: profile || undefined,
+     remoteHost: window.location.host,
+     remoteKind: 'url',
+--- a/apps/desktop/src/app/shell/wslg-window-controls.tsx
++++ b/apps/desktop/src/app/shell/wslg-window-controls.tsx
+@@ -27,7 +27,8 @@
+ const stopTitlebarDrag = (event: PointerEvent<HTMLButtonElement>) => event.stopPropagation()
+ 
+ export function WslgWindowControls({ isFullscreen, isMaximized }: WslgWindowControlsProps) {
+-  const controls = window.hermesDesktop?.windowControls
++  // hermes-rs: its window's bridge (`window.hermesRsWindow`, injected by its server).
++  const controls = window.hermesDesktop?.windowControls ?? window.hermesRsWindow
+ 
+   if (!controls || isFullscreen) {
+     return null
+--- a/apps/desktop/src/components/pane-shell/geometry.ts
++++ b/apps/desktop/src/components/pane-shell/geometry.ts
+@@ -63,7 +63,8 @@
+  * hidden controls).
+  */
+ export function windowControlsRect(connection: ConnectionLike | null, viewportWidth: number): Rect | null {
+-  const inElectron = typeof window !== 'undefined' && 'hermesDesktop' in window
++  // hermes-rs: its window paints caption buttons too (`window.hermesRsWindow`).
++  const inElectron = typeof window !== 'undefined' && ('hermesDesktop' in window || 'hermesRsWindow' in window)
+ 
+   if (!inElectron) {
+     return null
