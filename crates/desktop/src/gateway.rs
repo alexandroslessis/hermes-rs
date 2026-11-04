@@ -448,8 +448,16 @@ impl Gateway {
         };
         sessions
             .into_iter()
-            .filter(|s| self.runtime.is_running(&s.id))
+            .filter(|s| self.is_live(&s.id))
             .map(|s| {
+                // The page holds a session busy only while it's listed as `working` (or
+                // `waiting`, on the user: a card is open); any other status idles it on the next
+                // poll, which blinked Stop and Steer every 1.5 s mid-turn.
+                let status = if self.hub.open_prompts(&s.id).is_empty() {
+                    "working"
+                } else {
+                    "waiting"
+                };
                 json!({
                     "id": s.id,
                     "session_key": s.id,
@@ -457,7 +465,7 @@ impl Gateway {
                     "title": s.title.unwrap_or_default(),
                     "preview": "",
                     "model": s.model,
-                    "status": "running",
+                    "status": status,
                     "message_count": 0,
                     "started_at": s.created_at as f64 / 1000.,
                     "last_active": s.updated_at as f64 / 1000.,
@@ -709,12 +717,15 @@ impl Gateway {
             .unwrap_or_default()
     }
 
+    /// Whether the session has a turn in flight as the page sees it: the runtime's turn, or the
+    /// gap between a turn and its queued follow-up (the page must not see the turn end there).
+    fn is_live(&self, id: &str) -> bool {
+        self.runtime.is_running(id) || self.live_turns.lock().is_ok_and(|turns| turns.contains(id))
+    }
+
     fn session_info(&self, id: &str) -> Value {
         let record = self.runtime.store().session(id).ok().flatten();
-        // Between a turn and its queued follow-up the runtime is idle, but the page must not see
-        // the turn end.
-        let running = self.runtime.is_running(id)
-            || self.live_turns.lock().is_ok_and(|turns| turns.contains(id));
+        let running = self.is_live(id);
         match record {
             Some(record) => json!({
                 // A pick made mid-reply shows at once; it takes effect from the next turn.
