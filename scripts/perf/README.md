@@ -66,6 +66,8 @@ Providers ▸ Custom endpoints (validate, save with a key, the picker, activate,
 `attach-check.mjs` checks composer attachments (image upload and read-back, images reaching the
 model, held and detached images, file upload and `file.attach`); it is the provider on :47900
 itself, so stop `mock_llm.py` first.
+`files-check.mjs` checks the side panel's file routes (read, save, mkdir, git root, a ticketed
+download, a ranged media stream, the credential guard).
 
 ## Bundle analysis
 

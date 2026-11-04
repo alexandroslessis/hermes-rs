@@ -51,6 +51,10 @@ pub async fn serve(listener: tokio::net::TcpListener, state: Arc<ServerState>) {
     let app = Router::new()
         .route("/api/ws", get(websocket))
         .route("/api/hermes-rs/window", axum::routing::post(window_control))
+        // A file's bytes for the side panel (download, image, audio, video; `file_bytes`).
+        .route("/api/fs/download", get(file_bytes).head(file_bytes))
+        .route("/api/files/download", get(file_bytes).head(file_bytes))
+        .route("/api/files/stream", get(file_bytes).head(file_bytes))
         .route(
             "/api/chat/file-upload",
             axum::routing::post(file_upload).layer(axum::extract::DefaultBodyLimit::max(
@@ -176,6 +180,90 @@ async fn websocket(
         .protocols(chosen)
         .max_message_size(64 << 20)
         .on_upgrade(move |socket| async move { gateway.connection(socket).await })
+}
+
+/// `GET|HEAD /api/fs/download`, `/api/files/download`, `/api/files/stream` `?path=&session_id=
+/// [&ticket=]`: a file's bytes, with HTTP ranges (media seeks). `stream`, and `files/download`
+/// for an `<audio>`/`<video>` element, are inline; a download is an attachment. A ticket from
+/// `/api/files/ticket` must name this file. Hermes: `fs_download`, `stream_managed_file`,
+/// `download_managed_file` (`hermes_cli/web_routers/files.py`).
+async fn file_bytes(State(state): State<Arc<ServerState>>, request: Request) -> Response {
+    use tower::ServiceExt as _;
+
+    let query = request.uri().query().map(str::to_string);
+    let param = |name: &str| crate::rest::query_param(query.as_deref(), name);
+    let file = state.gateway.file_path(
+        &param("path").unwrap_or_default(),
+        param("session_id").as_deref(),
+    );
+    let json_error = |status: u16, body: serde_json::Value| {
+        (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+            [(header::CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        )
+            .into_response()
+    };
+    if let Some(ticket) = param("ticket")
+        && !state.gateway.ticket_allows(&ticket, &file)
+    {
+        return json_error(403, serde_json::json!({"detail": "The file ticket doesn't match."}));
+    }
+    let checked = file.clone();
+    match tokio::task::spawn_blocking(move || crate::files::readable(&checked)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err((status, body))) => return json_error(status, body),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    let media = matches!(
+        request
+            .headers()
+            .get("sec-fetch-dest")
+            .and_then(|v| v.to_str().ok()),
+        Some("audio" | "video")
+    );
+    let inline = match request.uri().path() {
+        "/api/files/stream" => true,
+        "/api/files/download" => media,
+        _ => false,
+    };
+    let mime = crate::files::mime(&file);
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut response = match tower_http::services::ServeFile::new(&file).oneshot(request).await {
+        Ok(response) => response.map(Body::new),
+        Err(error) => return json_error(500, serde_json::json!({"detail": error.to_string()})),
+    };
+    let headers = response.headers_mut();
+    if mime != "application/octet-stream"
+        && let Ok(value) = header::HeaderValue::from_str(mime)
+    {
+        headers.insert(header::CONTENT_TYPE, value);
+    }
+    let disposition = format!(
+        "{}; filename*=UTF-8''{}",
+        if inline { "inline" } else { "attachment" },
+        percent_encode(&name)
+    );
+    if let Ok(value) = header::HeaderValue::from_str(&disposition) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    headers.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    response
+}
+
+/// RFC 5987 encoding for a `filename*` value.
+fn percent_encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// `POST /api/chat/file-upload` (multipart, field `file`): a file the composer attaches

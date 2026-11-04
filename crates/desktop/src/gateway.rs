@@ -78,6 +78,8 @@ pub struct Gateway {
     generation: std::sync::Mutex<std::collections::HashMap<String, (u64, f64)>>,
     /// Session id → images attached for its next prompt (`image.attach`, `image.attach_bytes`).
     pending_images: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    /// File ticket → the file it opens (download links and media elements).
+    file_tickets: std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
 }
 
 impl Gateway {
@@ -98,6 +100,7 @@ impl Gateway {
             live_turns: Default::default(),
             context_lengths: Default::default(),
             pending_images: Default::default(),
+            file_tickets: Default::default(),
             generation: std::sync::Mutex::new(
                 std::fs::read(data_dir_for_stats.join(GENERATION_FILE))
                     .ok()
@@ -2181,6 +2184,24 @@ impl Gateway {
         &self.data_dir
     }
 
+    /// The file a page path names, relative to the session's folder when it names a session.
+    pub fn file_path(&self, path: &str, session_id: Option<&str>) -> PathBuf {
+        let cwd = session_id
+            .filter(|id| !id.is_empty())
+            .and_then(|id| self.runtime.store().session(id).ok().flatten())
+            .map(|record| PathBuf::from(record.cwd));
+        crate::files::resolve(path, cwd.as_deref())
+    }
+
+    /// Whether `ticket` was issued for `file` (`/api/files/ticket`).
+    pub fn ticket_allows(&self, ticket: &str, file: &std::path::Path) -> bool {
+        self.file_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(ticket)
+            .is_some_and(|issued| issued == file)
+    }
+
     /// REST routes this backend serves: `(status, body)`, or `None` for Hermes's 404.
     pub async fn rest(
         &self,
@@ -2227,11 +2248,63 @@ impl Gateway {
             .await
             .ok();
         }
+        // The side panel's file preview and spot editor (`files.rs`). Paths are relative to the
+        // session's folder when the page names a session.
+        let param = |name: &str| crate::rest::query_param(query, name);
         if (method, path) == ("GET", "/api/fs/read-data-url") {
-            let file = crate::rest::query_param(query, "path").unwrap_or_default();
+            let file = self.file_path(&param("path").unwrap_or_default(), param("session_id").as_deref());
+            if crate::files::is_sensitive(&file) {
+                return Some((403, json!({"detail": "That file holds credentials and isn't shown."})));
+            }
+            let file = file.display().to_string();
             return tokio::task::spawn_blocking(move || crate::attachments::read_data_url(&file))
                 .await
                 .ok();
+        }
+        if (method, path) == ("GET", "/api/fs/read-text") {
+            let file = self.file_path(&param("path").unwrap_or_default(), param("session_id").as_deref());
+            return tokio::task::spawn_blocking(move || crate::files::read_text(&file))
+                .await
+                .ok();
+        }
+        if (method, path) == ("GET", "/api/fs/git-root") {
+            let file = self.file_path(&param("path").unwrap_or_default(), None);
+            return tokio::task::spawn_blocking(move || (200, crate::files::git_root(&file)))
+                .await
+                .ok();
+        }
+        if method == "POST"
+            && matches!(path, "/api/fs/write-text" | "/api/files/mkdir" | "/api/files/ticket")
+        {
+            let body: Value = serde_json::from_slice(body).unwrap_or_default();
+            let named = body["path"].as_str().unwrap_or_default();
+            if named.trim().is_empty() {
+                return Some((400, json!({"detail": "path is required"})));
+            }
+            let file = self.file_path(named, body["session_id"].as_str());
+            return match path {
+                "/api/fs/write-text" => {
+                    let content = body["content"].as_str().unwrap_or_default().to_string();
+                    tokio::task::spawn_blocking(move || crate::files::write_text(&file, &content))
+                        .await
+                        .ok()
+                }
+                "/api/files/mkdir" => {
+                    tokio::task::spawn_blocking(move || crate::files::mkdir(&file)).await.ok()
+                }
+                // A download link or media element can't send headers: the page asks for a
+                // ticket bound to the file first (Hermes's `issue_file_ticket`).
+                _ => {
+                    let ticket = uuid::Uuid::new_v4().simple().to_string();
+                    let mut tickets = self.file_tickets.lock().unwrap_or_else(|e| e.into_inner());
+                    // (Old tickets go: a page makes a few per preview.)
+                    if tickets.len() > 512 {
+                        tickets.clear();
+                    }
+                    tickets.insert(ticket.clone(), file);
+                    Some((200, json!({"ticket": ticket})))
+                }
+            };
         }
         // Sign-in providers (Nous Portal, Claude, Codex): none here.
         if (method, path) == ("GET", "/api/providers/oauth") {

@@ -9,6 +9,7 @@ mod attachments;
 mod commands;
 mod endpoints;
 mod export;
+mod files;
 mod gateway;
 mod git;
 mod hub;
