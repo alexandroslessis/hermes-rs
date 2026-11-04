@@ -1,0 +1,16 @@
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/slash-desktop-commands.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/slash-desktop-commands.ts
+@@ -438,7 +438,12 @@
+         }
+       }
+ 
+-      const save = window.hermesDesktop?.saveTextFileAs
++      // hermes-rs: its window's Save As dialog (`window.hermesRsSaveTextFileAs`, injected by its
++      // server) when the webapp's own bridge has none.
++      type SaveTextFileAs = NonNullable<NonNullable<typeof window.hermesDesktop>['saveTextFileAs']>
++      const save =
++        window.hermesDesktop?.saveTextFileAs ??
++        (window as unknown as { hermesRsSaveTextFileAs?: SaveTextFileAs }).hermesRsSaveTextFileAs
+ 
+       if (typeof file?.content !== 'string' || !save) {
+         return out.render(copy().saveUnsupported)

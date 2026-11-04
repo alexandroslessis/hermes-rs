@@ -45,7 +45,7 @@ button:has(.codicon-mic) {
 /* Sub-pages of kept sections that this backend can't serve:
    Model — fallbacks, auxiliary models, subagents, mixture of agents (only the main model);
    Chat — attachments (image input mode); Appearance — the pet;
-   Safety — privacy (secret redaction), checkpoints (only approvals);
+   Safety — privacy (secret redaction);
    Keyboard — the HUD gesture and screen capture (native Desktop). */
 [data-tour='overlay-nav'] [data-tour='nav-config:model:fallbacks'],
 [data-tour='overlay-nav'] [data-tour='nav-config:model:auxiliary'],
@@ -54,7 +54,6 @@ button:has(.codicon-mic) {
 [data-tour='overlay-nav'] [data-tour='nav-config:chat:attachments'],
 [data-tour='overlay-nav'] [data-tour='nav-config:appearance:pet'],
 [data-tour='overlay-nav'] [data-tour='nav-config:safety:privacy'],
-[data-tour='overlay-nav'] [data-tour='nav-config:safety:checkpoints'],
 [data-tour='overlay-nav'] [data-tour='nav-keybinds:hud-gesture'],
 [data-tour='overlay-nav'] [data-tour='nav-keybinds:screen-capture'] {
   display: none !important;

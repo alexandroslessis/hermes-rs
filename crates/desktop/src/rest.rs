@@ -85,6 +85,9 @@ fn config_defaults() -> Value {
             "tool_progress": "all",
         },
         "approvals": {"mode": "manual"},
+        // On by default (Hermes's is opt-in): a coding harness keeps a way back from the agent's
+        // edits, as Claude Code does. Settings ▸ Safety ▸ Checkpoints switches it.
+        "checkpoints": {"enabled": true},
         "stt": {"enabled": false},
     })
 }

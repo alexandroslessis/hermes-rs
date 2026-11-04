@@ -261,6 +261,10 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
                     "close:function(){{hermesRsWindowDo('close')}}}};",
                     "function hermesRsWindowDo(a){{fetch('/api/hermes-rs/window',{{method:'POST',",
                     "headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:a}})}})}}",
+                    // `/save`'s Save As dialog (patches/0008-save-dialog.patch).
+                    "window.hermesRsSaveTextFileAs=function(r){{return fetch('/api/hermes-rs/save-file',",
+                    "{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(r)}})",
+                    ".then(function(x){{return x.json()}})}};",
                     "</script><style>{style}</style>"
                 ),
                 style = HIDE_CSS,

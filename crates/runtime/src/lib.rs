@@ -1238,8 +1238,19 @@ impl Runtime {
         let home = dirs::home_dir().context("no home directory")?;
         let outcome = commands::rollback(&self.checkpoints, &cwd, &home, args);
         let mut report = outcome.report;
-        if outcome.restored {
-            let last_turn = open.conversation.lock().messages().iter().rposition(|m| {
+        if outcome.restored && self.undo_last_turn(&open, session_id)? > 0 {
+            report.push_str("\n\nChat turn undone to match restored file state.");
+        }
+        self.add_command_output(&open, "rollback", &report)
+    }
+
+    /// Drops the last typed turn (after a whole-folder restore, so the conversation matches the
+    /// files); how many messages it removed.
+    fn undo_last_turn(&self, open: &OpenSession, session_id: &str) -> Result<usize> {
+        let (last_turn, total) = {
+            let conversation = open.conversation.lock();
+            let messages = conversation.messages();
+            let last = messages.iter().rposition(|m| {
                 m.role == rmcp::model::Role::User
                     && m.is_user_visible()
                     && !m.is_tool_response()
@@ -1247,22 +1258,62 @@ impl Runtime {
                         .iter()
                         .any(|c| matches!(c, MessageContent::Text(_)))
             });
-            if let Some(index) = last_turn {
-                self.rewind(session_id, index)?;
-                report.push_str("\n\nChat turn undone to match restored file state.");
-            }
-        }
-        self.add_command_output(&open, "rollback", &report)
+            (last, messages.len())
+        };
+        let Some(index) = last_turn else {
+            return Ok(0);
+        };
+        self.rewind(session_id, index)?;
+        Ok(total - index)
+    }
+
+    /// The checkpoint folder of a session: its working folder's project root (Hermes's
+    /// `_get_working_dir_for`).
+    pub fn checkpoint_dir(&self, session_id: &str) -> Result<PathBuf> {
+        let open = self.open(session_id)?;
+        let cwd = PathBuf::from(&open.record.lock().cwd);
+        let home = dirs::home_dir().context("no home directory")?;
+        Ok(self.checkpoints.working_dir_for(&cwd, &home))
+    }
+
+    /// Restores a session's files to a checkpoint (one file, or the folder: `all` overwrites hand
+    /// edits too), and after a whole-folder restore undoes the last chat turn, as `/rollback`
+    /// does. The restore, and how many messages were dropped.
+    pub fn restore_checkpoint(
+        &self,
+        session_id: &str,
+        hash: &str,
+        file: Option<&str>,
+        all: bool,
+    ) -> Result<(hermes_tools::checkpoints::Restored, usize)> {
+        let open = self.idle_session(session_id)?;
+        let workdir = self.checkpoint_dir(session_id)?;
+        let restored = self
+            .checkpoints
+            .restore(&workdir, hash, file, !all && file.is_none())
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let removed = if file.is_none() {
+            self.undo_last_turn(&open, session_id)?
+        } else {
+            0
+        };
+        Ok((restored, removed))
     }
 
     /// Hermes's `/diff [working|staged|all|session] [--stat] [path…]`. Returns the conversation
     /// after it, which ends with the diff.
     pub fn diff(&self, session_id: &str, args: &str) -> Result<Vec<Message>> {
         let open = self.idle_session(session_id)?;
+        let output = self.diff_report(session_id, args)?;
+        self.add_command_output(&open, "diff", &output)
+    }
+
+    /// `/diff`'s report, without adding it to the conversation (the desktop shows it as a note).
+    pub fn diff_report(&self, session_id: &str, args: &str) -> Result<String> {
+        let open = self.open(session_id)?;
         let cwd = PathBuf::from(&open.record.lock().cwd);
         let home = dirs::home_dir().context("no home directory")?;
-        let output = commands::diff(&self.checkpoints, &cwd, &home, args);
-        self.add_command_output(&open, "diff", &output)
+        Ok(commands::diff(&self.checkpoints, &cwd, &home, args))
     }
 
     /// The review pane: what this session changed, per file.
@@ -1360,6 +1411,13 @@ impl Runtime {
     /// Hermes's `/usage`: the session's token use, cost, context and its estimated breakdown.
     pub fn usage(&self, session_id: &str, context_length: Option<usize>) -> Result<Vec<Message>> {
         let open = self.idle_session(session_id)?;
+        let report = self.usage_text(session_id, context_length)?;
+        self.add_command_output(&open, "usage", &report)
+    }
+
+    /// `/usage`'s report, without adding it to the conversation.
+    pub fn usage_text(&self, session_id: &str, context_length: Option<usize>) -> Result<String> {
+        let open = self.open(session_id)?;
         let totals = self.store.usage_totals(session_id)?;
         let model = open.record.lock().model.clone();
         let compressions = open
@@ -1370,16 +1428,25 @@ impl Runtime {
             .filter(|m| compress::notice(m).is_some())
             .count();
         let breakdown = self.context_breakdown(session_id)?;
-        let report =
-            commands::usage_report(&model, &totals, context_length, compressions, &breakdown);
-        self.add_command_output(&open, "usage", &report)
+        Ok(commands::usage_report(
+            &model,
+            &totals,
+            context_length,
+            compressions,
+            &breakdown,
+        ))
     }
 
     /// Hermes's `/insights [--days N]`: activity across sessions.
     pub fn insights(&self, session_id: &str, args: &str) -> Result<Vec<Message>> {
         let open = self.idle_session(session_id)?;
-        let report = commands::insights_report(&self.store, args);
+        let report = self.insights_text(args);
         self.add_command_output(&open, "insights", &report)
+    }
+
+    /// `/insights`'s report, without adding it to a conversation.
+    pub fn insights_text(&self, args: &str) -> String {
+        commands::insights_report(&self.store, args)
     }
 
     fn idle_session(&self, session_id: &str) -> Result<Arc<OpenSession>> {

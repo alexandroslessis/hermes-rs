@@ -66,6 +66,12 @@ refresh it against the new Hermes commit (edit the exported file, then diff it a
     also with Settings open; maximized, the bar isn't clipped.
   - Known gap: the maximize glyph doesn't switch to "restore" (it reads Electron's `isMaximized`).
 
+- **0008-save-dialog.patch** (`app/session/hooks/use-prompt-actions/slash-desktop-commands.ts`):
+  `/save [json|md|html] [name] [redact]` hands the exported conversation to
+  `window.hermesRsSaveTextFileAs` when the webapp's bridge has no `saveTextFileAs` (it has none
+  in browser mode): the server opens Windows' Save As dialog and writes the file
+  (`POST /api/hermes-rs/save-file`; the content comes from `session.export`, `src/export.rs`).
+
 Startup bundle (JavaScript reached before the first paint), Hermes `c419cf7c`: 9.3 MB in 145
 files before 0003/0004, 6.6 MB in 109 after.
 

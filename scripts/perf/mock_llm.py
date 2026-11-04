@@ -86,7 +86,29 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
             self.wfile.flush()
 
-        text = reply_text(ARGS.tokens)
+        # "please write file NAME": one write_file call (to exercise checkpoints), then a short
+        # reply once its result is in.
+        messages = body.get("messages") or []
+        last = messages[-1] if messages else {}
+        asked = last.get("content") if last.get("role") == "user" else None
+        asked = asked if isinstance(asked, str) else " ".join(
+            p.get("text", "") for p in (asked or []) if isinstance(p, dict))
+        if asked and "please write file" in asked:
+            name = asked.split("please write file", 1)[1].split()[0] if asked.split("please write file", 1)[1].split() else "note.txt"
+            call = {"id": "mock", "object": "chat.completion.chunk", "created": created, "model": "mock",
+                    "choices": [{"index": 0, "finish_reason": None, "delta": {"tool_calls": [{
+                        "index": 0, "id": f"call_{REQUESTS}", "type": "function",
+                        "function": {"name": "write_file", "arguments": json.dumps(
+                            {"path": name, "content": f"written by the mock, request {REQUESTS}\n"})}}]}}]}
+            send(call)
+            send({"id": "mock", "object": "chat.completion.chunk", "created": created, "model": "mock",
+                  "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                  "usage": {"prompt_tokens": 3000, "completion_tokens": 20, "total_tokens": 3020}})
+            send("[DONE]")
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            return
+        text = "Wrote it." if last.get("role") == "tool" else reply_text(ARGS.tokens)
         interval = 1.0 / ARGS.tps
         start = time.perf_counter()
         for i in range(0, len(text), 4):

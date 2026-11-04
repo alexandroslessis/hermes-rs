@@ -44,6 +44,8 @@ const GENERATION_FILE: &str = "generation-stats.json";
 pub struct Gateway {
     pub runtime: Arc<Runtime>,
     pub rest: crate::rest::Rest,
+    /// Background actions the page follows by name (the curator's run).
+    actions: Arc<crate::maintenance::Actions>,
     data_dir: PathBuf,
     /// Changes when the process restarts, so reconnecting clients reset their replay state.
     replay_epoch: String,
@@ -74,6 +76,7 @@ impl Gateway {
         let gateway = Self {
             runtime,
             rest: crate::rest::Rest::new(data_dir.clone()),
+            actions: Default::default(),
             data_dir,
             replay_epoch: uuid::Uuid::new_v4().to_string(),
             hub,
@@ -92,10 +95,21 @@ impl Gateway {
             ),
         };
         // The runtime keeps the approval policy in memory: Settings' choice applies from the start.
-        gateway.apply_approvals_mode(&gateway.rest.config_value("approvals.mode"));
+        gateway.apply_settings();
+        crate::maintenance::schedule_curator(gateway.runtime.clone(), gateway.actions.clone());
         // So are the skills switched off in Capabilities ▸ Skills.
         crate::skills::apply_config(&gateway.runtime.skills(), &gateway.rest);
         gateway
+    }
+
+    /// The Settings the runtime keeps in memory, from the stored config record: at startup and
+    /// after every change.
+    fn apply_settings(&self) {
+        self.apply_approvals_mode(&self.rest.config_value("approvals.mode"));
+        // File checkpoints (`/rollback`), before the turn's first write.
+        self.runtime
+            .checkpoints()
+            .set_enabled(self.rest.config_value("checkpoints.enabled") != false);
     }
 
     /// Hermes's `approvals.mode` on the runtime's policy: manual asks, smart has a reviewer model
@@ -360,9 +374,7 @@ impl Gateway {
                             key
                         };
                         self.rest.set_config_value(key, value.clone());
-                        if key == "approvals.mode" {
-                            self.apply_approvals_mode(&value);
-                        }
+                        self.apply_settings();
                         Ok(json!({"key": key, "value": value, "ok": true}))
                     }
                 }
@@ -423,14 +435,21 @@ impl Gateway {
             {
                 Ok(json!({"type": "exec", "output": ""}))
             }
-            "slash.exec" => commands::exec(
-                &self.runtime,
-                params["command"].as_str().unwrap_or_default(),
-            )
-            .ok_or((
-                SERVER_ERROR,
-                "not a quick/plugin/bundle/skill command".to_string(),
-            )),
+            "slash.exec" => {
+                let command = params["command"].as_str().unwrap_or_default();
+                if let Some(answer) = self.builtin_command(params, command, &settings).await {
+                    return answer;
+                }
+                commands::exec(&self.runtime, command).ok_or((
+                    SERVER_ERROR,
+                    "not a quick/plugin/bundle/skill command".to_string(),
+                ))
+            }
+            "session.status" => {
+                let id = session_id(params)?;
+                let output = self.status_text(&id).await?;
+                Ok(json!({"output": output}))
+            }
             "command.dispatch" => commands::dispatch(
                 &self.runtime,
                 params["name"].as_str().unwrap_or_default(),
@@ -456,6 +475,26 @@ impl Gateway {
                 Ok(json!({"title": title, "session_key": id}))
             }
             "session.mutate" => self.mutate(params, &settings),
+            "session.rewind" => self.rewind_turn(params),
+            "rollback.list" | "rollback.diff" | "rollback.restore" => self.rollback(method, params),
+            "session.export" => self.export_session(params),
+            // Activity over the last `days` (default 30): sessions touched and their messages.
+            "insights.get" => {
+                let days = params["days"].as_i64().filter(|d| *d > 0).unwrap_or(30);
+                // (The store keeps milliseconds.)
+                let since = chrono::Utc::now().timestamp_millis() - days * 86_400_000;
+                let store = self.runtime.store();
+                let counts = store.message_counts().unwrap_or_default();
+                let recent: Vec<_> = store
+                    .list_sessions(100_000)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|s| s.updated_at >= since)
+                    .collect();
+                let messages: usize = recent.iter().filter_map(|s| counts.get(&s.id)).sum();
+                Ok(json!({"days": days, "sessions": recent.len(), "messages": messages}))
+            }
+            "session.compress" => self.compress_session(params, &settings).await,
             "session.delete" => {
                 let id = session_id(params)?;
                 self.runtime
@@ -1067,6 +1106,403 @@ impl Gateway {
         Ok(receipt)
     }
 
+    /// `session.rewind` (Desktop's typed `/undo` and `/retry`, `slash-session-commands.ts`): drop
+    /// the named user row and everything after it, answering with the dropped prompt, which `/undo`
+    /// puts back in the composer and `/retry` sends again. `replay_only` asks for a rewind whose
+    /// reply was lost; this backend answers every rewind, so there is none.
+    fn rewind_turn(&self, params: &Value) -> RpcResult {
+        let id = session_id(params)?;
+        let nothing = || json!({"session_id": id, "status": "nothing", "rewound_count": 0});
+        if params["replay_only"] == true {
+            return Ok(nothing());
+        }
+        let Some(row) = params["target_message_id"].as_u64() else {
+            return Ok(nothing());
+        };
+        if self.runtime.is_running(&id) {
+            return Err((SERVER_ERROR, "session busy".to_string()));
+        }
+        let error = |e: anyhow::Error| (SERVER_ERROR, format!("{e:#}"));
+        let before = self.runtime.messages(&id).map_err(error)?;
+        let keep = transcript::kept_before_row(row as usize);
+        let Some(target) = before.get(keep) else {
+            return Ok(nothing());
+        };
+        let content = target.as_concat_text();
+        let kept = self.runtime.rewind(&id, keep).map_err(error)?;
+        Ok(json!({
+            "session_id": id,
+            "status": "applied",
+            "rewound_count": before.len() - kept.len(),
+            "target_message": {"id": row, "content": content},
+            "revision": self.bump_revision(&id),
+            "execution_generation": EXECUTION_GENERATION,
+        }))
+    }
+
+    /// `/rollback` (`slash-desktop-commands.ts`): the session folder's file checkpoints, a diff
+    /// against one, restoring one (Hermes's `rollback.list|diff|restore`, from
+    /// `tools/checkpoint_manager.py`). `hash` is a hash prefix or a number in the list.
+    fn rollback(&self, method: &str, params: &Value) -> RpcResult {
+        let id = session_id(params)?;
+        let error = |e: String| (SERVER_ERROR, e);
+        let checkpoints = self.runtime.checkpoints();
+        if !checkpoints.enabled() {
+            return match method {
+                "rollback.list" => Ok(json!({"enabled": false, "checkpoints": []})),
+                _ => Err(error(
+                    "Checkpoints are off: Settings ▸ Safety ▸ Checkpoints.".into(),
+                )),
+            };
+        }
+        let workdir = self
+            .runtime
+            .checkpoint_dir(&id)
+            .map_err(|e| error(format!("{e:#}")))?;
+        let list = checkpoints.list(&workdir);
+        if method == "rollback.list" {
+            let rows: Vec<Value> = list
+                .iter()
+                .map(|c| json!({"hash": c.hash, "timestamp": c.timestamp, "message": c.reason}))
+                .collect();
+            return Ok(json!({"enabled": true, "checkpoints": rows}));
+        }
+        let wanted = params["hash"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase();
+        let hash = match wanted.parse::<usize>() {
+            Ok(n) if (1..=list.len()).contains(&n) => Some(list[n - 1].hash.clone()),
+            _ if wanted.is_empty() => None,
+            _ => list
+                .iter()
+                .find(|c| c.hash.starts_with(&wanted))
+                .map(|c| c.hash.clone()),
+        }
+        .ok_or_else(|| error(format!("No checkpoint {wanted}; /rollback lists them.")))?;
+        if method == "rollback.diff" {
+            let diff = checkpoints.diff(&workdir, &hash).map_err(error)?;
+            return Ok(json!({"stat": diff.stat, "diff": diff.diff}));
+        }
+        if self.runtime.is_running(&id) {
+            return Err(error("session busy".into()));
+        }
+        let file = params["file_path"]
+            .as_str()
+            .filter(|f| !f.trim().is_empty());
+        match self
+            .runtime
+            .restore_checkpoint(&id, &hash, file, params["all"] == true)
+        {
+            Ok((restored, removed)) => {
+                let mut kept = Vec::new();
+                if !restored.skipped_user_edits.is_empty() {
+                    kept.push(format!(
+                        "Kept your hand edits: {} (/rollback {} --all restores those too).",
+                        restored.skipped_user_edits.join(", "),
+                        &hash[..8.min(hash.len())]
+                    ));
+                }
+                if !restored.skipped_oversize.is_empty() {
+                    kept.push(format!(
+                        "Kept (too large for checkpoints): {}.",
+                        restored.skipped_oversize.join(", ")
+                    ));
+                }
+                let reason = [vec![restored.reason.clone()], kept].concat().join("\n");
+                // (After a whole-folder restore the page reloads the transcript itself.)
+                Ok(json!({
+                    "success": true,
+                    "restored_to": restored.restored_to,
+                    "reason": reason,
+                    "directory": restored.directory.display().to_string(),
+                    "file": restored.file,
+                    "history_removed": removed,
+                }))
+            }
+            Err(e) => Ok(json!({"success": false, "error": format!("{e:#}")})),
+        }
+    }
+
+    /// Hermes's built-in commands that report on the session (`slash.exec` output, shown as a
+    /// note in the chat): `/status`, `/context`, `/usage`, `/insights`, `/diff`, `/tools`,
+    /// `/memory`, and `/refine`, which starts a review. `None` for anything else (skills).
+    /// Hermes: `hermes_cli/commands.py`, `cli_commands_mixin.py`.
+    async fn builtin_command(
+        &self,
+        params: &Value,
+        command: &str,
+        settings: &Settings,
+    ) -> Option<RpcResult> {
+        let command = command.trim().trim_start_matches('/');
+        let (name, arg) = command
+            .split_once(char::is_whitespace)
+            .map(|(n, a)| (n, a.trim()))
+            .unwrap_or((command, ""));
+        let id = session_id(params).ok();
+        let error = |e: anyhow::Error| (SERVER_ERROR, format!("{e:#}"));
+        let need_id = || {
+            id.clone()
+                .ok_or((INVALID_PARAMS, "session_id is required".to_string()))
+        };
+        let output: Result<String, (i64, String)> = match name {
+            "status" => match need_id() {
+                Ok(id) => self.status_text(&id).await,
+                Err(e) => Err(e),
+            },
+            "context" | "ctx" => match need_id() {
+                Ok(id) => self.context_text(&id).await,
+                Err(e) => Err(e),
+            },
+            "usage" => match need_id() {
+                Ok(id) => {
+                    let window = self.window_for(&id).await;
+                    self.runtime.usage_text(&id, window).map_err(error)
+                }
+                Err(e) => Err(e),
+            },
+            "insights" => Ok(self.runtime.insights_text(arg)),
+            "diff" => need_id().and_then(|id| self.runtime.diff_report(&id, arg).map_err(error)),
+            "tools" => {
+                let (builtin, mcp) = self.runtime.tool_definitions();
+                let line = |t: &Value| {
+                    let description = t["description"].as_str().unwrap_or_default();
+                    let first = description.split(['.', '\n']).next().unwrap_or_default();
+                    format!(
+                        "  {}  {}",
+                        t["name"].as_str().unwrap_or_default(),
+                        first.trim()
+                    )
+                };
+                let mut out = vec![format!("Tools ({}):", builtin.len())];
+                out.extend(builtin.iter().map(line));
+                if !mcp.is_empty() {
+                    out.push(format!("\nMCP tools ({}):", mcp.len()));
+                    out.extend(mcp.iter().map(line));
+                }
+                Ok(out.join("\n"))
+            }
+            "memory" => {
+                let memory = self.runtime.memory();
+                let pending = memory.pending();
+                let gate = if memory.config().write_approval {
+                    "on"
+                } else {
+                    "off"
+                };
+                Ok(if pending.is_empty() {
+                    format!("No memory writes are waiting for approval (approval gate: {gate}).")
+                } else {
+                    let mut out = vec![format!(
+                        "Memory writes waiting for approval (gate: {gate}):"
+                    )];
+                    out.extend(pending.iter().map(|w| format!("  {}  {}", w.id, w.summary)));
+                    out.join("\n")
+                })
+            }
+            "refine" => {
+                match need_id().and_then(|id| Ok((self.provider_for(&id, settings)?, id))) {
+                    Ok((provider, id)) => {
+                        let focus = (!arg.is_empty()).then(|| arg.to_string());
+                        self.runtime
+                        .refine(&id, &provider, TurnOptions::default(), focus)
+                        .map(|()| {
+                            "Reviewing this conversation for lessons to save to memory and skills; \
+                             the review runs in the background."
+                                .to_string()
+                        })
+                        .map_err(error)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            _ => return None,
+        };
+        Some(output.map(|output| json!({"type": "exec", "output": output})))
+    }
+
+    /// The provider a session's turns go to.
+    fn provider_for(
+        &self,
+        id: &str,
+        settings: &Settings,
+    ) -> Result<hermes_runtime::ProviderConfig, (i64, String)> {
+        let record = self
+            .runtime
+            .store()
+            .session(id)
+            .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?
+            .ok_or((SERVER_ERROR, format!("Session {id} not found")))?;
+        Ok(settings
+            .provider(&record.provider)
+            .or(settings.active())
+            .ok_or((SERVER_ERROR, "No provider is configured".to_string()))?
+            .runtime())
+    }
+
+    /// The session model's context window, as the gauge shows it.
+    async fn window_for(&self, id: &str) -> Option<usize> {
+        let record = self.runtime.store().session(id).ok().flatten()?;
+        Some(self.context_length(&record.provider, &record.model).await)
+    }
+
+    /// `/status`: the session, its model and folder, tokens so far, the context in use.
+    async fn status_text(&self, id: &str) -> Result<String, (i64, String)> {
+        let store = self.runtime.store();
+        let record = store
+            .session(id)
+            .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?
+            .ok_or((SERVER_ERROR, format!("Session {id} not found")))?;
+        let totals = store.usage_totals(id).unwrap_or_default();
+        let messages = store.message_count(id).unwrap_or(0);
+        let window = self.context_length(&record.provider, &record.model).await;
+        let used = self
+            .runtime
+            .context_breakdown(id)
+            .map(|b| b.total())
+            .unwrap_or(0);
+        Ok([
+            format!(
+                "Session: {} ({})",
+                record.title.as_deref().unwrap_or("Untitled"),
+                record.id
+            ),
+            format!("Model: {} via {}", record.model, record.provider),
+            format!("Folder: {}", record.cwd),
+            format!("Messages: {messages}"),
+            format!(
+                "Tokens: {} in, {} out over {} calls",
+                totals.input_tokens, totals.output_tokens, totals.calls
+            ),
+            format!(
+                "Context: ~{used} of {window} ({}%)",
+                (used * 100).checked_div(window).unwrap_or(0)
+            ),
+        ]
+        .join("\n"))
+    }
+
+    /// `/context`: what the next request is made of, by part, against the model's window.
+    async fn context_text(&self, id: &str) -> Result<String, (i64, String)> {
+        let b = self
+            .runtime
+            .context_breakdown(id)
+            .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+        let window = self.window_for(id).await.unwrap_or(FALLBACK_CONTEXT);
+        let total = b.total();
+        let row = |name: &str, n: usize| {
+            format!(
+                "  {name:<18}~{n:>8}  {:>3}%",
+                (n * 100).checked_div(total).unwrap_or(0)
+            )
+        };
+        Ok([
+            format!(
+                "Context: ~{total} of {window} tokens ({}% of the window)",
+                (total * 100).checked_div(window).unwrap_or(0)
+            ),
+            row("System prompt", b.system_prompt),
+            row("Tool definitions", b.tool_definitions),
+            row("Skills", b.skills),
+            row("Memory", b.memory),
+            row("Conversation", b.conversation),
+            "Estimates (characters / 4); /compress summarizes the conversation now.".into(),
+        ]
+        .join("\n"))
+    }
+
+    /// `/compress [focus]` (`session.compress`): summarizes the conversation now, as Hermes's
+    /// context compression does when the window fills, and answers with the shorter transcript
+    /// the page shows from then on.
+    async fn compress_session(&self, params: &Value, settings: &Settings) -> RpcResult {
+        let id = session_id(params)?;
+        let error = |e: anyhow::Error| (SERVER_ERROR, format!("{e:#}"));
+        let record = self
+            .runtime
+            .store()
+            .session(&id)
+            .map_err(error)?
+            .ok_or((SERVER_ERROR, format!("Session {id} not found")))?;
+        let provider = settings
+            .provider(&record.provider)
+            .or(settings.active())
+            .ok_or((SERVER_ERROR, "No provider is configured".to_string()))?
+            .runtime();
+        let before_messages = self.runtime.messages(&id).map_err(error)?.len();
+        let before_tokens = self
+            .runtime
+            .context_breakdown(&id)
+            .map(|b| b.total())
+            .unwrap_or(0);
+        let focus = params["focus_topic"]
+            .as_str()
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .map(str::to_string);
+        let mut turn = self
+            .runtime
+            .compress(&id, &provider, TurnOptions::default(), focus)
+            .map_err(error)?;
+        let mut failed = None;
+        while let Some(event) = turn.events.recv().await {
+            if let RuntimeEvent::TurnFinished(TurnStatus::Failed(e)) = event {
+                failed = Some(e);
+            }
+        }
+        // A conversation too short to summarize ends the runtime's compress turn with this
+        // (`Runtime::compress`): nothing happened, nothing failed.
+        if failed.as_deref() == Some("Nothing to compress yet.") {
+            failed = None;
+        }
+        let after = self.runtime.messages(&id).map_err(error)?;
+        let after_tokens = self
+            .runtime
+            .context_breakdown(&id)
+            .map(|b| b.total())
+            .unwrap_or(0);
+        let compressed = failed.is_none() && after.len() < before_messages;
+        let headline = match (&failed, compressed) {
+            (Some(e), _) => format!("Compression failed: {e}"),
+            (None, true) => format!("Compressed: {before_messages} → {} messages", after.len()),
+            (None, false) => "Nothing to compress yet.".to_string(),
+        };
+        self.emit(&id, "session.info", self.session_info(&id));
+        Ok(json!({
+            "status": if failed.is_some() { "aborted" } else if compressed { "compressed" } else { "noop" },
+            "removed": before_messages.saturating_sub(after.len()),
+            "before_messages": before_messages,
+            "after_messages": after.len(),
+            "before_tokens": before_tokens,
+            "after_tokens": after_tokens,
+            "messages": transcript::messages(&after),
+            "summary": {
+                "headline": headline,
+                "token_line": compressed.then(|| format!("~{before_tokens} → ~{after_tokens} tokens")),
+                "aborted": failed.is_some(),
+                "noop": failed.is_none() && !compressed,
+            },
+        }))
+    }
+
+    /// `session.export` (`/save [json|md|html] [name] [redact]`): the conversation as file content;
+    /// the page saves it through a Save As dialog.
+    fn export_session(&self, params: &Value) -> RpcResult {
+        let id = session_id(params)?;
+        let format = crate::export::Format::parse(params["format"].as_str().unwrap_or("json"))
+            .ok_or((INVALID_PARAMS, "format is json, md or html".to_string()))?;
+        let store = self.runtime.store();
+        let error = |e: anyhow::Error| (SERVER_ERROR, format!("{e:#}"));
+        let record = store
+            .session(&id)
+            .map_err(error)?
+            .ok_or((SERVER_ERROR, format!("Session {id} not found")))?;
+        let rows = transcript::messages(&store.load_messages(&id).map_err(error)?);
+        let (content, filename) =
+            crate::export::export(&record, &rows, format, params["redact"] == true);
+        Ok(json!({"content": content, "filename": filename, "format": format.extension()}))
+    }
+
     /// Renames a session; the page's lists hear it through Hermes's `session.title` event.
     fn rename(&self, id: &str, title: &str) -> Result<(), (i64, String)> {
         let title = title.trim();
@@ -1411,7 +1847,10 @@ impl Gateway {
             .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
         self.subscribe(&id, outbox);
         let id_for_receipt = id.clone();
-        let started = gated.then(|| {
+        // Only a request that named its admission is released by name after its receipt (a
+        // generated one is never looked up, and its turn would wait forever).
+        let named = self::admission_id(params).is_some();
+        let started = (gated && named).then(|| {
             let (start, started) = tokio::sync::oneshot::channel();
             if let Ok(mut starts) = self.starts.lock() {
                 starts.insert(admission_id.clone(), start);
@@ -1635,6 +2074,108 @@ impl Gateway {
         if (method, path) == ("GET", "/api/profiles/sessions") {
             return Some((200, self.session_list(query)));
         }
+        // The sidebar's search: the sessions whose messages match, one hit each, newest first
+        // (Hermes's `/api/sessions/search`, over the store's full-text index).
+        if (method, path) == ("GET", "/api/sessions/search") {
+            let text = crate::rest::query_param(query, "q").unwrap_or_default();
+            let store = self.runtime.store();
+            // (The store matches the listed roles only.)
+            let roles = ["user".to_string(), "assistant".to_string()];
+            let hits = if text.trim().is_empty() {
+                Vec::new()
+            } else {
+                store
+                    .search(&hermes_store::SearchQuery {
+                        query: text.trim(),
+                        roles: &roles,
+                        exclude_sessions: &[],
+                        after_ms: None,
+                        before_ms: None,
+                        sort: hermes_store::SearchSort::Newest,
+                        limit: 200,
+                    })
+                    .unwrap_or_default()
+            };
+            let mut seen = std::collections::HashSet::new();
+            let results: Vec<Value> = hits
+                .into_iter()
+                .filter(|hit| seen.insert(hit.session_id.clone()))
+                .filter_map(|hit| {
+                    let record = store.session(&hit.session_id).ok().flatten()?;
+                    Some(json!({
+                        "session_id": hit.session_id,
+                        "lineage_root": hit.session_id,
+                        "snippet": hit.snippet,
+                        "role": hit.role,
+                        "model": record.model,
+                        "source": "desktop",
+                        "title": record.title,
+                        "session_started": record.created_at as f64 / 1000.,
+                        "last_active": record.updated_at as f64 / 1000.,
+                    }))
+                })
+                .take(50)
+                .collect();
+            return Some((200, json!({"results": results})));
+        }
+        // Settings ▸ Advanced ▸ Logs: this run's log (the app logs to its own log file).
+        if (method, path) == ("GET", "/api/logs") {
+            let lines = crate::rest::query_param(query, "lines")
+                .and_then(|l| l.parse().ok())
+                .unwrap_or(200usize);
+            let file = self.data_dir.join("logs").join("desktop.log");
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            let all: Vec<&str> = text.lines().collect();
+            let tail: Vec<&str> = all[all.len().saturating_sub(lines)..].to_vec();
+            return Some((
+                200,
+                json!({"file": file.display().to_string(), "lines": tail}),
+            ));
+        }
+        // Command Center ▸ Maintenance: the curator and the memory files.
+        match (method, path) {
+            ("GET", "/api/curator") => {
+                return Some((
+                    200,
+                    crate::maintenance::curator_status(&self.runtime.skills()),
+                ));
+            }
+            ("PUT", "/api/curator/paused") => {
+                let body: Value = serde_json::from_slice(body).unwrap_or_default();
+                let paused = body["paused"] == true;
+                return Some((
+                    200,
+                    crate::maintenance::set_curator_paused(&self.runtime.skills(), paused),
+                ));
+            }
+            ("POST", "/api/curator/run") => {
+                let started =
+                    crate::maintenance::run_curator(self.runtime.clone(), self.actions.clone());
+                return Some((
+                    200,
+                    json!({"ok": true, "pid": 0, "name": crate::maintenance::CURATOR_RUN,
+                           "already_running": !started}),
+                ));
+            }
+            ("GET", "/api/memory") => {
+                return Some((200, crate::maintenance::memory_status(&self.data_dir)));
+            }
+            ("POST", "/api/memory/reset") => {
+                let body: Value = serde_json::from_slice(body).unwrap_or_default();
+                return Some(crate::maintenance::reset_memory(&self.data_dir, &body));
+            }
+            _ => {}
+        }
+        if let Some(name) = path
+            .strip_prefix("/api/actions/")
+            .filter(|_| method == "GET")
+        {
+            let name = crate::rest::percent_decode(name.trim_end_matches("/status"));
+            let limit = crate::rest::query_param(query, "lines")
+                .and_then(|l| l.parse().ok())
+                .unwrap_or(200);
+            return Some((200, self.actions.status(&name, limit)));
+        }
         if path == "/api/skills" || path.starts_with("/api/skills/") {
             let store = self.runtime.skills();
             return crate::skills::route(&store, &self.rest, method, path, query, body);
@@ -1680,7 +2221,7 @@ impl Gateway {
         }
         if (method, path) == ("PUT", "/api/config") {
             let answer = self.rest.handle(method, path, query, body);
-            self.apply_approvals_mode(&self.rest.config_value("approvals.mode"));
+            self.apply_settings();
             return answer;
         }
         // "Choose a folder" (patches/0002): Windows' own folder dialog, opened by this process,
@@ -1707,6 +2248,58 @@ impl Gateway {
                 .into_iter()
                 .collect();
             return Some((200, json!({"paths": paths})));
+        }
+        // "Save as" for `/save` (patches/0008): Windows' own dialog, then the file written here.
+        if (method, path) == ("POST", "/api/hermes-rs/save-file") {
+            let body: Value = serde_json::from_slice(body).unwrap_or_default();
+            let content = body["content"].as_str().unwrap_or_default().to_string();
+            let title = body["title"].as_str().unwrap_or_default().to_string();
+            let default_path = body["defaultPath"].as_str().unwrap_or_default().to_string();
+            let filters: Vec<(String, Vec<String>)> = body["filters"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|f| {
+                    let name = f["name"].as_str().unwrap_or("File").to_string();
+                    let extensions = f["extensions"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect();
+                    (name, extensions)
+                })
+                .collect();
+            let saved = tokio::task::spawn_blocking(move || {
+                let mut dialog = rfd::FileDialog::new();
+                if !title.is_empty() {
+                    dialog = dialog.set_title(&title);
+                }
+                let default = Path::new(&default_path);
+                if let Some(name) = default.file_name() {
+                    dialog = dialog.set_file_name(name.to_string_lossy());
+                }
+                if let Some(dir) = default.parent().filter(|d| d.is_dir()) {
+                    dialog = dialog.set_directory(dir);
+                }
+                for (name, extensions) in &filters {
+                    dialog = dialog.add_filter(name, extensions);
+                }
+                let path = dialog.save_file()?;
+                Some(std::fs::write(&path, content).map(|()| path))
+            })
+            .await
+            .ok()
+            .flatten();
+            return Some((
+                200,
+                match saved {
+                    None => json!({"saved": false}),
+                    Some(Ok(path)) => json!({"saved": true, "path": path.display().to_string()}),
+                    Some(Err(error)) => json!({"saved": false, "error": error.to_string()}),
+                },
+            ));
         }
         // The file browser and the web folder picker (`/api/fs/list`).
         if (method, path) == ("GET", "/api/fs/list") {

@@ -26,35 +26,35 @@ backend code · **L** = a port of a Hermes subsystem.
 | 1.3 | **File preview and editing in the side panel.** Opening a file the agent touched, viewing an image, saving an edit. | `/api/fs/read-text` (13 call sites), `/api/fs/write-text`, `/api/fs/read-data-url`, `/api/files/ticket` + `/stream`, `/api/files/mkdir`, `/api/fs/download` | `/api/fs/list`, `paths.rs` | S–M |
 | 1.4 | **Git review panel**: the diff of the session's changes, staging. | `/api/git/review/diff`, `/api/git/review/stage`, `/api/git/file-diff`, `/api/git/branches` | `git.rs` (status, rev-parse), `runtime::commands::diff` | M |
 | 1.5 | **Interactive terminal** (your own shell in the panel; only the agent's process output works). | `/api/host-terminal` (a PTY over a socket) | `process.rs` (agent processes) | M (needs a PTY crate) |
-| 1.6 | **Typed `/undo` and `/retry` fail.** The restore button works; the typed commands call another method. | `session.rewind` unanswered (the button uses `session.mutate rewind`) | rewind in `gateway.rs` | S |
-| 1.7 | **Checkpoints are never taken**, so nothing can be rolled back; `/rollback` and its UI don't work. | Desktop never calls `checkpoints().set_enabled`; Settings ▸ Safety ▸ Checkpoints hidden; `rollback.list/diff/restore` unanswered | `Checkpoints`, `Runtime::rollback`, `runtime::commands::rollback` | S |
+| 1.6 | ✅ **Done 2026-11-04.** **Typed `/undo` and `/retry` fail.** The restore button works; the typed commands call another method. | `session.rewind` unanswered (the button uses `session.mutate rewind`) | rewind in `gateway.rs` | S |
+| 1.7 | ✅ **Done 2026-11-04** (on by default; Settings ▸ Safety ▸ Checkpoints). **Checkpoints are never taken**, so nothing can be rolled back; `/rollback` and its UI don't work. | Desktop never calls `checkpoints().set_enabled`; Settings ▸ Safety ▸ Checkpoints hidden; `rollback.list/diff/restore` unanswered | `Checkpoints`, `Runtime::rollback`, `runtime::commands::rollback` | S |
 | 1.8 | **MCP servers can't be added or used.** | Connectors tab hidden (by us); `mcp.servers.*`, `/api/mcp/servers*`, `reload.mcp` unanswered; the desktop never configures the runtime's MCP manager | `runtime::mcp::McpManager` (stdio + HTTP, configure, reconnect, status, tools) | M |
 
 ## 2. Commands and agent features that are half there
 
 | # | Gap | Evidence | Already in hermes-rs | Effort |
 |---|---|---|---|---|
-| 2.1 | Built-in commands answered "not a command": `/compress`, `/status`, `/diff`, `/usage`, `/insights`, `/context`, `/refine`, `/memory` (pending writes), `/tools`, `/history`. | `session.compress`, `session.status`, `command.dispatch` only knows skills | `Runtime::compress`, `diff`, `usage_report`, `insights_report`, `refine`, `context_breakdown`, memory approval store | S |
+| 2.1 | ✅ **Done 2026-11-04** (`/history` is the page's own). Built-in commands answered "not a command": `/compress`, `/status`, `/diff`, `/usage`, `/insights`, `/context`, `/refine`, `/memory` (pending writes), `/tools`, `/history`. | `session.compress`, `session.status`, `command.dispatch` only knows skills | `Runtime::compress`, `diff`, `usage_report`, `insights_report`, `refine`, `context_breakdown`, memory approval store | S |
 | 2.2 | **Live subagents**: delegation runs, but the page can't list, follow, steer or stop subagents. | `subagent.list` returns empty; `subagent.tail/steer/interrupt`, `agents.list`, `spawn_tree.*` unanswered | `runtime/src/delegate.rs` | M |
 | 2.3 | `/btw` (side question) and `/bg` (background prompt). | `prompt.btw`, `prompt.background` | the turn machinery | M |
 | 2.4 | `/branch` / fork a session from a message. | `session.branch*` | store, rewind | M |
-| 2.5 | Save / export a conversation (`/save`). | `session.save`, `session.export` | store | S |
+| 2.5 | ✅ **Done 2026-11-04** (Save As dialog, JSON/Markdown/HTML, redact). Save / export a conversation (`/save`). | `session.save`, `session.export` | store | S |
 | 2.6 | Coding-workflow commands from Hermes's registry: `/plan` (plan to `.hermes/plans/`), `/init` (write AGENTS.md from a repo scan), `/review` (subagent reviews the work), `/learn` (skill from anything). | `command.dispatch` | prompts in `prompts/hermes`, delegation, skill_manage | S each (mostly prompts) |
 | 2.7 | `/goal` + `/subgoal` (keep working until a goal is met) and `/loop` (re-run a prompt on an interval). | contract `goal`/`loop` commands | turn machinery | M |
 | 2.8 | Tool switches (turn tools off, Claude Code-style permissions). | Tools tab hidden (by us); `tools.list/configure`, `toolsets.list`, `/api/tools/toolsets*` | fixed tool set in `SessionTools` | M |
 | 2.9 | Auxiliary model routing in the UI (compression, review, curator, approval models; only titles are read). | Settings ▸ Model ▸ Auxiliary hidden; `providers::AuxModels` has `titles` only | aux routing in the runtime config (GPUI app sets it) | S–M |
-| 2.10 | Curator and background-review controls. | `/api/curator`, `/api/curator/paused`, `/api/curator/run` | `runtime::curator`, `set_background_review` | S |
-| 2.11 | Usage bars in the status bar, insights page. | `usage.bars`, `insights.get`, `/api/analytics/usage` | `usage_report`, `insights_report`, store usage table | S |
+| 2.10 | ✅ **Done 2026-11-04** (Command Center ▸ Maintenance; the curator also runs on its schedule again, which the desktop never did). Curator and background-review controls. | `/api/curator`, `/api/curator/paused`, `/api/curator/run` | `runtime::curator`, `set_background_review` | S |
+| 2.11 | ✅ **Done 2026-11-04** for insights (`usage.bars` turned out to be Nous subscription limits: not needed). Usage bars in the status bar, insights page. | `usage.bars`, `insights.get`, `/api/analytics/usage` | `usage_report`, `insights_report`, store usage table | S |
 
 ## 3. Sessions, memory, settings
 
 | # | Gap | Evidence | Already in hermes-rs | Effort |
 |---|---|---|---|---|
-| 3.1 | Memory manager: view and edit MEMORY.md / USER.md, pending writes, reset. | Settings ▸ Memory hidden; `/api/memory`, `/api/memory/reset` | `hermes_memory` store, approvals | S–M |
-| 3.2 | Session search in the sidebar. | `/api/sessions/search` | `session_search` tool, store search | S |
+| 3.1 | Partly done 2026-11-04: memory file sizes and reset (Command Center ▸ Maintenance). Memory manager: view and edit MEMORY.md / USER.md, pending writes, reset. | Settings ▸ Memory hidden; `/api/memory`, `/api/memory/reset` | `hermes_memory` store, approvals | S–M |
+| 3.2 | ✅ **Done 2026-11-04.** Session search in the sidebar. | `/api/sessions/search` | `session_search` tool, store search | S |
 | 3.3 | Archive / hide sessions. | `session.archive`, `session.set_hidden` | store (needs a flag kept outside the shared schema, or a schema bump the GPUI app tolerates) | S |
 | 3.4 | Sessions settings: retention / auto-prune, export, import. | Settings ▸ Sessions hidden | store delete | S–M |
-| 3.5 | Logs viewer, version and about. | Settings ▸ Advanced / About hidden; `/api/logs` | tracing output | S |
+| 3.5 | Logs done 2026-11-04 (the app now also logs to `logs\\desktop.log`; Command Center shows it); About still hidden. Logs viewer, version and about. | Settings ▸ Advanced / About hidden; `/api/logs` | tracing output | S |
 | 3.6 | Workspace settings (default folder). | Settings ▸ Workspace hidden | `/api/fs/default-cwd` | S |
 | 3.7 | Artifacts gallery (links and files the agent produced, across sessions). | sidebar entry hidden (by us) | mostly frontend over session messages | S |
 | 3.8 | Model fallbacks (another model when one fails). | Settings ▸ Model ▸ Fallbacks hidden | retry/classification in `llm` | M |

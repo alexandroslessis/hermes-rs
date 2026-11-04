@@ -6,9 +6,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod export;
 mod gateway;
 mod git;
 mod hub;
+mod maintenance;
 mod paths;
 mod projects;
 mod providers;
@@ -38,11 +40,8 @@ fn webapp_dist() -> PathBuf {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    let config = RuntimeConfig::for_current_user();
+    init_logging(config.as_ref().ok().map(|c| c.data_dir.as_path()));
 
     // The agent and the server run on their own tokio runtime; Tauri keeps the main thread.
     let tokio = tokio::runtime::Builder::new_multi_thread()
@@ -50,7 +49,7 @@ fn main() -> Result<()> {
         .thread_name("hermes-runtime")
         .enable_all()
         .build()?;
-    let mut config = RuntimeConfig::for_current_user()?;
+    let mut config = config?;
     let data_dir = config.data_dir.clone();
     // The terminal tool runs PowerShell, Windows' own shell; `terminal.shell: "bash"` in
     // desktop-config.json keeps Git Bash (when installed) instead.
@@ -147,6 +146,37 @@ fn main() -> Result<()> {
         .context("running the window")?;
     drop(tokio);
     Ok(())
+}
+
+/// The log: to stdout (a debug build's console) and to `logs\desktop.log` in the data folder,
+/// which a release build (no console) otherwise loses and Settings ▸ Advanced ▸ Logs reads. A log
+/// past 5 MB is moved to `desktop.log.1` at startup. `RUST_LOG` filters it (default `info`).
+fn init_logging(data_dir: Option<&std::path::Path>) {
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let file = data_dir.and_then(|dir| {
+        let folder = dir.join("logs");
+        std::fs::create_dir_all(&folder).ok()?;
+        let path = folder.join("desktop.log");
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 5 << 20) {
+            let _ = std::fs::rename(&path, folder.join("desktop.log.1"));
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    });
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false);
+    match file {
+        Some(file) => builder
+            .with_writer(std::io::stdout.and(std::sync::Mutex::new(file)))
+            .init(),
+        None => builder.init(),
+    }
 }
 
 /// The backend couldn't start (its data folder unreadable, the database locked by a newer

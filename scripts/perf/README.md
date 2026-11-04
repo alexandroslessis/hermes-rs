@@ -54,6 +54,14 @@ and the skills folder's git bookkeeping (`git status`, ~80 ms each launch; the f
 files on a first run) runs on a background thread (`SkillStore::seed_bundled_in_background`). The
 backend is now ready before WebView2 navigates; the rest of startup is WebView2's.
 
+## Protocol smoke test
+
+With the mock and an instance running (`perf.ps1 -Do start`; `HERMES_PERF_EXE` picks a debug
+build), `node scripts/perf/smoke.mjs 47810 <a folder with a file in it>` drives a session the way
+the page does (the mock answers "please write file NAME" with a `write_file` call) and checks
+rollback, `/undo`, the built-in commands, export, compress, the curator, memory, search and logs.
+`rollback-check.mjs` is the checkpoint round trip on its own.
+
 ## Bundle analysis
 
 ```powershell
