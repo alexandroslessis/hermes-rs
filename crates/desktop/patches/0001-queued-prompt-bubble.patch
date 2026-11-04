@@ -1,0 +1,72 @@
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.ts	2026-11-04 01:37:50.462456000 +0100
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/message-stream.ts	2026-11-04 01:37:50.492408500 +0100
+@@ -3,20 +3,21 @@
+ import { noteTurnSettled } from '@/app/session/hooks/use-session-actions/settled-turns'
+ import { burstVibeHearts } from '@/components/chat/vibe-hearts'
+ import { translateNow } from '@/i18n'
+-import type { GatewayEventPayload } from '@/lib/chat-messages'
++import { type GatewayEventPayload, textPart } from '@/lib/chat-messages'
+ import { coerceGatewayText, coerceThinkingText } from '@/lib/chat-runtime'
+ import { playCompletionSound } from '@/lib/completion-sound'
+ import { parseErrorSurface } from '@/lib/error-surface'
+ import { triggerHaptic } from '@/lib/haptics'
+ import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock } from '@/store/billing-block'
+ import { clearSettledClarifyRequest } from '@/store/clarify'
++import { getQueuedPrompts, removeQueuedPrompt } from '@/store/composer-queue'
+ import { setSessionCompacting } from '@/store/compaction'
+ import { noteFreeTierTurnComplete } from '@/store/free-tier-sign-in'
+ import { notify } from '@/store/notifications'
+ import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
+ import { clearAllPrompts } from '@/store/prompts'
+ import { providerWaitText, setSessionProviderWait } from '@/store/provider-wait'
+-import { setCurrentUsage, setTurnStartedAt } from '@/store/session'
++import { $sessions, resolveComposerSessionKey, setCurrentUsage, setTurnStartedAt } from '@/store/session'
+ import { refreshSupportedSessionControlAfterTurn } from '@/store/session-control'
+ import { $focusedStoredSessionId } from '@/store/session-focus'
+ import { $sessionStates } from '@/store/session-states'
+@@ -134,6 +135,36 @@
+ }
+ 
+ /** message.start: arm the session for a new turn, unless it re-sends the current one. */
++/**
++ * hermes-rs: a queued prompt the backend starts on its own (the queue panel's card) has no bubble,
++ * and no event draws one. Its turn's message.start names the admission as `turn_id`: the card
++ * becomes the user's bubble here, under the id a sent prompt's bubble has (`user-<submission>`),
++ * so the turn's receipt binds its stored row and a later transcript read doesn't paint it twice.
++ */
++function showStartedQueuedPrompt({ deps, sessionId }: GatewayEventContext, admissionId: string): void {
++  if (!sessionId || !admissionId) {
++    return
++  }
++
++  const storedId = deps.sessionStateByRuntimeIdRef.current.get(sessionId)?.storedSessionId ?? sessionId
++  const queueKey = resolveComposerSessionKey(storedId, $sessions.get()) ?? storedId
++  const entry = getQueuedPrompts(queueKey).find(candidate => candidate.id === admissionId && candidate.serverStatus)
++
++  if (!entry) {
++    return
++  }
++
++  const messageId = `user-${admissionId}`
++  const text = entry.displayText || entry.text
++
++  deps.updateSessionState(sessionId, state =>
++    state.messages.some(message => message.id === messageId)
++      ? state
++      : { ...state, messages: [...state.messages, { id: messageId, role: 'user', parts: [textPart(text)] }] }
++  )
++  removeQueuedPrompt(queueKey, admissionId)
++}
++
+ function handleMessageStart(ctx: GatewayEventContext): boolean {
+   const { deps, payload, sessionId, isActiveEvent } = ctx
+   const { compactedTurnRef, flushQueuedDeltas, dropQueuedDeltas, nativeSubagentSessionsRef } = deps
+@@ -152,6 +183,8 @@
+     return true
+   }
+ 
++  showStartedQueuedPrompt(ctx, turnId)
++
+   // Turn-boundary orphan drop (#119543): when no turn is live, anything
+   // still queued belongs to a turn that already ended (a delta reordered
+   // behind its own complete or heartbeat). Flushing it would seed a bubble

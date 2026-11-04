@@ -422,7 +422,7 @@ impl Gateway {
                     return Ok(json!({"status": "rejected", "session_id": id, "text": text}));
                 }
                 self.subscribe(&id, outbox);
-                self.enqueue(&id, json!({"text": text}), true);
+                self.enqueue(&id, json!({"text": text, "shown": true}), true);
                 self.runtime.cancel(&id);
                 self.hub.cancel_session(&id);
                 Ok(json!({"status": "redirected", "session_id": id, "text": text}))
@@ -759,6 +759,9 @@ impl Gateway {
             .map(|queue| {
                 queue
                     .iter()
+                    // A redirect or a missed steer is on the page already, as the bubble the
+                    // composer drew: as a card too it would show twice.
+                    .filter(|params| params["shown"] != true)
                     .map(|params| {
                         json!({
                             "admission_id": params["submission_id"],
@@ -1021,13 +1024,16 @@ impl Gateway {
                 let _ = started.await;
             }
             let mut stream = transcript::TurnStream::default();
-            // The page holds the turn as live from `running: true` until `running: false`.
-            this.emit(&id, "session.info", this.session_info(&id));
+            // message.start first: for a queued prompt it names the admission, and the page turns
+            // that queue card into the user's bubble (patches/0001) before the session.info below
+            // (whose `pending` no longer lists the prompt) retires the card. The page holds the
+            // turn as live from `running: true` until `running: false`.
             this.emit(
                 &id,
                 "message.start",
                 json!({"turn_id": admission, "admission_id": admission}),
             );
+            this.emit(&id, "session.info", this.session_info(&id));
             // While the turn runs, a `running: true` heartbeat (Hermes's backend sends one, and
             // `gateway.ready` says it does) keeps the page holding the turn as live through quiet
             // stretches: a long think, a retry, a wait on the provider.
@@ -1053,7 +1059,7 @@ impl Gateway {
                     }
                     // A steer the turn ended before reading: it runs next, as Hermes does.
                     RuntimeEvent::SteerUndelivered(text) => {
-                        this.enqueue(&id, json!({"text": text}), true);
+                        this.enqueue(&id, json!({"text": text, "shown": true}), true);
                     }
                     RuntimeEvent::TurnFinished(status) => {
                         let (status, error) = match status {
