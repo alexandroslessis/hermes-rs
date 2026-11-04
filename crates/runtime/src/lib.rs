@@ -661,6 +661,15 @@ impl Runtime {
         Ok(conversation.messages().clone())
     }
 
+    /// The session's background processes (empty when it isn't open in this process).
+    pub fn processes(&self, session_id: &str) -> Vec<serde_json::Value> {
+        self.sessions
+            .lock()
+            .get(session_id)
+            .map(|open| open.tools.process_list())
+            .unwrap_or_default()
+    }
+
     pub fn is_running(&self, session_id: &str) -> bool {
         self.sessions
             .lock()

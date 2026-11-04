@@ -7,7 +7,9 @@
 
 mod commands;
 mod gateway;
+mod git;
 mod hub;
+mod paths;
 mod providers;
 mod rest;
 mod server;

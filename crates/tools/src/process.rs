@@ -134,6 +134,13 @@ impl ProcessRegistry {
         }
     }
 
+    /// Every process's status (the `process` tool's `list`), oldest first.
+    pub(crate) fn status_list(&self) -> Vec<Value> {
+        let mut list: Vec<_> = self.processes.lock().values().cloned().collect();
+        list.sort_by_key(|process| process.started);
+        list.iter().map(|process| process.status_json()).collect()
+    }
+
     pub async fn kill_all(&self) {
         let processes: Vec<_> = self.processes.lock().values().cloned().collect();
         for process in processes {

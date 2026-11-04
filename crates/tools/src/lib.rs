@@ -386,6 +386,11 @@ impl SessionTools {
 }
 
 impl SessionTools {
+    /// The session's background processes, as the `process` tool lists them.
+    pub fn process_list(&self) -> Vec<Value> {
+        self.processes.status_list()
+    }
+
     async fn web_tool(&self, name: &str, args: &Value) -> ToolOutput {
         let Some(web) = &self.web else {
             return ToolOutput::error("Web tools are not available in this session.");

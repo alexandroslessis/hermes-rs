@@ -50,6 +50,8 @@ pub struct Gateway {
     pending_routes: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
     /// Sessions with a turn in flight, counting the queued prompts that follow it.
     live_turns: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// `provider\nmodel` → its context window, as the provider lists it (asked once).
+    context_lengths: std::sync::Mutex<std::collections::HashMap<String, Option<usize>>>,
 }
 
 impl Gateway {
@@ -66,6 +68,7 @@ impl Gateway {
             starts: Default::default(),
             pending_routes: Default::default(),
             live_turns: Default::default(),
+            context_lengths: Default::default(),
         };
         // The runtime keeps the approval policy in memory: Settings' choice applies from the start.
         gateway.apply_approvals_mode(&gateway.rest.config_value("approvals.mode"));
@@ -364,6 +367,64 @@ impl Gateway {
                     ))
                 }
             }
+            "session.context_breakdown" => self.context_breakdown(&session_id(params)?).await,
+            // The open approval cards, for a page that reconnected or switched back.
+            "approval.pending" => {
+                let id = session_id(params)?;
+                let approvals: Vec<Value> = self
+                    .hub
+                    .open_prompts(&id)
+                    .into_iter()
+                    .filter(|prompt| prompt["kind"] == "approval")
+                    .map(|prompt| {
+                        json!({
+                            "request_id": prompt["prompt_id"],
+                            "command": prompt["command"],
+                            "description": prompt["description"],
+                            "choices": prompt["choices"],
+                            "allow_permanent": true,
+                            "allow_session": true,
+                        })
+                    })
+                    .collect();
+                Ok(json!({"approvals": approvals}))
+            }
+            // The session's background processes (the `process` tool's list).
+            "process.list" => {
+                let id = session_id(params)?;
+                let processes: Vec<Value> = self
+                    .runtime
+                    .processes(&id)
+                    .into_iter()
+                    .map(|mut process| {
+                        process["uptime_seconds"] = process["running_seconds"].clone();
+                        process
+                    })
+                    .collect();
+                Ok(json!({"processes": processes}))
+            }
+            // hermes-rs keeps no registry of a turn's subagents yet: none to list.
+            "subagent.list" => Ok(json!({"subagents": [], "delegations": []})),
+            "complete.path" => {
+                let word = params["word"].as_str().unwrap_or_default().to_string();
+                let root = params["cwd"]
+                    .as_str()
+                    .filter(|cwd| !cwd.is_empty())
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        let id = params["session_id"].as_str()?;
+                        let record = self.runtime.store().session(id).ok().flatten()?;
+                        Some(PathBuf::from(record.cwd))
+                    })
+                    .or_else(dirs::home_dir)
+                    .unwrap_or_default();
+                // A name search walks the project: off the async workers.
+                let items =
+                    tokio::task::spawn_blocking(move || crate::paths::complete(&word, &root))
+                        .await
+                        .unwrap_or_default();
+                Ok(json!({"items": items}))
+            }
             "session.steer" => {
                 let id = session_id(params)?;
                 let text = params["text"].as_str().unwrap_or_default();
@@ -580,6 +641,85 @@ impl Gateway {
             .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
         self.emit(id, "session.info", self.session_info(id));
         Ok(())
+    }
+
+    /// A model's context window, as its provider lists it; asked once per model (`None` when the
+    /// provider doesn't say or can't be reached).
+    async fn context_length(&self, provider: &str, model: &str) -> Option<usize> {
+        let key = format!("{provider}\n{model}");
+        if let Some(known) = self
+            .context_lengths
+            .lock()
+            .ok()
+            .and_then(|lengths| lengths.get(&key).copied())
+        {
+            return known;
+        }
+        let settings = Settings::load(&self.data_dir);
+        let length = match settings.provider(provider) {
+            Some(provider) if provider.ready() => provider
+                .runtime()
+                .list_models()
+                .await
+                .ok()
+                .and_then(|models| models.into_iter().find(|m| m.id == model))
+                .and_then(|m| m.context_length),
+            _ => None,
+        };
+        if let Ok(mut lengths) = self.context_lengths.lock() {
+            lengths.insert(key, length);
+        }
+        length
+    }
+
+    /// The context gauge (`session.context_breakdown`, Hermes's `agent/context_breakdown.py`):
+    /// the frozen system prompt and the conversation, estimated at ~4 characters a token, against
+    /// the model's window. How full it is comes from the last request's real input tokens when the
+    /// session has made one, else from the estimate.
+    async fn context_breakdown(&self, id: &str) -> RpcResult {
+        let record = self
+            .runtime
+            .store()
+            .session(id)
+            .ok()
+            .flatten()
+            .ok_or((SERVER_ERROR, format!("Session not found: {id}")))?;
+        let tokens = |chars: usize| chars.div_ceil(4);
+        let system = tokens(record.system_prompt.len());
+        let messages = self.runtime.messages(id).unwrap_or_default();
+        let conversation = tokens(serde_json::to_string(&messages).map_or(0, |json| json.len()));
+        let estimated_total = system + conversation;
+        let context_max = self
+            .context_length(&record.provider, &record.model)
+            .await
+            .unwrap_or(0);
+        let measured = self
+            .runtime
+            .store()
+            .usage_totals(id)
+            .map_or(0, |usage| usage.last_input_tokens.max(0) as usize);
+        let (mut used, source) = if measured > 0 {
+            (measured, "provider_usage")
+        } else {
+            (estimated_total, "local_estimate")
+        };
+        if context_max > 0 {
+            used = used.min(context_max);
+        }
+        let category = |id: &str, label: &str, color: &str, tokens: usize| json!({"id": id, "label": label, "color": color, "tokens": tokens});
+        Ok(json!({
+            "categories": [
+                category("system_prompt", "System prompt", "var(--context-usage-system)", system),
+                category("conversation", "Conversation", "var(--context-usage-conversation)", conversation),
+            ],
+            "estimated_total": estimated_total,
+            "context_max": context_max,
+            "context_used": used,
+            "context_percent": if context_max > 0 { (used * 100 / context_max).min(100) } else { 0 },
+            "context_source": source,
+            "context_estimated": source != "provider_usage",
+            "model": record.model,
+        }))
     }
 
     /// The provider and model picked while the session's turn runs, if any.
@@ -1237,6 +1377,22 @@ impl Gateway {
             let answer = self.rest.handle(method, path, query, body);
             self.apply_approvals_mode(&self.rest.config_value("approvals.mode"));
             return answer;
+        }
+        // The coding rail's git reads (the folder is `path`; a non-repository reads as null).
+        if method == "GET" && matches!(path, "/api/git/status" | "/api/git/review/rev-parse") {
+            let folder = PathBuf::from(crate::rest::query_param(query, "path").unwrap_or_default());
+            let reference = crate::rest::query_param(query, "ref");
+            let status = path == "/api/git/status";
+            let answer = tokio::task::spawn_blocking(move || {
+                if status {
+                    crate::git::repo_status(&folder).unwrap_or(Value::Null)
+                } else {
+                    json!({"sha": crate::git::rev_parse(&folder, reference.as_deref())})
+                }
+            })
+            .await
+            .unwrap_or(Value::Null);
+            return Some((200, answer));
         }
         if (method, path) == ("GET", "/api/model/options") {
             let settings = Settings::load(&self.data_dir);
