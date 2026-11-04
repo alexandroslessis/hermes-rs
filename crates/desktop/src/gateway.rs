@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use futures::{SinkExt, StreamExt};
+use hermes_agent::events::AgentEvent;
 use hermes_runtime::{Runtime, RuntimeEvent, TurnOptions, TurnStatus};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -52,6 +53,9 @@ pub struct Gateway {
     live_turns: std::sync::Mutex<std::collections::HashSet<String>>,
     /// `provider\nmodel` → its context window, as the provider lists it (asked once).
     context_lengths: std::sync::Mutex<std::collections::HashMap<String, Option<usize>>>,
+    /// Session id → output tokens generated and the seconds the model calls took, this run
+    /// (the status bar's tokens per second).
+    generation: std::sync::Mutex<std::collections::HashMap<String, (u64, f64)>>,
 }
 
 impl Gateway {
@@ -69,6 +73,7 @@ impl Gateway {
             pending_routes: Default::default(),
             live_turns: Default::default(),
             context_lengths: Default::default(),
+            generation: Default::default(),
         };
         // The runtime keeps the approval policy in memory: Settings' choice applies from the start.
         gateway.apply_approvals_mode(&gateway.rest.config_value("approvals.mode"));
@@ -197,7 +202,107 @@ impl Gateway {
                 "model": settings.model,
                 "provider": settings.provider,
             }]})),
-            "projects.tree" => Ok(json!({"projects": []})),
+            "projects.tree" | "projects.project_sessions" => {
+                let projects = self.runtime.store().list_projects().unwrap_or_default();
+                let preview = params["preview_limit"].as_u64().unwrap_or(3) as usize;
+                let rows = self.session_rows();
+                // The tree lists counts; one project's sessions come hydrated.
+                let single = params["project_id"].as_str().map(str::to_string);
+                let mut tree = tokio::task::spawn_blocking(move || {
+                    crate::projects::tree(&projects, &rows, preview, single.is_some())
+                })
+                .await
+                .unwrap_or_default();
+                match params["project_id"].as_str() {
+                    Some(id) => {
+                        let project = tree["projects"]
+                            .as_array()
+                            .and_then(|all| all.iter().find(|p| p["id"] == id).cloned());
+                        Ok(json!({"project": project}))
+                    }
+                    None => {
+                        tree["active_id"] = self.rest.config_value("projects.active_id");
+                        Ok(tree)
+                    }
+                }
+            }
+            "projects.list" => Ok(self.project_list()),
+            "projects.create" => {
+                let name = params["name"]
+                    .as_str()
+                    .unwrap_or("Project")
+                    .trim()
+                    .to_string();
+                let mut folders: Vec<String> = params["folders"]
+                    .as_array()
+                    .map(|f| {
+                        f.iter()
+                            .filter_map(|p| p.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(primary) = params["primary_path"].as_str().filter(|p| !p.is_empty()) {
+                    folders.retain(|f| f != primary);
+                    folders.insert(0, primary.to_string());
+                }
+                let project = self
+                    .runtime
+                    .store()
+                    .create_project(&name, &folders)
+                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                if params["use"] == true {
+                    self.rest
+                        .set_config_value("projects.active_id", json!(project.id));
+                }
+                Ok(json!({"project": crate::projects::record(&project)}))
+            }
+            "projects.update" | "projects.add_folder" => {
+                let id = params["id"].as_str().unwrap_or_default();
+                let mut project = self
+                    .runtime
+                    .store()
+                    .list_projects()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|p| p.id == id)
+                    .ok_or((SERVER_ERROR, format!("No project {id}")))?;
+                if let Some(name) = params["name"].as_str().filter(|n| !n.trim().is_empty()) {
+                    project.name = name.trim().to_string();
+                }
+                if let Some(path) = params["path"].as_str().filter(|p| !p.is_empty()) {
+                    project.folders.retain(|f| f != path);
+                    if params["is_primary"] == true {
+                        project.folders.insert(0, path.to_string());
+                    } else {
+                        project.folders.push(path.to_string());
+                    }
+                }
+                self.runtime
+                    .store()
+                    .update_project(&project.id, &project.name, &project.folders)
+                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                Ok(json!({"project": crate::projects::record(&project)}))
+            }
+            "projects.delete" => {
+                let id = params["id"].as_str().unwrap_or_default();
+                self.runtime
+                    .store()
+                    .delete_project(id)
+                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                if self.rest.config_value("projects.active_id") == id {
+                    self.rest
+                        .set_config_value("projects.active_id", Value::Null);
+                }
+                Ok(self.project_list())
+            }
+            "projects.set_active" => {
+                let id = params["id"].clone();
+                self.rest.set_config_value("projects.active_id", id.clone());
+                Ok(json!({"active_id": id}))
+            }
+            // No scanning for repositories yet: the tree shows the ones sessions ran in.
+            "projects.discover_repos" => Ok(json!({"repos": []})),
+            "projects.record_repos" => Ok(json!({"repos": [], "accepted": true})),
             "session.active_list" => Ok(json!({"sessions": self.active_sessions()})),
             "model.options" => Ok(self
                 .model_options(&settings, params["session_id"].as_str())
@@ -641,6 +746,68 @@ impl Gateway {
             .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
         self.emit(id, "session.info", self.session_info(id));
         Ok(())
+    }
+
+    /// Counts one model call's output toward the session's tokens per second.
+    fn note_generation(&self, id: &str, output_tokens: u64, seconds: f64) {
+        if output_tokens == 0 || seconds <= 0.0 {
+            return;
+        }
+        if let Ok(mut generation) = self.generation.lock() {
+            let entry = generation.entry(id.to_string()).or_insert((0, 0.0));
+            entry.0 += output_tokens;
+            entry.1 += seconds;
+        }
+    }
+
+    /// The status bar's usage (`session.usage` / `message.complete`'s `usage`): the session's token
+    /// totals, how full the context is (the last call's input tokens against the model's window)
+    /// and the average generation speed.
+    fn usage_snapshot(&self, id: &str, last_input: Option<usize>) -> Value {
+        let store = self.runtime.store();
+        let totals = store.usage_totals(id).unwrap_or_default();
+        let record = store.session(id).ok().flatten();
+        let context_max = record
+            .as_ref()
+            .and_then(|r| {
+                let key = format!("{}\n{}", r.provider, r.model);
+                self.context_lengths
+                    .lock()
+                    .ok()?
+                    .get(&key)
+                    .copied()
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let used = last_input.unwrap_or(totals.last_input_tokens.max(0) as usize);
+        let used = if context_max > 0 {
+            used.min(context_max)
+        } else {
+            used
+        };
+        let avg_tps = self
+            .generation
+            .lock()
+            .ok()
+            .and_then(|g| g.get(id).copied())
+            .filter(|(_, seconds)| *seconds > 0.0)
+            .map(|(tokens, seconds)| tokens as f64 / seconds);
+        let mut usage = json!({
+            "model": record.as_ref().map(|r| r.model.clone()),
+            "input": totals.input_tokens,
+            "output": totals.output_tokens,
+            "total": totals.input_tokens + totals.output_tokens,
+            "calls": totals.calls,
+            "avg_tps": avg_tps,
+        });
+        if context_max > 0 && used > 0 {
+            usage["context_used"] = json!(used);
+            usage["context_max"] = json!(context_max);
+            usage["context_percent"] = json!((used * 100 / context_max).min(100));
+            usage["context_source"] = json!("provider_usage");
+            usage["context_estimated"] = json!(false);
+        }
+        usage
     }
 
     /// A model's context window, as its provider lists it; asked once per model (`None` when the
@@ -1128,6 +1295,7 @@ impl Gateway {
             .runtime();
         // The turn's rows start here (its receipt names them).
         let first_row = self.runtime.messages(&id).map(|m| m.len()).unwrap_or(0);
+        let (record_provider, record_model) = (record.provider.clone(), record.model.clone());
         let mut turn = self
             .runtime
             .start_turn(
@@ -1179,11 +1347,22 @@ impl Gateway {
             // stretches: a long think, a retry, a wait on the provider.
             let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
             heartbeat.tick().await;
+            // The model's context window, for the gauge (asked once per model, off this path).
+            {
+                let this = this.clone();
+                let (provider, model) = (record_provider.clone(), record_model.clone());
+                tokio::spawn(async move { this.context_length(&provider, &model).await });
+            }
+            // When the current model call began: the turn's start, then each tool result (tool
+            // time isn't generation time). A call's output tokens over its time are its speed.
+            let mut call_started = std::time::Instant::now();
+            let mut last_input: Option<usize> = None;
             loop {
                 let event = tokio::select! {
                     event = turn.events.recv() => event,
                     _ = heartbeat.tick() => {
                         this.emit(&id, "session.info", this.session_info(&id));
+                        this.emit(&id, "session.usage", json!({"usage": this.usage_snapshot(&id, last_input)}));
                         continue;
                     }
                 };
@@ -1192,7 +1371,24 @@ impl Gateway {
                     break;
                 };
                 match event {
+                    RuntimeEvent::Agent(AgentEvent::Usage(usage)) => {
+                        let output = usage.usage.output_tokens.unwrap_or(0).max(0) as u64;
+                        this.note_generation(&id, output, call_started.elapsed().as_secs_f64());
+                        last_input = usage
+                            .usage
+                            .input_tokens
+                            .map(|tokens| tokens.max(0) as usize);
+                        call_started = std::time::Instant::now();
+                        this.emit(
+                            &id,
+                            "session.usage",
+                            json!({"usage": this.usage_snapshot(&id, last_input)}),
+                        );
+                    }
                     RuntimeEvent::Agent(event) => {
+                        if matches!(&event, AgentEvent::Message(m) if m.is_tool_response()) {
+                            call_started = std::time::Instant::now();
+                        }
                         for (name, payload) in stream.agent_event(event) {
                             this.emit(&id, name, payload);
                         }
@@ -1217,6 +1413,7 @@ impl Gateway {
                                 "error": error,
                                 // The rows this turn wrote, so the page can restore or edit them.
                                 "persisted_turn": transcript::persisted_turn(&stored, first_row, &admission),
+                                "usage": this.usage_snapshot(&id, last_input),
                             }),
                         );
                         // With a prompt queued, the session stays live into its turn: a
@@ -1520,6 +1717,28 @@ impl Gateway {
             "pinned": s.pinned,
             "profile": "default",
         })
+    }
+
+    /// Every session as the sidebar lists it, newest first.
+    fn session_rows(&self) -> Vec<Value> {
+        let all = self.runtime.store().list_sessions(1000).unwrap_or_default();
+        let counts = self.runtime.store().message_counts().unwrap_or_default();
+        all.iter()
+            .map(|s| self.session_row(s, counts.get(&s.id).copied().unwrap_or(0)))
+            .collect()
+    }
+
+    /// `projects.list`: the user's projects and the active one.
+    fn project_list(&self) -> Value {
+        let projects: Vec<Value> = self
+            .runtime
+            .store()
+            .list_projects()
+            .unwrap_or_default()
+            .iter()
+            .map(crate::projects::record)
+            .collect();
+        json!({"projects": projects, "active_id": self.rest.config_value("projects.active_id")})
     }
 
     /// `/api/profiles/sessions`: the sidebar's list (`PaginatedSessions`).

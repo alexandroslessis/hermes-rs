@@ -10,6 +10,7 @@ mod gateway;
 mod git;
 mod hub;
 mod paths;
+mod projects;
 mod providers;
 mod rest;
 mod server;
