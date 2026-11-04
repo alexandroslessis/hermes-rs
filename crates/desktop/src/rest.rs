@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-/// The Hermes commit the bundled frontend was built from (what `/api/health` reports).
-pub const HERMES_COMMIT: &str = "c419cf7c";
+/// The Hermes commit this build ports (`HERMES_COMMIT` at the repository root: the one place
+/// it's set; the webapp build and `scripts/hermes-update-report.ps1` read it too).
+pub const HERMES_COMMIT: &str = include_str!("../../../HERMES_COMMIT");
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The model new sessions use, from the hermes-rs settings (`config.json`).
@@ -462,7 +463,7 @@ impl Rest {
                 "ok": true,
                 "version": VERSION,
                 "displayVersion": VERSION,
-                "commit": HERMES_COMMIT,
+                "commit": &HERMES_COMMIT.trim()[..8],
                 "auth_required": false,
             })),
             ("GET", "/api/status") => ok(json!({

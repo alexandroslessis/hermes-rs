@@ -3,6 +3,8 @@
 //! This backend's slash commands are the runtime's skills and bundles: running one answers
 //! Hermes's `skill` dispatch, whose message (the loaded skill) the page then sends as the prompt.
 //! Hermes's built-in commands the desktop runs itself (`/new`, `/model`, …) never reach here.
+//!
+//! Hermes: `tui_gateway/methods_complete.py` (`complete.slash`), `tui_gateway/command_discovery.py`.
 
 use hermes_runtime::Runtime;
 use hermes_tools::SkillStore;

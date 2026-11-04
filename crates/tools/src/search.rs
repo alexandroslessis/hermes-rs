@@ -1,4 +1,6 @@
 //! search_files: file-name globs and regex content search over a gitignore-aware walk.
+//!
+//! Hermes: `tools/file_tools.py` (`search_files`), `tools/file_operations_search.py`.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;

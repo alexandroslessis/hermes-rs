@@ -1,6 +1,8 @@
 //! Our conversation in Hermes's terms: stored messages as `TranscriptMessage`s (what
 //! `session.resume` returns) and a running turn's agent events as Hermes's stream events
 //! (`message.delta`, `reasoning.delta`, `tool.start`, `tool.complete`).
+//!
+//! Hermes: `tui_gateway/methods_session.py` (`session.resume`), `tui_gateway/prompt_turn.py` (stream events).
 
 use std::collections::HashMap;
 

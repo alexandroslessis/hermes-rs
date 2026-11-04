@@ -1,4 +1,6 @@
 //! clarify: ask the user questions and wait for the app to return their answers.
+//!
+//! Hermes: `tools/clarify_tool.py`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

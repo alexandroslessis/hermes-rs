@@ -6,6 +6,8 @@
 //! user stopped the turn), kills the whole process tree and the next call starts a fresh shell
 //! in the same directory. Without Git Bash, each command runs in a fresh PowerShell and only the
 //! working directory carries over.
+//!
+//! Hermes: `tools/terminal_tool.py`.
 
 use std::os::windows::process::CommandExt as _;
 use std::path::{Path, PathBuf};

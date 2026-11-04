@@ -4,6 +4,8 @@
 //! contract the frontend is generated from (`apps/shared/src/gateway-contract.openrpc.json`).
 //! A method this backend doesn't implement answers JSON-RPC's -32601, which the frontend treats
 //! as "not supported here" and hides.
+//!
+//! Hermes: `tui_gateway/server.py`, `tui_gateway/methods_prompt.py`, `tui_gateway/methods_session.py`; what the page expects: `apps/desktop/src/api/canonical-protocol.ts`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

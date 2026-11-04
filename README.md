@@ -2,11 +2,12 @@
 
 A Windows desktop re-implementation of the [Hermes agent](https://github.com/NousResearch/hermes-agent)
 in Rust: an agent with persistent memory and a self-improvement loop (skills, background
-review, curator), a native UI built from [Zed](https://github.com/zed-industries/zed)'s GPUI and
-`ui` crates, and OpenAI-compatible model providers.
+review, curator), Hermes's own desktop frontend, and OpenAI-compatible model providers.
 
-Status: **M1 (headless agent backend) done; M2 (chat UI) next**. See [PLAN.md](PLAN.md) for the
-roadmap and [FEATURES.md](FEATURES.md) for scope.
+The app is `crates/desktop` (`hermes-desktop.exe`): Hermes's own desktop frontend, built from the
+pinned Hermes commit, in a Tauri window over the Rust backend. The earlier GPUI app (`crates/app`)
+is frozen. See [PLAN.md](PLAN.md) for the roadmap, [FEATURES.md](FEATURES.md) for scope and
+[PORTING.md](PORTING.md) for what comes from where in Hermes and how to update to a newer Hermes.
 
 ## Build and run
 
@@ -15,9 +16,10 @@ Windows 11 SDK, and [rustup](https://rustup.rs). `rust-toolchain.toml` selects R
 automatically (rustup downloads it on first use).
 
 ```powershell
-cargo run -p hermes-rs            # the app (debug build; first build takes several minutes)
-cargo run -p hermes-rs --release  # optimized build
-cargo test                        # our crates' tests
+powershell -File scripts/build-hermes-webapp.ps1  # Hermes's frontend, once per HERMES_COMMIT (Node 26+ in tools\node)
+cargo run -p hermes-desktop                       # the app (debug build; first build takes several minutes)
+cargo run -p hermes-desktop --release             # optimized build
+cargo test                                        # our crates' tests
 ```
 
 Run the agent headless against a real endpoint (dev example; OpenRouter by default, works in
@@ -37,7 +39,8 @@ For another OpenAI-compatible server set `HERMES_BASE_URL` (e.g. `http://localho
 
 | Path | What |
 |---|---|
-| `crates/app` | The desktop app (`hermes-rs.exe`) |
+| `crates/desktop` | The app (`hermes-desktop.exe`): serves Hermes's frontend, speaks its protocol (see its README) |
+| `crates/app` | The GPUI app (`hermes-rs.exe`), frozen |
 | `crates/runtime` | Sessions and turns: assembles the agent, persists, streams events to the UI |
 | `crates/tools` | Agent tools: terminal, background processes, files, patch, search, todo, clarify |
 | `crates/prompts` | System-prompt builder and tool schemas (`prompts/tools`) |
@@ -45,6 +48,7 @@ For another OpenAI-compatible server set `HERMES_BASE_URL` (e.g. `http://localho
 | `crates/agent` | Agent state machine, skills discovery, compaction (from Goose) |
 | `crates/llm` | Messages, OpenAI-compatible provider, model catalog and discovery (from Goose) |
 | `vendor/zed` | GPUI, `ui`, `theme` and support crates copied from Zed (`scripts/vendor_zed.py`) |
+| `HERMES_COMMIT` | The Hermes commit this tree ports ([PORTING.md](PORTING.md)) |
 | `prompts/hermes` | Hermes prompts and tool schemas (`scripts/extract_hermes_prompts.py`) |
 | `skills` | Bundled skills from Hermes |
 | `assets` | Fonts, icons and themes from Zed |

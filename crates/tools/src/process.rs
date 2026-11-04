@@ -1,4 +1,6 @@
 //! Background processes: `terminal(background=true)` and the `process_manage` tool.
+//!
+//! Hermes: `tools/process_registry.py` (and its `process_registry_*.py` siblings).
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;

@@ -1,19 +1,21 @@
 # Builds Hermes's webapp bundle (the desktop frontend in browser mode) that hermes-desktop serves.
 #
-#   powershell -File scripts/build-hermes-webapp.ps1 [-Hermes ..\hermes-agent] [-Commit c419cf7c]
+#   powershell -File scripts/build-hermes-webapp.ps1 [-Hermes ..\hermes-agent] [-Commit <sha>]
 #
-# Exports Hermes at the pinned commit into target/hermes-src (the Hermes checkout is not touched)
+# Exports Hermes at the pinned commit (HERMES_COMMIT at the repository root, unless -Commit says
+# otherwise) into target/hermes-src (the Hermes checkout is not touched)
 # and runs Hermes's own build (apps/desktop/scripts/build-webapp.mjs) with the portable Node in
 # tools/node. Output: target/hermes-src/apps/desktop/dist-webapp, where hermes-desktop looks for it
 # (or set HERMES_UI_DIST).
 param(
     [string]$Hermes = (Join-Path $PSScriptRoot '..\..\hermes-agent'),
     # The commit the hermes-rs backend ports; the frontend must match it.
-    [string]$Commit = 'c419cf7c'
+    [string]$Commit = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+if (-not $Commit) { $Commit = (Get-Content (Join-Path $root 'HERMES_COMMIT') -Raw).Trim() }
 $node = Join-Path $root 'tools\node'
 if (-not (Test-Path (Join-Path $node 'node.exe'))) {
     Write-Error "Node 26+ is expected in tools\node (the official win-x64 zip, unpacked)."
