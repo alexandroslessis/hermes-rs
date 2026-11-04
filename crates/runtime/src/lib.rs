@@ -916,7 +916,11 @@ impl Runtime {
         let max_iterations = self.config.max_iterations;
         let session_id = session_id.to_string();
         let turn_cancel = cancel.clone();
-        tokio::spawn(async move {
+        // A turn that panics (a bug in a tool, say) must still end: otherwise the session stays
+        // "running", Stop finds nothing to stop, and every new prompt waits behind it forever.
+        let guard_session = runtime.session.clone();
+        let guard_events = events_tx.clone();
+        let turn = tokio::spawn(async move {
             if let Some((text, images)) = deferred {
                 let session = runtime.session.clone();
                 let attachments =
@@ -1038,6 +1042,18 @@ impl Runtime {
             let finished = status == TurnStatus::Completed;
             let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
             review_setup.after_turn(&runtime.session, turn_start, review_memory, finished);
+        });
+        tokio::spawn(async move {
+            if let Err(error) = turn.await
+                && error.is_panic()
+            {
+                tracing::error!("turn crashed: {error}");
+                *guard_session.running.lock() = None;
+                *guard_session.turn_state.lock() = None;
+                let _ = guard_events.send(RuntimeEvent::TurnFinished(TurnStatus::Failed(
+                    "The turn stopped on an internal error (details in the log).".into(),
+                )));
+            }
         });
         Ok(Turn {
             events: events_rx,

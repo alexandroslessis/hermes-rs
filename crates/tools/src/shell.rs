@@ -418,11 +418,47 @@ impl ShellSession {
             tree: Some(ProcessTree::contain(child.id())),
         };
         let mut stdout = child.stdout.take().expect("piped stdout");
+        // Kept up to MAX_CAPTURE_BYTES, as the bash path: the rest is read (so the command can
+        // finish) and dropped. Unbounded, a command printing millions of lines held hundreds of
+        // MB and made masking secrets in it take minutes.
         let mut captured = Vec::new();
-        let timed_out = tokio::time::timeout(timeout, stdout.read_to_end(&mut captured))
-            .await
-            .is_err();
-        let text = String::from_utf8_lossy(&captured).into_owned();
+        let mut dropped_bytes = 0usize;
+        // The end of the dropped part, where the sentinel line (exit code, folder) is.
+        let mut dropped_tail: Vec<u8> = Vec::new();
+        let read = async {
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                match stdout.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        let keep = n.min(MAX_CAPTURE_BYTES.saturating_sub(captured.len()));
+                        captured.extend_from_slice(&chunk[..keep]);
+                        dropped_bytes += n - keep;
+                        if keep < n {
+                            dropped_tail.extend_from_slice(&chunk[keep..n]);
+                            let excess = dropped_tail.len().saturating_sub(8 * 1024);
+                            dropped_tail.drain(..excess);
+                        }
+                    }
+                }
+            }
+        };
+        let timed_out = tokio::time::timeout(timeout, read).await.is_err();
+        let mut text = String::from_utf8_lossy(&captured).into_owned();
+        if dropped_bytes > 0 {
+            // The sentinel line is in the dropped part: keep only whole lines, and say so.
+            if let Some(end) = text.rfind('\n') {
+                text.truncate(end);
+            }
+            text.push_str(&format!(
+                "\n[... {dropped_bytes} more bytes of output were not kept ...]\n"
+            ));
+            let tail = String::from_utf8_lossy(&dropped_tail);
+            if let Some(line) = tail.lines().find(|l| l.starts_with(&sentinel)) {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
         let mut exit_code = None;
         let mut lines = Vec::new();
         for line in text.lines() {

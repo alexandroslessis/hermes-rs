@@ -173,17 +173,56 @@ fn already_masked(value: &str) -> bool {
     value == "***" || value.contains("...") && value.len() <= 13 || value.starts_with("«redacted")
 }
 
+/// `regex.replace_all`, which never panics: when the backtracking engine gives up on the whole
+/// text (`BacktrackLimitExceeded`, fancy-regex's `replace_all` unwraps it), each line is tried on
+/// its own; a line it still can't scan is kept as it is.
 fn replace(regex: &Regex, text: &str, render: impl Fn(&Captures) -> String) -> String {
-    regex
-        .replace_all(text, |caps: &Captures| render(caps))
-        .into_owned()
+    if let Ok(replaced) = regex.try_replacen(text, 0, |caps: &Captures| render(caps)) {
+        return replaced.into_owned();
+    }
+    text.split_inclusive('\n')
+        .map(|line| {
+            regex
+                .try_replacen(line, 0, |caps: &Captures| render(caps))
+                .map(|r| r.into_owned())
+                .unwrap_or_else(|_| line.to_string())
+        })
+        .collect()
 }
+
+/// Text past this size is masked in line-aligned chunks of about this size: the patterns' work
+/// (and backtracking) stays bounded by the chunk, not the whole output. A secret spanning a
+/// chunk boundary (only a multi-line private key could) is the price.
+const CHUNK: usize = 256 * 1024;
 
 /// Masks the secrets in `text`.
 pub fn redact(text: &str, source: Source) -> String {
     if text.is_empty() {
         return text.to_string();
     }
+    if text.len() > CHUNK {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while !rest.is_empty() {
+            let mut end = rest.len().min(CHUNK);
+            while !rest.is_char_boundary(end) {
+                end -= 1;
+            }
+            // Up to the last newline in the chunk, unless it has none.
+            if end < rest.len() {
+                if let Some(newline) = rest[..end].rfind('\n') {
+                    end = newline + 1;
+                }
+            }
+            out.push_str(&redact_chunk(&rest[..end], source));
+            rest = &rest[end..];
+        }
+        return out;
+    }
+    redact_chunk(text, source)
+}
+
+fn redact_chunk(text: &str, source: Source) -> String {
     let file = matches!(source, Source::File { .. });
     let assignments = matches!(
         source,
@@ -238,9 +277,9 @@ pub fn redact(text: &str, source: Source) -> String {
         });
     }
     if text.contains("BEGIN") && text.contains("-----") {
-        text = PRIVATE_KEY
-            .replace_all(&text, "[REDACTED PRIVATE KEY]")
-            .into_owned();
+        text = replace(&PRIVATE_KEY, &text, |_| {
+            "[REDACTED PRIVATE KEY]".to_string()
+        });
     }
     if text.contains("://") {
         text = replace(&DB_CONNSTR, &text, |caps| {
@@ -344,6 +383,22 @@ fn reads_secret_file(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn huge_output_is_masked_in_chunks_without_panicking() {
+        // A recursive file listing's worth of output (tens of MB once made a pattern exceed the
+        // regex engine's backtracking limit, and fancy-regex's replace_all panicked).
+        let mut text = String::new();
+        for i in 0..60_000 {
+            text.push_str(&format!(
+                "C:/repo/target/debug/deps/libthing-{i}.rlib: export TOKEN=x{i}\n"
+            ));
+        }
+        text.push_str("OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz0123456789\n");
+        let out = redact(&text, Source::Output);
+        assert!(!out.contains("sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"));
+        assert_eq!(out.lines().count(), text.lines().count());
+    }
 
     #[test]
     fn prefixed_keys_are_masked() {

@@ -108,6 +108,28 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
             return
+        # "please run slow": a terminal call that takes ten minutes; "please run big": one that
+        # prints two million lines (to exercise Stop and huge outputs).
+        if asked and ("please run slow" in asked or "please run big" in asked):
+            command = ("Start-Sleep -Seconds 600" if "slow" in asked
+                       else "1..2000000 | ForEach-Object { \"line $_ of a long listing\" }")
+            send({"id": "mock", "object": "chat.completion.chunk", "created": created, "model": "mock",
+                  "choices": [{"index": 0, "finish_reason": None, "delta": {"tool_calls": [{
+                      "index": 0, "id": f"call_{REQUESTS}", "type": "function",
+                      "function": {"name": "terminal", "arguments": json.dumps(
+                          {"command": command, "timeout": 900})}}]}}]})
+            send({"id": "mock", "object": "chat.completion.chunk", "created": created, "model": "mock",
+                  "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
+            send("[DONE]")
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            return
+        # "please hang": a few words, then the stream stalls (an unresponsive provider).
+        if asked and "please hang" in asked:
+            send({"id": "mock", "object": "chat.completion.chunk", "created": created, "model": "mock",
+                  "choices": [{"index": 0, "delta": {"content": "Thinking about"}, "finish_reason": None}]})
+            time.sleep(3600)
+            return
         text = "Wrote it." if last.get("role") == "tool" else reply_text(ARGS.tokens)
         interval = 1.0 / ARGS.tps
         start = time.perf_counter()
