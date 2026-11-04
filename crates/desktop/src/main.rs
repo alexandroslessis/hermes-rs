@@ -57,16 +57,6 @@ fn main() -> Result<()> {
     if !wants_git_bash(&data_dir) {
         config.shell = hermes_tools::ShellKind::PowerShell;
     }
-    // The runtime asks the user (approvals, clarify) through the page following the session.
-    let hub = Arc::new(hub::Hub::default());
-    let runtime = {
-        let _guard = tokio.enter();
-        Arc::new(Runtime::new(
-            config,
-            Arc::new(hub::DesktopBridge { hub: hub.clone() }),
-        )?)
-    };
-    runtime.warm_up();
 
     // The page keeps some settings in its localStorage, which belongs to its origin, so the
     // port stays the same between runs (HERMES_DESKTOP_PORT overrides it). When it's taken
@@ -85,21 +75,48 @@ fn main() -> Result<()> {
     let address = listener.local_addr()?;
     // The window, once Tauri has made it: the page's caption buttons act on it through the server.
     let window = Arc::new(std::sync::OnceLock::new());
-    let state = Arc::new(server::ServerState {
-        dist: webapp_dist(),
-        gateway: Arc::new(gateway::Gateway::new(runtime, hub, data_dir)),
-        token: uuid::Uuid::new_v4().simple().to_string(),
-        port: address.port(),
-        window: window.clone(),
-    });
-    tokio.spawn(async move {
-        match tokio::net::TcpListener::from_std(listener) {
-            Ok(listener) => server::serve(listener, state).await,
-            Err(error) => tracing::error!("server: {error}"),
-        }
-    });
     let url = format!("http://{address}/");
-    tracing::info!("serving Hermes's webapp at {url}");
+
+    // The backend (store, skills, tools; on a first run, seeding the bundled skills) is built
+    // while Tauri starts the window and WebView2, not before: the page only asks for it once
+    // WebView2 is up, and its first requests wait in the bound port's queue until it serves.
+    // (Built in sequence, the window started ~130ms later on every launch, ~1.9s on a first run.)
+    {
+        let window = window.clone();
+        let url = url.clone();
+        tokio.spawn(async move {
+            let built = tokio::task::spawn_blocking(move || -> Result<server::ServerState> {
+                // The runtime asks the user (approvals, clarify) through the page following the
+                // session.
+                let hub = Arc::new(hub::Hub::default());
+                let runtime = Arc::new(Runtime::new(
+                    config,
+                    Arc::new(hub::DesktopBridge { hub: hub.clone() }),
+                )?);
+                runtime.warm_up();
+                Ok(server::ServerState {
+                    dist: webapp_dist(),
+                    gateway: Arc::new(gateway::Gateway::new(runtime, hub, data_dir)),
+                    token: uuid::Uuid::new_v4().simple().to_string(),
+                    port: address.port(),
+                    window,
+                })
+            })
+            .await;
+            let state = match built {
+                Ok(Ok(state)) => Arc::new(state),
+                Ok(Err(error)) => fail(&format!("{error:#}")),
+                Err(error) => fail(&error.to_string()),
+            };
+            match tokio::net::TcpListener::from_std(listener) {
+                Ok(listener) => {
+                    tracing::info!("serving Hermes's webapp at {url}");
+                    server::serve(listener, state).await
+                }
+                Err(error) => tracing::error!("server: {error}"),
+            }
+        });
+    }
 
     tauri::Builder::default()
         .setup(move |app| {
@@ -130,6 +147,18 @@ fn main() -> Result<()> {
         .context("running the window")?;
     drop(tokio);
     Ok(())
+}
+
+/// The backend couldn't start (its data folder unreadable, the database locked by a newer
+/// schema, …): say so and quit, as the app did when the backend was built before the window.
+fn fail(error: &str) -> ! {
+    tracing::error!("starting the backend: {error}");
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Hermes")
+        .set_description(format!("Hermes couldn't start its backend:\n\n{error}"))
+        .show();
+    std::process::exit(1)
 }
 
 /// Whether Settings' config record asks for Git Bash (`terminal.shell: "bash"`).

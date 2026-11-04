@@ -656,8 +656,15 @@ impl SkillStore {
     }
 
     /// Copies the bundled skills in: new ones always, updated ones only when the user hasn't
-    /// edited the installed copy (its hash still matches the last bundled version).
+    /// edited the installed copy (its hash still matches the last bundled version). Then
+    /// records it in the skills history.
     pub fn seed_bundled(&self) {
+        let changed = self.seed_files();
+        self.record_seeding(changed);
+    }
+
+    /// The copying half of [`Self::seed_bundled`]: whether any file was written.
+    fn seed_files(&self) -> bool {
         let manifest_path = self.root.join(MANIFEST);
         let mut manifest: HashMap<String, String> = std::fs::read(&manifest_path)
             .ok()
@@ -697,8 +704,33 @@ impl SkillStore {
             &manifest_path,
             serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
         );
-        // Edits made outside skill_manage (by hand, or with the file tools) join the history
-        // before the bundle does, so either can be rolled back.
+        changed
+    }
+
+    /// [`Self::seed_bundled`] with the history kept on a background thread: the files are in
+    /// place on return, the git commits (~80ms of `git status` on every launch, a first commit of
+    /// ~300 files on a first run) follow off the startup path. The thread holds the write lock
+    /// before this returns, so any skill write waits for them and the history keeps its order.
+    pub fn seed_bundled_in_background(self: &std::sync::Arc<Self>) {
+        let changed = self.seed_files();
+        let store = self.clone();
+        let (locked, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _guard = store.write_lock.lock();
+            let _ = locked.send(());
+            store.commit_seeding(changed);
+        });
+        let _ = wait.recv();
+    }
+
+    fn record_seeding(&self, changed: bool) {
+        let _guard = self.write_lock.lock();
+        self.commit_seeding(changed);
+    }
+
+    /// Edits made outside skill_manage (by hand, or with the file tools) join the history before
+    /// the bundle does, so either can be rolled back.
+    fn commit_seeding(&self, changed: bool) {
         self.commit_outside_changes();
         if changed {
             self.commit("Seed bundled skills");
@@ -949,6 +981,30 @@ mod tests {
         assert!(!runs_on_windows(&fm));
         let (fm, _) = parse_frontmatter("---\nname: b\nplatforms: [linux, windows]\n---\nx");
         assert!(runs_on_windows(&fm));
+    }
+
+    #[test]
+    fn background_seeding_has_the_files_now_and_commits_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(SkillStore::new(
+            dir.path().join("skills"),
+            SkillsConfig::default(),
+        ));
+        store.seed_bundled_in_background();
+        // The files are there on return.
+        assert!(store.find("systematic-debugging").is_some());
+        // A write right away waits for the seeding commit, so it's the newest.
+        let created = store.manage_tool(
+            &json!({"operations": [{"action": "create", "name": "deploy",
+            "content": "---\nname: deploy\ndescription: Ships it.\n---\n# Deploy\n"}]}),
+        );
+        assert_eq!(created["success"], true, "{created}");
+        let history = store.history(5);
+        if !history.is_empty() {
+            // (No git installed: no history to check.)
+            assert_eq!(history[0].message, "skill_manage: create deploy");
+            assert_eq!(history[1].message, "Seed bundled skills");
+        }
     }
 
     #[test]

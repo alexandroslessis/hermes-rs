@@ -342,8 +342,12 @@ impl Runtime {
     pub fn new(config: RuntimeConfig, bridge: Arc<dyn UserBridge>) -> Result<Self> {
         let store = Store::open(&config.data_dir.join("sessions.db"))?;
         let memory = MemoryStore::new(config.data_dir.join("memories"), config.memory.clone());
-        let skills = SkillStore::new(config.data_dir.join("skills"), config.skills.clone());
-        skills.seed_bundled();
+        let skills = Arc::new(SkillStore::new(
+            config.data_dir.join("skills"),
+            config.skills.clone(),
+        ));
+        // The files now; their git history off the startup path.
+        skills.seed_bundled_in_background();
         let approvals = Arc::new(hermes_tools::approval::ApprovalStore::new(&config.data_dir));
         let checkpoints = Arc::new(hermes_tools::checkpoints::Checkpoints::new(
             config.data_dir.join("checkpoints"),
@@ -352,7 +356,7 @@ impl Runtime {
         Ok(Self {
             store: Arc::new(store),
             memory: Arc::new(memory),
-            skills: Arc::new(skills),
+            skills,
             approvals,
             checkpoints,
             mcp: Arc::default(),
