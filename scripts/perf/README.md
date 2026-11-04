@@ -63,6 +63,9 @@ rollback, `/undo`, the built-in commands, export, compress, the curator, memory,
 `rollback-check.mjs` is the checkpoint round trip on its own; `stop-check.mjs` checks Stop on a
 stalled provider, a long command and a huge output; `endpoints-check.mjs` checks Settings ▸
 Providers ▸ Custom endpoints (validate, save with a key, the picker, activate, delete).
+`attach-check.mjs` checks composer attachments (image upload and read-back, images reaching the
+model, held and detached images, file upload and `file.attach`); it is the provider on :47900
+itself, so stop `mock_llm.py` first.
 
 ## Bundle analysis
 

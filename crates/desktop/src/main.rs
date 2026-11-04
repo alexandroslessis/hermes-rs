@@ -5,6 +5,7 @@
 // Release builds are GUI-only (no console window); debug builds keep the console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod attachments;
 mod commands;
 mod endpoints;
 mod export;

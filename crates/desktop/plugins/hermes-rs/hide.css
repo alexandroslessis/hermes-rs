@@ -42,7 +42,7 @@ button:has(.codicon-mic) {
 
 /* Sub-pages of kept sections that this backend can't serve:
    Model — fallbacks, auxiliary models, subagents, mixture of agents (only the main model);
-   Chat — attachments (image input mode); Appearance — the pet;
+   Appearance — the pet;
    Safety — privacy (secret redaction);
    Keyboard — the HUD gesture and screen capture (native Desktop);
    Providers — sign-in accounts and catalog API keys (its providers are custom endpoints,
@@ -51,7 +51,6 @@ button:has(.codicon-mic) {
 [data-tour='overlay-nav'] [data-tour='nav-config:model:auxiliary'],
 [data-tour='overlay-nav'] [data-tour='nav-config:model:delegation'],
 [data-tour='overlay-nav'] [data-tour='nav-config:model:moa'],
-[data-tour='overlay-nav'] [data-tour='nav-config:chat:attachments'],
 [data-tour='overlay-nav'] [data-tour='nav-config:appearance:pet'],
 [data-tour='overlay-nav'] [data-tour='nav-config:safety:privacy'],
 [data-tour='overlay-nav'] [data-tour='nav-keybinds:hud-gesture'],

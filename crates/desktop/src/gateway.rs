@@ -41,6 +41,14 @@ const FALLBACK_CONTEXT: usize = 256_000;
 /// in the data folder.
 const GENERATION_FILE: &str = "generation-stats.json";
 
+/// What a provider's listing (or the bundled catalog) says about a model.
+#[derive(Debug, Clone, Copy, Default)]
+struct ModelFacts {
+    context_length: Option<usize>,
+    /// It accepts images.
+    vision: Option<bool>,
+}
+
 pub struct Gateway {
     pub runtime: Arc<Runtime>,
     pub rest: crate::rest::Rest,
@@ -64,10 +72,12 @@ pub struct Gateway {
     /// Sessions with a turn in flight, counting the queued prompts that follow it.
     live_turns: std::sync::Mutex<std::collections::HashSet<String>>,
     /// `provider\nmodel` → its context window, as the provider lists it (asked once).
-    context_lengths: std::sync::Mutex<std::collections::HashMap<String, Option<usize>>>,
+    context_lengths: std::sync::Mutex<std::collections::HashMap<String, ModelFacts>>,
     /// Session id → output tokens generated and the seconds the model calls took (kept in
     /// `GENERATION_FILE`; the status bar's tokens per second).
     generation: std::sync::Mutex<std::collections::HashMap<String, (u64, f64)>>,
+    /// Session id → images attached for its next prompt (`image.attach`, `image.attach_bytes`).
+    pending_images: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
 }
 
 impl Gateway {
@@ -87,6 +97,7 @@ impl Gateway {
             pending_routes: Default::default(),
             live_turns: Default::default(),
             context_lengths: Default::default(),
+            pending_images: Default::default(),
             generation: std::sync::Mutex::new(
                 std::fs::read(data_dir_for_stats.join(GENERATION_FILE))
                     .ok()
@@ -478,6 +489,62 @@ impl Gateway {
             "session.rewind" => self.rewind_turn(params),
             "rollback.list" | "rollback.diff" | "rollback.restore" => self.rollback(method, params),
             "session.export" => self.export_session(params),
+            // A file attached in the composer: copied into the session's folder, referenced as
+            // `@file:` in the prompt (`attachments.rs`).
+            "file.attach" => {
+                let id = session_id(params)?;
+                let record = self
+                    .runtime
+                    .store()
+                    .session(&id)
+                    .ok()
+                    .flatten()
+                    .ok_or((INVALID_PARAMS, format!("No session {id}.")))?;
+                crate::attachments::attach_file(std::path::Path::new(&record.cwd), params)
+                    .map_err(|e| (INVALID_PARAMS, e))
+            }
+            // Images held for the session's next prompt (the page's path when it doesn't upload
+            // them with the prompt).
+            "image.attach" | "image.attach_bytes" => {
+                let id = session_id(params)?;
+                let path = if method == "image.attach" {
+                    let path = params["path"].as_str().unwrap_or_default().trim().to_string();
+                    let file = std::path::Path::new(&path);
+                    if !file.is_file() {
+                        return Err((INVALID_PARAMS, format!("image not found: {path}")));
+                    }
+                    if !crate::attachments::is_image(file) {
+                        return Err((INVALID_PARAMS, format!("unsupported image: {path}")));
+                    }
+                    path
+                } else {
+                    let (status, saved) =
+                        crate::attachments::image_from_base64(&self.data_dir, params);
+                    if status != 200 {
+                        let detail = saved["detail"].as_str().unwrap_or("The image wasn't saved.");
+                        return Err((INVALID_PARAMS, detail.to_string()));
+                    }
+                    saved["path"].as_str().unwrap_or_default().to_string()
+                };
+                let mut pending = self.pending_images.lock().unwrap_or_else(|e| e.into_inner());
+                let images = pending.entry(id).or_default();
+                images.push(path.clone());
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                Ok(json!({"attached": true, "path": path, "name": name, "count": images.len(),
+                          "text": format!("[User attached image: {name}]")}))
+            }
+            "image.detach" => {
+                let id = session_id(params)?;
+                let path = params["path"].as_str().unwrap_or_default().trim();
+                let mut pending = self.pending_images.lock().unwrap_or_else(|e| e.into_inner());
+                let images = pending.entry(id).or_default();
+                let before = images.len();
+                images.retain(|p| p != path);
+                Ok(json!({"detached": images.len() != before, "count": images.len()}))
+            }
             // Activity over the last `days` (default 30): sessions touched and their messages.
             "insights.get" => {
                 let days = params["days"].as_i64().filter(|d| *d > 0).unwrap_or(30);
@@ -507,7 +574,16 @@ impl Gateway {
             "session.close" => Ok(json!({"closed": true})),
             "session.create" => self.create_session(params, &settings, outbox),
             "session.resume" | "session.history" => self.resume_session(params, outbox),
-            "prompt.submit" => self.submit(params, &settings, outbox, true),
+            "prompt.submit" => {
+                // What the model takes (images, its window) is asked of the provider once, before
+                // the turn starts.
+                if let Ok(id) = session_id(params)
+                    && let Some(record) = self.runtime.store().session(&id).ok().flatten()
+                {
+                    self.model_facts(&record.provider, &record.model).await;
+                }
+                self.submit(params, &settings, outbox, true)
+            }
             // The page's answer to an approval card (`choice`) or a clarify question (`answer`),
             // named by the prompt id it was shown with.
             "approval.respond" | "clarify.respond" => {
@@ -863,7 +939,7 @@ impl Gateway {
                 self.context_lengths
                     .lock()
                     .ok()
-                    .and_then(|lengths| lengths.get(&key).copied().flatten())
+                    .and_then(|lengths| lengths.get(&key).and_then(|facts| facts.context_length))
                     .unwrap_or(FALLBACK_CONTEXT)
             })
             .unwrap_or(0);
@@ -901,6 +977,19 @@ impl Gateway {
     /// A model's context window, as its provider lists it (remembered once the provider has
     /// answered), else Hermes's fallback for an unknown window.
     async fn context_length(&self, provider: &str, model: &str) -> usize {
+        let settings = Settings::load(&self.data_dir);
+        if let Some(length) = settings.provider(provider).and_then(|p| p.context_length) {
+            return length;
+        }
+        self.model_facts(provider, model)
+            .await
+            .context_length
+            .unwrap_or(FALLBACK_CONTEXT)
+    }
+
+    /// The model's window and whether it takes images, as its provider lists it (filled from the
+    /// bundled catalog), asked once.
+    async fn model_facts(&self, provider: &str, model: &str) -> ModelFacts {
         let key = format!("{provider}\n{model}");
         if let Some(known) = self
             .context_lengths
@@ -908,29 +997,43 @@ impl Gateway {
             .ok()
             .and_then(|lengths| lengths.get(&key).copied())
         {
-            return known.unwrap_or(FALLBACK_CONTEXT);
+            return known;
         }
         let settings = Settings::load(&self.data_dir);
-        if let Some(length) = settings.provider(provider).and_then(|p| p.context_length) {
-            return length;
-        }
         let listed = match settings.provider(provider) {
             Some(provider) if provider.ready() => provider.runtime().list_models().await.ok(),
             _ => None,
         };
         // A provider that didn't answer is asked again next time; one that answered without the
-        // model's window is not.
+        // model is not.
         let Some(models) = listed else {
-            return FALLBACK_CONTEXT;
+            return ModelFacts::default();
         };
-        let length = models
+        let facts = models
             .into_iter()
             .find(|m| m.id == model)
-            .and_then(|m| m.context_length);
+            .map(|m| ModelFacts { context_length: m.context_length, vision: m.supports_vision })
+            .unwrap_or_default();
         if let Ok(mut lengths) = self.context_lengths.lock() {
-            lengths.insert(key, length);
+            lengths.insert(key, facts);
         }
-        length.unwrap_or(FALLBACK_CONTEXT)
+        facts
+    }
+
+    /// Whether attached images go to the model as images (Hermes's `agent.image_input_mode`:
+    /// `native` always, `text` never, `auto` when the model takes them). Otherwise the prompt
+    /// names the image's path, for `vision_analyze`.
+    fn sends_images(&self, provider: &str, model: &str) -> bool {
+        match self.rest.config_value("agent.image_input_mode").as_str() {
+            Some("native") => true,
+            Some("text") => false,
+            _ => self
+                .context_lengths
+                .lock()
+                .ok()
+                .and_then(|facts| facts.get(&format!("{provider}\n{model}")).and_then(|f| f.vision))
+                .unwrap_or(false),
+        }
     }
 
     /// The context gauge (`session.context_breakdown`, Hermes's `agent/context_breakdown.py`):
@@ -1821,24 +1924,40 @@ impl Gateway {
         // The turn's rows start here (its receipt names them).
         let first_row = self.runtime.messages(&id).map(|m| m.len()).unwrap_or(0);
         let (record_provider, record_model) = (record.provider.clone(), record.model.clone());
-        let mut turn = self
-            .runtime
-            .start_turn(
-                &id,
-                &provider,
-                TurnOptions {
-                    // Only a picked effort is sent; unset leaves the provider's default (as Hermes).
-                    effort: self
-                        .efforts
-                        .lock()
-                        .ok()
-                        .and_then(|efforts| efforts.get(&id).cloned())
-                        .filter(|e| e != "none"),
-                    ..TurnOptions::default()
-                },
-                &text,
-            )
-            .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+        let options = TurnOptions {
+            // Only a picked effort is sent; unset leaves the provider's default (as Hermes).
+            effort: self
+                .efforts
+                .lock()
+                .ok()
+                .and_then(|efforts| efforts.get(&id).cloned())
+                .filter(|e| e != "none"),
+            supports_vision: self.sends_images(&record_provider, &record_model),
+            ..TurnOptions::default()
+        };
+        // Images attached in the composer (`attachments: [{path, mime}]`, uploaded first through
+        // `/api/chat/image-upload`): their bytes go with the prompt.
+        // Images attached through `image.attach` go with this prompt too.
+        let held: Vec<Value> = self
+            .pending_images
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|path| json!({"path": path}))
+            .collect();
+        let mut listed = params["attachments"].as_array().cloned().unwrap_or_default();
+        listed.extend(held);
+        let images = crate::attachments::image_bytes(&Value::Array(listed))
+            .map_err(|e| (INVALID_PARAMS, e))?;
+        let started = if images.is_empty() {
+            self.runtime.start_turn(&id, &provider, options, &text)
+        } else {
+            self.runtime
+                .start_turn_with_images(&id, &provider, options, &text, images)
+        };
+        let mut turn = started.map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
         self.subscribe(&id, outbox);
         let id_for_receipt = id.clone();
         // Only a request that named its admission is released by name after its receipt (a
@@ -2057,6 +2176,11 @@ impl Gateway {
         self.hub.emit(session_id, event, payload);
     }
 
+    /// The app's data folder.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
     /// REST routes this backend serves: `(status, body)`, or `None` for Hermes's 404.
     pub async fn rest(
         &self,
@@ -2092,6 +2216,22 @@ impl Gateway {
                 }
             }
             return Some(answer);
+        }
+        // The composer's attachments (`attachments.rs`).
+        if (method, path) == ("POST", "/api/chat/image-upload") {
+            let body: Value = serde_json::from_slice(body).unwrap_or_default();
+            let data_dir = self.data_dir.clone();
+            return tokio::task::spawn_blocking(move || {
+                crate::attachments::upload_image(&data_dir, &body)
+            })
+            .await
+            .ok();
+        }
+        if (method, path) == ("GET", "/api/fs/read-data-url") {
+            let file = crate::rest::query_param(query, "path").unwrap_or_default();
+            return tokio::task::spawn_blocking(move || crate::attachments::read_data_url(&file))
+                .await
+                .ok();
         }
         // Sign-in providers (Nous Portal, Claude, Codex): none here.
         if (method, path) == ("GET", "/api/providers/oauth") {

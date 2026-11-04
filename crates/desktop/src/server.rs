@@ -51,6 +51,12 @@ pub async fn serve(listener: tokio::net::TcpListener, state: Arc<ServerState>) {
     let app = Router::new()
         .route("/api/ws", get(websocket))
         .route("/api/hermes-rs/window", axum::routing::post(window_control))
+        .route(
+            "/api/chat/file-upload",
+            axum::routing::post(file_upload).layer(axum::extract::DefaultBodyLimit::max(
+                crate::attachments::MAX_BYTES + (1 << 20),
+            )),
+        )
         .route("/api/{*rest}", any(api))
         .fallback(get(static_file))
         .layer(axum::middleware::from_fn_with_state(
@@ -168,11 +174,45 @@ async fn websocket(
         .on_upgrade(move |socket| async move { gateway.connection(socket).await })
 }
 
+/// `POST /api/chat/file-upload` (multipart, field `file`): a file the composer attaches
+/// (`attachments.rs`).
+async fn file_upload(
+    State(state): State<Arc<ServerState>>,
+    mut form: axum::extract::Multipart,
+) -> Response {
+    let mut answer = (400, serde_json::json!({"detail": "file is required"}));
+    while let Ok(Some(field)) = form.next_field().await {
+        if field.name() != Some("file") {
+            continue;
+        }
+        let name = field.file_name().unwrap_or_default().to_string();
+        answer = match field.bytes().await {
+            Ok(bytes) => {
+                let data_dir = state.gateway.data_dir().to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    crate::attachments::store_upload(&data_dir, &name, &bytes)
+                })
+                .await
+                .unwrap_or((500, serde_json::json!({"detail": "The upload failed."})))
+            }
+            Err(e) => (413, serde_json::json!({"detail": format!("The upload failed: {e}")})),
+        };
+        break;
+    }
+    (
+        StatusCode::from_u16(answer.0).unwrap_or(StatusCode::OK),
+        [(header::CONTENT_TYPE, "application/json")],
+        answer.1.to_string(),
+    )
+        .into_response()
+}
+
 /// REST: the routes this backend implements, else Hermes's catch-all 404.
 async fn api(State(state): State<Arc<ServerState>>, request: Request) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
-    let body = axum::body::to_bytes(request.into_body(), 16 << 20)
+    // (An image upload is a data URL: a third larger than the image.)
+    let body = axum::body::to_bytes(request.into_body(), 40 << 20)
         .await
         .unwrap_or_default();
     match state
