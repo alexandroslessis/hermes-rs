@@ -72,6 +72,11 @@ refresh it against the new Hermes commit (edit the exported file, then diff it a
   in browser mode): the server opens Windows' Save As dialog and writes the file
   (`POST /api/hermes-rs/save-file`; the content comes from `session.export`, `src/export.rs`).
 
+- **0009-providers-open-on-custom-endpoints.patch** (`app/settings/index.tsx`): Settings ▸
+  Providers opens on Custom endpoints instead of Accounts. hermes-rs's providers are
+  OpenAI-compatible endpoints (`src/endpoints.rs`); the Accounts (sign-in) and API keys (Hermes's
+  provider catalog) sub-pages are hidden by `hide.css`.
+
 Startup bundle (JavaScript reached before the first paint), Hermes `c419cf7c`: 9.3 MB in 145
 files before 0003/0004, 6.6 MB in 109 after.
 

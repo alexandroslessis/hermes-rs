@@ -16,6 +16,23 @@ pub struct ProviderSettings {
     pub base_url: String,
     #[serde(default)]
     pub api_key_env: Option<String>,
+    // Settings ▸ Providers ▸ Custom endpoints (`endpoints.rs`); the GPUI app ignores them.
+    /// The model the endpoint starts with when made the default.
+    #[serde(default)]
+    pub default_model: Option<String>,
+    /// The endpoint's models when it doesn't list them (`discover_models` off).
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Ask the endpoint's `/models` for its models (else `models` is the list).
+    #[serde(default = "discover_by_default")]
+    pub discover_models: bool,
+    /// The context window to assume for the endpoint's models, when it doesn't say.
+    #[serde(default)]
+    pub context_length: Option<usize>,
+}
+
+fn discover_by_default() -> bool {
+    true
 }
 
 /// A model on a particular provider (the GPUI app's `ModelChoice`).
@@ -108,6 +125,26 @@ impl ProviderSettings {
     /// Callable: a key, or a server on this machine that needs none.
     pub fn ready(&self) -> bool {
         self.is_local() || self.api_key().is_some()
+    }
+
+    /// The model ids the picker offers: the endpoint's own list (asked when `discover_models`),
+    /// else the configured ones; both when it lists some and others are configured.
+    pub async fn model_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = if self.discover_models && self.ready() {
+            self.runtime()
+                .list_models()
+                .await
+                .map(|models| models.into_iter().map(|m| m.id).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for model in self.models.iter().chain(self.default_model.as_ref()) {
+            if !model.is_empty() && !ids.contains(model) {
+                ids.push(model.clone());
+            }
+        }
+        ids
     }
 
     pub fn runtime(&self) -> ProviderConfig {

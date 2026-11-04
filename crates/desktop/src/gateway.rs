@@ -748,16 +748,7 @@ impl Gateway {
         let mut providers = Vec::new();
         for provider in &settings.providers {
             let current = current_provider.as_deref() == Some(provider.id.as_str());
-            let models: Vec<String> = if provider.ready() {
-                provider
-                    .runtime()
-                    .list_models()
-                    .await
-                    .map(|models| models.into_iter().map(|m| m.id).collect())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            let models = provider.model_ids().await;
             providers.push(json!({
                 "slug": provider.id,
                 "name": provider.name,
@@ -920,6 +911,9 @@ impl Gateway {
             return known.unwrap_or(FALLBACK_CONTEXT);
         }
         let settings = Settings::load(&self.data_dir);
+        if let Some(length) = settings.provider(provider).and_then(|p| p.context_length) {
+            return length;
+        }
         let listed = match settings.provider(provider) {
             Some(provider) if provider.ready() => provider.runtime().list_models().await.ok(),
             _ => None,
@@ -2073,6 +2067,40 @@ impl Gateway {
     ) -> Option<(u16, Value)> {
         if (method, path) == ("GET", "/api/profiles/sessions") {
             return Some((200, self.session_list(query)));
+        }
+        // Settings ▸ Providers ▸ Custom endpoints (`endpoints.rs`).
+        if let Some(rest) = path.strip_prefix("/api/providers/custom-endpoints") {
+            let body: Value = serde_json::from_slice(body).unwrap_or_default();
+            let answer = match (method, rest.trim_start_matches('/')) {
+                ("GET", "") => (200, crate::endpoints::list(&self.data_dir)),
+                ("POST", "") => crate::endpoints::save(&self.data_dir, &body),
+                ("POST", "validate") => crate::endpoints::validate(&self.data_dir, &body).await,
+                ("POST", id) if id.ends_with("/activate") => {
+                    let id = crate::rest::percent_decode(id.trim_end_matches("/activate"));
+                    crate::endpoints::activate(&self.data_dir, &id).await
+                }
+                ("DELETE", id) if !id.is_empty() => {
+                    let id = crate::rest::percent_decode(id);
+                    crate::endpoints::delete(&self.data_dir, &id).await
+                }
+                _ => return None,
+            };
+            if method != "GET" {
+                // A changed endpoint may have a new window or models.
+                if let Ok(mut lengths) = self.context_lengths.lock() {
+                    lengths.clear();
+                }
+            }
+            return Some(answer);
+        }
+        // Sign-in providers (Nous Portal, Claude, Codex): none here.
+        if (method, path) == ("GET", "/api/providers/oauth") {
+            return Some((200, json!({"providers": []})));
+        }
+        // Hermes's catalog of provider keys (`.env`): none here, an endpoint keeps its own key.
+        // The Providers page waits for it before showing any view.
+        if (method, path) == ("GET", "/api/env") {
+            return Some((200, json!({})));
         }
         // The sidebar's search: the sessions whose messages match, one hit each, newest first
         // (Hermes's `/api/sessions/search`, over the store's full-text index).

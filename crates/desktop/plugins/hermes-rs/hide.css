@@ -29,8 +29,6 @@ button:has(.codicon-mic) {
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-config:advanced']) + [id$='-config:advanced'],
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-billing']),
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-billing']) + [id$='-billing'],
-[data-tour='overlay-nav'] div:has(> [data-tour='nav-providers']),
-[data-tour='overlay-nav'] div:has(> [data-tour='nav-providers']) + [id$='-providers'],
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-gateway']),
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-gateway']) + [id$='-gateway'],
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-keys']),
@@ -46,7 +44,9 @@ button:has(.codicon-mic) {
    Model — fallbacks, auxiliary models, subagents, mixture of agents (only the main model);
    Chat — attachments (image input mode); Appearance — the pet;
    Safety — privacy (secret redaction);
-   Keyboard — the HUD gesture and screen capture (native Desktop). */
+   Keyboard — the HUD gesture and screen capture (native Desktop);
+   Providers — sign-in accounts and catalog API keys (its providers are custom endpoints,
+   patches/0009). */
 [data-tour='overlay-nav'] [data-tour='nav-config:model:fallbacks'],
 [data-tour='overlay-nav'] [data-tour='nav-config:model:auxiliary'],
 [data-tour='overlay-nav'] [data-tour='nav-config:model:delegation'],
@@ -55,6 +55,8 @@ button:has(.codicon-mic) {
 [data-tour='overlay-nav'] [data-tour='nav-config:appearance:pet'],
 [data-tour='overlay-nav'] [data-tour='nav-config:safety:privacy'],
 [data-tour='overlay-nav'] [data-tour='nav-keybinds:hud-gesture'],
+[data-tour='overlay-nav'] [data-tour='nav-pview:accounts'],
+[data-tour='overlay-nav'] [data-tour='nav-pview:keys'],
 [data-tour='overlay-nav'] [data-tour='nav-keybinds:screen-capture'] {
   display: none !important;
 }

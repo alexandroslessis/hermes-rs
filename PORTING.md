@@ -53,6 +53,7 @@ Not from Hermes, so not in the map:
 | `paths.rs` | `tui_gateway/methods_complete.py` (`@` paths), `/api/fs/list` |
 | `projects.rs` | `tui_gateway/project_tree.py` |
 | `git.rs` | `hermes_cli/web_git.py` |
+| `endpoints.rs` | `hermes_cli/web_routers/models.py` (`/api/providers/custom-endpoints*`), `hermes_cli/custom_providers.py`; Chat Completions only |
 | `export.rs` | `session.export` (`tui_gateway/methods_session.py`), the page's `/save` |
 | `maintenance.rs` | `hermes_cli/web_routers/status.py` (`/api/curator*`, `/api/actions/*`), `hermes_cli/web_routers/ops.py` (`/api/memory*`), `agent/curator.py` (the schedule) |
 | `skills.rs` | `hermes_cli/web_routers/skills.py` (local routes), `hermes_cli/skills_config.py`; the hub (`tools/skills_hub*.py`, `tools/skills_guard.py`) not ported |

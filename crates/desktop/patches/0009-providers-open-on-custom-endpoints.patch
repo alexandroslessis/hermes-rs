@@ -1,0 +1,22 @@
+--- a/apps/desktop/src/app/settings/index.tsx
++++ b/apps/desktop/src/app/settings/index.tsx
+@@ -164,7 +164,9 @@
+   }, [activeView, setActiveView])
+   // Providers subnav (Accounts vs API keys) lives in its own param so each
+   // sub-view is deep-linkable and survives a refresh.
+-  const [providerView, setProviderView] = useRouteEnumParam<ProviderView>('pview', PROVIDER_VIEWS, 'accounts')
++  // hermes-rs: its providers are OpenAI-compatible endpoints (no sign-in accounts or catalog keys),
++  // so the section opens on Custom endpoints.
++  const [providerView, setProviderView] = useRouteEnumParam<ProviderView>('pview', PROVIDER_VIEWS, 'custom-endpoints')
+   const [keysView] = useRouteEnumParam<KeysView>('kview', KEYS_VIEWS, 'tools')
+   const [billingView] = useRouteEnumParam<BillingSubView>('bview', BILLING_VIEWS, 'overview')
+   const billingState = useBillingState()
+@@ -198,7 +200,7 @@
+   )
+ 
+   const openProviderView = useCallback(
+-    (view: ProviderView) => openSubView('providers', 'pview', view, 'accounts'),
++    (view: ProviderView) => openSubView('providers', 'pview', view, 'custom-endpoints'),
+     [openSubView]
+   )
+ 

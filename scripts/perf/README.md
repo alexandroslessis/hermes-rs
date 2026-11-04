@@ -60,7 +60,9 @@ With the mock and an instance running (`perf.ps1 -Do start`; `HERMES_PERF_EXE` p
 build), `node scripts/perf/smoke.mjs 47810 <a folder with a file in it>` drives a session the way
 the page does (the mock answers "please write file NAME" with a `write_file` call) and checks
 rollback, `/undo`, the built-in commands, export, compress, the curator, memory, search and logs.
-`rollback-check.mjs` is the checkpoint round trip on its own.
+`rollback-check.mjs` is the checkpoint round trip on its own; `stop-check.mjs` checks Stop on a
+stalled provider, a long command and a huge output; `endpoints-check.mjs` checks Settings ▸
+Providers ▸ Custom endpoints (validate, save with a key, the picker, activate, delete).
 
 ## Bundle analysis
 
