@@ -661,6 +661,28 @@ impl Runtime {
         Ok(conversation.messages().clone())
     }
 
+    /// The tool definitions every request carries, as sent: the built-in tools and the
+    /// connected MCP servers' tools (for a context breakdown).
+    pub fn tool_definitions(&self) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        let builtin = hermes_prompts::tools::tool_names()
+            .filter_map(|name| hermes_prompts::tools::tool_schema(name).ok())
+            .map(|schema| {
+                serde_json::json!({
+                    "name": schema.name,
+                    "description": schema.description,
+                    "parameters": schema.parameters,
+                })
+            })
+            .collect();
+        let mcp = self
+            .mcp
+            .tools()
+            .iter()
+            .filter_map(|tool| serde_json::to_value(tool).ok())
+            .collect();
+        (builtin, mcp)
+    }
+
     /// The session's background processes (empty when it isn't open in this process).
     pub fn processes(&self, session_id: &str) -> Vec<serde_json::Value> {
         self.sessions

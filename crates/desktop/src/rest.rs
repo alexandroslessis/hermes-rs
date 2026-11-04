@@ -309,7 +309,17 @@ pub struct Rest {
 
 impl Rest {
     pub fn new(data_dir: PathBuf) -> Self {
-        let ui_preferences = UiPreferences::read(&data_dir.join(UI_PREFERENCES_FILE));
+        let mut ui_preferences = UiPreferences::read(&data_dir.join(UI_PREFERENCES_FILE));
+        // The sidebar opens on the Projects view (a seed: a choice made in its menu stays).
+        if let Ok(true) = ui_preferences.write(&json!({
+            "seed": true,
+            "values": {"hermes.desktop.agentsGroupedByWorkspace": "true"},
+        })) {
+            let _ = std::fs::write(
+                data_dir.join(UI_PREFERENCES_FILE),
+                ui_preferences.document(),
+            );
+        }
         let config = read_json(&data_dir.join("desktop-config.json")).unwrap_or_else(|| json!({}));
         Self {
             plugins_dir: desktop_plugins_dir(&data_dir),
@@ -559,12 +569,16 @@ mod tests {
         let (_, empty) = rest
             .handle("GET", "/api/ui-preferences", None, b"")
             .unwrap();
-        assert_eq!(empty["exists"], false);
-        let theme = br#"{"values":{"hermes.desktop.theme":"dark","hermes-desktop-mode-v1":"x"}}"#;
+        // A fresh store holds only the seeded Projects view.
+        assert_eq!(
+            empty["values"],
+            json!({"hermes.desktop.agentsGroupedByWorkspace": "true"})
+        );
+        let theme = br#"{"values":{"hermes.desktop.theme":"dark","hermes-desktop-mode-v1":"x","hermes.desktop.agentsGroupedByWorkspace":"false"}}"#;
         let (_, written) = rest
             .handle("PATCH", "/api/ui-preferences", None, theme)
             .unwrap();
-        assert_eq!(written["revision"], 1);
+        assert_eq!(written["revision"], 2);
         assert_eq!(written["values"]["hermes.desktop.theme"], "dark");
         // A seed never overwrites; null deletes; foreign keys are refused whole.
         let seed = br#"{"seed":true,"values":{"hermes.desktop.theme":"light"}}"#;
@@ -583,7 +597,11 @@ mod tests {
         let (_, again) = Rest::new(dir.clone())
             .handle("GET", "/api/ui-preferences", None, b"")
             .unwrap();
-        assert_eq!(again["values"], json!({"hermes.desktop.theme": "dark"}));
+        // The user's choice of view survives the restart's seed.
+        assert_eq!(
+            again["values"],
+            json!({"hermes.desktop.theme": "dark", "hermes.desktop.agentsGroupedByWorkspace": "false"})
+        );
         assert_eq!(again["generation"], written["generation"]);
         let _ = std::fs::remove_dir_all(dir);
     }

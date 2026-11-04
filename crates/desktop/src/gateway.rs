@@ -855,7 +855,17 @@ impl Gateway {
         let system = tokens(record.system_prompt.len());
         let messages = self.runtime.messages(id).unwrap_or_default();
         let conversation = tokens(serde_json::to_string(&messages).map_or(0, |json| json.len()));
-        let estimated_total = system + conversation;
+        // Every request also carries the tool definitions: the built-in tools and MCP servers'.
+        let (builtin, mcp) = self.runtime.tool_definitions();
+        let json_tokens = |tools: &[Value]| {
+            if tools.is_empty() {
+                0
+            } else {
+                tokens(serde_json::to_string(tools).map_or(0, |json| json.len()))
+            }
+        };
+        let (tool_definitions, mcp_tools) = (json_tokens(&builtin), json_tokens(&mcp));
+        let estimated_total = system + tool_definitions + mcp_tools + conversation;
         let context_max = self
             .context_length(&record.provider, &record.model)
             .await
@@ -874,11 +884,34 @@ impl Gateway {
             used = used.min(context_max);
         }
         let category = |id: &str, label: &str, color: &str, tokens: usize| json!({"id": id, "label": label, "color": color, "tokens": tokens});
+        // Hermes's order; an empty category is left out, except the conversation.
+        let categories: Vec<Value> = [
+            (
+                "system_prompt",
+                "System prompt",
+                "var(--context-usage-system)",
+                system,
+            ),
+            (
+                "tool_definitions",
+                "Tool definitions",
+                "var(--context-usage-tools)",
+                tool_definitions,
+            ),
+            ("mcp", "MCP", "var(--context-usage-mcp)", mcp_tools),
+            (
+                "conversation",
+                "Conversation",
+                "var(--context-usage-conversation)",
+                conversation,
+            ),
+        ]
+        .into_iter()
+        .filter(|(id, _, _, tokens)| *tokens > 0 || *id == "conversation")
+        .map(|(id, label, color, tokens)| category(id, label, color, tokens))
+        .collect();
         Ok(json!({
-            "categories": [
-                category("system_prompt", "System prompt", "var(--context-usage-system)", system),
-                category("conversation", "Conversation", "var(--context-usage-conversation)", conversation),
-            ],
+            "categories": categories,
             "estimated_total": estimated_total,
             "context_max": context_max,
             "context_used": used,
