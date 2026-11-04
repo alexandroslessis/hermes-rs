@@ -35,6 +35,10 @@ pub const EXECUTION_GENERATION: u64 = 0;
 /// `DEFAULT_FALLBACK_CONTEXT`).
 const FALLBACK_CONTEXT: usize = 256_000;
 
+/// Each session's generated tokens and generation seconds (the status bar's tokens per second),
+/// in the data folder.
+const GENERATION_FILE: &str = "generation-stats.json";
+
 pub struct Gateway {
     pub runtime: Arc<Runtime>,
     pub rest: crate::rest::Rest,
@@ -57,13 +61,14 @@ pub struct Gateway {
     live_turns: std::sync::Mutex<std::collections::HashSet<String>>,
     /// `provider\nmodel` → its context window, as the provider lists it (asked once).
     context_lengths: std::sync::Mutex<std::collections::HashMap<String, Option<usize>>>,
-    /// Session id → output tokens generated and the seconds the model calls took, this run
-    /// (the status bar's tokens per second).
+    /// Session id → output tokens generated and the seconds the model calls took (kept in
+    /// `GENERATION_FILE`; the status bar's tokens per second).
     generation: std::sync::Mutex<std::collections::HashMap<String, (u64, f64)>>,
 }
 
 impl Gateway {
     pub fn new(runtime: Arc<Runtime>, hub: Arc<Hub>, data_dir: PathBuf) -> Self {
+        let data_dir_for_stats = data_dir.clone();
         let gateway = Self {
             runtime,
             rest: crate::rest::Rest::new(data_dir.clone()),
@@ -77,7 +82,12 @@ impl Gateway {
             pending_routes: Default::default(),
             live_turns: Default::default(),
             context_lengths: Default::default(),
-            generation: Default::default(),
+            generation: std::sync::Mutex::new(
+                std::fs::read(data_dir_for_stats.join(GENERATION_FILE))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                    .unwrap_or_default(),
+            ),
         };
         // The runtime keeps the approval policy in memory: Settings' choice applies from the start.
         gateway.apply_approvals_mode(&gateway.rest.config_value("approvals.mode"));
@@ -761,6 +771,10 @@ impl Gateway {
             let entry = generation.entry(id.to_string()).or_insert((0, 0.0));
             entry.0 += output_tokens;
             entry.1 += seconds;
+            // Kept across restarts (beside the store, whose schema the GPUI app shares).
+            if let Ok(json) = serde_json::to_vec(&*generation) {
+                let _ = std::fs::write(self.data_dir.join(GENERATION_FILE), json);
+            }
         }
     }
 
@@ -1087,6 +1101,8 @@ impl Gateway {
                 "execution_generation": EXECUTION_GENERATION,
                 // The queue panel's rows: prompts waiting for the running turn.
                 "pending": self.pending_rows(id),
+                // The status bar's numbers for a session opened before any turn of this run.
+                "usage": self.usage_snapshot(id, None),
             }),
             None => json!({"stored_session_id": id, "running": running}),
         }
@@ -1409,7 +1425,16 @@ impl Gateway {
                 match event {
                     RuntimeEvent::Agent(AgentEvent::Usage(usage)) => {
                         let output = usage.usage.output_tokens.unwrap_or(0).max(0) as u64;
-                        this.note_generation(&id, output, call_started.elapsed().as_secs_f64());
+                        // The provider's own timing when it reports one, else the call's.
+                        let seconds = usage
+                            .stats
+                            .as_ref()
+                            .and_then(|stats| stats.elapsed_ms)
+                            .map_or_else(
+                                || call_started.elapsed().as_secs_f64(),
+                                |ms| ms as f64 / 1000.0,
+                            );
+                        this.note_generation(&id, output, seconds);
                         last_input = usage
                             .usage
                             .input_tokens
