@@ -13,3 +13,11 @@ exported source before building the webapp. A patch that no longer applies stops
   nothing, and queued prompts lost their bubble before the next reply. Find why
   `steerQueuedNow` refuses server rows (likely its `isSteerableEntry` / `onSteer` / `busy`
   guards) before trying again, or draw the bubble from the `prompt.steer_queued` result instead.
+- **A queued message's bubble appears only after its reply.** Same root cause, for every
+  queued message (not just steered ones): with the canonical protocol (`native_dial` on the
+  socket URL) the backend owns the queue (`serverOwnsComposerQueue`), and when it starts a
+  queued admission no event draws the user's bubble; it shows when the transcript reloads.
+  `native_dial` also selects the whole canonical contract (receipts, approvals, mutations), so
+  it can't be dropped to hand the queue back to the page. Fix in the frontend: draw the bubble
+  when a pending row the page knows turns `started` (`store/pending-submissions.ts`,
+  `projectQueue`), which covers both cases.
