@@ -21,3 +21,12 @@ exported source before building the webapp. A patch that no longer applies stops
   it can't be dropped to hand the queue back to the page. Fix in the frontend: draw the bubble
   when a pending row the page knows turns `started` (`store/pending-submissions.ts`,
   `projectQueue`), which covers both cases.
+- **Tested live (2026-11-04, own instance + screenshots):** new session, "Name three animals"
+  sent, "Name three cities" queued with Ctrl+Enter. The queue card shows; when the queued turn
+  runs its reply appears straight after the first one and the "Name three cities" bubble never
+  shows, not even after the reply (only a reload of the session paints it). Backend-only levers
+  ruled out: no event draws a user bubble; the page's two transcript reloads
+  (`hydrateFromStoredSession` via `status.update` kind `ready`, `reconcileActiveTranscript`) both
+  skip while the page is busy, which it stays while it tracks the queued submission; queue
+  ownership (`serverOwnsComposerQueue`) comes from the page's own tile/route state and the
+  `native_dial` socket flag. So this needs the frontend change described above.
