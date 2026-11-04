@@ -53,3 +53,21 @@ The backend is built on the async runtime while Tauri starts WebView2 (`crates/d
 and the skills folder's git bookkeeping (`git status`, ~80 ms each launch; the first commit of ~300
 files on a first run) runs on a background thread (`SkillStore::seed_bundled_in_background`). The
 backend is now ready before WebView2 navigates; the rest of startup is WebView2's.
+
+## Bundle analysis
+
+```powershell
+# Why does a library load before the first paint? (shortest chain of static imports)
+node scripts/perf/import-chains.mjs target/hermes-src/.build/webapp-workspace <scratch dir> '@xterm/' '/katex/'
+# What the startup JavaScript is made of, by package and app folder
+node scripts/perf/sourcemap-build.mjs target/hermes-src/.build/webapp-workspace <scratch dir>
+node scripts/perf/startup-bytes.mjs <scratch dir> group 30
+```
+
+The workspace is prepared by `scripts/build-hermes-webapp.ps1` (with the patches applied).
+
+Lazy-loading xterm, CodeMirror, KaTeX and the brand icons (tried 2026-11-04, 10 Hermes files):
+startup JavaScript 6.5 -> 5.3 MB, but a fresh start's memory only -6 MB (~2%) and the composer
+~10 ms sooner. V8 compiles functions when first called and WebView2 caches compiled code, so code
+that loads but never runs costs little; not worth a 10-file patch to carry across Hermes updates.
+
