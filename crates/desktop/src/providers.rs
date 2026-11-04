@@ -93,6 +93,19 @@ pub fn save_default(data_dir: &Path, provider: &str, model: &str) -> anyhow::Res
     let object = config
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("config.json isn't an object"))?;
+    // The endpoint that stops being the default keeps its model (else it lists none, and its
+    // edit form opens without one).
+    let previous = object.get("provider").and_then(|p| p.as_str()).map(str::to_string);
+    let previous_model = object.get("model").and_then(|m| m.as_str()).map(str::to_string);
+    if let (Some(previous), Some(previous_model)) = (previous, previous_model)
+        && previous != provider
+        && !previous_model.is_empty()
+        && let Some(entries) = object.get_mut("providers").and_then(|p| p.as_array_mut())
+        && let Some(entry) = entries.iter_mut().find(|e| e["id"] == previous.as_str())
+        && entry["default_model"].as_str().is_none_or(str::is_empty)
+    {
+        entry["default_model"] = previous_model.into();
+    }
     object.insert("provider".into(), provider.into());
     object.insert("model".into(), model.into());
     std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;

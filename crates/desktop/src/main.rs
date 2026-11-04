@@ -138,6 +138,9 @@ fn main() -> Result<()> {
                 // drags and double-click maximizes; the shadow keeps the resize edges.
                 .decorations(false)
                 .shadow(true)
+                // Files dropped on the page reach it (the composer's drag-and-drop): Tauri's own
+                // drop handler would take them first.
+                .disable_drag_drop_handler()
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(720.0, 480.0)
                 .build()?;

@@ -76,6 +76,16 @@ refresh it against the new Hermes commit (edit the exported file, then diff it a
   Providers opens on Custom endpoints instead of Accounts. hermes-rs's providers are
   OpenAI-compatible endpoints (`src/endpoints.rs`); the Accounts (sign-in) and API keys (Hermes's
   provider catalog) sub-pages are hidden by `hide.css`.
+- **0010-native-zoom.patch** (`lib/browser-zoom.ts`): the text size (Ctrl +/−, Appearance) zooms
+  the window natively (`window.hermesRsWindow.setZoom` → WebView2's zoom, as Electron's
+  `webContents` zoom) instead of CSS `zoom` on the root, which misplaces every popover, menu and
+  tooltip (they open over their trigger, or cropped at the window's edge).
+- **0011-paste-files.patch** (`app/chat/composer/index.tsx`): files copied in Explorer and pasted
+  into the composer attach as a drop does (Hermes's paste takes images and text only).
+- **0012-new-endpoint-button.patch** (`app/settings/custom-endpoints-settings.tsx`): a "New
+  endpoint" button on the endpoint list. Hermes's form opens on the default endpoint and offers
+  "New endpoint" only beside it, so details typed in to add one could overwrite the endpoint open
+  in the form.
 
 Startup bundle (JavaScript reached before the first paint), Hermes `c419cf7c`: 9.3 MB in 145
 files before 0003/0004, 6.6 MB in 109 after.

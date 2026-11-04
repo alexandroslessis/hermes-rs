@@ -1,0 +1,31 @@
+--- a/apps/desktop/src/app/chat/composer/index.tsx
++++ b/apps/desktop/src/app/chat/composer/index.tsx
+@@ -43,6 +43,8 @@
+ import { $autoSpeakReplies } from '@/store/voice-prefs'
+ import { useTheme } from '@/themes'
+ 
++import { extractDroppedFiles } from '../hooks/use-composer-actions'
++
+ import { AttachmentList } from './attachments'
+ import { deriveBusySubmitState } from './busy-submit-state'
+ import { ComposerDockGlow, QueuedEditBanner } from './chat-bar-parts'
+@@ -566,6 +568,19 @@
+   }
+ 
+   const handlePaste = (event: ClipboardEvent<HTMLDivElement>) => {
++    // hermes-rs: files copied in Explorer paste as they drop (Hermes takes only images and text).
++    const pastedFiles = extractDroppedFiles(event.clipboardData).filter(
++      candidate => candidate.file && !candidate.file.type.startsWith('image/')
++    )
++
++    if (pastedFiles.length > 0 && onAttachDroppedItems) {
++      event.preventDefault()
++      triggerHaptic('selection')
++      void onAttachDroppedItems(pastedFiles)
++
++      return
++    }
++
+     const imageBlobs = extractClipboardImageBlobs(event.clipboardData)
+ 
+     if (imageBlobs.length > 0 && onAttachImageBlob) {

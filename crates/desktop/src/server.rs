@@ -121,14 +121,18 @@ async fn window_control(
     State(state): State<Arc<ServerState>>,
     body: axum::body::Bytes,
 ) -> Response {
-    let action = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| v["action"].as_str().map(str::to_string))
-        .unwrap_or_default();
+    let request = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
+    let action = request["action"].as_str().unwrap_or_default();
     let Some(window) = state.window.get() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let result = match action.as_str() {
+    let result = match action {
+        // The text size (patches/0010-native-zoom.patch): WebView2's own zoom, as Electron's,
+        // so the page lays out at the new size and its popovers measure right.
+        "zoom" => match request["factor"].as_f64().filter(|f| (0.5..=2.0).contains(f)) {
+            Some(factor) => window.set_zoom(factor),
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
         "minimize" => window.minimize(),
         "toggleMaximize" => match window.is_maximized() {
             Ok(true) => window.unmaximize(),
@@ -298,9 +302,13 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
                     "window.hermesRsWindow={{custom:true,",
                     "minimize:function(){{hermesRsWindowDo('minimize')}},",
                     "toggleMaximize:function(){{hermesRsWindowDo('toggleMaximize')}},",
-                    "close:function(){{hermesRsWindowDo('close')}}}};",
-                    "function hermesRsWindowDo(a){{fetch('/api/hermes-rs/window',{{method:'POST',",
-                    "headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:a}})}})}}",
+                    "close:function(){{hermesRsWindowDo('close')}},",
+                    "setZoom:function(f){{hermesRsWindowDo('zoom',{{factor:f}},3)}}}};",
+                    // (Retried while the window is still being made: 503.)
+                    "function hermesRsWindowDo(a,x,n){{fetch('/api/hermes-rs/window',{{method:'POST',",
+                    "headers:{{'Content-Type':'application/json'}},",
+                    "body:JSON.stringify(Object.assign({{action:a}},x||{{}}))}})",
+                    ".then(function(r){{if(r.status===503&&n)setTimeout(function(){{hermesRsWindowDo(a,x,n-1)}},500)}})}}",
                     // `/save`'s Save As dialog (patches/0008-save-dialog.patch).
                     "window.hermesRsSaveTextFileAs=function(r){{return fetch('/api/hermes-rs/save-file',",
                     "{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(r)}})",

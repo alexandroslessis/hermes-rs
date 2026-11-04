@@ -1,0 +1,33 @@
+--- a/apps/desktop/src/app/settings/custom-endpoints-settings.tsx
++++ b/apps/desktop/src/app/settings/custom-endpoints-settings.tsx
+@@ -346,7 +346,29 @@
+       <SettingsProfileScope className="mb-5" />
+       <div className="space-y-6">
+         <section>
+-          <SectionHeading icon={Globe} meta={`${endpoints.length}`} page title={t.settings.customEndpoints.title} />
++          <SectionHeading
++            aside={
++              // hermes-rs: a way to add one while another is open in the form (Hermes shows
++              // "New endpoint" only beside the form, under the endpoint being edited).
++              <Button
++                onClick={() => {
++                  setForm(EMPTY_FORM)
++                  setDiscoveredModels([])
++                  setDiscoveredDetails([])
++                }}
++                size="sm"
++                type="button"
++                variant="outline"
++              >
++                <Plus />
++                {ce.newEndpoint}
++              </Button>
++            }
++            icon={Globe}
++            meta={`${endpoints.length}`}
++            page
++            title={t.settings.customEndpoints.title}
++          />
+           <div className="divide-y divide-border/40 rounded-md border border-border/50">
+             {endpoints.length ? (
+               endpoints.map(endpoint => (

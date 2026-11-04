@@ -1,0 +1,20 @@
+--- a/apps/desktop/src/lib/browser-zoom.ts
++++ b/apps/desktop/src/lib/browser-zoom.ts
+@@ -15,6 +15,17 @@
+ 
+   const apply = (value: number) => {
+     percent = normalize(value)
++    // hermes-rs: its window zooms natively (WebView2, as Electron does), so the page lays out at the
++    // zoomed size; CSS zoom on the root misplaces every popover and tooltip.
++    const native = (window as { hermesRsWindow?: { setZoom?: (factor: number) => void } }).hermesRsWindow?.setZoom
++
++    if (native) {
++      document.documentElement.style.removeProperty('zoom')
++      native(percent / 100)
++
++      return
++    }
++
+     document.documentElement.style.zoom = String(percent / 100)
+   }
+ 
