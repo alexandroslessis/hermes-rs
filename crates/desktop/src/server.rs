@@ -118,10 +118,33 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
     let path = request.uri().path().trim_start_matches('/');
     if !path.is_empty() && !path.contains("..") {
         let file = state.dist.join(path);
-        if file.is_file() {
+        if let Ok(meta) = tokio::fs::metadata(&file).await
+            && meta.is_file()
+        {
+            // Cached, so WebView2 keeps the compiled scripts between launches (V8's code cache
+            // only serves scripts from the HTTP cache): without it every launch parses ~9 MB of
+            // JavaScript again. The bundler names everything under `assets/` by its content
+            // hash, so those never change under the same name; the few other files are
+            // revalidated by size and time (a 304 when unchanged).
+            let (cache, etag) = cache_policy(path, meta.len(), meta.modified().ok());
+            let unchanged = request
+                .headers()
+                .get(header::IF_NONE_MATCH)
+                .is_some_and(|tag| tag.as_bytes() == etag.as_bytes());
+            if unchanged {
+                return (
+                    StatusCode::NOT_MODIFIED,
+                    [(header::ETAG, etag), (header::CACHE_CONTROL, cache.into())],
+                )
+                    .into_response();
+            }
             if let Ok(bytes) = tokio::fs::read(&file).await {
                 return (
-                    [(header::CONTENT_TYPE, content_type(path))],
+                    [
+                        (header::CONTENT_TYPE, content_type(path).to_string()),
+                        (header::CACHE_CONTROL, cache.into()),
+                        (header::ETAG, etag),
+                    ],
                     Body::from(bytes),
                 )
                     .into_response();
@@ -175,6 +198,24 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
     }
 }
 
+/// A bundle file's `Cache-Control` and `ETag`: content-hashed `assets/` are kept for good, the
+/// rest revalidated by size and modification time.
+fn cache_policy(
+    path: &str,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+) -> (&'static str, String) {
+    let nanos = modified
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    let cache = if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    (cache, format!("W/\"{len:x}-{nanos:x}\""))
+}
+
 fn content_type(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
         "js" | "mjs" => "text/javascript",
@@ -192,5 +233,24 @@ fn content_type(path: &str) -> &'static str {
         "wasm" => "application/wasm",
         "webmanifest" => "application/manifest+json",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_policy;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn hashed_assets_are_kept_the_rest_revalidated() {
+        let at = Some(UNIX_EPOCH + Duration::from_secs(1));
+        let (cache, _) = cache_policy("assets/main-MDSzRDRC.js", 10, at);
+        assert_eq!(cache, "public, max-age=31536000, immutable");
+        let (cache, tag) = cache_policy("hermes.png", 10, at);
+        assert_eq!(cache, "no-cache");
+        // The tag changes with the file.
+        assert_ne!(tag, cache_policy("hermes.png", 11, at).1);
+        assert_ne!(tag, cache_policy("hermes.png", 10, Some(UNIX_EPOCH)).1);
+        assert_eq!(tag, cache_policy("hermes.png", 10, at).1);
     }
 }
