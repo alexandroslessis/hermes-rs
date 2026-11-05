@@ -12,9 +12,9 @@
  // links fall back to 'skills' via useRouteEnumParam.
  const CAPABILITY_MODES = ['skills', 'plugins', 'connectors', 'toolsets'] as const
  
-+// hermes-rs: its backend has skills, but no agent plugins, MCP connectors or switchable toolsets,
-+// so only the Skills tab is shown (other `?tab=` values fall back to it).
-+const SHOWN_MODES = ['skills'] as const
++// hermes-rs: its backend has skills and switchable toolsets, but no agent plugins or MCP connectors,
++// so only the Skills and Tools tabs are shown (other `?tab=` values fall back to Skills).
++const SHOWN_MODES = ['skills', 'toolsets'] as const
 +
  type CapabilityMode = (typeof CAPABILITY_MODES)[number]
  

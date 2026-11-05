@@ -77,6 +77,8 @@ on :47900 (stop `mock_llm.py` first).
 its own provider on :47900.
 `side-and-branch-check.mjs` checks `/branch` (all three routes, retries, the parent link), `/btw` and `/bg`
 with its own provider on :47900.
+`toolsets-check.mjs` checks Capabilities ▸ Tools (list, switch off and on, the next turn's tools, a refused
+call) with its own provider on :47900.
 
 ## Bundle analysis
 

@@ -84,6 +84,8 @@ pub struct Delegator {
     pub mcp: Arc<crate::mcp::McpManager>,
     /// The running children, for the page to list, steer and stop (`subagents.rs`).
     pub subagents: Arc<crate::subagents::Subagents>,
+    /// Tools the user switched off (Capabilities ▸ Tools), for children too.
+    pub disabled: Arc<std::collections::HashSet<String>>,
 }
 
 /// The parent's tools plus `delegate_task`.
@@ -542,6 +544,7 @@ impl Delegator {
             scratch_dir: scratch.clone(),
             state: state.clone(),
             result_limit: ops::result_size_limit(self.context_length),
+            disabled: self.disabled.clone(),
         });
         let mut model_config = ModelConfig::new(&self.model)
             .with_context_limit(self.context_length)
@@ -561,7 +564,7 @@ impl Delegator {
                 tool_names: tool_names.clone(),
             })),
             Step::Operation(Arc::new(ToolOperation::new().with_provider(provider))),
-            Step::Operation(Arc::new(ops::UnhandledToolCalls { tool_names })),
+            Step::Operation(Arc::new(ops::UnhandledToolCalls { tool_names, disabled: self.disabled.clone() })),
             // A steer from the page's subagent row, after the child's next tool results.
             Step::Operation(Arc::new(ops::DeliverSteer {
                 state: state.clone(),

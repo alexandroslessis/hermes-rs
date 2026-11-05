@@ -35,9 +35,10 @@ refresh it against the new Hermes commit (edit the exported file, then diff it a
   bundled plugin is picked up as usual; add it to the exclusion if its backend is missing.
 
 - **0005-skills-only-capabilities.patch** (`app/capabilities/index.tsx`): Capabilities shows only
-  the Skills tab; this backend has no agent plugins, MCP connectors or switchable toolsets (other
-  `?tab=` values fall back to Skills), and the page no longer downloads the plugin catalog. The
-  skills routes are `src/skills.rs`; the hub's are answered empty there (not ported).
+  the Skills and Tools tabs; this backend has no agent plugins or MCP connectors (other `?tab=`
+  values fall back to Skills), and the page no longer downloads the plugin catalog. The skills
+  routes are `src/skills.rs` (the hub's are answered empty there, not ported); the toolsets' are
+  `src/toolsets.rs`.
 
 - **0006-skills-open-on-installed.patch** (`app/capabilities/catalog/`: `use-catalog-filters.ts`,
   `catalog-browser.tsx`, `catalog-data.ts`): Skills opens with the Installed filter on (the hub

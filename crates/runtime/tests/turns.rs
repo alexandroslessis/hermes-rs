@@ -2351,6 +2351,33 @@ async fn a_background_prompt_runs_as_a_subagent_and_returns_its_answer() {
 }
 
 #[tokio::test]
+async fn a_tool_switched_off_is_not_offered_and_refused_if_called() {
+    let h = harness(vec![
+        tool_reply(&[("t1", "terminal", json!({"command": "echo hi"}))]),
+        text_reply("I couldn't run it."),
+    ])
+    .await;
+    h.runtime.set_disabled_tools(["terminal".to_string(), "process_manage".to_string()]);
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "run echo hi").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let requests = h.requests.lock().clone();
+    let offered: Vec<String> = requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!offered.contains(&"terminal".to_string()) && !offered.contains(&"process_manage".to_string()));
+    assert!(offered.contains(&"read_file".to_string()));
+    // The model called it anyway: refused, and told why.
+    let second = requests[1].to_string();
+    assert!(second.contains("turned off by the user"), "{second}");
+    // Switched back on: offered again from the next turn.
+    h.runtime.set_disabled_tools(Vec::new());
+}
+
+#[tokio::test]
 async fn paused_delegation_is_refused() {
     let h = harness(vec![
         tool_reply(&[("d1", "delegate_task", json!({"tasks": [{"goal": "x"}]}))]),

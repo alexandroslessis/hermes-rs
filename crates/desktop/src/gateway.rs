@@ -130,6 +130,9 @@ impl Gateway {
         self.runtime
             .checkpoints()
             .set_enabled(self.rest.config_value("checkpoints.enabled") != false);
+        // The tools switched off in Capabilities ▸ Tools.
+        let off = crate::toolsets::disabled_toolsets(&self.rest.config_value(crate::toolsets::CONFIG_KEY));
+        self.runtime.set_disabled_tools(crate::toolsets::disabled_tools(&off));
     }
 
     /// Hermes's `approvals.mode` on the runtime's policy: manual asks, smart has a reviewer model
@@ -2615,6 +2618,32 @@ impl Gateway {
                 }
             }
             return Some(answer);
+        }
+        // Capabilities ▸ Tools (`toolsets.rs`).
+        if let Some(route) = path.strip_prefix("/api/tools/") {
+            let off = || crate::toolsets::disabled_toolsets(&self.rest.config_value(crate::toolsets::CONFIG_KEY));
+            return match (method, route) {
+                ("GET", "toolsets") => Some((200, crate::toolsets::list(&off()))),
+                ("GET", "terminal/backends") => Some((200, crate::toolsets::terminal_backends())),
+                ("GET", rest) if rest.starts_with("toolsets/") && rest.ends_with("/config") => {
+                    let name = rest.trim_start_matches("toolsets/").trim_end_matches("/config");
+                    Some((200, crate::toolsets::config(&crate::rest::percent_decode(name))))
+                }
+                ("PUT", rest) if rest.starts_with("toolsets/") && !rest[9..].contains('/') => {
+                    let name = crate::rest::percent_decode(&rest[9..]);
+                    let body: Value = serde_json::from_slice(body).unwrap_or_default();
+                    let enabled = body["enabled"].as_bool().unwrap_or(true);
+                    match crate::toolsets::switch(&off(), &name, enabled) {
+                        Some(next) => {
+                            self.rest.set_config_value(crate::toolsets::CONFIG_KEY, json!(next));
+                            self.runtime.set_disabled_tools(crate::toolsets::disabled_tools(&next));
+                            Some((200, json!({"ok": true, "name": name, "enabled": enabled})))
+                        }
+                        None => Some((404, json!({"detail": format!("No toolset {name}.")}))),
+                    }
+                }
+                _ => None,
+            };
         }
         // The composer's attachments (`attachments.rs`).
         if (method, path) == ("POST", "/api/chat/image-upload") {

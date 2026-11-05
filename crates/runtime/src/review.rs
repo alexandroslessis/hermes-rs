@@ -190,6 +190,7 @@ async fn review(job: ReviewJob) -> Result<Vec<String>> {
         scratch_dir: session.tools.scratch_dir().to_path_buf(),
         state: state.clone(),
         result_limit: ops::result_size_limit(context_length),
+        disabled: Default::default(),
     });
     let mut model_config = ModelConfig::new(&model).with_context_limit(context_length);
     if let Some(params) = effort_params {
@@ -206,7 +207,7 @@ async fn review(job: ReviewJob) -> Result<Vec<String>> {
             tool_names: tool_names.clone(),
         })),
         Step::Operation(Arc::new(ToolOperation::new().with_provider(tools))),
-        Step::Operation(Arc::new(ops::UnhandledToolCalls { tool_names })),
+        Step::Operation(Arc::new(ops::UnhandledToolCalls { tool_names, disabled: Default::default() })),
         Step::Operation(Arc::new(ops::LengthContinuation {
             state: state.clone(),
         })),

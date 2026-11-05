@@ -23,6 +23,7 @@ mod rest;
 mod server;
 mod skills;
 mod terminal;
+mod toolsets;
 mod transcript;
 
 use std::path::PathBuf;

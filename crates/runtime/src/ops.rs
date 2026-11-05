@@ -461,6 +461,8 @@ impl Operation<TurnSession, HermesEffect> for ValidateToolCalls {
 /// had real calls. Without an answer the next request would be rejected for an unpaired call.
 pub struct UnhandledToolCalls {
     pub tool_names: Vec<String>,
+    /// Tools the user switched off: a call to one is told so (not that it doesn't exist).
+    pub disabled: Arc<HashSet<String>>,
 }
 
 #[async_trait]
@@ -498,11 +500,20 @@ impl Operation<TurnSession, HermesEffect> for UnhandledToolCalls {
                 .as_ref()
                 .map(|call| call.name.to_string())
                 .unwrap_or_default();
+            let available: Vec<String> = self
+                .tool_names
+                .iter()
+                .filter(|tool| !self.disabled.contains(*tool))
+                .cloned()
+                .collect();
+            let text = if self.disabled.contains(&name) {
+                format!("{name} is turned off by the user (Capabilities ▸ Tools); do without it.")
+            } else {
+                invalid_tool_name_message(&name, &available)
+            };
             response.add_tool_response_with_metadata(
                 request.id.clone(),
-                Ok(CallToolResult::error(vec![ContentBlock::text(
-                    invalid_tool_name_message(&name, &self.tool_names),
-                )])),
+                Ok(CallToolResult::error(vec![ContentBlock::text(text)])),
                 request.metadata.as_ref(),
             );
         }
@@ -652,6 +663,8 @@ pub struct GuardedTools {
     pub state: SharedTurnState,
     /// Characters a single result may put into the context (see [`result_size_limit`]).
     pub result_limit: usize,
+    /// Tools the user switched off (Capabilities ▸ Tools): not offered, and refused if called.
+    pub disabled: Arc<std::collections::HashSet<String>>,
 }
 
 #[async_trait]
@@ -660,7 +673,11 @@ impl ToolProvider<TurnSession> for GuardedTools {
         if self.state.lock().summary_requested {
             return Ok(Vec::new());
         }
-        self.inner.tools(session).await
+        let tools = self.inner.tools(session).await?;
+        Ok(tools
+            .into_iter()
+            .filter(|tool| !self.disabled.contains(tool.name.as_ref()))
+            .collect())
     }
 
     async fn call(
@@ -671,6 +688,13 @@ impl ToolProvider<TurnSession> for GuardedTools {
         emit: &Emitter,
     ) -> Result<CallToolResult, ErrorData> {
         let name = call.name.to_string();
+        if self.disabled.contains(&name) {
+            let text = serde_json::json!({
+                "success": false,
+                "error": format!("{name} is turned off by the user (Capabilities ▸ Tools); do without it."),
+            });
+            return Ok(CallToolResult::error(vec![rmcp::model::ContentBlock::text(text.to_string())]));
+        }
         let args = Value::Object(call.arguments.clone().unwrap_or_default());
         let result = self.inner.call(session, request_id, call, emit).await;
         match result {

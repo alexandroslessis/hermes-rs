@@ -346,6 +346,8 @@ pub struct Runtime {
     last_activity: Arc<Mutex<std::time::Instant>>,
     /// The `delegate_task` children running now (the page lists, steers and stops them).
     subagents: Arc<subagents::Subagents>,
+    /// Tools the user switched off (Capabilities ▸ Tools); each turn takes them as it starts.
+    disabled_tools: Mutex<std::collections::HashSet<String>>,
     curator_running: AtomicBool,
 }
 
@@ -381,6 +383,7 @@ impl Runtime {
             background_review: Arc::new(AtomicBool::new(true)),
             last_activity: Arc::new(Mutex::new(std::time::Instant::now())),
             subagents: Arc::default(),
+            disabled_tools: Mutex::new(Default::default()),
             curator_running: AtomicBool::new(false),
         })
     }
@@ -941,6 +944,8 @@ impl Runtime {
             summarizer.clone(),
         );
         let self_mcp = self.mcp.clone();
+        // The tools switched off as this turn starts (a switch applies from the next turn).
+        let disabled = Arc::new(self.disabled_tools.lock().clone());
         *self.last_activity.lock() = std::time::Instant::now();
         let last_activity = self.last_activity.clone();
 
@@ -1019,6 +1024,7 @@ impl Runtime {
                 scratch_dir: runtime.session.tools.scratch_dir().to_path_buf(),
                 state: state.clone(),
                 result_limit: ops::result_size_limit(context_length),
+                disabled: disabled.clone(),
             });
             let mut model_config = ModelConfig::new(&model)
                 .with_context_limit(context_length)
@@ -1037,7 +1043,7 @@ impl Runtime {
                     tool_names: tool_names.clone(),
                 })),
                 Step::Operation(Arc::new(ToolOperation::new().with_provider(tools))),
-                Step::Operation(Arc::new(ops::UnhandledToolCalls { tool_names })),
+                Step::Operation(Arc::new(ops::UnhandledToolCalls { tool_names, disabled: disabled.clone() })),
                 Step::Operation(Arc::new(ops::DeliverSteer {
                     state: state.clone(),
                 })),
@@ -1560,6 +1566,7 @@ impl Runtime {
             summarizer,
             mcp: self.mcp.clone(),
             subagents: self.subagents.clone(),
+            disabled: Arc::new(self.disabled_tools.lock().clone()),
         })
     }
 
@@ -1682,6 +1689,12 @@ impl Runtime {
             })
             .collect();
         Ok(answer.trim().to_string())
+    }
+
+    /// Tools the user switched off (Capabilities ▸ Tools), from the next turn on: not offered to
+    /// the model (nor to subagents), and refused if called anyway.
+    pub fn set_disabled_tools(&self, tools: impl IntoIterator<Item = String>) {
+        *self.disabled_tools.lock() = tools.into_iter().collect();
     }
 
     /// The `delegate_task` children running now: list, tail, steer, stop (`subagents.rs`).
