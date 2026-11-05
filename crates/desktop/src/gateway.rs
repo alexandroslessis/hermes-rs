@@ -41,6 +41,11 @@ const FALLBACK_CONTEXT: usize = 256_000;
 /// in the data folder.
 const GENERATION_FILE: &str = "generation-stats.json";
 
+/// Hermes's compaction status lines (`agent/conversation_compression.py` `COMPACTION_STATUS`,
+/// `COMPACTION_DONE_STATUS`).
+const COMPACTING_TEXT: &str = "🗜️ Compacting context — summarizing earlier conversation so I can continue...";
+const COMPACTED_TEXT: &str = "✓ Context compaction complete — continuing turn...";
+
 /// What a provider's listing (or the bundled catalog) says about a model.
 #[derive(Debug, Clone, Copy, Default)]
 struct ModelFacts {
@@ -2528,6 +2533,23 @@ impl Gateway {
                     // A subagent's activity: the page's live subagent rows.
                     RuntimeEvent::Agent(AgentEvent::Subagent { kind, payload }) => {
                         this.emit(&id, kind, payload);
+                    }
+                    // Compression before a model call can take minutes on a local model; the
+                    // page shows its "summarizing" indicator for the `compacting` /
+                    // `compacted` pair, else the turn looks hung (Hermes:
+                    // `tui_gateway/server.py` `_status_update`, `agent/conversation_compression.py`).
+                    RuntimeEvent::Agent(AgentEvent::Compacting) => {
+                        this.emit(&id, "status.update", json!({"kind": "compacting", "text": COMPACTING_TEXT}));
+                    }
+                    RuntimeEvent::Agent(AgentEvent::Compacted { .. }) => {
+                        this.emit(&id, "status.update", json!({"kind": "compacted", "text": COMPACTED_TEXT}));
+                    }
+                    RuntimeEvent::Agent(AgentEvent::CompactionFailed(error)) => {
+                        let text = match error {
+                            Some(error) => format!("Context compression failed ({error}); continuing with the full conversation."),
+                            None => "Context compression couldn't shorten the conversation; continuing.".to_string(),
+                        };
+                        this.emit(&id, "status.update", json!({"kind": "compacted", "text": text}));
                     }
                     RuntimeEvent::Agent(event) => {
                         if matches!(&event, AgentEvent::Message(m) if m.is_tool_response()) {

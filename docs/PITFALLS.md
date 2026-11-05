@@ -107,5 +107,16 @@ Things that cost hours once. Read this before debugging; check here first when s
 - **`target/hermes-src` has our patches applied.** To see Hermes's original file, read
   `../hermes-agent` at `HERMES_COMMIT` (`git -C ../hermes-agent show <commit>:<path>`).
 - **No Hermes install on this machine**; import tests use generated homes.
+- **Hermes keeps two views of a session.** Rows its compression folded away stay as
+  `active = 0, compacted = 1` (shown, not sent), its summary is a row with
+  `_compressed_summary = 1` (sent, not shown), and only `active = 1` rows go to the model.
+  Importing the display view as the model's context made a long Hermes session's first turn here
+  re-summarize everything with no visible progress: "loads forever" (fixed 2026-11-05 in
+  `hermes_import.rs`, imported as user-only / agent-only messages). Any other reader of Hermes's
+  database must make the same split.
+- **Compression must be visible.** A turn that compresses first emits `status.update`
+  `compacting` / `compacted` (the page's "Summarizing thread" indicator); without it a long
+  compression on a local model looks like a hung turn (Hermes's own comment in
+  `tui_gateway/server.py` `_status_update`).
 - **The store is shared with the GPUI app**: a schema change breaks the user's other app. Side
   files only.

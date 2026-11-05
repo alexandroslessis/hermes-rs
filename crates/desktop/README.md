@@ -45,7 +45,8 @@ Hermes on this computer, from every profile (`HERMES_HOME`, else `%LOCALAPPDATA%
 `~\.hermes`), with a preview and one-click import; `/import-hermes` imports all of them. Hermes's
 database is only read. An imported session keeps its title, folder, times and conversation (text,
 tool calls and results; reasoning isn't carried over) and talks to the current default endpoint
-and model. Each is imported once (`hermes-imports.json` in the data folder remembers them).
+and model. A session Hermes had compressed keeps that compression: its whole history is shown,
+and the model gets Hermes's summary and what followed, as it did in Hermes. Each is imported once (`hermes-imports.json` in the data folder remembers them).
 `src/hermes_import.rs`; `scripts/perf/import-check.mjs` checks it against a home built by
 Hermes's own code (`scripts/perf/make-hermes-db.py`).
 

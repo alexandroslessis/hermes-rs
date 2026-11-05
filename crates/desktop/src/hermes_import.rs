@@ -260,13 +260,30 @@ struct Row {
     tool_call_id: Option<String>,
     tool_calls: Option<String>,
     timestamp: f64,
+    /// In the model's context (Hermes's `active = 1`). Rows a compression folded away are only
+    /// shown; importing them for the model too would make the first turn re-summarize a history
+    /// Hermes had already compressed.
+    model: bool,
+    /// A compression summary (`_compressed_summary`): for the model only, never shown.
+    summary: bool,
 }
 
+/// Every row an import reads: the displayed history (current rows and those compression folded
+/// away) and the compression summaries, each marked for who sees it. Hermes's own split:
+/// `active = 1` is what it sends the model (`hermes_state_messages.py` `_ACTIVE_IDS_SQL`),
+/// `active = 1 OR compacted = 1` what it shows (`_DISPLAY_ACTIVE_CLAUSE`).
 fn rows(conn: &Connection, session: &str) -> rusqlite::Result<Vec<Row>> {
-    let filter = history_rows(&columns(conn, "messages"));
+    let message_columns = columns(conn, "messages");
+    let has = |c: &str| message_columns.contains(c);
+    let (model, filter) = if has("active") && has("compacted") {
+        ("active = 1", "AND (active = 1 OR compacted = 1)")
+    } else {
+        ("1", "")
+    };
+    let summary = if has("_compressed_summary") { "_compressed_summary = 1" } else { "0" };
     let mut statement = conn.prepare(&format!(
-        "SELECT role, content, tool_call_id, tool_calls, timestamp FROM messages
-         WHERE session_id = ?1 AND {filter} ORDER BY id"
+        "SELECT role, content, tool_call_id, tool_calls, timestamp, {model}, {summary} FROM messages
+         WHERE session_id = ?1 AND role IN ('user', 'assistant', 'tool') {filter} ORDER BY id"
     ))?;
     let found = statement.query_map([session], |row| {
         Ok(Row {
@@ -275,9 +292,17 @@ fn rows(conn: &Connection, session: &str) -> rusqlite::Result<Vec<Row>> {
             tool_call_id: row.get(2)?,
             tool_calls: row.get(3)?,
             timestamp: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+            model: row.get::<_, Option<bool>>(5)?.unwrap_or(true),
+            summary: row.get::<_, Option<bool>>(6)?.unwrap_or(false),
         })
     })?;
     Ok(found.flatten().collect())
+}
+
+/// Who sees an imported row's message: the user (unless it's a compression summary) and the
+/// model (if it was in Hermes's context; a summary always is).
+fn visibility(row: &Row) -> (bool, bool) {
+    (!row.summary, row.model || row.summary)
 }
 
 /// Hermes's rows as our conversation. Every tool call ends up with a result (a placeholder for
@@ -286,8 +311,10 @@ fn rows(conn: &Connection, session: &str) -> rusqlite::Result<Vec<Row>> {
 fn conversation(rows: &[Row]) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::new();
     let mut open_calls: Vec<String> = Vec::new();
-    let close = |out: &mut Vec<Message>, open_calls: &mut Vec<String>, results: Option<Message>| {
-        let mut message = results.unwrap_or_else(Message::user);
+    // Results are seen by whoever saw their calls, so a call and its result never part.
+    let mut calls_seen = (true, true);
+    let close = |out: &mut Vec<Message>, open_calls: &mut Vec<String>, results: Option<Message>, seen: (bool, bool)| {
+        let mut message = results.unwrap_or_else(Message::user).with_visibility(seen.0, seen.1);
         let answered: HashSet<String> = message.get_tool_response_ids().into_iter().map(str::to_string).collect();
         for id in open_calls.drain(..) {
             if !answered.contains(&id) {
@@ -322,22 +349,23 @@ fn conversation(rows: &[Row]) -> Vec<Message> {
                     }
                     index += 1;
                 }
-                close(&mut out, &mut open_calls, Some(results));
+                close(&mut out, &mut open_calls, Some(results), calls_seen);
                 continue;
             }
             "user" => {
                 if !open_calls.is_empty() {
-                    close(&mut out, &mut open_calls, None);
+                    close(&mut out, &mut open_calls, None, calls_seen);
                 }
                 if !row.content.trim().is_empty() {
-                    let mut message = Message::user().with_text(row.content.clone());
+                    let (shown, model) = visibility(row);
+                    let mut message = Message::user().with_text(row.content.clone()).with_visibility(shown, model);
                     message.created = created;
                     out.push(message.with_generated_id_if_missing());
                 }
             }
             "assistant" => {
                 if !open_calls.is_empty() {
-                    close(&mut out, &mut open_calls, None);
+                    close(&mut out, &mut open_calls, None, calls_seen);
                 }
                 let mut message = Message::assistant();
                 message.created = created;
@@ -365,8 +393,9 @@ fn conversation(rows: &[Row]) -> Vec<Message> {
                     );
                     open_calls.push(id.to_string());
                 }
+                calls_seen = visibility(row);
                 if !message.content.is_empty() {
-                    out.push(message.with_generated_id_if_missing());
+                    out.push(message.with_visibility(calls_seen.0, calls_seen.1).with_generated_id_if_missing());
                 }
             }
             _ => {}
@@ -374,7 +403,7 @@ fn conversation(rows: &[Row]) -> Vec<Message> {
         index += 1;
     }
     if !open_calls.is_empty() {
-        close(&mut out, &mut open_calls, None);
+        close(&mut out, &mut open_calls, None, calls_seen);
     }
     out
 }
@@ -386,7 +415,7 @@ pub fn preview(data_dir: &Path, id: &str) -> Result<Value, String> {
     let rows = rows(&conn, &session).map_err(|e| e.to_string())?;
     let texts: Vec<Value> = rows
         .iter()
-        .filter(|r| matches!(r.role.as_str(), "user" | "assistant") && !r.content.trim().is_empty())
+        .filter(|r| matches!(r.role.as_str(), "user" | "assistant") && !r.summary && !r.content.trim().is_empty())
         .map(|r| json!({"role": r.role, "content": r.content}))
         .collect();
     let cwd: Option<String> = conn
@@ -451,7 +480,7 @@ pub fn import(target: &Target, id: &str) -> Result<Value, String> {
     store.replace_messages(&made.id, &messages).map_err(|e| format!("{e:#}"))?;
     let first_user = messages
         .iter()
-        .find(|m| m.role == Role::User)
+        .find(|m| m.role == Role::User && m.is_user_visible())
         .map(|m| {
             m.content
                 .iter()
@@ -513,7 +542,63 @@ mod tests {
             tool_call_id: call.map(str::to_string),
             tool_calls: calls.map(str::to_string),
             timestamp: 1_700_000_000.0,
+            model: true,
+            summary: false,
         }
+    }
+
+    /// A session Hermes compressed: the folded-away rows stay shown, the model gets Hermes's
+    /// summary and what followed it, so the first turn here doesn't summarize it all again.
+    #[test]
+    fn a_compressed_session_keeps_hermes_s_context() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT,
+                 tool_call_id TEXT, tool_calls TEXT, timestamp REAL, active INTEGER, compacted INTEGER,
+                 _compressed_summary INTEGER);
+             INSERT INTO messages (session_id, role, content, tool_call_id, tool_calls, timestamp, active, compacted, _compressed_summary) VALUES
+               ('s', 'user', 'old question', NULL, NULL, 1, 0, 1, 0),
+               ('s', 'assistant', '', NULL, '[{\"id\":\"c0\",\"function\":{\"name\":\"terminal\",\"arguments\":\"{}\"}}]', 2, 0, 1, 0),
+               ('s', 'tool', 'huge output', 'c0', NULL, 3, 0, 1, 0),
+               ('s', 'assistant', 'old answer', NULL, NULL, 4, 0, 1, 0),
+               ('s', 'user', 'undone question', NULL, NULL, 5, 0, 0, 0),
+               ('s', 'user', 'Summary of the earlier conversation', NULL, NULL, 6, 1, 0, 1),
+               ('s', 'user', 'new question', NULL, NULL, 7, 1, 0, 0),
+               ('s', 'assistant', 'new answer', NULL, NULL, 8, 1, 0, 0);",
+        )
+        .unwrap();
+        let messages = conversation(&rows(&conn, "s").unwrap());
+        let seen: Vec<(String, bool, bool)> = messages
+            .iter()
+            .map(|m| (m.as_concat_text(), m.is_user_visible(), m.is_agent_visible()))
+            .collect();
+        let expect = |text: &str, user: bool, model: bool| (text.to_string(), user, model);
+        assert_eq!(seen[0], expect("old question", true, false));
+        // The folded-away call and its result: shown, not sent.
+        assert!(!messages[1].is_agent_visible() && messages[1].is_user_visible());
+        assert!(!messages[2].is_agent_visible() && messages[2].is_user_visible());
+        assert_eq!(messages[2].get_tool_response_ids(), HashSet::from(["c0"]));
+        assert_eq!(seen[3], expect("old answer", true, false));
+        // A rewound row (neither active nor compacted) isn't imported; the summary is the model's.
+        assert_eq!(seen[4], expect("Summary of the earlier conversation", false, true));
+        assert_eq!(seen[5], expect("new question", true, true));
+        assert_eq!(seen[6], expect("new answer", true, true));
+        assert_eq!(messages.len(), 7);
+    }
+
+    /// Older Hermes databases have none of the compression columns: everything is for both.
+    #[test]
+    fn an_old_schema_imports_everything_for_both() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT,
+                 tool_call_id TEXT, tool_calls TEXT, timestamp REAL);
+             INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s', 'user', 'hi', 1), ('s', 'assistant', 'hello', 2);",
+        )
+        .unwrap();
+        let messages = conversation(&rows(&conn, "s").unwrap());
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|m| m.is_user_visible() && m.is_agent_visible()));
     }
 
     #[test]
