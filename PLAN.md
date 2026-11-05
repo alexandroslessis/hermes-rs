@@ -1,5 +1,10 @@
 # hermes-rs — Plan
 
+> **History (GPUI era, 2026-10/11).** The app is now `crates/desktop` (Hermes's own frontend on
+> the Rust backend); the GPUI app this plan describes is frozen. The live to-do list is
+> [GAPS.md](GAPS.md); how to work on the code is [AGENTS.md](AGENTS.md). The ground rules below
+> about ports, citations and copying still apply.
+
 A Windows desktop app that re-implements the Hermes agent in Rust: an agent backend with
 persistent memory and a self-improvement loop (skills, background review, curator), a native GPUI
 interface built from Zed's UI code, and OpenAI-compatible model providers.

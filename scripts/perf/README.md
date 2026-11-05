@@ -85,6 +85,11 @@ Settings ▸ Memory reaches the store; it restores the perf instance's memory fi
 imported chat) against a home built by `make-hermes-db.py` with Hermes's own SessionDB; start the
 instance with `HERMES_HOME` set to it.
 
+`cdp.mjs '<expression>'` evaluates JavaScript in the instance's page (DevTools port 9223) and
+prints the result; `hover.mjs '<selector|label|text>' [click]` moves the mouse onto an element and
+lists the popovers, tooltips and menus that appear, with their boxes. Together they check UI
+without screenshots (see `docs/TESTING.md`).
+
 ## Bundle analysis
 
 ```powershell

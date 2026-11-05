@@ -1,5 +1,5 @@
 //! Capabilities ▸ Tools: the agent's tools in Hermes's toolsets, each switchable. A toolset switched
-//! off is kept in `config.json` (`disabled_toolsets`) and its tools are neither offered to the model
+//! off is kept in `desktop-config.json` (`disabled_toolsets`) and its tools are neither offered to the model
 //! nor run, from the next turn on (subagents included).
 //!
 //! Hermes: `hermes_cli/web_routers/tools.py` (`/api/tools/toolsets*`), `hermes_cli/tools_config.py`

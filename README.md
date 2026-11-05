@@ -6,8 +6,13 @@ review, curator), Hermes's own desktop frontend, and OpenAI-compatible model pro
 
 The app is `crates/desktop` (`hermes-desktop.exe`): Hermes's own desktop frontend, built from the
 pinned Hermes commit, in a Tauri window over the Rust backend. The earlier GPUI app (`crates/app`)
-is frozen. See [PLAN.md](PLAN.md) for the roadmap, [FEATURES.md](FEATURES.md) for scope and
-[PORTING.md](PORTING.md) for what comes from where in Hermes and how to update to a newer Hermes.
+is frozen. See [GAPS.md](GAPS.md) for what's still missing, [FEATURES.md](FEATURES.md) for scope
+and [PORTING.md](PORTING.md) for what comes from where in Hermes and how to update to a newer
+Hermes. ([PLAN.md](PLAN.md) is the GPUI-era roadmap, kept as history.)
+
+**Working on the code (people or coding agents): start with [AGENTS.md](AGENTS.md)**, then the
+guides in [`docs/`](docs/): architecture, conventions, workflow, testing, pitfalls, the playbook
+for each remaining gap, and releasing.
 
 ## Build and run
 

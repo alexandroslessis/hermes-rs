@@ -51,11 +51,17 @@ Hermes's own code (`scripts/perf/make-hermes-db.py`).
 
 ## Status
 
-Works: startup, the session list, opening a session's transcript, sending a prompt with streamed
-reasoning, text and tool calls, stopping a turn; approval cards for flagged commands and clarify
-questions; titles from the title model; skills and bundles in the `/` menu; rename, delete and pin;
-switching a session's model (within its provider) and reasoning effort; restore-and-rerun; Settings
-(`desktop-config.json`) and interface preferences (`ui-preferences.json`) in the data folder.
+Works: startup, the session list and search, transcripts, prompts with streamed reasoning, text
+and tool calls, stop, queue and steer; approval cards and clarify questions; titles; skills and
+bundles in the `/` menu; rename, delete, pin, branch; model and effort per session;
+restore-and-rerun, `/undo`, `/retry`, checkpoints and `/rollback`; built-in commands (`/compress`,
+`/status`, `/diff`, `/usage`, `/insights`, `/context`, `/tools`, `/save`), coding commands
+(`/plan`, `/init`, `/review`, `/learn`), `/btw`, `/bg`; custom endpoints and keys in Settings;
+attachments (images, files, paste, drop); the side panel's file preview/edit, git review and
+terminal; live subagents; Capabilities ▸ Skills and Tools; the Star map and Settings ▸ Memory;
+Command Center (maintenance, curator, logs, insights); importing Hermes sessions; the installer.
 
-Not here (hidden or answering "off"): messaging, artifacts, scheduled jobs, bots, kanban, radio,
-pets, voice, goals and loops, archiving, Hermes's built-in backend slash commands.
+Not here (hidden or answering "not here"): MCP connectors, goals and loops, archiving, auxiliary
+model settings, fallbacks, artifacts, scheduled jobs, messaging, bots, kanban, pets, voice. The
+list with evidence is [GAPS.md](../../GAPS.md); how to build each is
+[docs/GAPS-PLAYBOOK.md](../../docs/GAPS-PLAYBOOK.md).
