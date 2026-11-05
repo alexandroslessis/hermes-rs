@@ -3068,6 +3068,7 @@ dependencies = [
  "futures",
  "hermes_agent",
  "hermes_llm",
+ "hermes_prompts",
  "hermes_runtime",
  "hermes_store",
  "hermes_tools",

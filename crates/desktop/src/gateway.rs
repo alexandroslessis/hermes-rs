@@ -451,6 +451,14 @@ impl Gateway {
             }
             "slash.exec" => {
                 let command = params["command"].as_str().unwrap_or_default();
+                let (name, arg) = command
+                    .trim()
+                    .trim_start_matches('/')
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((command.trim().trim_start_matches('/'), ""));
+                if let Some(answer) = self.coding_command(params, name, arg) {
+                    return answer;
+                }
                 if let Some(answer) = self.builtin_command(params, command, &settings).await {
                     return answer;
                 }
@@ -463,6 +471,14 @@ impl Gateway {
                 let id = session_id(params)?;
                 let output = self.status_text(&id).await?;
                 Ok(json!({"output": output}))
+            }
+            "command.dispatch" if self
+                .coding_command(params, params["name"].as_str().unwrap_or_default(), "")
+                .is_some() =>
+            {
+                let name = params["name"].as_str().unwrap_or_default();
+                let arg = params["arg"].as_str().unwrap_or_default();
+                self.coding_command(params, name, arg).expect("a coding command")
             }
             "command.dispatch" => commands::dispatch(
                 &self.runtime,
@@ -1364,6 +1380,83 @@ impl Gateway {
     /// note in the chat): `/status`, `/context`, `/usage`, `/insights`, `/diff`, `/tools`,
     /// `/memory`, and `/refine`, which starts a review. `None` for anything else (skills).
     /// Hermes: `hermes_cli/commands.py`, `cli_commands_mixin.py`.
+    /// The `/review` reviewer's goal and briefing: the session's last user and assistant messages
+    /// (their text), and the skills it loaded (`snapshot_recent_messages`,
+    /// `collect_parent_loaded_skills`).
+    fn review_task(&self, id: &str, instructions: &str) -> (String, String) {
+        use hermes_llm::conversation::message::MessageContent;
+        let messages = self.runtime.messages(id).unwrap_or_default();
+        let mut recent: Vec<(bool, String)> = messages
+            .iter()
+            .rev()
+            .filter(|m| m.is_user_visible())
+            .filter_map(|m| {
+                let is_user = m.role == rmcp::model::Role::User;
+                let text: Vec<&str> = m
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        MessageContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let text = text.join("\n").trim().to_string();
+                // A command's prompt is shown as the command it was typed as.
+                let text = commands::typed_command(&text).unwrap_or(text);
+                (!text.is_empty()).then_some((is_user, text))
+            })
+            .take(hermes_prompts::coding::REVIEW_CONTEXT_MESSAGES)
+            .collect();
+        recent.reverse();
+        let mut skills: Vec<String> = Vec::new();
+        for request in messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(MessageContent::as_tool_request)
+        {
+            let Ok(call) = &request.tool_call else { continue };
+            let args = call.arguments.clone().unwrap_or_default();
+            // Whole-skill loads only (a reference file is a detail of the skill).
+            if call.name == "skill_view" && args.get("file_path").is_none() {
+                if let Some(name) = args.get("name").and_then(Value::as_str) {
+                    if !skills.iter().any(|s| s == name) && skills.len() < 8 {
+                        skills.push(name.to_string());
+                    }
+                }
+            }
+        }
+        hermes_prompts::coding::review_task(&recent, instructions, &skills)
+    }
+
+    /// `/plan`, `/init`, `/learn`, `/review` (`commands::coding_command`): `None` for another
+    /// command. `/init` writes the session's folder's AGENTS.md; `/review` needs a conversation.
+    fn coding_command(&self, params: &Value, name: &str, arg: &str) -> Option<RpcResult> {
+        let name = name.trim_start_matches('/');
+        if !matches!(name, "plan" | "init" | "learn" | "review") {
+            return None;
+        }
+        let record = session_id(params)
+            .ok()
+            .and_then(|id| self.runtime.store().session(&id).ok().flatten());
+        let cwd = record.as_ref().map(|r| r.cwd.clone()).unwrap_or_default();
+        if name == "review"
+            && record
+                .as_ref()
+                .is_none_or(|r| self.runtime.messages(&r.id).map_or(true, |m| m.is_empty()))
+        {
+            return Some(Ok(json!({"type": "exec",
+                "output": "Nothing to review yet — send a message first."})));
+        }
+        if name == "init" && cwd.is_empty() {
+            return Some(Err((INVALID_PARAMS, "/init needs a session with a folder".to_string())));
+        }
+        let existing = (name == "init")
+            .then(|| std::fs::read_to_string(std::path::Path::new(&cwd).join("AGENTS.md")).ok())
+            .flatten()
+            .map(|text| text.trim_start_matches('\u{feff}').to_string());
+        commands::coding_command(name, arg, &cwd, existing.as_deref()).map(Ok)
+    }
+
     async fn builtin_command(
         &self,
         params: &Value,
@@ -1989,7 +2082,20 @@ impl Gateway {
         listed.extend(held);
         let images = crate::attachments::image_bytes(&Value::Array(listed))
             .map_err(|e| (INVALID_PARAMS, e))?;
-        let started = if images.is_empty() {
+        let started = if let Some(instructions) = commands::review_instructions(&text) {
+            // `/review`: the turn starts an independent reviewer subagent on the recent
+            // conversation (Hermes's `start_review`), then the model presents its findings.
+            let (goal, context) = self.review_task(&id, instructions);
+            let arguments = json!({"goal": goal, "context": context});
+            self.runtime.start_turn_with_call(
+                &id,
+                &provider,
+                options,
+                &text,
+                "delegate_task",
+                arguments.as_object().cloned().unwrap_or_default(),
+            )
+        } else if images.is_empty() {
             self.runtime.start_turn(&id, &provider, options, &text)
         } else {
             self.runtime

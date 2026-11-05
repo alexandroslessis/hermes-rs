@@ -1,5 +1,6 @@
 //! Prompt text and tool schemas embedded from `prompts/`, and the system-prompt builder.
 
+pub mod coding;
 pub mod compress;
 pub mod review;
 pub mod system;

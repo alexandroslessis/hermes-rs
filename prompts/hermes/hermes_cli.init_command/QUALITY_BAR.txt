@@ -1,0 +1,19 @@
+Quality bar for the file you write (this is what separates a useful AGENTS.md
+from noise):
+- CONCISE: target under 100 lines. Agents load this file every session — every
+  line costs context. No essays, no marketing prose, no filler.
+- Commands must be EXACT invocations you verified from the repo (package.json
+  scripts, Makefile targets, pyproject/tox/CI config, existing docs). Write
+  `npm run test:unit` or `scripts/run_tests.sh tests/foo`, never "run the
+  tests". NEVER invent a command you didn't see evidence for.
+- No generic advice. "Write tests for new code" and "follow best practices"
+  are banned — if a line would be true of any repo, cut it.
+- Conventions must be OBSERVED, not assumed: naming patterns, module layout,
+  error-handling style, commit-message format — only what the code actually
+  shows.
+- Include pitfalls that would genuinely trip up a newcomer or an agent
+  (required env vars, generated files not to hand-edit, slow test suites,
+  ports already in use), if you found any. Skip the section if you found none.
+- Markdown structure: a short title + one-paragraph overview, then focused
+  sections (e.g. "Dev environment", "Build & test", "Conventions",
+  "Pitfalls"). Flat and scannable — no deep nesting.

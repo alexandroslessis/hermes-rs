@@ -744,7 +744,23 @@ impl Runtime {
         options: TurnOptions,
         text: &str,
     ) -> Result<Turn> {
-        self.begin_turn(session_id, provider, options, Some(text), Vec::new())
+        self.begin_turn(session_id, provider, options, Some(text), Vec::new(), None)
+    }
+
+    /// [`Self::start_turn`] whose first step is a tool call made for the user (Hermes's scripted
+    /// prelude: `/review` starts its reviewer with `delegate_task`); the model goes on from its
+    /// result.
+    pub fn start_turn_with_call(
+        &self,
+        session_id: &str,
+        provider: &ProviderConfig,
+        options: TurnOptions,
+        text: &str,
+        tool: &str,
+        arguments: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Turn> {
+        let call = rmcp::model::CallToolRequestParams::new(tool.to_string()).with_arguments(arguments);
+        self.begin_turn(session_id, provider, options, Some(text), Vec::new(), Some(call))
     }
 
     /// [`Self::start_turn`] with images the user attached (raw file bytes, any common format).
@@ -756,7 +772,7 @@ impl Runtime {
         text: &str,
         images: Vec<Vec<u8>>,
     ) -> Result<Turn> {
-        self.begin_turn(session_id, provider, options, Some(text), images)
+        self.begin_turn(session_id, provider, options, Some(text), images, None)
     }
 
     /// Hermes's `/retry`: drops the provider error that ended the last turn and runs the agent
@@ -767,7 +783,7 @@ impl Runtime {
         provider: &ProviderConfig,
         options: TurnOptions,
     ) -> Result<Turn> {
-        self.begin_turn(session_id, provider, options, None, Vec::new())
+        self.begin_turn(session_id, provider, options, None, Vec::new(), None)
     }
 
     fn begin_turn(
@@ -777,6 +793,7 @@ impl Runtime {
         options: TurnOptions,
         text: Option<&str>,
         images: Vec<Vec<u8>>,
+        prelude: Option<rmcp::model::CallToolRequestParams>,
     ) -> Result<Turn> {
         let TurnOptions {
             context_length,
@@ -874,21 +891,31 @@ impl Runtime {
         let deferred = text
             .filter(|t| !images.is_empty() || !hermes_tools::references::url_targets(t).is_empty())
             .map(|t| (t.to_string(), images));
-        let first_event = match text {
-            Some(_) if deferred.is_some() => Ok(None),
+        let first_events = match text {
+            Some(_) if deferred.is_some() => Ok(Vec::new()),
             Some(text) => user_message(&open, text, context_length, &Default::default(), &[])
                 .and_then(|user| {
-                    runtime
-                        .append(user.clone())
-                        .map(|()| Some(AgentEvent::Message(user)))
+                    runtime.append(user.clone())?;
+                    let mut events = vec![AgentEvent::Message(user)];
+                    // A scripted first step: the assistant's tool call, which the turn's tool
+                    // step runs before any model call.
+                    if let Some(call) = prelude {
+                        let id = format!("call_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+                        let request = Message::assistant()
+                            .with_tool_request(id, Ok(call))
+                            .with_generated_id_if_missing();
+                        runtime.append(request.clone())?;
+                        events.push(AgentEvent::Message(request));
+                    }
+                    Ok(events)
                 }),
             None => runtime
                 .drop_trailing_errors()
                 .and_then(|conversation| conversation.context("there is no failed turn to retry"))
-                .map(|conversation| Some(AgentEvent::HistoryReplaced(conversation))),
+                .map(|conversation| vec![AgentEvent::HistoryReplaced(conversation)]),
         };
-        let first_event = match first_event {
-            Ok(event) => event,
+        let first_events = match first_events {
+            Ok(events) => events,
             Err(error) => {
                 *open.running.lock() = None;
                 return Err(error);
@@ -916,7 +943,7 @@ impl Runtime {
         let last_activity = self.last_activity.clone();
 
         let (events_tx, events_rx) = mpsc::unbounded_channel();
-        if let Some(event) = first_event {
+        for event in first_events {
             let _ = events_tx.send(RuntimeEvent::Agent(event));
         }
         let max_iterations = self.config.max_iterations;

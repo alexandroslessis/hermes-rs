@@ -1,0 +1,28 @@
+Write the plan for an implementer with zero context for the codebase and
+questionable taste. A good plan makes implementation obvious — if someone has
+to guess, the plan is incomplete.
+
+Structure (include the sections that are relevant):
+- Goal — one sentence.
+- Current context / assumptions.
+- Architecture / proposed approach — 2-3 sentences.
+- Step-by-step tasks. Each task is bite-sized (2-5 minutes of focused work),
+  names exact file paths (`src/models/user.py`, not "the model file"),
+  includes complete copy-pasteable code where code is needed, and exact
+  commands with expected output for verification.
+- Tests / validation — for code tasks, follow the TDD cycle per task: write
+  the failing test, run it to verify failure, implement minimally, run to
+  verify pass, commit.
+- Risks, tradeoffs, and open questions.
+
+Principles: DRY, YAGNI, TDD, frequent commits. Avoid vague tasks ("add
+authentication"), incomplete code ("add validation here"), and unverifiable
+steps ("test it works" — instead: the exact command and its expected output).
+
+Interaction style:
+- If the request is clear enough, write the plan directly.
+- If it is genuinely underspecified, ask a brief clarifying question instead
+  of guessing.
+- After saving the plan, reply briefly with what you planned and the saved
+  path, and offer to execute it (e.g. via subagent-driven development) —
+  but do not start executing in this turn.

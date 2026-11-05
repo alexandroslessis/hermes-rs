@@ -2254,6 +2254,52 @@ async fn a_subagent_reports_its_start_tools_text_and_end() {
 }
 
 #[tokio::test]
+async fn a_turn_can_start_with_a_tool_call_made_for_the_user() {
+    // `/review`: the reviewer starts at once (no parent model call first), then the parent model
+    // presents its result.
+    let h = harness(vec![
+        text_reply("Verdict: no defects found."),
+        text_reply("The reviewer found no defects."),
+    ])
+    .await;
+    let session = session_in(&h);
+    let arguments = json!({"goal": "Review recent work", "context": "the excerpt"});
+    let mut turn = h
+        .runtime
+        .start_turn_with_call(
+            &session,
+            &h.provider,
+            TurnOptions::default(),
+            "/review",
+            "delegate_task",
+            arguments.as_object().cloned().unwrap(),
+        )
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(60), turn.events.recv())
+        .await
+        .unwrap()
+    {
+        let finished = matches!(event, RuntimeEvent::TurnFinished(_));
+        events.push(event);
+        if finished {
+            break;
+        }
+    }
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 2, "the child, then the parent: no model call before the review");
+    let child = sent_messages(&requests[0]);
+    assert!(child[0]["content"].to_string().contains("You are a focused subagent"));
+    assert!(requests[1].to_string().contains("Verdict: no defects found."));
+    assert_eq!(last_text(&h, &session), "The reviewer found no defects.");
+    // Stored in order: the user's command, the scripted call, its result, the answer.
+    let messages = h.runtime.messages(&session).unwrap();
+    assert_eq!(messages[0].as_concat_text(), "/review");
+    assert!(messages[1].content.iter().any(|c| c.as_tool_request().is_some()));
+}
+
+#[tokio::test]
 async fn paused_delegation_is_refused() {
     let h = harness(vec![
         tool_reply(&[("d1", "delegate_task", json!({"tasks": [{"goal": "x"}]}))]),
