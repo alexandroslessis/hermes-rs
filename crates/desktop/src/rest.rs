@@ -89,6 +89,8 @@ fn config_defaults() -> Value {
         // edits, as Claude Code does. Settings ▸ Safety ▸ Checkpoints switches it.
         "checkpoints": {"enabled": true},
         "stt": {"enabled": false},
+        // Settings ▸ Sessions: hide sessions idle this many days (`archive.rs`); off by default.
+        "sessions": {"auto_archive": false, "auto_archive_days": 3},
         // The built-in memory (MEMORY.md, USER.md), applied to new sessions (Hermes's
         // `memory.*`; `write_approval` is ours: stage the agent's writes for review).
         "memory": {

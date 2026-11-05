@@ -5,6 +5,7 @@
 // Release builds are GUI-only (no console window); debug builds keep the console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod archive;
 mod attachments;
 mod aux_models;
 mod branch;
@@ -114,7 +115,11 @@ fn main() -> Result<()> {
                 runtime.warm_up();
                 Ok(server::ServerState {
                     dist: webapp_dist(),
-                    gateway: Arc::new(gateway::Gateway::new(runtime, hub, data_dir)),
+                    gateway: {
+                        let gateway = Arc::new(gateway::Gateway::new(runtime, hub, data_dir));
+                        gateway::Gateway::schedule(&gateway);
+                        gateway
+                    },
                     token: uuid::Uuid::new_v4().simple().to_string(),
                     port: address.port(),
                     window,

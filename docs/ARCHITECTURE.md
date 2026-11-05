@@ -125,6 +125,7 @@ Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`
 | Chat: send, stream, stop, queue, steer | gw `submit`, `transcript.rs`, runtime `start_turn` | `prompt.submit`, `session.interrupt`, `session.steer`, `prompt.*_queued` | `smoke.mjs`, `stop-check.mjs` |
 | Approvals, clarify | `hub.rs` (`DesktopBridge`), `hermes_tools::approval` | `approval.respond`, `clarify.respond` | `smoke.mjs` |
 | Sidebar: sessions, search, pin, rename, delete | gw `session_list`, `session_route` | `/api/profiles/sessions`, `/api/sessions/*` | — |
+| Archive, Settings ▸ Sessions | `archive.rs`, gw `set_archived`, `auto_archive` | PATCH `archived`, `session.mutate archive`, `?archived=` | `archive-check.mjs` |
 | Projects view | `projects.rs` | `projects.tree`, `projects.*` | — |
 | `/` menu, skills commands | `commands.rs` | `commands.catalog`, `complete.slash`, `slash.exec`, `command.dispatch` | — |
 | Built-in commands (`/status`, `/compress`, `/diff`…) | gw `builtin_command`, runtime `commands.rs` | `slash.exec` | — |
@@ -202,6 +203,7 @@ Data folder (`%APPDATA%\hermes-rs`, or `HERMES_RS_HOME`):
 | `config.json`, `desktop-config.json`, `ui-preferences.json` | above |
 | `generation-stats.json` | gateway (tokens/s per session) |
 | `branches.json` | `branch.rs` (child → parent session) |
+| `archived-sessions.json` | `archive.rs` (archived sessions, last auto-archive sweep) |
 | `hermes-imports.json` | `hermes_import.rs` (imported Hermes session ids) |
 | `memories/MEMORY.md`, `memories/USER.md` | `hermes_memory` |
 | `skills/` (+ `.usage.json`, `.archive/`) | `hermes_tools::skills`, curator |

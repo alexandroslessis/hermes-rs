@@ -11,8 +11,8 @@ button:has(.codicon-mic) {
   display: none !important;
 }
 
-/* Settings sections with nothing this backend reads or serves. A section is its row's wrapper
-   (the row and its expand chevron) and its sub-page list, whose id ends in the section id
+/* Settings sections with nothing this backend reads or serves (Sessions is served: archive.rs).
+   A section is its row's wrapper (the row and its expand chevron) and its sub-page list, whose id ends in the section id
    (`overlay-split-layout.tsx`). Clicking a section opens its first sub-page, so one whose
    sub-pages are all unsupported (About: updates, uninstall) goes whole. */
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-config:workspace']),
@@ -31,8 +31,6 @@ button:has(.codicon-mic) {
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-gateway']) + [id$='-gateway'],
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-keys']),
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-keys']) + [id$='-keys'],
-[data-tour='overlay-nav'] div:has(> [data-tour='nav-sessions']),
-[data-tour='overlay-nav'] div:has(> [data-tour='nav-sessions']) + [id$='-sessions'],
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-about']),
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-about']) + [id$='-about'] {
   display: none !important;

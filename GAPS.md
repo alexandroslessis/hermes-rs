@@ -55,8 +55,8 @@ backend code · **L** = a port of a Hermes subsystem.
 |---|---|---|---|---|
 | 3.1 | ✅ **Done 2026-11-05** (the Star map: learned skills and every memory entry as nodes, opened, edited, deleted; Settings ▸ Memory: on/off, sizes, write approval, applied to the store; earlier: file sizes and reset in Command Center ▸ Maintenance). Pending writes stay in the chat's approval cards; no external memory providers. Memory manager: view and edit MEMORY.md / USER.md, pending writes, reset. | Settings ▸ Memory hidden; `/api/memory`, `/api/memory/reset` | `hermes_memory` store, approvals | S–M |
 | 3.2 | ✅ **Done 2026-11-04.** Session search in the sidebar. | `/api/sessions/search` | `session_search` tool, store search | S |
-| 3.3 | Archive / hide sessions. | `session.archive`, `session.set_hidden` | store (needs a flag kept outside the shared schema, or a schema bump the GPUI app tolerates) | S |
-| 3.4 | Sessions settings: retention / auto-prune, export, import. | Settings ▸ Sessions hidden | store delete | S–M |
+| 3.3 | ✅ **Done 2026-11-05** (archive from the sidebar or the shortcut; hidden from the sidebar and project tree, listed in Settings ▸ Sessions to restore or delete; kept in `archived-sessions.json`; `session.set_hidden` not ported: the page doesn't call it). Archive / hide sessions. | `session.archive`, `session.set_hidden` | store (needs a flag kept outside the shared schema, or a schema bump the GPUI app tolerates) | S |
+| 3.4 | ✅ **Done 2026-11-05** (Settings ▸ Sessions: the archived list, opt-in auto-archive of idle sessions, the default folder for new sessions; the page has no prune/export/import controls, `/save` exports one session). Sessions settings: retention / auto-prune, export, import. | Settings ▸ Sessions hidden | store delete | S–M |
 | 3.5 | Logs done 2026-11-04 (the app now also logs to `logs\\desktop.log`; Command Center shows it); About still hidden. Logs viewer, version and about. | Settings ▸ Advanced / About hidden; `/api/logs` | tracing output | S |
 | 3.6 | Workspace settings (default folder). | Settings ▸ Workspace hidden | `/api/fs/default-cwd` | S |
 | 3.7 | Artifacts gallery (links and files the agent produced, across sessions). | sidebar entry hidden (by us) | mostly frontend over session messages | S |
@@ -107,7 +107,7 @@ image generation, computer use, cloud profiles.
 5. Then sections 3 and 4, and 5 as wanted.
 
 Status 2026-11-05: steps 1–3 done, step 4 done except 1.8 MCP (skipped for now by the user).
-Open, in suggested order: 1.8 MCP, 3.3 archive, 3.7 artifacts, 3.6 workspace,
-3.5 about, 3.4 sessions settings, 3.8 fallbacks, 2.7 goals/loops, then section 4's small issues.
+Open, in suggested order: 1.8 MCP, 3.7 artifacts, 3.6 workspace,
+3.5 about, 3.8 fallbacks, 2.7 goals/loops, then section 4's small issues.
 
 

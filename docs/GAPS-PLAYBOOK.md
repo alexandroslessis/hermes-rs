@@ -142,33 +142,20 @@ file are starting points; the page's code decides (WORKFLOW.md step 1).
 desktop: `Runtime::run_curator(Some(CuratorModel))`), and Hermes's `review` slot (the `/review`
 reviewer subagent's model: the delegator would need a per-child provider).
 
-## 3.3 Archive / hide sessions — S
+## 3.3 Archive / hide sessions and 3.4 Settings ▸ Sessions — ✅ done 2026-11-05
 
-**Page:** `PATCH /api/sessions/{id}` with `{archived: bool}` (`setSessionArchived`), RPC
-`session.archive` (keybinding "Archive current session"), list calls with
-`archived=exclude|include|only` (`api/sessions.ts`), `session.set_hidden`.
-**Current state:** `session_route` refuses `archived` with a 400 explaining it's unavailable.
-**Hermes:** `tui_gateway/methods_session.py` (`session.archive`, `set_hidden`), SessionDB columns.
+Built as `crates/desktop/src/archive.rs` (+ `scripts/perf/archive-check.mjs`): PATCH `archived`
+and `session.mutate` `archive` set it, `/api/profiles/sessions?archived=exclude|only|include`
+filters, the project tree leaves archived sessions out, the opt-in sweep (`sessions.auto_archive`,
+`auto_archive_days`) runs hourly at most once a day, and a swept session returns when used.
+Settings ▸ Sessions needed no backend of its own: its archived list is `archived=only`, its
+default folder lives in the page's storage (`lib/browser-settings.ts`) and is picked through the
+native dialog (patch 0002).
 
-**Steps:**
-1. Side file `session-flags.json` (`{id: {archived: bool, hidden: bool}}`) with a small `Flags`
-   struct like `branch.rs` `Links` (load, set, get, remove on delete).
-2. `session_route` PATCH: set the flag. `session.archive` / `session.set_hidden` RPC: same, plus
-   lineage (branch children from `branches.json`) as Hermes does.
-3. Filters: `session_list`/`session_rows` honour `archived=` query (default `exclude`) and leave
-   hidden ones out of the default list. Check the sidebar's "Archived" view uses `only`.
-4. `sessions.auto_archive` setting (see 3.4) can reuse this.
-5. Delete the flag when a session is deleted.
-
-## 3.4 Settings ▸ Sessions — S–M
-
-**Page:** section `nav-sessions` (hidden in `hide.css`); read its component under
-`app/settings/` to list the keys and routes (retention/auto-prune, export all, import).
-**Steps:** serve its keys via `config_defaults()`; retention = a startup + daily task in the
-gateway that archives (3.3) or deletes sessions older than N days (only if the user set it, off by
-default); export = reuse `export.rs` per session into a folder chosen with the native save dialog
-(patch 0008 bridge); import = our own export format, and point to Ctrl+K ▸ "Import session" for
-Hermes's sessions (`hermes_import.rs`). Do 3.3 first.
+**Left:** `session.set_hidden` (the page doesn't call it); Hermes's `sessions.auto_prune`
+(deleting old sessions) has no control on this page; the page asks for
+`/api/sessions/{id}/mutation-snapshot` before a PATCH and falls back without it (serving it would
+add Hermes's write fencing, not needed with one window).
 
 ## 3.5 Settings ▸ About — S
 

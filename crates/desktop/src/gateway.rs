@@ -89,6 +89,8 @@ pub struct Gateway {
     branches: crate::branch::Links,
     /// A branch request's idempotency key → the branch it made (a retried request gets it again).
     branch_keys: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Archived sessions and the auto-archive sweep (`archive.rs`).
+    archive: crate::archive::Archive,
 }
 
 impl Gateway {
@@ -111,6 +113,7 @@ impl Gateway {
             pending_images: Default::default(),
             file_tickets: Default::default(),
             branches: crate::branch::Links::load(&data_dir_for_stats),
+            archive: crate::archive::Archive::load(&data_dir_for_stats),
             branch_keys: Default::default(),
             generation: std::sync::Mutex::new(
                 std::fs::read(data_dir_for_stats.join(GENERATION_FILE))
@@ -125,6 +128,50 @@ impl Gateway {
         // So are the skills switched off in Capabilities ▸ Skills.
         crate::skills::apply_config(&gateway.runtime.skills(), &gateway.rest);
         gateway
+    }
+
+    /// Background work that needs the shared gateway: the hourly auto-archive check (it sweeps at
+    /// most once a day, and only when Settings ▸ Sessions turned it on).
+    pub fn schedule(this: &Arc<Self>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let weak = Arc::downgrade(this);
+        handle.spawn(async move {
+            let mut hourly = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                hourly.tick().await;
+                let Some(this) = weak.upgrade() else { break };
+                let _ = tokio::task::spawn_blocking(move || this.auto_archive()).await;
+            }
+        });
+    }
+
+    /// Settings ▸ Sessions' auto-archive (`archive.rs`): when it's on, sessions idle for
+    /// `sessions.auto_archive_days` go to the archive.
+    fn auto_archive(&self) {
+        let sessions = self.rest.config_value("sessions");
+        if sessions["auto_archive"] != true {
+            return;
+        }
+        let days = sessions["auto_archive_days"]
+            .as_f64()
+            .filter(|d| *d >= 1.0)
+            .unwrap_or(crate::archive::DEFAULT_IDLE_DAYS);
+        let all = self.runtime.store().list_sessions(100_000).unwrap_or_default();
+        let candidates: Vec<crate::archive::Candidate<'_>> = all
+            .iter()
+            .map(|s| crate::archive::Candidate {
+                id: &s.id,
+                last_active: s.updated_at,
+                pinned: s.pinned,
+                running: self.runtime.is_running(&s.id),
+            })
+            .collect();
+        let swept = self.archive.sweep(&candidates, days, chrono::Utc::now().timestamp_millis());
+        if !swept.is_empty() {
+            tracing::info!("auto-archive: archived {} session(s) idle for {days} days or more", swept.len());
+        }
     }
 
     /// The Settings the runtime keeps in memory, from the stored config record: at startup and
@@ -152,6 +199,8 @@ impl Gateway {
         // The tools switched off in Capabilities ▸ Tools.
         let off = crate::toolsets::disabled_toolsets(&self.rest.config_value(crate::toolsets::CONFIG_KEY));
         self.runtime.set_disabled_tools(crate::toolsets::disabled_tools(&off));
+        // Auto-archive just switched on sweeps now (it waits a day between sweeps itself).
+        self.auto_archive();
     }
 
     /// Hermes's `approvals.mode` on the runtime's policy: manual asks, smart has a reviewer model
@@ -703,6 +752,7 @@ impl Gateway {
                     .delete_session(&id)
                     .await
                     .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                self.archive.forget(&id);
                 Ok(json!({"deleted": id}))
             }
             // Nothing to release: a session lives in the store, not in a worker.
@@ -1401,11 +1451,11 @@ impl Gateway {
                     .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
                 json!({"status": "applied", "target_message_id": row, "message_count": kept.len()})
             }
+            // The keyboard shortcut's `session.archive` (`canonical-protocol.ts`).
             "archive" => {
-                return Err((
-                    SERVER_ERROR,
-                    "Archiving isn't available in hermes-rs; delete the session instead.".into(),
-                ));
+                let archived = payload["archived"].as_bool().unwrap_or(true);
+                self.set_archived(&id, archived)?;
+                json!({"archived": archived})
             }
             other => {
                 return Err((
@@ -1933,6 +1983,22 @@ impl Gateway {
     }
 
     /// Renames a session; the page's lists hear it through Hermes's `session.title` event.
+    /// Archives or restores a session (the sidebar, the shortcut, Settings ▸ Sessions). An
+    /// archived session leaves the pins, as Hermes's does.
+    fn set_archived(&self, id: &str, archived: bool) -> Result<(), (i64, String)> {
+        let store = self.runtime.store();
+        let record = store
+            .session(id)
+            .ok()
+            .flatten()
+            .ok_or((INVALID_PARAMS, format!("No session {id}.")))?;
+        if archived && record.pinned {
+            store.set_pinned(id, false).map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+        }
+        self.archive.set(id, archived, chrono::Utc::now().timestamp_millis());
+        Ok(())
+    }
+
     fn rename(&self, id: &str, title: &str) -> Result<(), (i64, String)> {
         let title = title.trim();
         self.runtime
@@ -2355,6 +2421,8 @@ impl Gateway {
             other => other.to_string(),
         };
         let admission_id = admission_id(params).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // A session the idle sweep archived is back in use: back in the sidebar too.
+        self.archive.reopened(&id);
         if self.runtime.is_running(&id) {
             // A rewind can't wait behind the turn: the page interrupts and retries on "busy".
             if params["confirm_truncate"] == true {
@@ -3177,11 +3245,10 @@ impl Gateway {
             }
             "PATCH" => {
                 let changes: Value = serde_json::from_slice(body).unwrap_or_default();
-                if changes["archived"] == true {
-                    return Some((
-                        400,
-                        json!({"detail": "Archiving isn't available in hermes-rs; delete the session instead."}),
-                    ));
+                if let Some(archived) = changes["archived"].as_bool()
+                    && let Err((_, error)) = self.set_archived(id, archived)
+                {
+                    return Some((500, json!({"detail": error})));
                 }
                 if let Some(pinned) = changes["pinned"].as_bool() {
                     if let Err(error) = store.set_pinned(id, pinned) {
@@ -3195,7 +3262,10 @@ impl Gateway {
                 Some((200, json!({"ok": true})))
             }
             "DELETE" => match self.runtime.delete_session(id).await {
-                Ok(()) => Some((200, json!({"ok": true}))),
+                Ok(()) => {
+                    self.archive.forget(id);
+                    Some((200, json!({"ok": true})))
+                }
                 Err(error) => Some((500, json!({"detail": format!("{error:#}")}))),
             },
             _ => None,
@@ -3266,17 +3336,19 @@ impl Gateway {
             "output_tokens": 0,
             "is_active": self.runtime.is_running(&s.id),
             "pinned": s.pinned,
+            "archived": self.archive.is_archived(&s.id),
             "profile": "default",
             // A branch is listed under the session it came from.
             "parent_session_id": self.branches.parent(&s.id),
         })
     }
 
-    /// Every session as the sidebar lists it, newest first.
+    /// Every session the sidebar's project tree shows (archived ones aren't), newest first.
     fn session_rows(&self) -> Vec<Value> {
         let all = self.runtime.store().list_sessions(1000).unwrap_or_default();
         let counts = self.runtime.store().message_counts().unwrap_or_default();
         all.iter()
+            .filter(|s| !self.archive.is_archived(&s.id))
             .map(|s| self.session_row(s, counts.get(&s.id).copied().unwrap_or(0)))
             .collect()
     }
@@ -3301,7 +3373,16 @@ impl Gateway {
         };
         let limit = param("limit").unwrap_or(50);
         let offset = param("offset").unwrap_or(0);
-        let all = self.runtime.store().list_sessions(1000).unwrap_or_default();
+        // `archived=exclude` (the sidebar, default), `only` (Settings ▸ Sessions), `include`.
+        let filter = crate::archive::Filter::parse(crate::rest::query_param(query, "archived").as_deref());
+        let all: Vec<_> = self
+            .runtime
+            .store()
+            .list_sessions(1000)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| filter.keeps(self.archive.is_archived(&s.id)))
+            .collect();
         let counts = self.runtime.store().message_counts().unwrap_or_default();
         let sessions: Vec<Value> = all
             .iter()
