@@ -415,6 +415,23 @@ impl Delegator {
         })
     }
 
+    /// Hermes's `/bg`: one subagent on `goal`, outside any turn (`task_id` names it). Returns
+    /// its result (`status`, `summary`, `error`…), as one entry of `delegate_task`'s results.
+    pub async fn background(&self, goal: &str, task_id: &str, emit: &Emitter) -> Value {
+        let base_prompt = match (self.base_prompt)() {
+            Ok(prompt) => prompt,
+            Err(error) => return json!({"status": "failed", "error": format!("{error:#}")}),
+        };
+        let task = ChildTask {
+            index: 0,
+            task_count: 1,
+            goal,
+            context: None,
+            delegation_id: task_id,
+        };
+        self.run_child(task, &base_prompt, task_id, emit).await
+    }
+
     async fn run_child(
         &self,
         task: ChildTask<'_>,

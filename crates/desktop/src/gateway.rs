@@ -80,6 +80,10 @@ pub struct Gateway {
     pending_images: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
     /// File ticket → the file it opens (download links and media elements).
     file_tickets: std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
+    /// Branch → the session it was branched from (`branch.rs`).
+    branches: crate::branch::Links,
+    /// A branch request's idempotency key → the branch it made (a retried request gets it again).
+    branch_keys: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl Gateway {
@@ -101,6 +105,8 @@ impl Gateway {
             context_lengths: Default::default(),
             pending_images: Default::default(),
             file_tickets: Default::default(),
+            branches: crate::branch::Links::load(&data_dir_for_stats),
+            branch_keys: Default::default(),
             generation: std::sync::Mutex::new(
                 std::fs::read(data_dir_for_stats.join(GENERATION_FILE))
                     .ok()
@@ -508,6 +514,64 @@ impl Gateway {
             "session.rewind" => self.rewind_turn(params),
             "rollback.list" | "rollback.diff" | "rollback.restore" => self.rollback(method, params),
             "session.export" => self.export_session(params),
+            // `/branch` and the message menu's Branch (`branch.rs`).
+            "session.branch" => self.branch(params, &settings, outbox, false, false),
+            "session.branch_whole" => self.branch(params, &settings, outbox, true, true),
+            "session.branch_stored" => self.branch(params, &settings, outbox, true, true),
+            // `/btw`: a side question about the conversation, answered as `btw.complete`.
+            "prompt.btw" => {
+                let id = session_id(params)?;
+                let question = params["text"].as_str().unwrap_or_default().trim().to_string();
+                if question.is_empty() {
+                    return Err((INVALID_PARAMS, "text required".to_string()));
+                }
+                let provider = self.session_provider(&id, &settings)?;
+                let task_id = format!("btw_{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+                let this = self.clone();
+                let task = task_id.clone();
+                tokio::spawn(async move {
+                    let text = match this.runtime.side_question(&id, &provider, &question).await {
+                        Ok(answer) if !answer.is_empty() => answer,
+                        Ok(_) => "error: the model gave no answer".to_string(),
+                        Err(error) => format!("error: {error:#}"),
+                    };
+                    this.emit(&id, "btw.complete", json!({"task_id": task, "question": question, "text": text}));
+                });
+                Ok(json!({"task_id": task_id}))
+            }
+            // `/bg`: the prompt runs as a background subagent; its answer arrives as
+            // `background.complete`, its progress as its subagent row's events.
+            "prompt.background" => {
+                let id = session_id(params)?;
+                let text = params["text"].as_str().unwrap_or_default().trim().to_string();
+                if text.is_empty() {
+                    return Err((INVALID_PARAMS, "text required".to_string()));
+                }
+                let provider = self.session_provider(&id, &settings)?;
+                let record = self.runtime.store().session(&id).ok().flatten();
+                let options = TurnOptions {
+                    supports_vision: record
+                        .as_ref()
+                        .is_some_and(|r| self.sends_images(&r.provider, &r.model)),
+                    ..TurnOptions::default()
+                };
+                let mut task = self
+                    .runtime
+                    .background(&id, &provider, options, &text)
+                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                let task_id = task.task_id.clone();
+                let this = self.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = task.events.recv().await {
+                        if let AgentEvent::Subagent { kind, payload } = event {
+                            this.emit(&id, kind, payload);
+                        }
+                    }
+                    let text = task.done.await.unwrap_or_else(|e| format!("error: {e}"));
+                    this.emit(&id, "background.complete", json!({"task_id": task.task_id, "text": text}));
+                });
+                Ok(json!({"task_id": task_id}))
+            }
             // A file attached in the composer: copied into the session's folder, referenced as
             // `@file:` in the prompt (`attachments.rs`).
             "file.attach" => {
@@ -1878,6 +1942,148 @@ impl Gateway {
         self.hub.subscribe(session_id, outbox);
     }
 
+    /// The provider a session talks to (its own, else the default).
+    fn session_provider(
+        &self,
+        id: &str,
+        settings: &Settings,
+    ) -> Result<hermes_runtime::ProviderConfig, (i64, String)> {
+        let record = self
+            .runtime
+            .store()
+            .session(id)
+            .ok()
+            .flatten()
+            .ok_or((INVALID_PARAMS, format!("No session {id}.")))?;
+        Ok(settings
+            .provider(&record.provider)
+            .or(settings.active())
+            .ok_or((SERVER_ERROR, "No provider is configured".to_string()))?
+            .runtime())
+    }
+
+    /// `session.branch` (up to a message: `through_message_id`, else `count` of the page's
+    /// rows), `session.branch_whole` and `session.branch_stored` (all of it, `whole`): a new
+    /// session starting with the parent's conversation, listed under it (`branch.rs`).
+    fn branch(
+        &self,
+        params: &Value,
+        settings: &Settings,
+        outbox: &Outbox,
+        whole: bool,
+        omit_messages: bool,
+    ) -> RpcResult {
+        let parent = params["parent_session_id"]
+            .as_str()
+            .or(params["session_id"].as_str())
+            .filter(|id| !id.is_empty())
+            .ok_or((INVALID_PARAMS, "session_id is required".to_string()))?
+            .to_string();
+        let record = self
+            .runtime
+            .store()
+            .session(&parent)
+            .ok()
+            .flatten()
+            .ok_or((INVALID_PARAMS, format!("No session {parent}.")))?;
+        let key = params["idempotency_key"].as_str().filter(|k| !k.is_empty());
+        let existing = key.and_then(|key| {
+            self.branch_keys
+                .lock()
+                .ok()
+                .and_then(|keys| keys.get(key).cloned())
+        });
+        let (child, kept) = match existing {
+            // A retried request: the branch it already made.
+            Some(child) => {
+                let kept = self.runtime.messages(&child).unwrap_or_default();
+                (child, kept)
+            }
+            None => {
+                let messages = self
+                    .runtime
+                    .messages(&parent)
+                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                let keep = if whole {
+                    messages.len()
+                } else if let Some(row) = params["through_message_id"].as_u64() {
+                    row as usize
+                } else if let Some(count) = params["count"].as_u64().filter(|c| *c > 0) {
+                    // The page's rows: through the count-th one.
+                    transcript::messages(&messages)
+                        .get(count as usize - 1)
+                        .and_then(|row| row["row_id"].as_u64())
+                        .map_or(messages.len(), |row| row as usize)
+                } else {
+                    messages.len()
+                };
+                let kept = crate::branch::cut(&messages, keep);
+                if kept.is_empty() {
+                    return Err((INVALID_PARAMS, "nothing to branch — send a message first".to_string()));
+                }
+                let provider = self.session_provider(&parent, settings)?;
+                let cwd = params["cwd"]
+                    .as_str()
+                    .filter(|c| !c.is_empty())
+                    .unwrap_or(&record.cwd)
+                    .to_string();
+                let made = self
+                    .runtime
+                    .create_session(&provider, &record.model, None, std::path::Path::new(&cwd))
+                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                self.runtime
+                    .store()
+                    .replace_messages(&made.id, &kept)
+                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                let taken: Vec<String> = self
+                    .runtime
+                    .store()
+                    .list_sessions(1000)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|s| s.title)
+                    .collect();
+                let title = params["name"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| crate::branch::title(record.title.as_deref(), &taken));
+                let _ = self.runtime.store().set_title(&made.id, &title);
+                self.branches.link(&made.id, &parent);
+                if let (Some(key), Ok(mut keys)) = (key, self.branch_keys.lock()) {
+                    keys.insert(key.to_string(), made.id.clone());
+                }
+                (made.id, kept)
+            }
+        };
+        self.subscribe(&child, outbox);
+        let title = self
+            .runtime
+            .store()
+            .session(&child)
+            .ok()
+            .flatten()
+            .and_then(|r| r.title)
+            .unwrap_or_default();
+        let mut answer = json!({
+            "session_id": child,
+            "stored_session_id": child,
+            "title": title,
+            "parent": parent,
+            "message_count": kept.len(),
+            "info": self.session_info(&child),
+            "revision": self.revision(&child),
+            "execution_generation": EXECUTION_GENERATION,
+        });
+        if omit_messages {
+            answer["messages_omitted"] = json!(true);
+        } else {
+            answer["messages"] = json!(transcript::messages(&kept));
+        }
+        Ok(answer)
+    }
+
     fn create_session(&self, params: &Value, settings: &Settings, outbox: &Outbox) -> RpcResult {
         let provider_id = params["provider"]
             .as_str()
@@ -1905,12 +2111,39 @@ impl Gateway {
         if let Some(title) = params["title"].as_str().filter(|t| !t.is_empty()) {
             let _ = self.runtime.store().set_title(&record.id, title);
         }
+        // A branch the page builds itself: the messages it starts with, and its parent.
+        let seeded: Vec<hermes_llm::conversation::message::Message> = params["messages"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        let text = row["content"].as_str().filter(|t| !t.trim().is_empty())?;
+                        let message = match row["role"].as_str() {
+                            Some("assistant") => {
+                                hermes_llm::conversation::message::Message::assistant().with_text(text)
+                            }
+                            _ => hermes_llm::conversation::message::Message::user().with_text(text),
+                        };
+                        Some(message.with_generated_id_if_missing())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !seeded.is_empty() {
+            self.runtime
+                .store()
+                .replace_messages(&record.id, &seeded)
+                .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+        }
+        if let Some(parent) = params["parent_session_id"].as_str().filter(|p| !p.is_empty()) {
+            self.branches.link(&record.id, parent);
+        }
         self.subscribe(&record.id, outbox);
         Ok(json!({
             "session_id": record.id,
             "stored_session_id": record.id,
-            "message_count": 0,
-            "messages": [],
+            "message_count": seeded.len(),
+            "messages": transcript::messages(&seeded),
             "info": self.session_info(&record.id),
             "revision": self.revision(&record.id),
             "execution_generation": EXECUTION_GENERATION,
@@ -2831,6 +3064,8 @@ impl Gateway {
             "is_active": self.runtime.is_running(&s.id),
             "pinned": s.pinned,
             "profile": "default",
+            // A branch is listed under the session it came from.
+            "parent_session_id": self.branches.parent(&s.id),
         })
     }
 

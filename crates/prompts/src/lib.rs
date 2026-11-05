@@ -3,6 +3,7 @@
 pub mod coding;
 pub mod compress;
 pub mod review;
+pub mod side;
 pub mod system;
 pub mod text;
 pub mod titles;

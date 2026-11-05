@@ -31,6 +31,7 @@ FILES = [
     "agent/learn_prompt.py",
     "agent/plan_prompt.py",
     "agent/review_engine.py",
+    "agent/side_question.py",
     "hermes_cli/init_command.py",
     "agent/context_compressor.py",
     "agent/title_generator.py",

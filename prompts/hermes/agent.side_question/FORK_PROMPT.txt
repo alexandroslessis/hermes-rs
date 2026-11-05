@@ -1,0 +1,6 @@
+The user asked a quick SIDE question with /btw while the main work continues in the original session.
+Rules:
+- Answer ONLY the side question, using the conversation above as context. Do not continue, redo, or critique the main task.
+- Do NOT call any tools — they are disabled for this side question. Answer directly in text.
+- If the conversation does not contain enough information to answer, say so plainly instead of guessing.
+- Be concise and direct.

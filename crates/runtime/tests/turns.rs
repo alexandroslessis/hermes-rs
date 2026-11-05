@@ -2300,6 +2300,57 @@ async fn a_turn_can_start_with_a_tool_call_made_for_the_user() {
 }
 
 #[tokio::test]
+async fn a_side_question_reads_the_conversation_without_changing_it() {
+    let h = harness(vec![
+        text_reply("I renamed the module to parser.rs."),
+        text_reply("You renamed it to parser.rs."),
+    ])
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "rename lexer.rs").await;
+    let before = h.runtime.messages(&session).unwrap().len();
+    let answer = h
+        .runtime
+        .side_question(&session, &h.provider, "what did we rename it to?")
+        .await
+        .unwrap();
+    assert_eq!(answer, "You renamed it to parser.rs.");
+    let request = h.requests.lock().last().cloned().unwrap();
+    let sent = sent_messages(&request);
+    assert!(sent[0]["content"].to_string().contains("SIDE question"));
+    let asked = sent[1]["content"].to_string();
+    assert!(asked.contains("USER: rename lexer.rs"), "{asked}");
+    assert!(asked.contains("ASSISTANT: I renamed the module to parser.rs."));
+    assert!(asked.contains("Side question: what did we rename it to?"));
+    assert!(request["tools"].as_array().is_none_or(|t| t.is_empty()), "no tools");
+    assert_eq!(h.runtime.messages(&session).unwrap().len(), before, "conversation untouched");
+}
+
+#[tokio::test]
+async fn a_background_prompt_runs_as_a_subagent_and_returns_its_answer() {
+    let h = harness(vec![text_reply("Background answer: 42.")]).await;
+    let session = session_in(&h);
+    let mut task = h
+        .runtime
+        .background(&session, &h.provider, TurnOptions::default(), "compute the answer")
+        .unwrap();
+    assert!(task.task_id.starts_with("bg_"));
+    let mut kinds = Vec::new();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(60), task.events.recv())
+        .await
+        .unwrap()
+    {
+        if let AgentEvent::Subagent { kind, payload } = event {
+            assert_eq!(payload["goal"], "compute the answer");
+            kinds.push(kind);
+        }
+    }
+    assert_eq!(kinds, ["subagent.start", "subagent.progress", "subagent.complete"]);
+    assert_eq!(task.done.await.unwrap(), "Background answer: 42.");
+    assert!(h.runtime.messages(&session).unwrap().is_empty(), "the session's own conversation is untouched");
+}
+
+#[tokio::test]
 async fn paused_delegation_is_refused() {
     let h = harness(vec![
         tool_reply(&[("d1", "delegate_task", json!({"tasks": [{"goal": "x"}]}))]),

@@ -75,6 +75,8 @@ stage, commit context, commit, branches, worktrees, revert).
 on :47900 (stop `mock_llm.py` first).
 `coding-commands-check.mjs` checks `/plan`, `/init`, `/learn` and `/review` (its reviewer subagent) with
 its own provider on :47900.
+`side-and-branch-check.mjs` checks `/branch` (all three routes, retries, the parent link), `/btw` and `/bg`
+with its own provider on :47900.
 
 ## Bundle analysis
 

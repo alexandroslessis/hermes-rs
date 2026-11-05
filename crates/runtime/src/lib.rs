@@ -317,6 +317,13 @@ pub struct Turn {
     pub cancel: CancellationToken,
 }
 
+/// A `/bg` task (`Runtime::background`): its id, its subagent's events, and its answer.
+pub struct Background {
+    pub task_id: String,
+    pub events: mpsc::UnboundedReceiver<AgentEvent>,
+    pub done: tokio::task::JoinHandle<String>,
+}
+
 pub struct Runtime {
     store: Arc<Store>,
     memory: Arc<MemoryStore>,
@@ -924,20 +931,15 @@ impl Runtime {
         let mut turn_start = open.conversation.lock().messages().len();
         let web = self.web.clone();
         let rebuild_prompt = self.prompt_rebuild(&open, context_length);
-        let delegator = Arc::new(delegate::Delegator {
-            parent: open.clone(),
-            store: self.store.clone(),
-            llm: llm.clone(),
-            model: model.clone(),
+        let delegator = self.delegator(
+            &open,
+            llm.clone(),
+            &model,
             context_length,
-            effort_params: effort_params.clone(),
+            effort_params.clone(),
             supports_vision,
-            base_prompt: self.child_base_prompt(&open, context_length),
-            child_tools: self.child_tools(),
-            summarizer: summarizer.clone(),
-            mcp: self.mcp.clone(),
-            subagents: self.subagents.clone(),
-        });
+            summarizer.clone(),
+        );
         let self_mcp = self.mcp.clone();
         *self.last_activity.lock() = std::time::Instant::now();
         let last_activity = self.last_activity.clone();
@@ -1531,6 +1533,155 @@ impl Runtime {
         };
         self.store.upsert_message(&session_id, index, &message)?;
         Ok(messages)
+    }
+
+    /// What a session's subagents run with (`delegate_task`, `/bg`).
+    #[allow(clippy::too_many_arguments)]
+    fn delegator(
+        &self,
+        open: &Arc<OpenSession>,
+        llm: Arc<dyn Provider>,
+        model: &str,
+        context_length: Option<usize>,
+        effort_params: Option<HashMap<String, serde_json::Value>>,
+        supports_vision: bool,
+        summarizer: compress::Summarizer,
+    ) -> Arc<delegate::Delegator> {
+        Arc::new(delegate::Delegator {
+            parent: open.clone(),
+            store: self.store.clone(),
+            llm,
+            model: model.to_string(),
+            context_length,
+            effort_params,
+            supports_vision,
+            base_prompt: self.child_base_prompt(open, context_length),
+            child_tools: self.child_tools(),
+            summarizer,
+            mcp: self.mcp.clone(),
+            subagents: self.subagents.clone(),
+        })
+    }
+
+    /// Hermes's `/bg <prompt>`: the prompt runs as a background subagent of the session (its own
+    /// conversation and tools; the session's own conversation is untouched, and it may be busy).
+    /// It is listed, followed, steered and stopped like any subagent; its events arrive on the
+    /// receiver, and the task ends with its answer (or `error: …`).
+    pub fn background(
+        &self,
+        session_id: &str,
+        provider: &ProviderConfig,
+        options: TurnOptions,
+        text: &str,
+    ) -> Result<Background> {
+        let open = self.open(session_id)?;
+        let llm = provider.provider()?;
+        let model = open.record.lock().model.clone();
+        let summarizer = summarizer_for(&options.aux, &llm, &model, options.context_length)?;
+        let effort_params = options
+            .effort
+            .as_deref()
+            .map(|effort| effort_request_params(&provider.base_url, effort));
+        let delegator = self.delegator(
+            &open,
+            llm,
+            &model,
+            options.context_length,
+            effort_params,
+            options.supports_vision,
+            summarizer,
+        );
+        let task_id = format!("bg_{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let emit = Emitter::new(events_tx, CancellationToken::new());
+        let (goal, id) = (text.trim().to_string(), task_id.clone());
+        let done = tokio::spawn(async move {
+            let result = delegator.background(&goal, &id, &emit).await;
+            match result["status"].as_str() {
+                Some("completed") => result["summary"].as_str().unwrap_or_default().to_string(),
+                Some("interrupted") => "error: stopped".to_string(),
+                _ => format!(
+                    "error: {}",
+                    result["error"].as_str().unwrap_or("the background task failed")
+                ),
+            }
+        });
+        Ok(Background { task_id, events, done })
+    }
+
+    /// Hermes's `/btw <question>`: a question about the conversation answered from a snapshot of
+    /// it, in one request without tools (`agent/side_question.py`'s one-shot path). The
+    /// conversation is untouched, and it may be mid-turn.
+    pub async fn side_question(
+        &self,
+        session_id: &str,
+        provider: &ProviderConfig,
+        question: &str,
+    ) -> Result<String> {
+        use hermes_prompts::side::{self, Line};
+        anyhow::ensure!(!question.trim().is_empty(), "a side question needs text");
+        let messages = self.messages(session_id)?;
+        let model = self
+            .store
+            .session(session_id)?
+            .map(|record| record.model)
+            .context("no such session")?;
+        let mut lines = Vec::new();
+        for message in messages.iter().filter(|m| m.is_agent_visible()) {
+            let text: String = message
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    MessageContent::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let tools: Vec<String> = message
+                .content
+                .iter()
+                .filter_map(MessageContent::as_tool_request)
+                .filter_map(|r| r.tool_call.as_ref().ok().map(|c| c.name.to_string()))
+                .collect();
+            let results: Vec<String> = message
+                .content
+                .iter()
+                .filter(|c| c.as_tool_response().is_some())
+                .map(compress::response_text)
+                .collect();
+            match message.role {
+                rmcp::model::Role::Assistant => {
+                    if !tools.is_empty() {
+                        lines.push(Line::CalledTools(tools));
+                    }
+                    lines.push(Line::Said { label: "ASSISTANT", text });
+                }
+                rmcp::model::Role::User if !results.is_empty() => {
+                    lines.push(Line::Said { label: "TOOL RESULT", text: results.join("\n") });
+                }
+                rmcp::model::Role::User => lines.push(Line::Said { label: "USER", text }),
+            }
+        }
+        let llm = provider.provider()?;
+        let config = ModelConfig::new(&model).with_max_tokens(Some(2048));
+        let (reply, _) = llm
+            .complete(
+                &config,
+                side::INSTRUCTIONS,
+                &[Message::user().with_text(side::user_input(&side::transcript(&lines), question))],
+                &[],
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("side question failed: {error}"))?;
+        let answer: String = reply
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                MessageContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        Ok(answer.trim().to_string())
     }
 
     /// The `delegate_task` children running now: list, tail, steer, stop (`subagents.rs`).

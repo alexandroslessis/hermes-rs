@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod attachments;
+mod branch;
 mod commands;
 mod endpoints;
 mod export;

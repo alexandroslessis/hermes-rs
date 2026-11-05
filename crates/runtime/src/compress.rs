@@ -180,7 +180,7 @@ pub fn tool_definition_tokens() -> usize {
         .div_ceil(CHARS_PER_TOKEN)
 }
 
-fn response_text(content: &MessageContent) -> String {
+pub(crate) fn response_text(content: &MessageContent) -> String {
     match content.as_tool_response().map(|r| &r.tool_result) {
         Some(Ok(_)) => content.as_tool_response_text().unwrap_or_default(),
         Some(Err(error)) => error.message.to_string(),
