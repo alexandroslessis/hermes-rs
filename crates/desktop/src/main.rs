@@ -12,6 +12,7 @@ mod export;
 mod files;
 mod gateway;
 mod git;
+mod git_review;
 mod hub;
 mod maintenance;
 mod paths;

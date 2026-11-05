@@ -2550,21 +2550,16 @@ impl Gateway {
                 .unwrap_or_else(|_| json!({"entries": [], "error": "read-error"}));
             return Some((200, listing));
         }
-        // The coding rail's git reads (the folder is `path`; a non-repository reads as null).
-        if method == "GET" && matches!(path, "/api/git/status" | "/api/git/review/rev-parse") {
-            let folder = PathBuf::from(crate::rest::query_param(query, "path").unwrap_or_default());
-            let reference = crate::rest::query_param(query, "ref");
-            let status = path == "/api/git/status";
-            let answer = tokio::task::spawn_blocking(move || {
-                if status {
-                    crate::git::repo_status(&folder).unwrap_or(Value::Null)
-                } else {
-                    json!({"sha": crate::git::rev_parse(&folder, reference.as_deref())})
-                }
+        // The coding rail and the review pane (`git_review.rs`; the folder is `path`).
+        if path.starts_with("/api/git/") {
+            let (method, path) = (method.to_string(), path.to_string());
+            let (query, body) = (query.map(str::to_string), body.to_vec());
+            return tokio::task::spawn_blocking(move || {
+                crate::git_review::route(&method, &path, query.as_deref(), &body)
             })
             .await
-            .unwrap_or(Value::Null);
-            return Some((200, answer));
+            .ok()
+            .flatten();
         }
         if (method, path) == ("GET", "/api/model/options") {
             let settings = Settings::load(&self.data_dir);

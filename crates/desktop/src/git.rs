@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// The changed-file list's cap (Hermes's `files[:200]`).
 const FILE_CAP: usize = 200;
 /// Untracked files whose lines are counted (`_UNTRACKED_SCAN_CAP`), and the size past which one
@@ -36,7 +36,7 @@ pub(crate) fn git(cwd: &Path, args: &[&str]) -> (bool, String) {
     }
 }
 
-fn git_line(cwd: &Path, args: &[&str]) -> String {
+pub(crate) fn git_line(cwd: &Path, args: &[&str]) -> String {
     let (ok, out) = git(cwd, args);
     if ok {
         out.trim().to_string()
@@ -51,7 +51,7 @@ pub fn rev_parse(cwd: &Path, reference: Option<&str>) -> Option<String> {
 }
 
 /// `old => new` and `dir/{old => new}/f` name the new path (`resolve_rename_path`).
-fn renamed_to(raw: &str) -> String {
+pub(crate) fn renamed_to(raw: &str) -> String {
     let path = raw.trim();
     if !path.contains(" => ") {
         return path.to_string();
@@ -70,7 +70,7 @@ fn renamed_to(raw: &str) -> String {
 }
 
 /// One changed path of `git status --porcelain=v2 -z` as `(tag, xy, path)` (`_walk_entries`).
-fn entries(raw: &str) -> Vec<(char, String, String)> {
+pub(crate) fn entries(raw: &str) -> Vec<(char, String, String)> {
     let mut out = Vec::new();
     let mut records = raw.split('\0');
     while let Some(record) = records.next() {
@@ -122,7 +122,7 @@ fn numstat_totals(cwd: &Path, args: &[&str]) -> (u64, u64) {
 }
 
 /// An untracked file's line count (its `+N`); binary or oversized files count 0.
-fn untracked_lines(cwd: &Path, relative: &str) -> u64 {
+pub(crate) fn untracked_lines(cwd: &Path, relative: &str) -> u64 {
     let path = cwd.join(relative);
     let Ok(meta) = std::fs::metadata(&path) else {
         return 0;
@@ -145,7 +145,7 @@ fn untracked_lines(cwd: &Path, relative: &str) -> u64 {
 }
 
 /// The repository's trunk ("main", "master"…), preferring origin's default branch.
-fn default_branch(cwd: &Path) -> Option<String> {
+pub(crate) fn default_branch(cwd: &Path) -> Option<String> {
     let head = git_line(cwd, &["rev-parse", "--abbrev-ref", "origin/HEAD"]);
     if !head.is_empty() && head != "origin/HEAD" {
         return head.split_once('/').map(|(_, name)| name.to_string());

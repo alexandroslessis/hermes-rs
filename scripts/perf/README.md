@@ -68,6 +68,8 @@ model, held and detached images, file upload and `file.attach`); it is the provi
 itself, so stop `mock_llm.py` first.
 `files-check.mjs` checks the side panel's file routes (read, save, mkdir, git root, a ticketed
 download, a ranged media stream, the credential guard).
+`git-check.mjs` checks the review pane's git routes in a throwaway repository (list, diffs,
+stage, commit context, commit, branches, worktrees, revert).
 
 ## Bundle analysis
 
