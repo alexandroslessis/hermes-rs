@@ -38,6 +38,8 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 uuid = { workspace = true, features = ["v4"] }
 portable-pty = "0.9"
+# The window's taskbar and title icons, loaded at the display's exact size (`main.rs`).
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

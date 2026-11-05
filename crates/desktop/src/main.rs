@@ -152,6 +152,15 @@ fn main() -> Result<()> {
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(720.0, 480.0)
                 .build()?;
+            // Sharp taskbar and title icons, again when the window moves to a display of
+            // another scale.
+            set_window_icons(&built);
+            let rescaled = built.clone();
+            built.on_window_event(move |event| {
+                if let tauri::WindowEvent::ScaleFactorChanged { .. } = event {
+                    set_window_icons(&rescaled);
+                }
+            });
             let _ = window.set(built);
             Ok(())
         })
@@ -160,6 +169,54 @@ fn main() -> Result<()> {
     terminals.close_all();
     drop(tokio);
     Ok(())
+}
+
+/// The window's icons from the exe's own icon (`icons/icon.ico`, every size), at exactly the
+/// sizes Windows draws them at the window's DPI: the taskbar's (large) and the title's (small).
+/// Tauri sets one bitmap (the `.ico`'s first entry) and Windows rescales it, which blurs.
+fn set_window_icons(window: &tauri::WebviewWindow) {
+    use std::sync::Mutex;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::Controls::LoadIconWithScaleDown;
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DestroyIcon, HICON, ICON_BIG, ICON_SMALL, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON,
+        SendMessageW, WM_SETICON,
+    };
+    /// The icon resource tauri-build embeds (`32512 ICON "icons/icon.ico"`).
+    const APP_ICON: usize = 32512;
+    /// The icons this set before (destroyed when replaced): `[large, small]`.
+    static PREVIOUS: Mutex<[usize; 2]> = Mutex::new([0, 0]);
+
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let hwnd = hwnd.0;
+    let mut previous = PREVIOUS.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: plain Win32 calls on this process's own window and module; each icon handle is
+    // used only after the call that made it succeeded.
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd);
+        let module = GetModuleHandleW(std::ptr::null());
+        let kinds = [(ICON_BIG, SM_CXICON, SM_CYICON), (ICON_SMALL, SM_CXSMICON, SM_CYSMICON)];
+        for (slot, (kind, metric_x, metric_y)) in kinds.into_iter().enumerate() {
+            let (width, height) = (
+                GetSystemMetricsForDpi(metric_x, dpi),
+                GetSystemMetricsForDpi(metric_y, dpi),
+            );
+            let mut icon: HICON = std::ptr::null_mut();
+            if LoadIconWithScaleDown(module, APP_ICON as *const u16, width, height, &mut icon) != 0
+                || icon.is_null()
+            {
+                continue;
+            }
+            SendMessageW(hwnd, WM_SETICON, kind as usize, icon as isize);
+            if previous[slot] != 0 {
+                DestroyIcon(previous[slot] as HICON);
+            }
+            previous[slot] = icon as usize;
+        }
+    }
 }
 
 /// The log: to stdout (a debug build's console) and to `logs\desktop.log` in the data folder,
