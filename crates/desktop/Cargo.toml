@@ -15,6 +15,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 axum = { version = "0.8", features = ["ws", "multipart"] }
 base64.workspace = true
+sha2 = "0.10"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs"] }
 chrono = { workspace = true, features = ["clock"] }
@@ -26,6 +27,7 @@ hermes_prompts.workspace = true
 hermes_runtime.workspace = true
 hermes_store.workspace = true
 hermes_tools.workspace = true
+hermes_memory.workspace = true
 keyring = { version = "3.6.3", features = ["windows-native"] }
 rmcp.workspace = true
 serde.workspace = true

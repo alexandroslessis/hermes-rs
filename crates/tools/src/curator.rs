@@ -276,19 +276,29 @@ impl SkillStore {
     /// Moves a skill's folder into `.archive/` (Hermes's `archive_skill`). Only curator-managed,
     /// unpinned skills of this folder.
     pub fn archive(&self, name: &str) -> Result<(), String> {
+        self.archive_skill(name, true)
+    }
+
+    /// [`Self::archive`] for the user's own delete (the Star map): any skill of this folder that
+    /// isn't pinned, curator-managed or not (Hermes's `skill_usage.archive_skill`). Restorable.
+    pub fn archive_by_user(&self, name: &str) -> Result<(), String> {
+        self.archive_skill(name, false)
+    }
+
+    fn archive_skill(&self, name: &str, curator: bool) -> Result<(), String> {
         let skill = self
             .find(name)
             .ok_or_else(|| format!("Skill '{name}' not found."))?;
         if skill.external {
             return Err(format!(
-                "'{name}' lives in an external folder and is read-only to the curator."
+                "'{name}' lives in an external folder and is read-only here."
             ));
         }
         let record = self.record(&skill.name);
         if record.pinned {
             return Err(format!("'{name}' is pinned."));
         }
-        if !record.curator_managed() {
+        if curator && !record.curator_managed() {
             return Err(format!(
                 "'{name}' isn't curator-managed, so the curator won't archive it."
             ));
@@ -317,7 +327,8 @@ impl SkillStore {
             record.archived_at = Some(now_string());
             record.archived_from = Some(from);
         });
-        self.commit(&format!("curator: archive {}", skill.name));
+        let who = if curator { "curator" } else { "user" };
+        self.commit(&format!("{who}: archive {}", skill.name));
         Ok(())
     }
 

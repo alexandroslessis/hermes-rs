@@ -539,6 +539,41 @@ impl MemoryStore {
         )})
     }
 
+    /// The user's own edit of one entry (the Star map; Hermes's `learning_mutations`): `entry`,
+    /// matched by its text under the lock, is replaced by `replacement`, or removed (`None`).
+    /// A replacement may not put the file over its limit; a removal always may (it's how a file
+    /// over its limit gets back under).
+    pub fn edit_entry(&self, target: Target, entry: &str, replacement: Option<&str>) -> Value {
+        let entry = entry.trim().to_string();
+        let replacement = replacement.map(|r| r.trim().to_string());
+        let file = target.file_name();
+        self.mutate(target, false, move |entries, limit| {
+            let Some(index) = entries.iter().position(|e| e.trim() == entry) else {
+                return Mutation::Reply(error("memory node id is stale — refresh the graph"));
+            };
+            let mut next = entries.to_vec();
+            let message = match &replacement {
+                Some(text) => {
+                    next[index] = text.clone();
+                    let total = Self::chars(&next);
+                    if total > limit {
+                        return Mutation::Reply(json!({
+                            "success": false,
+                            "error": format!("Replacement would put memory at {total}/{limit} chars. Shorten the new content."),
+                            "over_budget": true,
+                        }));
+                    }
+                    format!("updated memory in {file}")
+                }
+                None => {
+                    next.remove(index);
+                    format!("deleted memory from {file}")
+                }
+            };
+            Mutation::Write(next, message, json!({}))
+        })
+    }
+
     /// Applies a batch atomically against the final budget: any failing op writes nothing.
     pub fn apply(&self, target: Target, ops: &[Operation], failures: &mut TurnFailures) -> Value {
         self.batch(target, ops, failures, true)

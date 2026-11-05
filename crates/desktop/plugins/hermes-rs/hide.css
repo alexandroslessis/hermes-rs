@@ -21,8 +21,6 @@ button:has(.codicon-mic) {
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-config:browser']) + [id$='-config:browser'],
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-vault']),
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-vault']) + [id$='-vault'],
-[data-tour='overlay-nav'] div:has(> [data-tour='nav-config:memory']),
-[data-tour='overlay-nav'] div:has(> [data-tour='nav-config:memory']) + [id$='-config:memory'],
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-config:voice']),
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-config:voice']) + [id$='-config:voice'],
 [data-tour='overlay-nav'] div:has(> [data-tour='nav-config:advanced']),

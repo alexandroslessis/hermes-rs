@@ -89,6 +89,15 @@ fn config_defaults() -> Value {
         // edits, as Claude Code does. Settings ▸ Safety ▸ Checkpoints switches it.
         "checkpoints": {"enabled": true},
         "stt": {"enabled": false},
+        // The built-in memory (MEMORY.md, USER.md), applied to new sessions (Hermes's
+        // `memory.*`; `write_approval` is ours: stage the agent's writes for review).
+        "memory": {
+            "memory_enabled": true,
+            "user_profile_enabled": true,
+            "memory_char_limit": 2200,
+            "user_char_limit": 1375,
+            "write_approval": false,
+        },
     })
 }
 
@@ -289,6 +298,11 @@ fn config_schema() -> serde_json::Map<String, Value> {
                 "Tool progress display",
                 &["off", "new", "all", "verbose"],
             )),
+            "memory.memory_enabled" => Some(json!({"description": "Keep the agent's notes (MEMORY.md) and give them to new sessions"})),
+            "memory.user_profile_enabled" => Some(json!({"description": "Keep what the agent learns about you (USER.md) and give it to new sessions"})),
+            "memory.memory_char_limit" => Some(json!({"description": "Largest size of MEMORY.md, in characters"})),
+            "memory.user_char_limit" => Some(json!({"description": "Largest size of USER.md, in characters"})),
+            "memory.write_approval" => Some(json!({"description": "Ask before the agent saves to memory"})),
             _ => None,
         };
         if let (Some(field), Some(overrides)) = (field.as_object_mut(), overrides) {

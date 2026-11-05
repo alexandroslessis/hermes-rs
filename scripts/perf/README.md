@@ -79,6 +79,8 @@ its own provider on :47900.
 with its own provider on :47900.
 `toolsets-check.mjs` checks Capabilities ▸ Tools (list, switch off and on, the next turn's tools, a refused
 call) with its own provider on :47900.
+`memory-check.mjs` checks the Star map's routes (graph, node detail, edit, delete, a stale id) and that
+Settings ▸ Memory reaches the store; it restores the perf instance's memory files after.
 
 ## Bundle analysis
 

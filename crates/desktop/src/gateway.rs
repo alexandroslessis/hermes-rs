@@ -130,6 +130,20 @@ impl Gateway {
         self.runtime
             .checkpoints()
             .set_enabled(self.rest.config_value("checkpoints.enabled") != false);
+        // Settings ▸ Memory: which files new sessions keep and get, their sizes, approvals.
+        let memory = self.rest.config_value("memory");
+        let defaults = hermes_memory::MemoryConfig::default();
+        let flag = |key: &str, default: bool| memory[key].as_bool().unwrap_or(default);
+        let size = |key: &str, default: usize| {
+            memory[key].as_u64().filter(|n| *n > 0).map_or(default, |n| n as usize)
+        };
+        self.runtime.memory().set_config(hermes_memory::MemoryConfig {
+            memory_enabled: flag("memory_enabled", defaults.memory_enabled),
+            user_profile_enabled: flag("user_profile_enabled", defaults.user_profile_enabled),
+            memory_char_limit: size("memory_char_limit", defaults.memory_char_limit),
+            user_char_limit: size("user_char_limit", defaults.user_char_limit),
+            write_approval: flag("write_approval", defaults.write_approval),
+        });
         // The tools switched off in Capabilities ▸ Tools.
         let off = crate::toolsets::disabled_toolsets(&self.rest.config_value(crate::toolsets::CONFIG_KEY));
         self.runtime.set_disabled_tools(crate::toolsets::disabled_tools(&off));
@@ -2618,6 +2632,26 @@ impl Gateway {
                 }
             }
             return Some(answer);
+        }
+        // The Star map: learned skills and memories, viewed, edited and deleted (`learning.rs`).
+        if let Some(route) = path.strip_prefix("/api/learning/") {
+            let (skills, memory) = (self.runtime.skills(), self.runtime.memory());
+            let body: Value = serde_json::from_slice(body).unwrap_or_default();
+            let id = crate::rest::query_param(query, "id")
+                .or_else(|| body["id"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            let content = body["content"].as_str().unwrap_or_default().to_string();
+            let (method, route) = (method.to_string(), route.to_string());
+            return tokio::task::spawn_blocking(move || match (method.as_str(), route.as_str()) {
+                ("GET", "graph") => Some((200, crate::learning::graph(&skills, &memory))),
+                ("GET", "node") => Some(crate::learning::detail(&skills, &memory, &id)),
+                ("DELETE", "node") => Some(crate::learning::delete(&skills, &memory, &id)),
+                ("PUT", "node") => Some(crate::learning::edit(&skills, &memory, &id, &content)),
+                _ => None,
+            })
+            .await
+            .ok()
+            .flatten();
         }
         // Capabilities ▸ Tools (`toolsets.rs`).
         if let Some(route) = path.strip_prefix("/api/tools/") {

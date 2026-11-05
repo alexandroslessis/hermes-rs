@@ -95,6 +95,34 @@ pub struct SkillStore {
 }
 
 /// `(frontmatter, body)` of a SKILL.md; the frontmatter is empty when absent or unparseable.
+/// A list field of a skill's frontmatter (`metadata.hermes.<key>`, else `<key>`), as a YAML list
+/// or a comma-separated string (`tags`, `related_skills`).
+pub fn frontmatter_list(frontmatter: &serde_yaml::Mapping, key: &str) -> Vec<String> {
+    let value = frontmatter
+        .get("metadata")
+        .and_then(|m| m.get("hermes"))
+        .and_then(|h| h.get(key).cloned())
+        .or_else(|| frontmatter.get(key).cloned());
+    match value {
+        Some(serde_yaml::Value::Sequence(items)) => items
+            .iter()
+            .filter_map(|i| i.as_str().map(str::to_string))
+            .collect(),
+        Some(serde_yaml::Value::String(s)) => s
+            .trim_matches(['[', ']'])
+            .split(',')
+            .map(|t| t.trim().trim_matches(['\'', '"']).to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A list field (see [`frontmatter_list`]) read from a whole `SKILL.md`.
+pub fn skill_md_list(text: &str, key: &str) -> Vec<String> {
+    frontmatter_list(&parse_frontmatter(text).0, key)
+}
+
 pub fn parse_frontmatter(text: &str) -> (serde_yaml::Mapping, String) {
     let text = text.trim_start_matches('\u{feff}');
     let Some(rest) = text.strip_prefix("---") else {
@@ -520,29 +548,7 @@ impl SkillStore {
             }
         };
         let (frontmatter, _) = parse_frontmatter(&content);
-        let hermes = frontmatter
-            .get("metadata")
-            .and_then(|m| m.get("hermes"))
-            .cloned();
-        let list = |key: &str| -> Vec<String> {
-            let value = hermes
-                .as_ref()
-                .and_then(|h| h.get(key).cloned())
-                .or_else(|| frontmatter.get(key).cloned());
-            match value {
-                Some(serde_yaml::Value::Sequence(items)) => items
-                    .iter()
-                    .filter_map(|i| i.as_str().map(str::to_string))
-                    .collect(),
-                Some(serde_yaml::Value::String(s)) => s
-                    .trim_matches(['[', ']'])
-                    .split(',')
-                    .map(|t| t.trim().trim_matches(['\'', '"']).to_string())
-                    .filter(|t| !t.is_empty())
-                    .collect(),
-                _ => Vec::new(),
-            }
-        };
+        let list = |key: &str| frontmatter_list(&frontmatter, key);
         let linked = Self::linked_files(&skill.dir);
         let rel = skill
             .skill_md()

@@ -15,6 +15,7 @@ mod gateway;
 mod git;
 mod git_review;
 mod hub;
+mod learning;
 mod maintenance;
 mod paths;
 mod projects;

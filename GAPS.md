@@ -50,7 +50,7 @@ backend code · **L** = a port of a Hermes subsystem.
 
 | # | Gap | Evidence | Already in hermes-rs | Effort |
 |---|---|---|---|---|
-| 3.1 | Partly done 2026-11-04: memory file sizes and reset (Command Center ▸ Maintenance). Memory manager: view and edit MEMORY.md / USER.md, pending writes, reset. | Settings ▸ Memory hidden; `/api/memory`, `/api/memory/reset` | `hermes_memory` store, approvals | S–M |
+| 3.1 | ✅ **Done 2026-11-05** (the Star map: learned skills and every memory entry as nodes, opened, edited, deleted; Settings ▸ Memory: on/off, sizes, write approval, applied to the store; earlier: file sizes and reset in Command Center ▸ Maintenance). Pending writes stay in the chat's approval cards; no external memory providers. Memory manager: view and edit MEMORY.md / USER.md, pending writes, reset. | Settings ▸ Memory hidden; `/api/memory`, `/api/memory/reset` | `hermes_memory` store, approvals | S–M |
 | 3.2 | ✅ **Done 2026-11-04.** Session search in the sidebar. | `/api/sessions/search` | `session_search` tool, store search | S |
 | 3.3 | Archive / hide sessions. | `session.archive`, `session.set_hidden` | store (needs a flag kept outside the shared schema, or a schema bump the GPUI app tolerates) | S |
 | 3.4 | Sessions settings: retention / auto-prune, export, import. | Settings ▸ Sessions hidden | store delete | S–M |
