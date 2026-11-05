@@ -11,6 +11,7 @@ pub mod mcp;
 mod ops;
 mod review;
 mod session;
+pub mod subagents;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub use curator::{CuratorModel, CuratorOutcome};
+pub use delegate::MAX_CONCURRENT_CHILDREN;
 pub use hermes_tools::{
     ClarifyAnswer, ClarifyOutcome, ClarifyQuestion, ClarifyRequest, ClarifyResponse, ProcessNotice,
 };
@@ -335,6 +337,8 @@ pub struct Runtime {
     background_review: Arc<AtomicBool>,
     /// When a turn last started or ended: the curator waits for the app to be idle.
     last_activity: Arc<Mutex<std::time::Instant>>,
+    /// The `delegate_task` children running now (the page lists, steers and stops them).
+    subagents: Arc<subagents::Subagents>,
     curator_running: AtomicBool,
 }
 
@@ -369,6 +373,7 @@ impl Runtime {
             sessions: Mutex::new(HashMap::new()),
             background_review: Arc::new(AtomicBool::new(true)),
             last_activity: Arc::new(Mutex::new(std::time::Instant::now())),
+            subagents: Arc::default(),
             curator_running: AtomicBool::new(false),
         })
     }
@@ -904,6 +909,7 @@ impl Runtime {
             child_tools: self.child_tools(),
             summarizer: summarizer.clone(),
             mcp: self.mcp.clone(),
+            subagents: self.subagents.clone(),
         });
         let self_mcp = self.mcp.clone();
         *self.last_activity.lock() = std::time::Instant::now();
@@ -1498,6 +1504,11 @@ impl Runtime {
         };
         self.store.upsert_message(&session_id, index, &message)?;
         Ok(messages)
+    }
+
+    /// The `delegate_task` children running now: list, tail, steer, stop (`subagents.rs`).
+    pub fn subagents(&self) -> &subagents::Subagents {
+        &self.subagents
     }
 
     /// Hermes's `/steer`: a message for the running turn, delivered to the model right after its

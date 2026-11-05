@@ -71,6 +71,8 @@ download, a ranged media stream, the credential guard).
 `git-check.mjs` checks the review pane's git routes in a throwaway repository (list, diffs,
 stage, commit context, commit, branches, worktrees, revert).
 `terminal-check.mjs` checks the side panel's terminal (open, run, reattach with replay, close, exit).
+`subagents-check.mjs` checks live subagents (events, list, tail, steer, stop) with its own provider
+on :47900 (stop `mock_llm.py` first).
 
 ## Bundle analysis
 

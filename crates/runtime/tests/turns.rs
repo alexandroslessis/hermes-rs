@@ -2210,6 +2210,64 @@ async fn delegate_task_runs_a_subagent_and_returns_its_summary() {
 }
 
 #[tokio::test]
+async fn a_subagent_reports_its_start_tools_text_and_end() {
+    let h = harness(vec![
+        tool_reply(&[(
+            "d1",
+            "delegate_task",
+            json!({"tasks": [{"goal": "read the notes"}]}),
+        )]),
+        tool_reply(&[("r1", "read_file", json!({"path": "notes.md"}))]),
+        text_reply("The notes are empty."),
+        text_reply("Done."),
+    ])
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "delegate reading the notes").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let subagent: Vec<(&str, &Value)> = events
+        .iter()
+        .filter_map(|e| match e {
+            RuntimeEvent::Agent(AgentEvent::Subagent { kind, payload }) => Some((*kind, payload)),
+            _ => None,
+        })
+        .collect();
+    let kinds: Vec<&str> = subagent.iter().map(|(k, _)| *k).collect();
+    assert_eq!(
+        kinds,
+        ["subagent.start", "subagent.tool", "subagent.progress", "subagent.complete"],
+        "{subagent:?}"
+    );
+    let id = subagent[0].1["subagent_id"].as_str().unwrap();
+    assert!(subagent.iter().all(|(_, p)| p["subagent_id"] == id && p["goal"] == "read the notes"));
+    assert_eq!(subagent[0].1["task_count"], 1);
+    assert_eq!(subagent[1].1["tool_name"], "read_file");
+    assert_eq!(subagent[1].1["tool_preview"], "notes.md");
+    assert_eq!(subagent[2].1["text"], "The notes are empty.");
+    let done = subagent[3].1;
+    assert_eq!(done["status"], "completed");
+    assert_eq!(done["summary"], "The notes are empty.");
+    assert_eq!(done["files_read"], json!(["notes.md"]));
+    assert_eq!(done["tool_count"], 1);
+    // Gone from the running list once it ends.
+    assert!(h.runtime.subagents().list(&session).is_empty());
+}
+
+#[tokio::test]
+async fn paused_delegation_is_refused() {
+    let h = harness(vec![
+        tool_reply(&[("d1", "delegate_task", json!({"tasks": [{"goal": "x"}]}))]),
+        text_reply("ok"),
+    ])
+    .await;
+    h.runtime.subagents().set_paused(true);
+    let session = session_in(&h);
+    run_turn(&h, &session, "go").await;
+    let second = h.requests.lock()[1].to_string();
+    assert!(second.contains("Delegation is paused"), "{second}");
+}
+
+#[tokio::test]
 async fn too_many_delegated_tasks_are_refused() {
     let tasks: Vec<Value> = (0..11)
         .map(|i| json!({"goal": format!("task {i}")}))

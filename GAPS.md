@@ -35,7 +35,7 @@ backend code · **L** = a port of a Hermes subsystem.
 | # | Gap | Evidence | Already in hermes-rs | Effort |
 |---|---|---|---|---|
 | 2.1 | ✅ **Done 2026-11-04** (`/history` is the page's own). Built-in commands answered "not a command": `/compress`, `/status`, `/diff`, `/usage`, `/insights`, `/context`, `/refine`, `/memory` (pending writes), `/tools`, `/history`. | `session.compress`, `session.status`, `command.dispatch` only knows skills | `Runtime::compress`, `diff`, `usage_report`, `insights_report`, `refine`, `context_breakdown`, memory approval store | S |
-| 2.2 | **Live subagents**: delegation runs, but the page can't list, follow, steer or stop subagents. | `subagent.list` returns empty; `subagent.tail/steer/interrupt`, `agents.list`, `spawn_tree.*` unanswered | `runtime/src/delegate.rs` | M |
+| 2.2 | ✅ **Done 2026-11-05** (`subagent.start/tool/thinking/progress/complete` events; `subagent.list`, `tail`, `steer`, `interrupt`; `delegation.status`, `delegation.pause`. Not ported: `spawn_tree.*` and `agents.list`, which the page doesn't call). **Live subagents**: delegation runs, but the page can't list, follow, steer or stop subagents. | `subagent.list` returns empty; `subagent.tail/steer/interrupt`, `agents.list`, `spawn_tree.*` unanswered | `runtime/src/delegate.rs` | M |
 | 2.3 | `/btw` (side question) and `/bg` (background prompt). | `prompt.btw`, `prompt.background` | the turn machinery | M |
 | 2.4 | `/branch` / fork a session from a message. | `session.branch*` | store, rewind | M |
 | 2.5 | ✅ **Done 2026-11-04** (Save As dialog, JSON/Markdown/HTML, redact). Save / export a conversation (`/save`). | `session.save`, `session.export` | store | S |

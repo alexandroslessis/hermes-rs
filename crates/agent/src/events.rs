@@ -29,4 +29,11 @@ pub enum AgentEvent {
         task: usize,
         text: String,
     },
+    /// A `delegate_task` child's activity for the desktop page (Hermes's `subagent.*` events):
+    /// `kind` is `start`, `tool`, `thinking`, `progress` or `complete`; `payload` is Hermes's
+    /// `SubagentEventPayload`.
+    Subagent {
+        kind: &'static str,
+        payload: serde_json::Value,
+    },
 }

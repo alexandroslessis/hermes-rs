@@ -82,6 +82,8 @@ pub struct Delegator {
     pub summarizer: compress::Summarizer,
     /// MCP servers' tools, offered to the parent and (as in Hermes) inherited by children.
     pub mcp: Arc<crate::mcp::McpManager>,
+    /// The running children, for the page to list, steer and stop (`subagents.rs`).
+    pub subagents: Arc<crate::subagents::Subagents>,
 }
 
 /// The parent's tools plus `delegate_task`.
@@ -183,8 +185,121 @@ impl UserBridge for ChildBridge {
     }
 }
 
-/// A short label for a child's tool call in the progress line.
-fn progress_line(name: &str, args: &serde_json::Map<String, Value>) -> String {
+/// One task of a batch, as `run_child` takes it.
+struct ChildTask<'a> {
+    index: usize,
+    task_count: usize,
+    goal: &'a str,
+    context: Option<&'a str>,
+    delegation_id: &'a str,
+}
+
+/// `base` with `extra`'s fields over it (a subagent event's payload).
+fn with(base: &Value, extra: Value) -> Value {
+    let mut payload = base.clone();
+    if let (Some(payload), Value::Object(extra)) = (payload.as_object_mut(), extra) {
+        payload.extend(extra);
+    }
+    payload
+}
+
+/// Turns a child's events into the parent's: a progress line per tool call (the delegate_task
+/// card), and the page's `subagent.*` events. Text and reasoning stream in pieces; each stretch
+/// goes out as one `progress` / `thinking` event when the next tool call (or the end) comes.
+#[derive(Default)]
+struct Relay {
+    registry: Arc<crate::subagents::Subagents>,
+    subagent_id: String,
+    base: Value,
+    emit: Option<Emitter>,
+    tool_call_id: String,
+    index: usize,
+    text: String,
+    thinking: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    files_read: Vec<String>,
+    files_written: Vec<String>,
+}
+
+impl Relay {
+    fn send(&self, kind: &'static str, extra: Value) {
+        if let Some(emit) = &self.emit {
+            emit.emit(AgentEvent::Subagent { kind, payload: with(&self.base, extra) });
+        }
+    }
+
+    fn flush(&mut self) {
+        let thinking = std::mem::take(&mut self.thinking);
+        if !thinking.trim().is_empty() {
+            self.send("subagent.thinking", json!({"text": thinking.trim()}));
+        }
+        let text = std::mem::take(&mut self.text);
+        if !text.trim().is_empty() {
+            self.send("subagent.progress", json!({"text": text.trim()}));
+        }
+    }
+
+    fn event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::Usage(usage) => {
+                self.input_tokens += usage.usage.input_tokens.unwrap_or(0).max(0) as u64;
+                self.output_tokens += usage.usage.output_tokens.unwrap_or(0).max(0) as u64;
+            }
+            AgentEvent::Message(message) if message.role == Role::Assistant => {
+                for content in &message.content {
+                    match content {
+                        MessageContent::Text(t) if !t.text.is_empty() => {
+                            self.text.push_str(&t.text);
+                            self.registry.append_tail(&self.subagent_id, &t.text);
+                        }
+                        MessageContent::Thinking(t) if !t.thinking.is_empty() => {
+                            self.thinking.push_str(&t.thinking);
+                        }
+                        MessageContent::ToolRequest(request) => {
+                            let Ok(call) = &request.tool_call else { continue };
+                            self.flush();
+                            let args = call.arguments.clone().unwrap_or_default();
+                            let detail = tool_detail(&args);
+                            if let Some(emit) = &self.emit {
+                                emit.emit(AgentEvent::SubagentProgress {
+                                    tool_call_id: self.tool_call_id.clone(),
+                                    task: self.index,
+                                    text: progress_line(&call.name, &args),
+                                });
+                            }
+                            let count = self.registry.tool_started(&self.subagent_id, &call.name);
+                            let path = args.get("path").and_then(Value::as_str).map(str::to_string);
+                            match (call.name.as_ref(), path) {
+                                ("read_file", Some(path)) if !self.files_read.contains(&path) => {
+                                    self.files_read.push(path)
+                                }
+                                ("write_file" | "patch", Some(path)) if !self.files_written.contains(&path) => {
+                                    self.files_written.push(path)
+                                }
+                                _ => {}
+                            }
+                            self.registry.append_tail(
+                                &self.subagent_id,
+                                &format!("\n▸ {}\n", progress_line(&call.name, &args)),
+                            );
+                            self.send(
+                                "subagent.tool",
+                                json!({"tool_name": call.name, "tool_preview": detail, "tool_count": count,
+                                       "status": "running"}),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The detail of a child's tool call: its command, path, query… on one short line.
+fn tool_detail(args: &serde_json::Map<String, Value>) -> String {
     let detail = [
         "command",
         "path",
@@ -202,7 +317,12 @@ fn progress_line(name: &str, args: &serde_json::Map<String, Value>) -> String {
     })
     .unwrap_or_default();
     let detail: String = detail.split_whitespace().collect::<Vec<_>>().join(" ");
-    let detail: String = detail.chars().take(80).collect();
+    detail.chars().take(80).collect()
+}
+
+/// A short label for a child's tool call in the progress line.
+fn progress_line(name: &str, args: &serde_json::Map<String, Value>) -> String {
+    let detail = tool_detail(args);
     if detail.is_empty() {
         name.to_string()
     } else {
@@ -241,6 +361,9 @@ impl Delegator {
         if tasks.is_empty() {
             return json!({"success": false, "error": "tasks must contain at least one task."});
         }
+        if self.subagents.paused() {
+            return json!({"success": false, "error": "Delegation is paused by the user: do the work yourself, or ask whether to resume delegation."});
+        }
         if tasks.len() > MAX_CONCURRENT_CHILDREN {
             return json!({"success": false, "error": format!(
                 "Too many tasks ({}): at most {MAX_CONCURRENT_CHILDREN} subagents run in parallel. Split the work into smaller batches.",
@@ -268,18 +391,21 @@ impl Delegator {
             Err(error) => return json!({"success": false, "error": format!("{error:#}")}),
         };
         let started = Instant::now();
+        // One batch: the page groups its children by this id.
+        let delegation_id = format!("dg-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let task_count = specs.len();
         let runs = specs.into_iter().map(|(index, goal, context)| {
             let base_prompt = base_prompt.clone();
+            let delegation_id = &delegation_id;
             async move {
-                self.run_child(
+                let task = ChildTask {
                     index,
-                    &goal,
-                    context.as_deref(),
-                    &base_prompt,
-                    request_id,
-                    emit,
-                )
-                .await
+                    task_count,
+                    goal: &goal,
+                    context: context.as_deref(),
+                    delegation_id,
+                };
+                self.run_child(task, &base_prompt, request_id, emit).await
             }
         });
         let results = futures::future::join_all(runs).await;
@@ -291,13 +417,12 @@ impl Delegator {
 
     async fn run_child(
         &self,
-        index: usize,
-        goal: &str,
-        context: Option<&str>,
+        task: ChildTask<'_>,
         base_prompt: &str,
         request_id: &str,
         parent_emit: &Emitter,
     ) -> Value {
+        let ChildTask { index, task_count, goal, context, delegation_id } = task;
         let started = Instant::now();
         let subagent_id = format!(
             "sa-{index}-{}",
@@ -349,30 +474,42 @@ impl Delegator {
         let cancel = parent_emit.cancel_token().child_token();
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let emit = Emitter::new(events_tx, cancel.clone());
-        // The child's tool calls become progress lines under the parent's delegate_task card.
-        let progress_emit = parent_emit.clone();
-        let progress_id = request_id.to_string();
+        // Listed while it runs: the page can follow, steer and stop it.
+        self.subagents.register(crate::subagents::NewChild {
+            subagent_id: subagent_id.clone(),
+            session_id: parent_id.clone(),
+            goal: goal.to_string(),
+            delegation_id: delegation_id.to_string(),
+            model: self.model.clone(),
+            cancel: cancel.clone(),
+            state: state.clone(),
+        });
+        let base = json!({
+            "goal": goal, "task_count": task_count, "task_index": index,
+            "subagent_id": subagent_id, "parent_id": null, "delegation_id": delegation_id,
+            "depth": 1, "model": self.model,
+        });
+        parent_emit.emit(AgentEvent::Subagent {
+            kind: "subagent.start",
+            payload: with(&base, json!({"status": "running", "tool_count": 0})),
+        });
+        // The child's activity: progress lines under the parent's delegate_task card, and the
+        // page's live subagent rows.
+        let mut relay = Relay {
+            registry: self.subagents.clone(),
+            subagent_id: subagent_id.clone(),
+            base: base.clone(),
+            emit: Some(parent_emit.clone()),
+            tool_call_id: request_id.to_string(),
+            index,
+            ..Relay::default()
+        };
         let relay = tokio::spawn(async move {
             while let Some(event) = events_rx.recv().await {
-                if let AgentEvent::Message(message) = event {
-                    for request in message
-                        .content
-                        .iter()
-                        .filter_map(MessageContent::as_tool_request)
-                    {
-                        if let Ok(call) = &request.tool_call {
-                            progress_emit.emit(AgentEvent::SubagentProgress {
-                                tool_call_id: progress_id.clone(),
-                                task: index,
-                                text: progress_line(
-                                    &call.name,
-                                    &call.arguments.clone().unwrap_or_default(),
-                                ),
-                            });
-                        }
-                    }
-                }
+                relay.event(event);
             }
+            relay.flush();
+            relay
         });
         let tool_names: Vec<String> = SessionTools::tool_names()
             .into_iter()
@@ -408,6 +545,10 @@ impl Delegator {
             })),
             Step::Operation(Arc::new(ToolOperation::new().with_provider(provider))),
             Step::Operation(Arc::new(ops::UnhandledToolCalls { tool_names })),
+            // A steer from the page's subagent row, after the child's next tool results.
+            Step::Operation(Arc::new(ops::DeliverSteer {
+                state: state.clone(),
+            })),
             Step::Operation(Arc::new(ops::LengthContinuation {
                 state: state.clone(),
             })),
@@ -430,7 +571,8 @@ impl Delegator {
         let outcome = machine.run(&runtime, &session_id, &emit).await;
         drop(machine);
         drop(emit);
-        let _ = relay.await;
+        let relay = relay.await.unwrap_or_default();
+        self.subagents.finish(&subagent_id);
         tools.shutdown().await;
 
         let messages = child.conversation.lock().messages().clone();
@@ -482,6 +624,24 @@ impl Delegator {
                 Some(json!({"tool": call.name, "status": status}))
             })
             .collect();
+        let duration = (started.elapsed().as_secs_f64() * 100.0).round() / 100.0;
+        parent_emit.emit(AgentEvent::Subagent {
+            kind: "subagent.complete",
+            payload: with(
+                &base,
+                json!({
+                    "status": status,
+                    "summary": if summary.trim().is_empty() { error.clone().unwrap_or_default() } else { capped(&summary) },
+                    "duration_seconds": duration,
+                    "api_calls": replies.len(),
+                    "tool_count": tool_trace.len(),
+                    "input_tokens": relay.input_tokens,
+                    "output_tokens": relay.output_tokens,
+                    "files_read": relay.files_read,
+                    "files_written": relay.files_written,
+                }),
+            ),
+        });
         json!({
             "task_index": index,
             "status": status,

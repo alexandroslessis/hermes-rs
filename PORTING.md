@@ -67,6 +67,7 @@ Not from Hermes, so not in the map:
 | `guards.rs` | `agent/repetition_guard.py`, `agent/tool_guardrails.py` |
 | `review.rs` | `agent/background_review.py` |
 | `curator.rs` | `agent/curator.py` |
+| `subagents.rs`, `delegate.rs` (events) | `tools/delegate_tool_registry.py`, `tui_gateway` `subagent.*` and `delegation.status/pause`; `spawn_tree.*` not ported |
 | **Tools** (`crates/tools`) | |
 | `shell.rs` | `tools/terminal_tool.py` |
 | `process.rs` | `tools/process_registry.py` |

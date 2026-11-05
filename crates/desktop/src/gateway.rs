@@ -681,8 +681,43 @@ impl Gateway {
                 let id = session_id(params)?;
                 Ok(json!({"killed": self.runtime.stop_processes(&id).await}))
             }
-            // hermes-rs keeps no registry of a turn's subagents yet: none to list.
-            "subagent.list" => Ok(json!({"subagents": [], "delegations": []})),
+            // The session's running subagents (`delegate_task` children): the page's rows follow
+            // their `subagent.*` events and reconcile against this list.
+            "subagent.list" => {
+                let id = session_id(params)?;
+                Ok(json!({"subagents": self.runtime.subagents().list(&id), "delegations": []}))
+            }
+            "subagent.tail" | "subagent.steer" | "subagent.interrupt" => {
+                let id = session_id(params)?;
+                let child = params["subagent_id"].as_str().unwrap_or_default().to_string();
+                let subagents = self.runtime.subagents();
+                Ok(match method {
+                    "subagent.tail" => subagents.tail(&id, &child),
+                    "subagent.interrupt" => {
+                        json!({"found": subagents.interrupt(&id, &child), "subagent_id": child})
+                    }
+                    _ => {
+                        let text = params["text"].as_str().unwrap_or_default().trim().to_string();
+                        if text.is_empty() {
+                            return Err((INVALID_PARAMS, "text is required".to_string()));
+                        }
+                        // (Hermes's `SteerStatus`: queued for the child's next tool results.)
+                        let status = if subagents.steer(&id, &child, &text) { "queued" } else { "rejected" };
+                        json!({"status": status, "subagent_id": child, "text": text})
+                    }
+                })
+            }
+            "delegation.status" => Ok(json!({
+                "active": self.runtime.subagents().active(),
+                "paused": self.runtime.subagents().paused(),
+                "max_spawn_depth": 1,
+                "max_concurrent_children": hermes_runtime::MAX_CONCURRENT_CHILDREN,
+            })),
+            "delegation.pause" => {
+                let paused = params["paused"].as_bool().unwrap_or(true);
+                self.runtime.subagents().set_paused(paused);
+                Ok(json!({"paused": paused}))
+            }
             "complete.path" => {
                 let word = params["word"].as_str().unwrap_or_default().to_string();
                 let root = params["cwd"]
@@ -2043,6 +2078,10 @@ impl Gateway {
                             "session.usage",
                             json!({"usage": this.usage_snapshot(&id, last_input)}),
                         );
+                    }
+                    // A subagent's activity: the page's live subagent rows.
+                    RuntimeEvent::Agent(AgentEvent::Subagent { kind, payload }) => {
+                        this.emit(&id, kind, payload);
                     }
                     RuntimeEvent::Agent(event) => {
                         if matches!(&event, AgentEvent::Message(m) if m.is_tool_response()) {
