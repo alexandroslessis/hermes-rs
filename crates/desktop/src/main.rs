@@ -14,6 +14,7 @@ mod files;
 mod gateway;
 mod git;
 mod git_review;
+mod hermes_import;
 mod hub;
 mod learning;
 mod maintenance;
@@ -38,13 +39,19 @@ use tauri::{WebviewUrl, WebviewWindowBuilder};
 const DEFAULT_PORT: u16 = 47_731;
 
 /// Hermes's built webapp: `HERMES_UI_DIST`, else the prototype's build output.
+/// Hermes's webapp bundle: `HERMES_UI_DIST`, else `webapp\` next to the exe (where the installer
+/// puts it, `tauri.conf.json`'s `resources`), else the repository's build (a developer's run).
 fn webapp_dist() -> PathBuf {
-    std::env::var_os("HERMES_UI_DIST")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/hermes-src/apps/desktop/dist-webapp")
-        })
+    if let Some(dist) = std::env::var_os("HERMES_UI_DIST") {
+        return PathBuf::from(dist);
+    }
+    let installed = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("webapp")))
+        .filter(|dir| dir.join("index.html").is_file());
+    installed.unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/hermes-src/apps/desktop/dist-webapp")
+    })
 }
 
 fn main() -> Result<()> {

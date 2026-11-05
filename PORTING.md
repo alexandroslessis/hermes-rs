@@ -62,6 +62,7 @@ Not from Hermes, so not in the map:
 | `branch.rs` | `tui_gateway/methods_session_branch.py`; copies stored messages (tools included) where Hermes copies visible text; parent links in `branches.json` (the shared schema has no parent column) |
 | `toolsets.rs` | `hermes_cli/web_routers/tools.py` (`/api/tools/toolsets*`, `/api/tools/terminal/backends`), `hermes_cli/tools_config.py` (`CONFIGURABLE_TOOLSETS`); keeps the disabled toolsets (`disabled_toolsets`) where Hermes keeps the enabled ones per platform |
 | `learning.rs` | `agent/learning_graph.py`, `agent/learning_mutations.py` (`/api/learning/*`, served by `hermes_cli/web_routers/status.py`); memory edits through `MemoryStore::edit_entry` (the store's lock and drift guard), skill deletes through `archive_by_user` |
+| `hermes_import.rs` | `tui_gateway/methods_session_foreign.py` (`session.foreign.list/preview/import`, Hermes's Claude Code / Codex import screen, here fed from Hermes's own `state.db`), `hermes_state_common.py` (the schema), `hermes_constants.py` (`get_hermes_home`) |
 | `export.rs` | `session.export` (`tui_gateway/methods_session.py`), the page's `/save` |
 | `maintenance.rs` | `hermes_cli/web_routers/status.py` (`/api/curator*`, `/api/actions/*`), `hermes_cli/web_routers/ops.py` (`/api/memory*`), `agent/curator.py` (the schedule) |
 | `skills.rs` | `hermes_cli/web_routers/skills.py` (local routes), `hermes_cli/skills_config.py`; the hub (`tools/skills_hub*.py`, `tools/skills_guard.py`) not ported |

@@ -13,7 +13,20 @@
     }
   },
   "bundle": {
-    "active": false,
-    "icon": ["icons/icon.ico"]
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
+    "publisher": "hermes-rs",
+    "shortDescription": "Hermes, on a Rust backend",
+    "resources": {
+      "../../target/hermes-src/apps/desktop/dist-webapp/": "webapp/"
+    },
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper" },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico"
+      }
+    }
   }
 }

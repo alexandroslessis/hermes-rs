@@ -81,6 +81,9 @@ with its own provider on :47900.
 call) with its own provider on :47900.
 `memory-check.mjs` checks the Star map's routes (graph, node detail, edit, delete, a stale id) and that
 Settings ▸ Memory reaches the store; it restores the perf instance's memory files after.
+`import-check.mjs` checks the Hermes importer (list, preview, import, `/import-hermes`, continuing an
+imported chat) against a home built by `make-hermes-db.py` with Hermes's own SessionDB; start the
+instance with `HERMES_HOME` set to it.
 
 ## Bundle analysis
 

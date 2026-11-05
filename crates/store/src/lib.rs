@@ -240,6 +240,15 @@ impl Store {
     }
 
     /// Pins or unpins a session (its place in the list by time is kept).
+    /// A session's start and last activity (milliseconds): an imported session keeps its own.
+    pub fn set_times(&self, id: &str, created_at: i64, updated_at: i64) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE sessions SET created_at = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, created_at, updated_at],
+        )?;
+        Ok(())
+    }
+
     pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
         self.conn.lock().execute(
             "UPDATE sessions SET pinned = ?2 WHERE id = ?1",

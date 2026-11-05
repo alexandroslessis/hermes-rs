@@ -11,13 +11,15 @@ use hermes_runtime::Runtime;
 use hermes_tools::SkillStore;
 use serde_json::{Value, json};
 
-/// Hermes's coding commands this backend runs (`coding_command`), as `hermes_cli/commands.py`
-/// describes them.
-const CODING_COMMANDS: [(&str, &str); 4] = [
+/// The built-in commands this backend runs and offers in the `/` menu: Hermes's coding commands
+/// (`coding_command`), as `hermes_cli/commands.py` describes them, and `/import-hermes`
+/// (`Gateway::builtin_command`).
+const CODING_COMMANDS: [(&str, &str); 5] = [
     ("plan", "Write a markdown implementation plan to .hermes/plans/ without executing anything"),
     ("init", "Generate or update AGENTS.md project instructions from a repo scan"),
     ("review", "Spawn an independent subagent to review the work just discussed (PR, code, docs)"),
     ("learn", "Learn a reusable skill from anything you describe (dirs, URLs, this chat, notes)"),
+    ("import-hermes", "Import every session from the original Hermes on this computer"),
 ];
 
 /// A command the `/` menu offers: `(name, description, origin)`: the coding commands, then the

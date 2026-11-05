@@ -28,6 +28,7 @@ hermes_runtime.workspace = true
 hermes_store.workspace = true
 hermes_tools.workspace = true
 hermes_memory.workspace = true
+rusqlite.workspace = true
 keyring = { version = "3.6.3", features = ["windows-native"] }
 rmcp.workspace = true
 serde.workspace = true

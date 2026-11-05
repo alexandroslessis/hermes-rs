@@ -3077,6 +3077,7 @@ dependencies = [
  "portable-pty",
  "rfd",
  "rmcp",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

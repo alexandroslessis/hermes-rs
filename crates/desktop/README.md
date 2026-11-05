@@ -27,6 +27,28 @@ It uses the same data folder and settings as the GPUI app (`HERMES_RS_HOME` to p
 `HERMES_DESKTOP_PORT` fixes the local server's port, so a browser can open the same page while
 debugging.
 
+## Installer
+
+After step 1 above, from `crates/desktop` (Node in `tools/node` on the `PATH`):
+
+    npx -y @tauri-apps/cli@2 build
+
+It builds the release app and an NSIS installer in `<target>/release/bundle/nsis/`
+(`Hermes_<version>_x64-setup.exe`): a per-user install (no admin prompt) that carries the webapp
+next to the exe (`webapp\`) and fetches WebView2 if the computer lacks it. Data stays in the same
+data folder as a developer's run, so an installed and a built copy share settings and sessions.
+
+## Sessions from the original Hermes
+
+The Import screen (command palette, Ctrl+K ▸ "Import session") lists the sessions of the original
+Hermes on this computer, from every profile (`HERMES_HOME`, else `%LOCALAPPDATA%\hermes`, else
+`~\.hermes`), with a preview and one-click import; `/import-hermes` imports all of them. Hermes's
+database is only read. An imported session keeps its title, folder, times and conversation (text,
+tool calls and results; reasoning isn't carried over) and talks to the current default endpoint
+and model. Each is imported once (`hermes-imports.json` in the data folder remembers them).
+`src/hermes_import.rs`; `scripts/perf/import-check.mjs` checks it against a home built by
+Hermes's own code (`scripts/perf/make-hermes-db.py`).
+
 ## Status
 
 Works: startup, the session list, opening a session's transcript, sending a prompt with streamed

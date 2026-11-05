@@ -531,6 +531,42 @@ impl Gateway {
             "session.rewind" => self.rewind_turn(params),
             "rollback.list" | "rollback.diff" | "rollback.restore" => self.rollback(method, params),
             "session.export" => self.export_session(params),
+            // The Import screen: sessions from the original Hermes (`hermes_import.rs`).
+            "session.foreign.list" => {
+                let source = params["source"].as_str().map(str::to_string);
+                let offset = params["offset"].as_u64().unwrap_or(0) as usize;
+                let data_dir = self.data_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::hermes_import::list(&data_dir, source.as_deref(), offset)
+                })
+                .await
+                .map_err(|e| (SERVER_ERROR, e.to_string()))
+            }
+            "session.foreign.preview" => {
+                let id = params["id"].as_str().unwrap_or_default().to_string();
+                let data_dir = self.data_dir.clone();
+                tokio::task::spawn_blocking(move || crate::hermes_import::preview(&data_dir, &id))
+                    .await
+                    .map_err(|e| (SERVER_ERROR, e.to_string()))?
+                    .map_err(|e| (INVALID_PARAMS, e))
+            }
+            "session.foreign.import" => {
+                let id = params["id"].as_str().unwrap_or_default().to_string();
+                let (provider, model) = self.import_route(&settings)?;
+                let this = self.clone();
+                tokio::task::spawn_blocking(move || {
+                    let target = crate::hermes_import::Target {
+                        runtime: &this.runtime,
+                        provider,
+                        model,
+                        data_dir: &this.data_dir,
+                    };
+                    crate::hermes_import::import(&target, &id)
+                })
+                .await
+                .map_err(|e| (SERVER_ERROR, e.to_string()))?
+                .map_err(|e| (INVALID_PARAMS, e))
+            }
             // `/branch` and the message menu's Branch (`branch.rs`).
             "session.branch" => self.branch(params, &settings, outbox, false, false),
             "session.branch_whole" => self.branch(params, &settings, outbox, true, true),
@@ -1556,6 +1592,44 @@ impl Gateway {
                 .ok_or((INVALID_PARAMS, "session_id is required".to_string()))
         };
         let output: Result<String, (i64, String)> = match name {
+            // Every session of the original Hermes not imported yet (`hermes_import.rs`).
+            "import-hermes" => match self.import_route(settings) {
+                Ok((provider, model)) => {
+                    let runtime = self.runtime.clone();
+                    let data_dir = self.data_dir.clone();
+                    let found = tokio::task::spawn_blocking(move || {
+                        let sources = crate::hermes_import::sources();
+                        let target = crate::hermes_import::Target {
+                            runtime: &runtime,
+                            provider,
+                            model,
+                            data_dir: &data_dir,
+                        };
+                        (sources, crate::hermes_import::import_all(&target))
+                    })
+                    .await;
+                    match found {
+                        Ok((sources, _)) if sources.is_empty() => Ok(
+                            "No Hermes data found here (looked in HERMES_HOME, %LOCALAPPDATA%\\hermes and ~\\.hermes)."
+                                .to_string(),
+                        ),
+                        Ok((sources, (imported, already, failed))) => {
+                            let mut text = format!(
+                                "Imported {imported} session{} from Hermes ({} database{}); {already} already here.",
+                                if imported == 1 { "" } else { "s" },
+                                sources.len(),
+                                if sources.len() == 1 { "" } else { "s" },
+                            );
+                            if !failed.is_empty() {
+                                text.push_str(&format!("\nNot imported ({}):\n{}", failed.len(), failed.join("\n")));
+                            }
+                            Ok(text)
+                        }
+                        Err(e) => Err((SERVER_ERROR, e.to_string())),
+                    }
+                }
+                Err(e) => Err(e),
+            },
             "status" => match need_id() {
                 Ok(id) => self.status_text(&id).await,
                 Err(e) => Err(e),
@@ -1957,6 +2031,22 @@ impl Gateway {
 
     fn subscribe(&self, session_id: &str, outbox: &Outbox) {
         self.hub.subscribe(session_id, outbox);
+    }
+
+    /// What imported sessions talk to: the default endpoint and model.
+    fn import_route(
+        &self,
+        settings: &Settings,
+    ) -> Result<(hermes_runtime::ProviderConfig, String), (i64, String)> {
+        let provider = settings
+            .active()
+            .ok_or((SERVER_ERROR, "Set up an endpoint first (Settings ▸ Providers): imported sessions use it.".to_string()))?;
+        let model = settings
+            .model
+            .clone()
+            .or_else(|| provider.default_model.clone())
+            .ok_or((SERVER_ERROR, "Choose a model first: imported sessions use it.".to_string()))?;
+        Ok((provider.runtime(), model))
     }
 
     /// The provider a session talks to (its own, else the default).
