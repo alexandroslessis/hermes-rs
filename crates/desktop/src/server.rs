@@ -45,11 +45,14 @@ pub struct ServerState {
     pub port: u16,
     /// The app's window, once made: the page's caption buttons act on it.
     pub window: Arc<std::sync::OnceLock<tauri::WebviewWindow>>,
+    /// The side panel's shells (`/api/host-terminal`).
+    pub terminals: Arc<crate::terminal::Terminals>,
 }
 
 pub async fn serve(listener: tokio::net::TcpListener, state: Arc<ServerState>) {
     let app = Router::new()
         .route("/api/ws", get(websocket))
+        .route("/api/host-terminal", get(host_terminal))
         .route("/api/hermes-rs/window", axum::routing::post(window_control))
         // A file's bytes for the side panel (download, image, audio, video; `file_bytes`).
         .route("/api/fs/download", get(file_bytes).head(file_bytes))
@@ -264,6 +267,21 @@ fn percent_encode(text: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+/// `GET /api/host-terminal` (a WebSocket): a shell in the side panel (`terminal.rs`).
+async fn host_terminal(
+    State(state): State<Arc<ServerState>>,
+    upgrade: WebSocketUpgrade,
+    request: Request,
+) -> Response {
+    let query = request.uri().query().map(str::to_string);
+    let param = |name: &str| crate::rest::query_param(query.as_deref(), name).filter(|v| !v.is_empty());
+    let (attach, action, cwd) = (param("attach"), param("action"), param("cwd"));
+    let cols = crate::terminal::dimension(param("cols").as_deref(), 80, 1000);
+    let rows = crate::terminal::dimension(param("rows").as_deref(), 24, 500);
+    let terminals = state.terminals.clone();
+    upgrade.on_upgrade(move |socket| terminals.serve(socket, attach, action, cols, rows, cwd))
 }
 
 /// `POST /api/chat/file-upload` (multipart, field `file`): a file the composer attaches

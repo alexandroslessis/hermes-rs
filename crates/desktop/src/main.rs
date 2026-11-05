@@ -21,6 +21,7 @@ mod providers;
 mod rest;
 mod server;
 mod skills;
+mod terminal;
 mod transcript;
 
 use std::path::PathBuf;
@@ -84,9 +85,12 @@ fn main() -> Result<()> {
     // while Tauri starts the window and WebView2, not before: the page only asks for it once
     // WebView2 is up, and its first requests wait in the bound port's queue until it serves.
     // (Built in sequence, the window started ~130ms later on every launch, ~1.9s on a first run.)
+    // The side panel's shells (`terminal.rs`), ended when the window closes.
+    let terminals = Arc::new(terminal::Terminals::default());
     {
         let window = window.clone();
         let url = url.clone();
+        let terminals = terminals.clone();
         tokio.spawn(async move {
             let built = tokio::task::spawn_blocking(move || -> Result<server::ServerState> {
                 // The runtime asks the user (approvals, clarify) through the page following the
@@ -103,6 +107,7 @@ fn main() -> Result<()> {
                     token: uuid::Uuid::new_v4().simple().to_string(),
                     port: address.port(),
                     window,
+                    terminals,
                 })
             })
             .await;
@@ -151,6 +156,7 @@ fn main() -> Result<()> {
         })
         .run(tauri::generate_context!())
         .context("running the window")?;
+    terminals.close_all();
     drop(tokio);
     Ok(())
 }

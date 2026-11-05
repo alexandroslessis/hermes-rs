@@ -53,6 +53,7 @@ Not from Hermes, so not in the map:
 | `paths.rs` | `tui_gateway/methods_complete.py` (`@` paths), `/api/fs/list` |
 | `projects.rs` | `tui_gateway/project_tree.py` |
 | `git.rs` | `hermes_cli/web_git.py` (`repo_status`, `review_rev_parse`) |
+| `terminal.rs` | `hermes_cli/web_host_terminal.py`, `web_host_terminal_sessions.py`, `pty_session.py` (`/api/host-terminal`); single viewer per shell (a newer one supersedes with 4409), no input queue limits |
 | `git_review.rs` | `hermes_cli/web_git.py` (the rest: review pane, commit, branches, worktrees, `gh` ship flow), `hermes_cli/web_routers/git.py`; a configured `init.defaultBranch` counts only when that branch exists |
 | `attachments.rs` | `hermes_cli/web_routers/files.py` (`/api/chat/image-upload`, `/api/fs/read-data-url`), `hermes_cli/web_routers/uploads.py` (`/api/chat/file-upload`), `tui_gateway/methods_prompt.py` (`image.attach*`, `image.detach`, `file.attach`), `agent/image_routing.py` (`agent.image_input_mode`) |
 | `files.rs` | `hermes_cli/web_routers/files.py` (`/api/fs/read-text`, `/api/fs/write-text`, `/api/files/mkdir`, `/api/fs/git-root`, the sensitive-path guard; `/api/fs/download`, `/api/files/stream`, `/api/files/ticket` are in `server.rs` and `gateway.rs`) |
