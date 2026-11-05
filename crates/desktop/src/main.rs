@@ -20,6 +20,7 @@ mod hermes_import;
 mod hub;
 mod learning;
 mod maintenance;
+mod open_file;
 mod paths;
 mod projects;
 mod providers;

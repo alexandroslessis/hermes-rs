@@ -8,7 +8,6 @@
 // Hidden sidebar rows (Hermes's `sidebarNav.prefs` area; Capabilities can't be hidden — it
 // hosts the Plugins tab):
 //   messaging  — Telegram/Discord/Slack bridges (Hermes's gateway platforms)
-//   artifacts  — the artifacts index
 //   cron       — scheduled jobs
 
 export default {
@@ -19,7 +18,7 @@ export default {
     ctx.register({
       id: 'hide-unsupported',
       area: 'sidebarNav.prefs',
-      data: { hide: ['messaging', 'artifacts', 'cron'] }
+      data: { hide: ['messaging', 'cron'] }
     })
   }
 }

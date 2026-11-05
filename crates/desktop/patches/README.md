@@ -91,6 +91,15 @@ refresh it against the new Hermes commit (edit the exported file, then diff it a
 Startup bundle (JavaScript reached before the first paint), Hermes `c419cf7c`: 9.3 MB in 145
 files before 0003/0004, 6.6 MB in 109 after.
 
+- **0013-open-file-links.patch** (`app/artifacts/index.tsx`, `lib/browser-desktop-bridge.ts`):
+  Hermes's browser build can't open the server's files: the Artifacts gallery (which sees our
+  connection as remote) downloads a copy, and `openExternal` drops `file:` links. Here the
+  backend is on the user's machine, so both ask `POST /api/hermes-rs/open-file`
+  (`open_file.rs`) first, which opens the file with its default app, or shows it selected in
+  Explorer when it's a program or script (a link never runs one); without the route, or for a
+  file that's gone, the gallery keeps Hermes's download. Tested live 2026-11-05
+  (`scripts/perf/artifacts-check.mjs`).
+
 ## To do
 
 - **Skill hub** (install from Capabilities ▸ Skills ▸ Discover): `tools/skills_hub*.py` and

@@ -1,0 +1,49 @@
+--- a/apps/desktop/src/app/artifacts/index.tsx
++++ b/apps/desktop/src/app/artifacts/index.tsx
+@@ -18,7 +18,7 @@
+ } from '@/components/ui/pagination'
+ import { RowButton } from '@/components/ui/row-button'
+ import { Tip } from '@/components/ui/tooltip'
+-import { getSessionMessages, listAllProfileSessions } from '@/hermes'
++import { getSessionMessages, hermesApi, listAllProfileSessions } from '@/hermes'
+ import { type Translations, useI18n } from '@/i18n'
+ import { resolveBrandIcon } from '@/lib/brand-icon'
+ import {
+@@ -277,6 +277,21 @@
+       const { href } = artifact
+ 
+       try {
++        // hermes-rs: the backend runs on this machine, so a file opens there: its default app,
++        // or Explorer with it selected when it's a program. A backend without the route (or a
++        // file that's gone) keeps Hermes's handling below.
++        if (isArtifactFilePath(artifact.value)) {
++          const opened = await hermesApi<{ ok: boolean }>({
++            path: '/api/hermes-rs/open-file',
++            method: 'POST',
++            body: { url: artifact.value }
++          }).catch(() => null)
++
++          if (opened?.ok) {
++            return
++          }
++        }
++
+         // A gateway-local file resolves to file:// in remote mode (the file
+         // lives on the gateway, not this disk). Opening that locally fails —
+         // and an OAuth remote connection has no query token to build a download
+--- a/apps/desktop/src/lib/browser-desktop-bridge.ts
++++ b/apps/desktop/src/lib/browser-desktop-bridge.ts
+@@ -93,6 +93,13 @@
+     if (target?.kind === 'web') {
+       window.open(target.url, '_blank', 'noopener,noreferrer')
+     }
++
++    // hermes-rs: the backend runs on this machine, so a `file:` link opens there: its default
++    // app, or Explorer with it selected when it's a program. A backend without the route
++    // keeps the browser's rule (nothing happens).
++    if (target?.kind === 'file') {
++      await api({ path: '/api/hermes-rs/open-file', method: 'POST', body: { url: target.url } }).catch(() => undefined)
++    }
+   }
+ 
+   const uploads = createBrowserUploadsBridge({ api, bootstrap, currentProfile, objectUrls, previewUrls })

@@ -25,6 +25,12 @@ Things that cost hours once. Read this before debugging; check here first when s
 - **Relative `CARGO_TARGET_DIR`** is resolved against the cwd: running cargo from `crates/x/src`
   with `target/claude` created a 3.4 GB `crates/desktop/src/target`. Use an absolute path or run
   from the repo root.
+- **A rebuilt frontend isn't served until `cargo build` runs again.** Tauri's build step copies
+  `dist-webapp` (the bundle's `resources`) into `<target>/<profile>/webapp/`, and the exe
+  prefers that copy (`main.rs` `webapp_dist`). After `build-hermes-webapp.ps1`, run
+  `cargo build -p hermes-desktop` before restarting the instance, or it serves the previous
+  page. Check with `cdp.mjs "performance.getEntriesByType('resource').map(e => e.name)"`
+  against the hashed file names in `dist-webapp/assets`.
 - **`cargo test` doesn't rebuild the app binary.** Run `cargo build -p hermes-desktop` before a
   live check, or you're testing the old exe.
 - **The user's build locks `target/debug`.** Always `target/claude`.
@@ -59,6 +65,10 @@ Things that cost hours once. Read this before debugging; check here first when s
   its local settings. A second instance gets a random port and empty local settings, by design.
 - **The page uses a HashRouter.** Navigate with `location.hash = '#/settings'`; `pushState` does
   nothing.
+- **The page sees this backend as a remote gateway** (`isRemoteGateway()` is true in the
+  browser build): actions on files take Hermes's remote paths (download a copy over
+  `/api/fs/download`, ignore `file:` links). Where opening on this machine is right, a patch
+  asks our backend first (0013, `open_file.rs`).
 - **Native dialogs** (folder pick, save as) come through patches 0002/0008 and the window bridge;
   the browser's own pickers don't give paths.
 

@@ -59,7 +59,7 @@ backend code · **L** = a port of a Hermes subsystem.
 | 3.4 | ✅ **Done 2026-11-05** (Settings ▸ Sessions: the archived list, opt-in auto-archive of idle sessions, the default folder for new sessions; the page has no prune/export/import controls, `/save` exports one session). Sessions settings: retention / auto-prune, export, import. | Settings ▸ Sessions hidden | store delete | S–M |
 | 3.5 | Logs done 2026-11-04 (the app now also logs to `logs\\desktop.log`; Command Center shows it); About still hidden. Logs viewer, version and about. | Settings ▸ Advanced / About hidden; `/api/logs` | tracing output | S |
 | 3.6 | Workspace settings (default folder). | Settings ▸ Workspace hidden | `/api/fs/default-cwd` | S |
-| 3.7 | Artifacts gallery (links and files the agent produced, across sessions). | sidebar entry hidden (by us) | mostly frontend over session messages | S |
+| 3.7 | ✅ **Done 2026-11-05** (the sidebar's Artifacts: links and files from the 30 latest sessions; a file opens in its default app, a program or script is only shown in Explorer: `open_file.rs`, patch 0013. As in Hermes, a `write_file` result isn't indexed: files come from replies, terminal output and producer tools). Artifacts gallery (links and files the agent produced, across sessions). | sidebar entry hidden (by us) | mostly frontend over session messages | S |
 | 3.8 | Model fallbacks (another model when one fails). | Settings ▸ Model ▸ Fallbacks hidden | retry/classification in `llm` | M |
 
 ## 4. Known small issues
@@ -107,7 +107,7 @@ image generation, computer use, cloud profiles.
 5. Then sections 3 and 4, and 5 as wanted.
 
 Status 2026-11-05: steps 1–3 done, step 4 done except 1.8 MCP (skipped for now by the user).
-Open, in suggested order: 1.8 MCP, 3.7 artifacts, 3.6 workspace,
+Open, in suggested order: 1.8 MCP, 3.6 workspace,
 3.5 about, 3.8 fallbacks, 2.7 goals/loops, then section 4's small issues.
 
 

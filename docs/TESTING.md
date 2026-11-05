@@ -132,9 +132,9 @@ text/DOM through DevTools:
 - `tools/node/node.exe scripts/perf/hover.mjs "<selector|aria-label|text>" [click]` — hover or
   click and get the boxes of popovers/tooltips that appear (positioning bugs).
 - The page routes by hash: navigate with `location.hash = '#/…'`, not `pushState`.
-- After editing a patch, `hide.css` or `plugin.js`: rebuild the webapp (patches) or just the exe
-  (`hide.css` is `include_str!`'d; `plugin.js` is written to the data folder on start), restart
-  the instance.
+- After editing a patch, `hide.css` or `plugin.js`: rebuild the webapp (patches), then always
+  the exe (`cargo build`: it recopies the webapp next to the exe, and `hide.css` / `plugin.js`
+  are `include_str!`'d), then restart the instance.
 
 ## 4. The user's checklist
 

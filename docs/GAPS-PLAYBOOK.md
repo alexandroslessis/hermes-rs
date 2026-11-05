@@ -176,15 +176,14 @@ the terminal tool). Leave `code_execution.mode` and `persistent_shell` hidden (n
 `execute_code`; our shell isn't persistent). Unhide the section with per-sub-page selectors for
 the rest.
 
-## 3.7 Artifacts gallery — S
+## 3.7 Artifacts gallery — ✅ done 2026-11-05
 
-**Page:** sidebar entry hidden by `plugin.js` (`hide: ['messaging', 'artifacts', 'cron']`). The
-gallery uses `getSessionMessages` (`/api/sessions/{id}/messages`, served by `stored_messages`)
-and `listAllProfileSessions` (`/api/profiles/sessions`, served).
-**Steps:** remove `'artifacts'` from `plugin.js`, rebuild the exe (it's `include_str!`'d),
-restart your instance, open it (`location.hash` to its route; find the route in
-`app/` routes), and read the wire log for unanswered calls. Likely nothing else is needed; if
-it is, serve it from the store. Check that file links open through `/api/fs/*` (side panel).
+Unhidden in `plugin.js`; it reads `/api/profiles/sessions` and `/api/sessions/{id}/messages`,
+both already served. One gap found live: Hermes's browser build can't open the server's files (the
+gallery downloads a copy, `openExternal` drops `file:` links); `open_file.rs` + patch 0013 open them on this machine (programs and
+scripts are only shown in Explorer). `scripts/perf/artifacts-check.mjs` checks it through the
+page. Note for checks: Hermes's gallery doesn't index a `write_file` result (it has no path
+key); files come from replies, terminal output and producer tools' path keys.
 
 ## 3.8 Model fallbacks — M
 

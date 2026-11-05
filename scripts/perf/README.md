@@ -81,6 +81,8 @@ with its own provider on :47900.
 call) with its own provider on :47900.
 `memory-check.mjs` checks the Star map's routes (graph, node detail, edit, delete, a stale id) and that
 Settings ▸ Memory reaches the store; it restores the perf instance's memory files after.
+`artifacts-check.mjs` checks the Artifacts view through the page (a written file named in a reply
+and a link are listed).
 `archive-check.mjs` checks archived sessions (archive from PATCH and the shortcut, the `archived=`
 lists, the project tree, unarchive, deleting an archived one, the auto-archive defaults).
 `import-check.mjs` checks the Hermes importer (list, preview, import, `/import-hermes`, continuing an

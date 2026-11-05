@@ -59,10 +59,10 @@ restore-and-rerun, `/undo`, `/retry`, checkpoints and `/rollback`; built-in comm
 `/status`, `/diff`, `/usage`, `/insights`, `/context`, `/tools`, `/save`), coding commands
 (`/plan`, `/init`, `/review`, `/learn`), `/btw`, `/bg`; custom endpoints and keys in Settings;
 attachments (images, files, paste, drop); the side panel's file preview/edit, git review and
-terminal; live subagents; archiving and Settings ▸ Sessions; Capabilities ▸ Skills and Tools; the Star map and Settings ▸ Memory;
+terminal; live subagents; archiving and Settings ▸ Sessions; the Artifacts gallery; Capabilities ▸ Skills and Tools; the Star map and Settings ▸ Memory;
 Command Center (maintenance, curator, logs, insights); Settings ▸ Model ▸ Auxiliary (side jobs'
 models); importing Hermes sessions; the installer.
 
-Not here (hidden or answering "not here"): MCP connectors, goals and loops, fallbacks, artifacts, scheduled jobs, messaging, bots, kanban, pets, voice. The
+Not here (hidden or answering "not here"): MCP connectors, goals and loops, fallbacks, scheduled jobs, messaging, bots, kanban, pets, voice. The
 list with evidence is [GAPS.md](../../GAPS.md); how to build each is
 [docs/GAPS-PLAYBOOK.md](../../docs/GAPS-PLAYBOOK.md).
