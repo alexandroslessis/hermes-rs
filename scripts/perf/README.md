@@ -85,6 +85,10 @@ Settings ▸ Memory reaches the store; it restores the perf instance's memory fi
 imported chat) against a home built by `make-hermes-db.py` with Hermes's own SessionDB; start the
 instance with `HERMES_HOME` set to it.
 
+`aux-models-check.mjs` checks Settings ▸ Model ▸ Auxiliary (the four jobs, refused assignments,
+a title and a compression model with its own and an inherited effort reaching their requests,
+reset).
+
 `cdp.mjs '<expression>'` evaluates JavaScript in the instance's page (DevTools port 9223) and
 prints the result; `hover.mjs '<selector|label|text>' [click]` moves the mouse onto an element and
 lists the popovers, tooltips and menus that appear, with their boxes. Together they check UI

@@ -18,6 +18,10 @@ Things that cost hours once. Read this before debugging; check here first when s
 - **sed / heredocs corrupt Rust and regexes.** Escapes in char literals (`'\\'`), `\r\n`, `$`
   and backticks get mangled. Use the Edit tool for source changes. A `node -e` replace script
   that throws writes nothing — check its output.
+- **Python edit scripts write CRLF on Windows** (`Path.write_text` translates `\n`). Git
+  normalizes to LF on commit, so the commit is clean, but the working copy changes; pass
+  `newline="\n"` (`open(..., "w", newline="\n")`) to avoid it. Check `git diff --cached --stat`
+  before committing: a whole-file change means line endings.
 - **Relative `CARGO_TARGET_DIR`** is resolved against the cwd: running cargo from `crates/x/src`
   with `target/claude` created a 3.4 GB `crates/desktop/src/target`. Use an absolute path or run
   from the repo root.
@@ -114,6 +118,10 @@ Things that cost hours once. Read this before debugging; check here first when s
   re-summarize everything with no visible progress: "loads forever" (fixed 2026-11-05 in
   `hermes_import.rs`, imported as user-only / agent-only messages). Any other reader of Hermes's
   database must make the same split.
+- **Pass the model's window.** Until 2026-11-05 no desktop turn set `TurnOptions.context_length`,
+  so compression assumed the runtime's 128k default (threshold 96k) whatever the model held: a
+  32k local model overflowed first. Build options with `Gateway::turn_options`, never
+  `TurnOptions::default()`.
 - **Compression must be visible.** A turn that compresses first emits `status.update`
   `compacting` / `compacted` (the page's "Summarizing thread" indicator); without it a long
   compression on a local model looks like a hung turn (Hermes's own comment in

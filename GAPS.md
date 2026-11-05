@@ -45,7 +45,7 @@ backend code · **L** = a port of a Hermes subsystem.
 | 2.6 | ✅ **Done 2026-11-05** (`/plan`, `/init`, `/learn` send their prompt as a turn; `/review` starts a reviewer subagent on the recent conversation, then the model presents its findings). Coding-workflow commands from Hermes's registry: `/plan` (plan to `.hermes/plans/`), `/init` (write AGENTS.md from a repo scan), `/review` (subagent reviews the work), `/learn` (skill from anything). | `command.dispatch` | prompts in `prompts/hermes`, delegation, skill_manage | S each (mostly prompts) |
 | 2.7 | `/goal` + `/subgoal` (keep working until a goal is met) and `/loop` (re-run a prompt on an interval). | contract `goal`/`loop` commands | turn machinery | M |
 | 2.8 | ✅ **Done 2026-11-05** (Capabilities ▸ Tools: ten toolsets, each switchable from the next turn, subagents included; kept in `desktop-config.json`; Claude Code-style per-command permissions not done). Tool switches (turn tools off, Claude Code-style permissions). | Tools tab hidden (by us); `tools.list/configure`, `toolsets.list`, `/api/tools/toolsets*` | fixed tool set in `SessionTools` | M |
-| 2.9 | Auxiliary model routing in the UI (compression, review, curator, approval models; only titles are read). | Settings ▸ Model ▸ Auxiliary hidden; `providers::AuxModels` has `titles` only | aux routing in the runtime config (GPUI app sets it) | S–M |
+| 2.9 | ✅ **Done 2026-11-05** (Settings ▸ Model ▸ Auxiliary: compression, approval, titles and the background review, each on its own model and effort or following the chat's; also every turn now gets its model's known context window, so compression starts in time on small local models). Auxiliary model routing in the UI (compression, review, curator, approval models; only titles are read). | Settings ▸ Model ▸ Auxiliary hidden; `providers::AuxModels` has `titles` only | aux routing in the runtime config (GPUI app sets it) | S–M |
 | 2.10 | ✅ **Done 2026-11-04** (Command Center ▸ Maintenance; the curator also runs on its schedule again, which the desktop never did). Curator and background-review controls. | `/api/curator`, `/api/curator/paused`, `/api/curator/run` | `runtime::curator`, `set_background_review` | S |
 | 2.11 | ✅ **Done 2026-11-04** for insights (`usage.bars` turned out to be Nous subscription limits: not needed). Usage bars in the status bar, insights page. | `usage.bars`, `insights.get`, `/api/analytics/usage` | `usage_report`, `insights_report`, store usage table | S |
 
@@ -107,7 +107,7 @@ image generation, computer use, cloud profiles.
 5. Then sections 3 and 4, and 5 as wanted.
 
 Status 2026-11-05: steps 1–3 done, step 4 done except 1.8 MCP (skipped for now by the user).
-Open, in suggested order: 1.8 MCP, 2.9 aux routing, 3.3 archive, 3.7 artifacts, 3.6 workspace,
+Open, in suggested order: 1.8 MCP, 3.3 archive, 3.7 artifacts, 3.6 workspace,
 3.5 about, 3.4 sessions settings, 3.8 fallbacks, 2.7 goals/loops, then section 4's small issues.
 
 

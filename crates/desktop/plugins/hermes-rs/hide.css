@@ -38,15 +38,29 @@ button:has(.codicon-mic) {
   display: none !important;
 }
 
+/* Settings ▸ Model ▸ Auxiliary lists all of Hermes's side jobs; hermes-rs runs four of them with
+   a model of their own (compression, approval, titles, and the background review it adds as an
+   extra row: `aux_models.rs`). The others' rows (`aux-task-<slot>`, model-settings.tsx) go. */
+#aux-task-vision,
+#aux-task-skills_hub,
+#aux-task-mcp,
+#aux-task-review,
+#aux-task-voice_chat,
+#aux-task-triage_specifier,
+#aux-task-kanban_decomposer,
+#aux-task-profile_describer,
+#aux-task-curator {
+  display: none !important;
+}
+
 /* Sub-pages of kept sections that this backend can't serve:
-   Model — fallbacks, auxiliary models, subagents, mixture of agents (only the main model);
+   Model — fallbacks, subagents, mixture of agents (only the main model and side jobs);
    Appearance — the pet;
    Safety — privacy (secret redaction);
    Keyboard — the HUD gesture and screen capture (native Desktop);
    Providers — sign-in accounts and catalog API keys (its providers are custom endpoints,
    patches/0009). */
 [data-tour='overlay-nav'] [data-tour='nav-config:model:fallbacks'],
-[data-tour='overlay-nav'] [data-tour='nav-config:model:auxiliary'],
 [data-tour='overlay-nav'] [data-tour='nav-config:model:delegation'],
 [data-tour='overlay-nav'] [data-tour='nav-config:model:moa'],
 [data-tour='overlay-nav'] [data-tour='nav-config:appearance:pet'],

@@ -126,34 +126,21 @@ empty output, because the page polls each session's goal. Replace that stub.
    `{"done": false}` then `{"done": true}`); live check with an embedded provider that answers
    both chat and judge requests (tell them apart by the system prompt).
 
-## 2.9 Auxiliary model routing in Settings — S–M
+## 2.9 Auxiliary model routing in Settings — ✅ done 2026-11-05
 
-**What the user gets:** Settings ▸ Model ▸ Auxiliary: pick which model writes titles, compression
-summaries, background reviews, curator runs, approval judgements (and the goal judge, later).
+Built as `crates/desktop/src/aux_models.rs` (see its header and `scripts/perf/aux-models-check.mjs`):
+`GET /api/model/auxiliary` and `POST /api/model/set {scope: "auxiliary"}`, choices in `config.json`
+`aux_models` (the GPUI app's names), each with an optional effort; `Gateway::turn_options` hands
+them to every turn; unrun slots' rows hidden in `hide.css` (`#aux-task-<slot>`).
 
-**Already here:** runtime `AuxModels { compression, review, approval }` in `TurnOptions.aux`
-(`crates/runtime/src/lib.rs`), each falling back to the turn's model; desktop
-`providers::AuxModels { titles }` read from `config.json` `aux_models`. The GPUI app's
-`AuxModelSettings` (`crates/app/src/config.rs`) has compression, background_review, curator,
-approval, title_generation — the complete set, same file.
+**Lesson for the other recipes here:** this recipe's first draft guessed the page edited
+`auxiliary.*` keys through the generic config form. Investigation showed a dedicated screen
+(`app/settings/model-settings.tsx`, `aux-task-rows.tsx`) on its own routes. The recipes in this
+file are starting points; the page's code decides (WORKFLOW.md step 1).
 
-**Page:** sub-page `auxiliary` shows every key with prefix `auxiliary.` (Hermes's
-`auxiliary.<task>.provider/model/...`), `app/settings/config-subpages.ts`.
-
-**Steps:**
-1. Decide the storage: the page writes `desktop-config.json` `auxiliary.<task>.{provider,model}`.
-   Read those (falling back to `config.json` `aux_models` so GPUI settings still count) in one
-   helper `aux_models(&self) -> hermes_runtime::AuxModels`.
-2. Fill `TurnOptions.aux` in `submit` (today it's left default) and use the titles choice in
-   `title_session`. Curator: pass its model where `runtime::curator` is started.
-3. `config_defaults()`: add `auxiliary: {compression:{provider:"",model:""}, background_review:…,
-   curator:…, approval:…, title_generation:…}`; in `config_schema()` make `provider` a select of
-   configured provider ids and `model` free text (or follow Hermes's field component if it renders
-   a model picker for these keys — check `config-field.tsx`).
-4. Unhide `[data-tour='nav-config:model:auxiliary']` in `hide.css`. Keep only the tasks we run;
-   hide the others if the page lists them.
-5. Tests: unit for the merge/fallback; turn test that compression uses the aux model (the wiremock
-   records `model` in the request); live check sets a key and reads `/api/config` back.
+**Left:** the curator slot (only once the curator's model consolidation pass is offered in the
+desktop: `Runtime::run_curator(Some(CuratorModel))`), and Hermes's `review` slot (the `/review`
+reviewer subagent's model: the delegator would need a per-child provider).
 
 ## 3.3 Archive / hide sessions — S
 

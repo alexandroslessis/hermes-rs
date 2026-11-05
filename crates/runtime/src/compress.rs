@@ -743,6 +743,8 @@ pub struct Summarizer {
     /// The session model's window, which decides when to compress (`context_length` is the
     /// summarizing model's own).
     pub window: Option<usize>,
+    /// Extra request fields (the compression model's reasoning effort).
+    pub request_params: Option<std::collections::HashMap<String, Value>>,
 }
 
 pub struct Compacted {
@@ -935,7 +937,10 @@ pub fn undo(conversation: &mut Conversation) -> bool {
 /// One summarizer call: the prompt as the only message, no tools; the reply's text without
 /// reasoning, redacted (the summarizer may echo secrets).
 async fn summarize(summarizer: &Summarizer, prompt: &str) -> Result<String> {
-    let config = ModelConfig::new(&summarizer.model).with_context_limit(summarizer.context_length);
+    let mut config = ModelConfig::new(&summarizer.model).with_context_limit(summarizer.context_length);
+    if let Some(params) = &summarizer.request_params {
+        config = config.with_merged_request_params(params.clone());
+    }
     let request = [Message::user().with_text(prompt)];
     let (reply, _) = summarizer
         .llm

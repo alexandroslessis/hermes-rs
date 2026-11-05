@@ -313,6 +313,7 @@ impl AppState {
                 .get(&provider.id)
                 .and_then(|list| list.models.iter().find(|m| m.id == choice.model))
                 .and_then(|m| m.context_length),
+            effort: None,
         })
     }
 

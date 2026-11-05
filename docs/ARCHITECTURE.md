@@ -139,6 +139,7 @@ Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`
 | Side panel: terminal | `terminal.rs`, `server.rs` | `/api/host-terminal` (PTY socket) | `terminal-check.mjs` |
 | Subagents | runtime `delegate.rs`, `subagents.rs`; gw `subagent.*` | `subagent.*`, `delegation.*` | `subagents-check.mjs` |
 | Model picker, effort | gw `model_options`, `switch_model`, `providers.rs` | `model.options`, `config.set {key: "model"}`, `session.mutate` | `switch.mjs` |
+| Settings ▸ Model ▸ Auxiliary | `aux_models.rs`, gw `turn_options` | `/api/model/auxiliary`, `/api/model/set {scope: auxiliary}` | `aux-models-check.mjs` |
 | Settings ▸ Providers ▸ Custom endpoints | `endpoints.rs`, `providers.rs` | `/api/providers/custom-endpoints*` | `endpoints-check.mjs` |
 | Settings (all other pages) | `rest.rs` (`config_defaults`, `config_schema`), gw `apply_settings` | `/api/config*` | — |
 | Settings ▸ Memory, the Star map | `learning.rs`, `hermes_memory` | `/api/learning/*`, `/api/memory*` | `memory-check.mjs` |
@@ -152,7 +153,9 @@ Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`
 
 1. Page: `prompt.submit {session_id, text, …}` (or `session.create` first).
 2. `Gateway::submit`: resolves the session's provider/model (`provider_for`, `route_session`),
-   attachments (`pending_images`, `attachments.rs`), queues it if a turn is running
+   attachments (`pending_images`, `attachments.rs`), builds the `TurnOptions` with
+   `Gateway::turn_options` (the model's known window, the session's effort, the side jobs'
+   models — use it for every runtime call that takes options), queues it if a turn is running
    (`enqueue`/`run_queued`), then `runtime.start_turn(...)` (or `start_turn_with_images`,
    `start_turn_with_call` for a scripted first tool call).
 3. `Runtime::start_turn` (runtime `lib.rs`): loads the session from the store, builds the system
@@ -182,7 +185,7 @@ Two settings files, with different owners — don't mix them up:
 
 | File | Read/written by | Holds |
 |---|---|---|
-| `config.json` | `providers::Settings::load/save` | providers (custom endpoints), the default model, aux models (`titles`), shared with GPUI |
+| `config.json` | `providers::Settings::load/save`, `aux_models.rs` | providers (custom endpoints), the default model, the side jobs' models (`aux_models`), shared with GPUI |
 | `desktop-config.json` | `rest.rs` (`config_value("a.b")`, `set_config_value`) | everything on Hermes's Settings page (Hermes's `config.yaml` keys, dotted) |
 | `ui-preferences.json` | `rest.rs` | the page's interface preferences |
 

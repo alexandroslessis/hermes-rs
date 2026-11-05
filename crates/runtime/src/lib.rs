@@ -114,6 +114,9 @@ pub struct AuxModel {
     pub provider: ProviderConfig,
     pub model: String,
     pub context_length: Option<usize>,
+    /// The job's own reasoning effort (Hermes's `auxiliary.<task>.reasoning_effort`); `None`
+    /// keeps the job's default (the provider's, or off for the approval judge).
+    pub effort: Option<String>,
 }
 
 /// Hermes's `auxiliary.compression` and `auxiliary.background_review` (the curator's model is
@@ -131,16 +134,20 @@ struct SmartGuard {
     llm: Arc<dyn Provider>,
     model: String,
     base_url: String,
+    /// The approval model's own effort (Settings ▸ Model ▸ Auxiliary); off when unset.
+    effort: Option<String>,
 }
 
 #[async_trait::async_trait]
 impl hermes_tools::approval::ApprovalGuard for SmartGuard {
     async fn assess(&self, command: &str, description: &str) -> hermes_tools::approval::Verdict {
         use hermes_tools::approval::{self, Verdict};
+        // One word, but a reasoning model needs room to think first when effort is on.
+        let thinking = self.effort.as_deref().is_some_and(|effort| effort != "none");
         let config = ModelConfig::new(&self.model)
-            .with_max_tokens(Some(64))
+            .with_max_tokens(Some(if thinking { 4096 } else { 64 }))
             .with_temperature(Some(0.0))
-            .with_merged_request_params(effort_request_params(&self.base_url, "none"));
+            .with_merged_request_params(effort_request_params(&self.base_url, self.effort.as_deref().unwrap_or("none")));
         let request =
             [Message::user().with_text(approval::smart_user_prompt(command, description))];
         let reply = tokio::time::timeout(
@@ -185,14 +192,23 @@ fn summarizer_for(
             model: aux.model.clone(),
             context_length: aux.context_length,
             window: context_length,
+            request_params: aux_effort_params(aux),
         },
         None => compress::Summarizer {
             llm: llm.clone(),
             model: model.to_string(),
             context_length,
             window: context_length,
+            request_params: None,
         },
     })
+}
+
+/// A side job's request fields for its chosen effort, if it has one.
+fn aux_effort_params(aux: &AuxModel) -> Option<HashMap<String, serde_json::Value>> {
+    aux.effort
+        .as_deref()
+        .map(|effort| effort_request_params(&aux.provider.base_url, effort))
 }
 
 /// Hermes's `generate_title`: a 3–7 word name for a session from its opening message, written by
@@ -202,6 +218,17 @@ pub async fn generate_title(
     model: &str,
     opening: &str,
 ) -> Result<Option<String>> {
+    generate_title_with_effort(provider, model, None, opening).await
+}
+
+/// [`generate_title`] with the title model's own reasoning effort (`auxiliary.title_generation`);
+/// `None` turns reasoning off, as Hermes does for titles.
+pub async fn generate_title_with_effort(
+    provider: &ProviderConfig,
+    model: &str,
+    effort: Option<&str>,
+    opening: &str,
+) -> Result<Option<String>> {
     use hermes_prompts::titles;
     let llm = provider.provider()?;
     let snippet: String = opening
@@ -209,8 +236,13 @@ pub async fn generate_title(
         .take(titles::MAX_TITLE_INPUT_CHARS)
         .collect();
     let config = ModelConfig::new(model)
-        .with_max_tokens(Some(titles::TITLE_MAX_TOKENS))
-        .with_merged_request_params(effort_request_params(&provider.base_url, "none"));
+        .with_max_tokens(Some(if effort.is_some_and(|e| e != "none") {
+            // A thinking model spends tokens before the title.
+            4096
+        } else {
+            titles::TITLE_MAX_TOKENS
+        }))
+        .with_merged_request_params(effort_request_params(&provider.base_url, effort.unwrap_or("none")));
     let (reply, _) = llm
         .complete(
             &config,
@@ -832,7 +864,7 @@ impl Runtime {
                     aux.provider.provider()?,
                     aux.model.clone(),
                     aux.context_length,
-                    None,
+                    aux_effort_params(aux),
                 ),
                 None => (
                     llm.clone(),
@@ -861,6 +893,7 @@ impl Runtime {
                     llm,
                     model: aux.model.clone(),
                     base_url: aux.provider.base_url.clone(),
+                    effort: aux.effort.clone(),
                 }) as Arc<dyn hermes_tools::approval::ApprovalGuard>
             }),
             None => provider.provider().ok().map(|llm| {
@@ -868,6 +901,7 @@ impl Runtime {
                     llm,
                     model: open.record.lock().model.clone(),
                     base_url: provider.base_url.clone(),
+                    effort: None,
                 }) as Arc<dyn hermes_tools::approval::ApprovalGuard>
             }),
         };
@@ -1125,7 +1159,7 @@ impl Runtime {
                 aux.provider.provider()?,
                 aux.model.clone(),
                 aux.context_length,
-                None,
+                aux_effort_params(aux),
             ),
             None => (
                 provider.provider()?,
@@ -2038,6 +2072,7 @@ pub async fn smart_review(
         llm: provider.provider()?,
         model: model.to_string(),
         base_url: provider.base_url.clone(),
+        effort: None,
     };
     Ok(guard.assess(command, description).await)
 }

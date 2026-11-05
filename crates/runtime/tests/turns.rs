@@ -2671,6 +2671,7 @@ async fn compression_uses_the_auxiliary_model_when_one_is_set() {
                 provider: h.provider.clone(),
                 model: "summary-model".into(),
                 context_length: Some(32_000),
+                effort: Some("low".into()),
             }),
             review: None,
             approval: None,
@@ -2687,6 +2688,9 @@ async fn compression_uses_the_auxiliary_model_when_one_is_set() {
     let requests = h.requests.lock().clone();
     assert_eq!(requests[3]["model"], "test-model");
     assert_eq!(requests[4]["model"], "summary-model");
+    // The compression model's own effort (Settings ▸ Model ▸ Auxiliary) goes with its request.
+    assert_eq!(requests[4]["reasoning_effort"], "low");
+    assert!(requests[3].get("reasoning_effort").is_none());
 }
 
 #[tokio::test]

@@ -35,7 +35,7 @@ A Windows desktop app that runs **Hermes** (NousResearch's agent, `../hermes-age
 | Something behaves oddly | [docs/PITFALLS.md](docs/PITFALLS.md) — read it *before* debugging; most surprises are in it |
 | Updating to a newer Hermes | [PORTING.md](PORTING.md) |
 | Changing Hermes's frontend | [crates/desktop/patches/README.md](crates/desktop/patches/README.md) |
-| Building the installer / shipping | [docs/RELEASING.md](docs/RELEASING.md) |
+| Building the installer / shipping | [docs/RELEASING.md](docs/RELEASING.md); the user's step-by-step: [docs/INSTALLER-TUTORIAL.md](docs/INSTALLER-TUTORIAL.md) |
 | Performance work | [scripts/perf/README.md](scripts/perf/README.md) |
 
 `PLAN.md` and `FEATURES.md` are from the GPUI era (2026-10/11). `FEATURES.md`'s keep/later/drop

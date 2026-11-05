@@ -40,13 +40,35 @@ fn discover_by_default() -> bool {
 pub struct ModelChoice {
     pub provider: String,
     pub model: String,
+    /// The job's own reasoning effort (Settings ▸ Model ▸ Auxiliary); ours, the GPUI app has none.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
-/// The side-job models (Settings ▸ Auxiliary models in the GPUI app).
+/// The side-job models (Settings ▸ Model ▸ Auxiliary, `aux_models.rs`; the GPUI app's names).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AuxModels {
     #[serde(default)]
+    pub compression: Option<ModelChoice>,
+    #[serde(default)]
+    pub review: Option<ModelChoice>,
+    #[serde(default)]
+    pub approval: Option<ModelChoice>,
+    #[serde(default)]
     pub titles: Option<ModelChoice>,
+}
+
+impl AuxModels {
+    /// A job's choice by its `config.json` key.
+    pub fn get(&self, key: &str) -> Option<&ModelChoice> {
+        match key {
+            "compression" => self.compression.as_ref(),
+            "review" => self.review.as_ref(),
+            "approval" => self.approval.as_ref(),
+            "titles" => self.titles.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

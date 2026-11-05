@@ -13,7 +13,9 @@ investigation is how wrong shapes and invented behaviour get in.
 
 ## 1. Investigate: what does the page call, and what does Hermes answer?
 
-Work outside-in: the page decides the protocol, Hermes's server decides the behaviour.
+Work outside-in: the page decides the protocol, Hermes's server decides the behaviour. Do this
+even when GAPS-PLAYBOOK.md has a recipe: recipes are starting points written before the code was
+read (2.9's guessed the wrong routes and storage).
 
 1. **The page.** Find the screen's component and the calls it makes:
    ```bash

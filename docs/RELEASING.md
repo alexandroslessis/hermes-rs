@@ -1,5 +1,8 @@
 # Releasing: the Windows installer
 
+(For people: the step-by-step version is [INSTALLER-TUTORIAL.md](INSTALLER-TUTORIAL.md). Keep the
+two in step when the build changes.)
+
 The app ships as an NSIS installer built by Tauri's CLI and published on the `installer` branch
 (no `gh` on this machine, so no GitHub Releases from here). Build and publish only when the user
 asks for it.

@@ -606,13 +606,7 @@ impl Gateway {
                     return Err((INVALID_PARAMS, "text required".to_string()));
                 }
                 let provider = self.session_provider(&id, &settings)?;
-                let record = self.runtime.store().session(&id).ok().flatten();
-                let options = TurnOptions {
-                    supports_vision: record
-                        .as_ref()
-                        .is_some_and(|r| self.sends_images(&r.provider, &r.model)),
-                    ..TurnOptions::default()
-                };
+                let options = self.turn_options(&id);
                 let mut task = self
                     .runtime
                     .background(&id, &provider, options, &text)
@@ -1152,6 +1146,53 @@ impl Gateway {
 
     /// A model's context window, as its provider lists it (remembered once the provider has
     /// answered), else Hermes's fallback for an unknown window.
+    /// A model's context window when it's known without asking the provider: the endpoint's
+    /// setting, else what its model list said (cached by `context_length`). `None` lets the
+    /// runtime assume its default; the 256k display fallback is never passed on.
+    fn known_context(&self, provider: &str, model: &str) -> Option<usize> {
+        let settings = Settings::load(&self.data_dir);
+        if let Some(length) = settings.provider(provider).and_then(|p| p.context_length) {
+            return Some(length);
+        }
+        self.context_lengths
+            .lock()
+            .ok()?
+            .get(&format!("{provider}\n{model}"))
+            .and_then(|facts| facts.context_length)
+    }
+
+    /// What every turn of a session runs with: its model's window (so compression starts in
+    /// time for a small local model) and the side jobs' models (Settings ▸ Model ▸ Auxiliary).
+    fn turn_options(&self, session: &str) -> TurnOptions {
+        let settings = Settings::load(&self.data_dir);
+        let record = self.runtime.store().session(session).ok().flatten();
+        let context = |provider: &str, model: &str| self.known_context(provider, model);
+        // Only a picked effort is sent; unset leaves the provider's default (as Hermes).
+        let effort = self
+            .efforts
+            .lock()
+            .ok()
+            .and_then(|efforts| efforts.get(session).cloned())
+            .filter(|e| e != "none");
+        let mut aux = crate::aux_models::runtime_models(&settings, &context);
+        // "Inherit main model effort" (the Auxiliary page's default): compression and the
+        // background review think as hard as the chat. The approval judge and titles keep
+        // reasoning off unless picked, as Hermes runs them.
+        for job in [&mut aux.compression, &mut aux.review].into_iter().flatten() {
+            if job.effort.is_none() {
+                job.effort = effort.clone();
+            }
+        }
+        TurnOptions {
+            context_length: record.as_ref().and_then(|r| context(&r.provider, &r.model)),
+            effort,
+            supports_vision: record
+                .as_ref()
+                .is_some_and(|r| self.sends_images(&r.provider, &r.model)),
+            aux,
+        }
+    }
+
     async fn context_length(&self, provider: &str, model: &str) -> usize {
         let settings = Settings::load(&self.data_dir);
         if let Some(length) = settings.provider(provider).and_then(|p| p.context_length) {
@@ -1694,7 +1735,7 @@ impl Gateway {
                     Ok((provider, id)) => {
                         let focus = (!arg.is_empty()).then(|| arg.to_string());
                         self.runtime
-                        .refine(&id, &provider, TurnOptions::default(), focus)
+                        .refine(&id, &provider, self.turn_options(&id), focus)
                         .map(|()| {
                             "Reviewing this conversation for lessons to save to memory and skills; \
                              the review runs in the background."
@@ -1830,7 +1871,7 @@ impl Gateway {
             .map(str::to_string);
         let mut turn = self
             .runtime
-            .compress(&id, &provider, TurnOptions::default(), focus)
+            .compress(&id, &provider, self.turn_options(&id), focus)
             .map_err(error)?;
         let mut failed = None;
         while let Some(event) = turn.events.recv().await {
@@ -2369,11 +2410,12 @@ impl Gateway {
                 Some((
                     settings.provider(&choice.provider)?.runtime(),
                     choice.model.clone(),
+                    choice.effort.clone(),
                 ))
             });
             let fallback = settings
                 .provider(&record.provider)
-                .map(|p| (p.runtime(), record.model.clone()));
+                .map(|p| (p.runtime(), record.model.clone(), None));
             (chosen.or(fallback), shown.clone())
         });
         if record.title.is_none() {
@@ -2400,17 +2442,7 @@ impl Gateway {
         // The turn's rows start here (its receipt names them).
         let first_row = self.runtime.messages(&id).map(|m| m.len()).unwrap_or(0);
         let (record_provider, record_model) = (record.provider.clone(), record.model.clone());
-        let options = TurnOptions {
-            // Only a picked effort is sent; unset leaves the provider's default (as Hermes).
-            effort: self
-                .efforts
-                .lock()
-                .ok()
-                .and_then(|efforts| efforts.get(&id).cloned())
-                .filter(|e| e != "none"),
-            supports_vision: self.sends_images(&record_provider, &record_model),
-            ..TurnOptions::default()
-        };
+        let options = self.turn_options(&id);
         // Images attached in the composer (`attachments: [{path, mime}]`, uploaded first through
         // `/api/chat/image-upload`): their bytes go with the prompt.
         // Images attached through `image.attach` go with this prompt too.
@@ -2587,9 +2619,9 @@ impl Gateway {
                         if !this.has_queued(&id) {
                             this.end_live(&id);
                         }
-                        if let Some((Some((provider, model)), opening)) = titling {
+                        if let Some((Some((provider, model, effort)), opening)) = titling {
                             if status == "complete" {
-                                this.title_session(&id, &provider, &model, &opening).await;
+                                this.title_session(&id, &provider, &model, effort.as_deref(), &opening).await;
                             }
                         }
                         break;
@@ -2664,9 +2696,10 @@ impl Gateway {
         id: &str,
         provider: &hermes_runtime::ProviderConfig,
         model: &str,
+        effort: Option<&str>,
         opening: &str,
     ) {
-        match hermes_runtime::generate_title(provider, model, opening).await {
+        match hermes_runtime::generate_title_with_effort(provider, model, effort, opening).await {
             Ok(Some(title)) => {
                 let _ = self.runtime.store().set_title(id, &title);
                 self.emit(
@@ -2974,29 +3007,24 @@ impl Gateway {
             let store = self.runtime.skills();
             return crate::skills::route(&store, &self.rest, method, path, query, body);
         }
-        // Settings ▸ Model ▸ Main model: the default model (the hermes-rs settings').
+        // Settings ▸ Model: the default model (the hermes-rs settings') and the side jobs' models
+        // (`aux_models.rs`).
         if (method, path) == ("GET", "/api/model/auxiliary") {
-            let settings = Settings::load(&self.data_dir);
-            return Some((
-                200,
-                json!({
-                    "main": {"provider": settings.provider, "model": settings.model},
-                    "tasks": [],
-                }),
-            ));
+            return Some((200, crate::aux_models::list(&self.data_dir)));
         }
         if (method, path) == ("POST", "/api/model/set") {
             let body: Value = serde_json::from_slice(body).unwrap_or_default();
+            match body["scope"].as_str() {
+                None | Some("main") => {}
+                Some("auxiliary") => return Some(crate::aux_models::assign(&self.data_dir, &body)),
+                Some(scope) => {
+                    return Some((400, json!({"detail": format!("Unknown model scope {scope}")})));
+                }
+            }
             let (Some(provider), Some(model)) = (body["provider"].as_str(), body["model"].as_str())
             else {
                 return Some((400, json!({"detail": "provider and model are required"})));
             };
-            if body["scope"].as_str().is_some_and(|scope| scope != "main") {
-                return Some((
-                    400,
-                    json!({"detail": "Only the main model can be set in hermes-rs"}),
-                ));
-            }
             if Settings::load(&self.data_dir).provider(provider).is_none() {
                 return Some((
                     400,
