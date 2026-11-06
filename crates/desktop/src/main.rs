@@ -22,6 +22,7 @@ mod learning;
 mod maintenance;
 mod open_file;
 mod paths;
+mod profiles;
 mod projects;
 mod providers;
 mod rest;

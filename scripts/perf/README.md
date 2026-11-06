@@ -90,6 +90,8 @@ receipt's cwd/branch/repo-root, session.info and the list carrying the identity,
 replacing it with nulls, the bare-home move filing the session into Home, the unknown-folder refusal,
 the busy refusal while a turn runs) with its
 own provider on :47900.
+`profiles-check.mjs` checks the profiles window's SOUL.md editor (read, save, read back, a never-written
+one as missing, another profile name refused like Hermes); it restores the SOUL.md it found.
 `import-check.mjs` checks the Hermes importer (list, preview, import, `/import-hermes`, continuing an
 imported chat) against a home built by `make-hermes-db.py` with Hermes's own SessionDB; start the
 instance with `HERMES_HOME` set to it.

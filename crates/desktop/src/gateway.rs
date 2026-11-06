@@ -3013,6 +3013,31 @@ impl Gateway {
             };
         }
         // Sign-in providers (Nous Portal, Claude, Codex): none here.
+        // The profiles window's SOUL.md editor (profiles.rs): the default profile's persona, read
+        // and written in the data folder. The multi-profile routes (create, rename, delete,
+        // export, import) aren't ported — a single-profile backend has no second profile.
+        if let Some(name) = path
+            .strip_prefix("/api/profiles/")
+            .and_then(|rest| rest.strip_suffix("/soul"))
+        {
+            let name = crate::rest::percent_decode(name);
+            if method == "GET" {
+                let data_dir = self.data_dir.clone();
+                return tokio::task::spawn_blocking(move || crate::profiles::soul(&data_dir, &name))
+                    .await
+                    .ok();
+            }
+            if method == "PUT" {
+                let body: Value = serde_json::from_slice(body).unwrap_or_default();
+                let content = body["content"].as_str().unwrap_or_default().to_string();
+                let data_dir = self.data_dir.clone();
+                return tokio::task::spawn_blocking(move || {
+                    crate::profiles::save_soul(&data_dir, &name, &content)
+                })
+                .await
+                .ok();
+            }
+        }
         if (method, path) == ("GET", "/api/providers/oauth") {
             return Some((200, json!({"providers": []})));
         }

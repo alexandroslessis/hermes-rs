@@ -59,7 +59,7 @@ restore-and-rerun, `/undo`, `/retry`, checkpoints and `/rollback`; built-in comm
 `/status`, `/diff`, `/usage`, `/insights`, `/context`, `/tools`, `/save`), coding commands
 (`/plan`, `/init`, `/review`, `/learn`), `/btw`, `/bg`; custom endpoints and keys in Settings;
 attachments (images, files, paste, drop); moving a session between projects (drag onto a project
-row, the folder picker on an open chat, or the Home bucket); the side panel's file preview/edit, git review and
+row, the folder picker on an open chat, or the Home bucket); the profiles window's SOUL.md editor; the side panel's file preview/edit, git review and
 terminal; live subagents; archiving and Settings ▸ Sessions; the Artifacts gallery; Capabilities ▸ Skills and Tools; the Star map and Settings ▸ Memory;
 Command Center (maintenance, curator, logs, insights); Settings ▸ Model ▸ Auxiliary (side jobs'
 models); importing Hermes sessions; the installer.
