@@ -30,6 +30,7 @@ mod skills;
 mod terminal;
 mod toolsets;
 mod transcript;
+mod workspace;
 
 use std::path::PathBuf;
 use std::sync::Arc;

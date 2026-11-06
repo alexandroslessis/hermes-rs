@@ -1778,6 +1778,24 @@ impl Runtime {
         }
     }
 
+    /// A committed workspace move: drop the session's cached in-memory state so the next turn
+    /// rebuilds it from the stored record — the tools' cwd, the shell and its environment follow
+    /// the new folder then (Hermes's `_evict_cached_agent(live.route)` and
+    /// `drop_session_terminal` on a committed workspace move). The transcript is the store's
+    /// (every append is persisted), so nothing is lost. Idle sessions only.
+    pub async fn evict(&self, session_id: &str) -> Result<()> {
+        let open = self.sessions.lock().get(session_id).cloned();
+        let Some(open) = open else {
+            return Ok(());
+        };
+        if open.running.lock().is_some() {
+            anyhow::bail!("a turn is running in this session");
+        }
+        self.sessions.lock().remove(session_id);
+        open.tools.shutdown().await;
+        Ok(())
+    }
+
     /// Stops the session's shell and background processes and forgets its in-memory state.
     pub async fn close(&self, session_id: &str) {
         let open = self.sessions.lock().remove(session_id);

@@ -237,7 +237,7 @@ config key is `fallback_model` (single dict or list; `hermes_cli/config.py`) rea
 | **Browser automation** (`browser_*` tools over CDP) — L | Hermes: `tools/browser_*.py` (`browser_cdp_tool.py`, `browser_launcher.py`, `browser_session*.py`). Launch Edge/Chrome with `--remote-debugging-port` and a private profile, drive with CDP (copy `scripts/perf/cdp.mjs` ideas into Rust, `tokio-tungstenite`). Settings ▸ Browser is hidden; unhide with it. |
 | **`execute_code`** — M | Hermes: `tools/code_execution_tool.py`. Run Python through `uv run` in a temp folder with a timeout; return stdout/stderr. Gate behind approvals. |
 | **Tool search (deferred tools)** — M | Matters once MCP adds many tools: offer a `tool_search` tool and only the names, load schemas on demand. Hermes: grep `tool_search`. Breaks caching if done naively: keep the offered set stable within a session. |
-| **Git worktrees per session** — M | Routes exist (`git_review.rs` worktree list/add). Missing: creating a session in a fresh worktree (`session.workspace.move`, project settings). |
+| **Git worktrees per session** — M | Routes exist (`git_review.rs` worktree list/add), and the workspace move they'd follow is done (`workspace.rs`, 2026-11-06). Missing: creating a session in a fresh worktree (project settings). |
 | **`/cron` while the app runs** — M | Hermes: `cron/` (scheduler, jobs file). A tokio scheduler in the gateway, jobs in a side file, each run a new session (or a fixed one); unhide the sidebar `cron` entry in `plugin.js`. |
 | **Voice** — L | STT/TTS providers; whisper.cpp / Piper locally. Unhide voice controls in `hide.css`. |
 | **Local model management** — L | Ollama covers it; skip unless asked. |

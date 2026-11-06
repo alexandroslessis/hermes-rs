@@ -27,6 +27,11 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const SERVER_ERROR: i64 = -32000;
 
+/// A session whose turn runs refuses edits, restores and moves (the frozen policy would change
+/// under it). The page reads the typed reason off the error's `data` (`canonical-protocol.ts`
+/// `failure()`, the move's "busy" notice) and matches the prose otherwise (`isSessionBusyError`).
+const BUSY: &str = "session busy";
+
 type RpcResult = Result<Value, (i64, String)>;
 
 /// Hermes fences turn control and prompt answers by an execution generation. This backend runs
@@ -87,6 +92,8 @@ pub struct Gateway {
     file_tickets: std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
     /// Branch → the session it was branched from (`branch.rs`).
     branches: crate::branch::Links,
+    /// Session id → the git identity of its workspace (`workspace.rs`), kept beside the store.
+    workspaces: std::sync::Arc<crate::workspace::Workspaces>,
     /// A branch request's idempotency key → the branch it made (a retried request gets it again).
     branch_keys: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// Archived sessions and the auto-archive sweep (`archive.rs`).
@@ -113,6 +120,7 @@ impl Gateway {
             pending_images: Default::default(),
             file_tickets: Default::default(),
             branches: crate::branch::Links::load(&data_dir_for_stats),
+            workspaces: std::sync::Arc::new(crate::workspace::Workspaces::load(&data_dir_for_stats)),
             archive: crate::archive::Archive::load(&data_dir_for_stats),
             branch_keys: Default::default(),
             generation: std::sync::Mutex::new(
@@ -286,7 +294,13 @@ impl Gateway {
                 } else {
                     tracing::warn!("RPC {method} failed: {message}");
                 }
-                json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+                let mut error = json!({"code": code, "message": message});
+                if message == BUSY {
+                    // The page's canonical protocol and the move's notice read the refusal's
+                    // reason (`data.reason`), not just the prose.
+                    error["data"] = json!({"reason": "session_busy"});
+                }
+                json!({"jsonrpc": "2.0", "id": id, "error": error})
             }
         };
         send(&outbox, reply);
@@ -581,7 +595,7 @@ impl Gateway {
                     .unwrap_or_default();
                 Ok(json!({"title": title, "session_key": id}))
             }
-            "session.mutate" => self.mutate(params, &settings),
+            "session.mutate" => self.mutate(params, &settings).await,
             "session.rewind" => self.rewind_turn(params),
             "rollback.list" | "rollback.diff" | "rollback.restore" => self.rollback(method, params),
             "session.export" => self.export_session(params),
@@ -1404,7 +1418,7 @@ impl Gateway {
 
     /// Hermes's canonical `session.mutate`: a session edit presenting the revision the page last
     /// saw. Edits here are one user's, so the revision is reported but not enforced.
-    fn mutate(&self, params: &Value, settings: &Settings) -> RpcResult {
+    async fn mutate(&self, params: &Value, settings: &Settings) -> RpcResult {
         let id = session_id(params)?;
         let payload = &params["payload"];
         let mut receipt = match params["operation"].as_str().unwrap_or_default() {
@@ -1443,13 +1457,48 @@ impl Gateway {
                     .as_u64()
                     .ok_or((INVALID_PARAMS, "target_message_id is required".to_string()))?;
                 if self.runtime.is_running(&id) {
-                    return Err((SERVER_ERROR, "session busy".to_string()));
+                    return Err((SERVER_ERROR, BUSY.to_string()));
                 }
                 let kept = self
                     .runtime
                     .rewind(&id, transcript::kept_before_row(row as usize))
                     .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
                 json!({"status": "applied", "target_message_id": row, "message_count": kept.len()})
+            }
+            // Move to project (`session.workspace.move`, and the composer's folder picker on an
+            // open chat — both become this mutation in the page's canonical protocol): the stored
+            // cwd and git identity move together (`workspace.rs`), idle sessions only. The live
+            // state is dropped so the next turn's tools and shell start in the new folder.
+            "workspace" => {
+                let requested = payload["cwd"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .ok_or((INVALID_PARAMS, "cwd is required".to_string()))?;
+                if self.runtime.is_running(&id) {
+                    return Err((SERVER_ERROR, BUSY.to_string()));
+                }
+                let runtime = self.runtime.clone();
+                let workspaces = self.workspaces.clone();
+                let moved = id.clone();
+                let requested = requested.to_string();
+                let (cwd, branch, root) =
+                    tokio::task::spawn_blocking(move || {
+                        crate::workspace::move_session(runtime.store(), &workspaces, &moved, &requested)
+                    })
+                    .await
+                    .map_err(|e| (SERVER_ERROR, format!("the move failed: {e}")))?
+                    .map_err(|e| match e {
+                        crate::workspace::MoveError::InvalidFolder(folder) => {
+                            (INVALID_PARAMS, format!("No such folder: {folder}"))
+                        }
+                        crate::workspace::MoveError::Store(message) => (SERVER_ERROR, message),
+                    })?;
+                if let Err(e) = self.runtime.evict(&id).await {
+                    tracing::warn!("dropping the moved session's live state: {e:#}");
+                }
+                self.emit(&id, "session.info", self.session_info(&id));
+                json!({"cwd": cwd, "branch": branch, "git_repo_root": root})
             }
             // The keyboard shortcut's `session.archive` (`canonical-protocol.ts`).
             "archive" => {
@@ -2061,6 +2110,9 @@ impl Gateway {
                 "model": self.pending_route(id).map_or(record.model, |(_, model)| model),
                 "provider": self.pending_route(id).map_or(record.provider, |(provider, _)| provider),
                 "cwd": record.cwd,
+                // The git identity a move recorded; the sidebar groups by the repo root.
+                "git_branch": self.workspaces.identity(id).and_then(|(branch, _)| branch),
+                "git_repo_root": self.workspaces.identity(id).and_then(|(_, root)| root),
                 "title": record.title.unwrap_or_default(),
                 "stored_session_id": record.id,
                 "running": running,
@@ -3356,6 +3408,10 @@ impl Gateway {
             "pinned": s.pinned,
             "archived": self.archive.is_archived(&s.id),
             "profile": "default",
+            // The git identity a move recorded (the sidebar groups by the repo root); a session
+            // that never moved carries none and groups by its cwd.
+            "git_branch": self.workspaces.identity(&s.id).and_then(|(branch, _)| branch),
+            "git_repo_root": self.workspaces.identity(&s.id).and_then(|(_, root)| root),
             // A branch is listed under the session it came from.
             "parent_session_id": self.branches.parent(&s.id),
         })

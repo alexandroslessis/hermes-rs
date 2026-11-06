@@ -398,6 +398,75 @@ async fn retry_without_a_failed_turn_is_refused() {
     assert!(!h.runtime.is_running(&session.id));
 }
 
+/// Answers every chat-completions request with a 429 daily-limit body, and records requests.
+struct RateLimited {
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+impl Respond for RateLimited {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        self.requests.lock().push(request.body_json().unwrap());
+        ResponseTemplate::new(429)
+            .insert_header("retry-after", "19919")
+            .set_body_json(json!({
+                "error": {
+                    "message": "Rate limit exceeded: user daily request limit reached (800 of 800). \
+                                Retry after 19919 seconds.",
+                    "metadata": {"retry_after_seconds": 19919}
+                }
+            }))
+    }
+}
+
+#[tokio::test]
+async fn a_daily_limit_429_ends_the_turn_instead_of_retrying_for_hours() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(RateLimited { requests: requests.clone() })
+        .mount(&server)
+        .await;
+    let data = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let runtime = runtime_with(data.path(), Arc::new(Bridge));
+    let provider = ProviderConfig {
+        id: "mock".into(),
+        base_url: format!("{}/v1", server.uri()),
+        api_key: Some("key".into()),
+    };
+    let session = runtime.create_session(&provider, "test-model", None, work.path()).unwrap();
+    // The same store the runtime writes to: it is moved into the harness below.
+    let store = hermes_store::Store::open(&data.path().join("sessions.db")).unwrap();
+
+    let began = std::time::Instant::now();
+    let events = run_turn(
+        &Harness {
+            _server: server,
+            data,
+            work,
+            runtime,
+            provider,
+            requests: requests.clone(),
+        },
+        &session.id,
+        "hello",
+    )
+    .await;
+    let elapsed = began.elapsed();
+
+    // The quota is reached: the turn ends (the provider error is shown as a message) instead of
+    // sleeping out the Retry-After (up to the retry cap, three times) while the chat's timer runs.
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert!(elapsed < Duration::from_secs(30), "the turn waited {elapsed:?}");
+    // One request: a quota 429 is not transient, the provider layer does not retry it.
+    assert_eq!(requests.lock().len(), 1);
+    // The error card carries the provider's message (in its Error block, not plain text).
+    let last = store.load_messages(&session.id).unwrap().pop().unwrap();
+    let error = last.content.iter().find_map(|c| c.as_error()).unwrap();
+    assert!(error.message.contains("daily request limit reached"));
+}
+
 #[tokio::test]
 async fn cancelling_stops_a_running_command_and_answers_its_call() {
     if !matches!(detect_shell(), hermes_tools::ShellKind::GitBash(_)) {

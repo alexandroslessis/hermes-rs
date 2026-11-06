@@ -265,6 +265,18 @@ impl Store {
         Ok(())
     }
 
+    /// Move to project: the stored workspace is replaced, never merged (Hermes's
+    /// `update_session_cwd` with `replace_git_meta`). The sidebar groups by it; the git identity
+    /// (branch / repo root) lives beside it in a side file (`crates/desktop/src/workspace.rs`),
+    /// not in this shared schema.
+    pub fn set_session_cwd(&self, id: &str, cwd: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE sessions SET cwd = ?2 WHERE id = ?1",
+            params![id, cwd],
+        )?;
+        Ok(())
+    }
+
     /// Switching models rebuilds the frozen prompt too; see `Runtime::set_session_model`.
     pub fn set_model(&self, id: &str, model: &str, system_prompt: &str) -> Result<()> {
         self.conn.lock().execute(
