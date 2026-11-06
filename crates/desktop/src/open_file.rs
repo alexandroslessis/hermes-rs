@@ -9,7 +9,7 @@
 //!
 //! Hermes: `apps/desktop/electron/` opener rule (`openExternal`), `apps/shared/src/external-url.ts`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Extensions Windows runs instead of opening (`PATHEXT` and the other shell-executable types).
 const RUNS: [&str; 34] = [
@@ -74,6 +74,7 @@ pub fn run(open: &Open) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn link_to(path: &Path) -> String {
         format!("file:///{}", path.display().to_string().replace('\\', "/").replace(' ', "%20"))
