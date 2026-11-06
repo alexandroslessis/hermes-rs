@@ -100,6 +100,19 @@ files before 0003/0004, 6.6 MB in 109 after.
   file that's gone, the gallery keeps Hermes's download. Tested live 2026-11-05
   (`scripts/perf/artifacts-check.mjs`).
 
+- **0014-move-to-home.patch** (`app/chat/session-drag.ts`,
+  `app/chat/sidebar/session-actions-menu.tsx`, `store/projects.ts`): a session can be moved to
+  the sidebar's Home bucket — dragged onto its row, or the row's own "Move to project"
+  submenu. Hermes excludes Home from both ("no folder to move into"); here moving there is a
+  deviation the user asked for, and it targets the bare home workspace (the backend's default
+  cwd), which is what Hermes's own tree files into Home ("no cwd, bare home, deleted
+  workspace"). The store hunk fetches that cwd for the Home target; the session's own current
+  bucket (the tree snapshot's owner map) stays a non-target. Hermes's `session-drag.test.ts`
+  "is not a target for Home — there is no folder to move into" fails by design: it checks the
+  exclusion this patch removes, which is the deviation the user asked for. Tested live
+  2026-11-06 (`scripts/perf/workspace-check.mjs`: the move, the tree filing the session into
+  Home).
+
 ## To do
 
 - **Skill hub** (install from Capabilities ▸ Skills ▸ Discover): `tools/skills_hub*.py` and

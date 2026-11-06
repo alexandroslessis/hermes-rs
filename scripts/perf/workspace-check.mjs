@@ -110,6 +110,16 @@ check('a non-repo folder answers a null identity', toPlain?.branch === null && t
 const plainInfo = latestInfo(sid)
 check('the identity is replaced, not merged', plainInfo?.cwd === plainReal && (plainInfo?.git_branch ?? null) === null, { cwd: plainInfo?.cwd, branch: plainInfo?.git_branch })
 
+// A bare-home workspace is what the backend's tree files into Home (its Home
+// bucket is "no cwd, bare home, deleted workspace") — moving there is how a
+// session lands in the Home bucket.
+const home = (await rest('GET', '/api/fs/default-cwd')).body?.cwd
+const toHome = await move(sid, home).catch(e => { check('move to the bare home workspace', false, e.message); return null })
+check('move to the bare home workspace', toHome !== null && toHome?.cwd === home, toHome)
+const treeBody = await rpc('projects.tree', { preview_limit: 3 }).catch(() => null)
+const homeBucket = (treeBody?.projects ?? []).find(p => p.isNoProject)
+check('the tree files the session into Home', Boolean(homeBucket?.sessionIds?.includes(sid)), homeBucket && { id: homeBucket.id, sessions: homeBucket.sessionIds })
+
 const missing = await move(sid, join(plainDir, 'no-such-folder')).then(() => null, e => e)
 check('an unknown folder is refused', missing?.code === -32602, missing?.message)
 

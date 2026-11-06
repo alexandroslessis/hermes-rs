@@ -87,7 +87,8 @@ and a link are listed).
 lists, the project tree, unarchive, deleting an archived one, the auto-archive defaults).
 `workspace-check.mjs` checks moving a session between projects (the canonical `workspace` mutation: the
 receipt's cwd/branch/repo-root, session.info and the list carrying the identity, a non-repo folder
-replacing it with nulls, the unknown-folder refusal, the busy refusal while a turn runs) with its
+replacing it with nulls, the bare-home move filing the session into Home, the unknown-folder refusal,
+the busy refusal while a turn runs) with its
 own provider on :47900.
 `import-check.mjs` checks the Hermes importer (list, preview, import, `/import-hermes`, continuing an
 imported chat) against a home built by `make-hermes-db.py` with Hermes's own SessionDB; start the
