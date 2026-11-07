@@ -19,13 +19,12 @@ pub fn message_error(messages: &[Message]) -> Option<(MessageErrorKind, String)>
     Some((error.kind, error.message.clone()))
 }
 
-/// The error card's structured descriptor (Hermes's `error_surface.py`): which layer of the
-/// stack failed and the classifier's code, so the card says what happened in plain words and
-/// offers code-appropriate actions instead of toasting an opaque string. Advisory — the page
-/// falls back to a generic headline when it is absent.
-pub fn error_surface(kind: MessageErrorKind, text: &str, provider: &str, model: &str) -> Value {
+/// The error card's descriptor parts `(layer, code, retryable)` (Hermes's `error_surface.py`):
+/// which layer of the stack failed and the classifier's code, so the card says what happened in
+/// plain words and offers code-appropriate actions instead of toasting an opaque string.
+fn error_surface_parts(kind: MessageErrorKind, text: &str) -> (&'static str, &'static str, bool) {
     use MessageErrorKind as K;
-    let (layer, code, retryable) = match kind {
+    match kind {
         K::Authentication => ("auth", "auth", false),
         // A quota limit (usage/daily/monthly reached) reproduces on retry; a transient rate
         // limit clears on its own — the same classification `should_retry` uses.
@@ -35,7 +34,13 @@ pub fn error_surface(kind: MessageErrorKind, text: &str, provider: &str, model: 
         K::ContextLengthExceeded => ("provider", "context_overflow", false),
         K::CreditsExhausted => ("billing", "billing", false),
         K::Other => ("provider", "provider_error", true),
-    };
+    }
+}
+
+/// The error card's structured descriptor (Hermes's `error_surface.py`). Advisory — the page
+/// falls back to a generic headline when it is absent.
+pub fn error_surface(kind: MessageErrorKind, text: &str, provider: &str, model: &str) -> Value {
+    let (layer, code, retryable) = error_surface_parts(kind, text);
     let mut surface = json!({"layer": layer, "code": code, "retryable": retryable});
     if !provider.is_empty() {
         surface["provider"] = json!(provider);
@@ -44,6 +49,55 @@ pub fn error_surface(kind: MessageErrorKind, text: &str, provider: &str, model: 
         surface["model"] = json!(model);
     }
     surface
+}
+
+/// The card copy's `(title, hint)` for a failure code, else its layer (Hermes's
+/// `tui_gateway/user_messages.py` `_TURN_ERROR_CODE_COPY`, desktop words: the page strips the
+/// bubble's text and renders the card, so this is what the transcript keeps for a reopened
+/// session and what `message.complete`'s text carries).
+fn turn_error_copy(code: &str) -> Option<(&'static str, &'static str)> {
+    match code {
+        "auth" => Some(("The model provider rejected the API key", "Fix the key in Settings ▸ Keys, then retry.")),
+        "billing" => Some(("The model provider reports no credit left", "Top up the account or switch provider, then retry.")),
+        "rate_limit" => Some(("The model provider is rate-limiting requests", "Wait a moment, then retry.")),
+        "server_error" => Some(("The model provider had an internal error", "Wait a moment, then retry.")),
+        "timeout" => Some(("The model provider did not answer in time", "Try again; if it keeps happening, switch provider.")),
+        "context_overflow" => Some(("The conversation is too long for this model", "Run /compress, then retry.")),
+        _ => None,
+    }
+}
+
+/// The assistant-slot text for a turn that produced no reply (Hermes's `turn_error_text`):
+/// title, what it means for the user, the raw provider detail on its own line, and the next
+/// step. The page's completion path appends the turn's message only when the frame's text is
+/// non-empty, so a provider error with nothing streamed carries this account.
+pub fn turn_error_text(kind: MessageErrorKind, detail: &str, provider: &str) -> String {
+    let (layer, code, retryable) = error_surface_parts(kind, detail);
+    let (title, hint) = turn_error_copy(code)
+        .or_else(|| turn_error_copy(layer))
+        .unwrap_or(("The request failed", "Retry, or switch provider."));
+    // A quota limit reproduces on retry: the next step is the reset or another provider.
+    let hint = if !retryable && code == "rate_limit" {
+        "The limit resets on its own; switch provider to keep going."
+    } else {
+        hint
+    };
+    let identity = if provider.is_empty() {
+        String::new()
+    } else {
+        format!(" ({provider})")
+    };
+    let mut detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    if detail.len() > 400 {
+        detail.truncate(399);
+        detail.push('\u{2026}');
+    }
+    [format!("{title}{identity}. Your message was not answered.")]
+        .into_iter()
+        .chain((!detail.is_empty()).then(|| format!("Details: {detail}")))
+        .chain(std::iter::once(hint.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Stored messages as the transcript Hermes's frontend renders: user and assistant text, and
@@ -93,6 +147,11 @@ pub fn messages(messages: &[Message]) -> Vec<Value> {
                     if let Some(&index) = calls.get(&response.id) {
                         out[index]["text"] = Value::String(result);
                     }
+                }
+                // A provider error the turn ended on: the account is the row's text, so a
+                // reopened session shows it (Hermes's failed-turn boundary).
+                MessageContent::Error(error) if message.role == Role::Assistant => {
+                    text.push_str(&turn_error_text(error.kind, &error.message, ""));
                 }
                 _ => {}
             }
@@ -329,6 +388,39 @@ mod tests {
             Message::assistant().with_text("the reply"),
         ];
         assert_eq!(message_error(&stored), None);
+    }
+
+    #[test]
+    fn the_account_names_the_fix_and_carries_the_detail() {
+        let account = turn_error_text(MessageErrorKind::RateLimit, "user daily request limit reached (800 of 800).", "error-mock");
+        assert!(account.starts_with("The model provider is rate-limiting requests (error-mock). Your message was not answered."), "{account}");
+        assert!(account.contains("Details: user daily request limit reached"));
+        // A quota limit reproduces on retry: the next step says so.
+        assert!(account.contains("The limit resets on its own"), "{account}");
+
+        // A transient rate limit's next step is the retry.
+        let account = turn_error_text(MessageErrorKind::RateLimit, "please try again in 1s", "");
+        assert!(account.contains("Wait a moment, then retry."), "{account}");
+        assert!(!account.contains('('), "no identity without a provider: {account}");
+    }
+
+    #[test]
+    fn the_transcript_renders_the_error_account_for_a_reopened_session() {
+        let stored = vec![
+            Message::user().with_text("hello"),
+            Message::assistant().with_text("partial answer"),
+            Message::from_provider_error(&ProviderError::RateLimitExceeded {
+                details: "user daily request limit reached (800 of 800).".into(),
+                retry_delay: Some(Duration::from_secs(19919)),
+            }),
+        ];
+        let rows = messages(&stored);
+        let last = rows.last().expect("the error row is kept");
+        assert_eq!(last["role"], "assistant");
+        let text = last["text"].as_str().unwrap();
+        assert!(text.starts_with("The model provider is rate-limiting requests."), "{text}");
+        assert!(text.contains("Your message was not answered."));
+        assert!(text.contains("Details: "));
     }
 
     #[test]

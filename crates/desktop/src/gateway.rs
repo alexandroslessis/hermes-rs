@@ -2734,7 +2734,7 @@ impl Gateway {
                             status = "error";
                             error = Some(text.clone());
                         }
-                        let surface = failure.map(|(kind, text)| {
+                        let surface = failure.clone().map(|(kind, text)| {
                             let (provider, model) = this
                                 .runtime
                                 .store()
@@ -2746,13 +2746,30 @@ impl Gateway {
                             crate::transcript::error_surface(kind, &text, &provider, &model)
                         });
                         // A turn that also streamed output keeps it: the text is the user's, not
-                        // the error string (Hermes's partial failure settle).
-                        let partial = status == "error" && !stream.text().trim().is_empty();
+                        // the error string (Hermes's partial failure settle). One that streamed
+                        // nothing carries the account instead — the page's completion path
+                        // appends the turn's message only when the frame's text is non-empty, so
+                        // an empty frame would end the turn in silence (no card, no bubble).
+                        let provider_for_account = this
+                            .runtime
+                            .store()
+                            .session(&id)
+                            .ok()
+                            .flatten()
+                            .map(|record| record.provider)
+                            .unwrap_or_default();
+                        let text = match (&failure, stream.text().trim().is_empty()) {
+                            (Some((kind, detail)), true) => {
+                                crate::transcript::turn_error_text(*kind, detail, &provider_for_account)
+                            }
+                            _ => stream.text().to_string(),
+                        };
+                        let partial = status == "error" && !text.trim().is_empty();
                         this.emit(
                             &id,
                             "message.complete",
                             json!({
-                                "text": stream.text(),
+                                "text": text,
                                 "status": status,
                                 "error": error,
                                 "error_surface": surface,
