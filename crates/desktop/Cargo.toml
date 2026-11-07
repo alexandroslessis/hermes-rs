@@ -1,6 +1,6 @@
 [package]
 name = "hermes-desktop"
-version = "0.2.2"
+version = "0.2.3"
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
