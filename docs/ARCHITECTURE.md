@@ -122,7 +122,7 @@ Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`
 
 | Screen / command | Backend | Calls | Live check |
 |---|---|---|---|
-| Chat: send, stream, stop, queue, steer | gw `submit`, `transcript.rs`, runtime `start_turn` | `prompt.submit`, `session.interrupt`, `session.steer`, `prompt.*_queued` | `smoke.mjs`, `stop-check.mjs` |
+| Chat: send, stream, stop, queue, steer | gw `submit`, `transcript.rs`, runtime `start_turn` | `prompt.submit`, `session.interrupt`, `session.steer`, `prompt.*_queued` | `smoke.mjs`, `stop-check.mjs`, `provider-error-check.mjs` |
 | Approvals, clarify | `hub.rs` (`DesktopBridge`), `hermes_tools::approval` | `approval.respond`, `clarify.respond` | `smoke.mjs` |
 | Sidebar: sessions, search, pin, rename, delete | gw `session_list`, `session_route` | `/api/profiles/sessions`, `/api/sessions/*` | — |
 | Artifacts (sidebar), `file:` links | page over `stored_messages`; `open_file.rs` (patch 0013) | `/api/sessions/{id}/messages`, `/api/hermes-rs/open-file` | `artifacts-check.mjs` |

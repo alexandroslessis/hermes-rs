@@ -118,6 +118,13 @@ fn is_usage_limit(message: &str) -> bool {
     USAGE_LIMIT_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
+/// True when a rate-limit error says a request/usage limit is reached (a daily or monthly
+/// quota): retrying unchanged reproduces it, so the error card's Retry action hides. Same
+/// classification `should_retry` uses.
+pub fn is_usage_limit_error(message: &str) -> bool {
+    is_usage_limit(message)
+}
+
 fn is_permanent_request_failure(message: &str) -> bool {
     PERMANENT_REQUEST_FAILURE_MARKERS
         .iter()

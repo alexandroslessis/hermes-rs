@@ -261,6 +261,9 @@ pub struct SystemNotificationContent {
 #[serde(rename_all = "camelCase")]
 pub enum MessageErrorKind {
     Authentication,
+    RateLimit,
+    ServerError,
+    Network,
     ContextLengthExceeded,
     CreditsExhausted,
     #[serde(other)]
@@ -272,6 +275,9 @@ impl From<&crate::errors::ProviderError> for MessageErrorKind {
         use crate::errors::ProviderError;
         match err {
             ProviderError::Authentication(_) => MessageErrorKind::Authentication,
+            ProviderError::RateLimitExceeded { .. } => MessageErrorKind::RateLimit,
+            ProviderError::ServerError(_) => MessageErrorKind::ServerError,
+            ProviderError::NetworkError(_) => MessageErrorKind::Network,
             ProviderError::ContextLengthExceeded(_) => MessageErrorKind::ContextLengthExceeded,
             ProviderError::CreditsExhausted { .. } => MessageErrorKind::CreditsExhausted,
             _ => MessageErrorKind::Other,

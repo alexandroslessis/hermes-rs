@@ -92,6 +92,9 @@ the busy refusal while a turn runs) with its
 own provider on :47900.
 `profiles-check.mjs` checks the profiles window's SOUL.md editor (read, save, read back, a never-written
 one as missing, another profile name refused like Hermes); it restores the SOUL.md it found.
+`provider-error-check.mjs` checks the provider-error card's contract (its own provider on :47900 answers a
+429 daily limit): the turn's `message.complete` carries status "error", the provider's text and the
+descriptor — layer/code, a quota limit not retryable.
 `import-check.mjs` checks the Hermes importer (list, preview, import, `/import-hermes`, continuing an
 imported chat) against a home built by `make-hermes-db.py` with Hermes's own SessionDB; start the
 instance with `HERMES_HOME` set to it.

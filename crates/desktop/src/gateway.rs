@@ -2716,12 +2716,38 @@ impl Gateway {
                         this.enqueue(&id, json!({"text": text, "shown": true}), true);
                     }
                     RuntimeEvent::TurnFinished(status) => {
-                        let (status, error) = match status {
+                        let (mut status, mut error) = match status {
                             TurnStatus::Completed => ("complete", None),
                             TurnStatus::Cancelled => ("interrupted", None),
                             TurnStatus::Failed(error) => ("error", Some(error)),
                         };
                         let stored = this.runtime.messages(&id).unwrap_or_default();
+                        // A turn that ended on a provider error carries it as the conversation's
+                        // last message (ops::ExitOnError yields it). The page's error card keys
+                        // off the failure status, so the turn is reported like Hermes's failed
+                        // turn result: status "error", the provider's text, and the structured
+                        // descriptor the card names the fix from.
+                        let failure = (status == "complete")
+                            .then(|| crate::transcript::message_error(&stored))
+                            .flatten();
+                        if let Some((_kind, text)) = &failure {
+                            status = "error";
+                            error = Some(text.clone());
+                        }
+                        let surface = failure.map(|(kind, text)| {
+                            let (provider, model) = this
+                                .runtime
+                                .store()
+                                .session(&id)
+                                .ok()
+                                .flatten()
+                                .map(|record| (record.provider, record.model))
+                                .unwrap_or_default();
+                            crate::transcript::error_surface(kind, &text, &provider, &model)
+                        });
+                        // A turn that also streamed output keeps it: the text is the user's, not
+                        // the error string (Hermes's partial failure settle).
+                        let partial = status == "error" && !stream.text().trim().is_empty();
                         this.emit(
                             &id,
                             "message.complete",
@@ -2729,6 +2755,8 @@ impl Gateway {
                                 "text": stream.text(),
                                 "status": status,
                                 "error": error,
+                                "error_surface": surface,
+                                "partial": partial,
                                 // The rows this turn wrote, so the page can restore or edit them.
                                 "persisted_turn": transcript::persisted_turn(&stored, first_row, &admission),
                                 "usage": this.usage_snapshot(&id, last_input),

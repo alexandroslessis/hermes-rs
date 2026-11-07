@@ -7,9 +7,44 @@
 use std::collections::HashMap;
 
 use hermes_agent::events::AgentEvent;
-use hermes_llm::conversation::message::{Message, MessageContent};
+use hermes_llm::conversation::message::{Message, MessageContent, MessageErrorKind};
 use rmcp::model::Role;
 use serde_json::{Value, json};
+
+/// The error a turn ended on, as `(kind, text)` from its last message (`ops::ExitOnError`
+/// yields a provider error as one): the page's error card keys off the failure status, so the
+/// turn is reported like Hermes's failed turn result (`failed=True`, `error=<the text>`).
+pub fn message_error(messages: &[Message]) -> Option<(MessageErrorKind, String)> {
+    let error = messages.last()?.content.iter().find_map(|c| c.as_error())?;
+    Some((error.kind, error.message.clone()))
+}
+
+/// The error card's structured descriptor (Hermes's `error_surface.py`): which layer of the
+/// stack failed and the classifier's code, so the card says what happened in plain words and
+/// offers code-appropriate actions instead of toasting an opaque string. Advisory — the page
+/// falls back to a generic headline when it is absent.
+pub fn error_surface(kind: MessageErrorKind, text: &str, provider: &str, model: &str) -> Value {
+    use MessageErrorKind as K;
+    let (layer, code, retryable) = match kind {
+        K::Authentication => ("auth", "auth", false),
+        // A quota limit (usage/daily/monthly reached) reproduces on retry; a transient rate
+        // limit clears on its own — the same classification `should_retry` uses.
+        K::RateLimit => ("provider", "rate_limit", !hermes_llm::retry::is_usage_limit_error(text)),
+        K::ServerError => ("provider", "server_error", true),
+        K::Network => ("endpoint", "timeout", true),
+        K::ContextLengthExceeded => ("provider", "context_overflow", false),
+        K::CreditsExhausted => ("billing", "billing", false),
+        K::Other => ("provider", "provider_error", true),
+    };
+    let mut surface = json!({"layer": layer, "code": code, "retryable": retryable});
+    if !provider.is_empty() {
+        surface["provider"] = json!(provider);
+    }
+    if !model.is_empty() {
+        surface["model"] = json!(model);
+    }
+    surface
+}
 
 /// Stored messages as the transcript Hermes's frontend renders: user and assistant text, and
 /// each tool call with its result.
@@ -231,6 +266,70 @@ pub fn user_turn_index(messages: &[Message], ordinal: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hermes_llm::errors::ProviderError;
+    use std::time::Duration;
+
+    #[test]
+    fn the_error_a_turn_ended_on_is_reported_with_its_surface() {
+        let stored = vec![
+            Message::user().with_text("hello"),
+            Message::assistant().with_text("partial answer"),
+            Message::from_provider_error(&ProviderError::RateLimitExceeded {
+                details: "user daily request limit reached (800 of 800). Retry after 19919 seconds."
+                    .into(),
+                retry_delay: Some(Duration::from_secs(19919)),
+            }),
+        ];
+        let (kind, text) = message_error(&stored).expect("the turn ended on an error");
+        assert_eq!(kind, MessageErrorKind::RateLimit);
+        assert!(text.contains("daily request limit reached"));
+
+        let surface = error_surface(kind, &text, "openrouter", "mock");
+        assert_eq!(surface["layer"], "provider");
+        assert_eq!(surface["code"], "rate_limit");
+        // A quota limit reproduces on retry: the card's Retry action hides.
+        assert_eq!(surface["retryable"], false);
+        assert_eq!(surface["provider"], "openrouter");
+        assert_eq!(surface["model"], "mock");
+    }
+
+    #[test]
+    fn a_transient_rate_limit_and_other_kinds_surface_their_fix() {
+        let transient = error_surface(
+            MessageErrorKind::RateLimit,
+            "please try again in 1s",
+            "openrouter",
+            "mock",
+        );
+        assert_eq!(transient["code"], "rate_limit");
+        assert_eq!(transient["retryable"], true);
+
+        for (kind, layer, code, retryable) in [
+            (MessageErrorKind::Authentication, "auth", "auth", false),
+            (MessageErrorKind::ContextLengthExceeded, "provider", "context_overflow", false),
+            (MessageErrorKind::CreditsExhausted, "billing", "billing", false),
+            (MessageErrorKind::ServerError, "provider", "server_error", true),
+            (MessageErrorKind::Network, "endpoint", "timeout", true),
+            (MessageErrorKind::Other, "provider", "provider_error", true),
+        ] {
+            let surface = error_surface(kind, "x", "", "");
+            assert_eq!(surface["layer"], layer, "{code}");
+            assert_eq!(surface["code"], code, "{code}");
+            assert_eq!(surface["retryable"], retryable, "{code}");
+            // Identity is only stamped for the session that actually failed.
+            assert!(surface.get("provider").is_none());
+            assert!(surface.get("model").is_none());
+        }
+    }
+
+    #[test]
+    fn a_turn_that_completed_normally_has_no_error_to_report() {
+        let stored = vec![
+            Message::user().with_text("hello"),
+            Message::assistant().with_text("the reply"),
+        ];
+        assert_eq!(message_error(&stored), None);
+    }
 
     #[test]
     fn row_ids_are_stored_positions_and_cut_where_restore_asks() {
