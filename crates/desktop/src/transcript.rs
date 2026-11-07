@@ -2,7 +2,9 @@
 //! `session.resume` returns) and a running turn's agent events as Hermes's stream events
 //! (`message.delta`, `reasoning.delta`, `tool.start`, `tool.complete`).
 //!
-//! Hermes: `tui_gateway/methods_session.py` (`session.resume`), `tui_gateway/prompt_turn.py` (stream events).
+//! Hermes: `tui_gateway/methods_session.py` (`session.resume`), `tui_gateway/prompt_turn.py` (stream
+//! events), and the failed-turn boundary a provider-error turn leaves (`agent/conversation_loop.py`
+//! `_close_durable_failed_turn` + `agent/turn_failure_copy.py` `failed_turn_notice`).
 
 use std::collections::HashMap;
 
@@ -28,7 +30,11 @@ fn error_surface_parts(kind: MessageErrorKind, text: &str) -> (&'static str, &'s
         K::Authentication => ("auth", "auth", false),
         // A quota limit (usage/daily/monthly reached) reproduces on retry; a transient rate
         // limit clears on its own — the same classification `should_retry` uses.
-        K::RateLimit => ("provider", "rate_limit", !hermes_llm::retry::is_usage_limit_error(text)),
+        K::RateLimit => (
+            "provider",
+            "rate_limit",
+            !hermes_llm::retry::is_usage_limit_error(text),
+        ),
         K::ServerError => ("provider", "server_error", true),
         K::Network => ("endpoint", "timeout", true),
         K::ContextLengthExceeded => ("provider", "context_overflow", false),
@@ -57,12 +63,30 @@ pub fn error_surface(kind: MessageErrorKind, text: &str, provider: &str, model: 
 /// session and what `message.complete`'s text carries).
 fn turn_error_copy(code: &str) -> Option<(&'static str, &'static str)> {
     match code {
-        "auth" => Some(("The model provider rejected the API key", "Fix the key in Settings ▸ Keys, then retry.")),
-        "billing" => Some(("The model provider reports no credit left", "Top up the account or switch provider, then retry.")),
-        "rate_limit" => Some(("The model provider is rate-limiting requests", "Wait a moment, then retry.")),
-        "server_error" => Some(("The model provider had an internal error", "Wait a moment, then retry.")),
-        "timeout" => Some(("The model provider did not answer in time", "Try again; if it keeps happening, switch provider.")),
-        "context_overflow" => Some(("The conversation is too long for this model", "Run /compress, then retry.")),
+        "auth" => Some((
+            "The model provider rejected the API key",
+            "Fix the key in Settings ▸ Keys, then retry.",
+        )),
+        "billing" => Some((
+            "The model provider reports no credit left",
+            "Top up the account or switch provider, then retry.",
+        )),
+        "rate_limit" => Some((
+            "The model provider is rate-limiting requests",
+            "Wait a moment, then retry.",
+        )),
+        "server_error" => Some((
+            "The model provider had an internal error",
+            "Wait a moment, then retry.",
+        )),
+        "timeout" => Some((
+            "The model provider did not answer in time",
+            "Try again; if it keeps happening, switch provider.",
+        )),
+        "context_overflow" => Some((
+            "The conversation is too long for this model",
+            "Run /compress, then retry.",
+        )),
         _ => None,
     }
 }
@@ -101,8 +125,9 @@ pub fn turn_error_text(kind: MessageErrorKind, detail: &str, provider: &str) -> 
 }
 
 /// Stored messages as the transcript Hermes's frontend renders: user and assistant text, and
-/// each tool call with its result.
-pub fn messages(messages: &[Message]) -> Vec<Value> {
+/// each tool call with its result. `provider`/`model` name the failed turn's boundary card
+/// (Hermes's failed-turn fingerprint); pass empty when unknown.
+pub fn messages(messages: &[Message], provider: &str, model: &str) -> Vec<Value> {
     let mut out = Vec::new();
     // Tool results arrive in a later message; they're filled into their call's entry.
     let mut calls: HashMap<String, usize> = HashMap::new();
@@ -117,6 +142,10 @@ pub fn messages(messages: &[Message]) -> Vec<Value> {
         let timestamp = message.created as f64;
         let mut text = String::new();
         let mut reasoning = String::new();
+        // A turn that ended on a provider error: the boundary row's display metadata so the page
+        // redraws the styled error card on reopen (Hermes's failed-turn boundary). Advisory — the
+        // account lives on the live card; a reopened session shows the card, not a plain block.
+        let mut failed_turn: Option<Value> = None;
         for content in &message.content {
             match content {
                 MessageContent::Text(t) => text.push_str(&without_think_tags(&t.text)),
@@ -148,15 +177,28 @@ pub fn messages(messages: &[Message]) -> Vec<Value> {
                         out[index]["text"] = Value::String(result);
                     }
                 }
-                // A provider error the turn ended on: the account is the row's text, so a
-                // reopened session shows it (Hermes's failed-turn boundary).
+                // A provider error the turn ended on: the boundary row carries the display
+                // metadata (Hermes's failed-turn boundary), so the page redraws the styled error
+                // card on reopen. The row gets Hermes's short failed-turn notice as its own text
+                // (the page won't drop a content-less failed_turn row before it paints the card
+                // from `display_metadata`); the account itself lives on the live frame.
                 MessageContent::Error(error) if message.role == Role::Assistant => {
-                    text.push_str(&turn_error_text(error.kind, &error.message, ""));
+                    let notice = if messages[..=index].iter().any(has_tool) {
+                        "This turn did not complete. Some actions may have already run; verify their effects before resending."
+                    } else {
+                        "Your request was not processed. Send it again if you still want me to carry it out."
+                    };
+                    text.push_str(notice);
+                    failed_turn = Some(json!({
+                        "error": error.message,
+                        "error_surface": error_surface(error.kind, &error.message, provider, model),
+                    }));
                 }
                 _ => {}
             }
         }
-        if text.trim().is_empty() && reasoning.is_empty() {
+        let failed_turn = failed_turn;
+        if text.trim().is_empty() && reasoning.is_empty() && failed_turn.is_none() {
             continue;
         }
         let role = match message.role {
@@ -169,15 +211,31 @@ pub fn messages(messages: &[Message]) -> Vec<Value> {
             }
             Role::Assistant => "assistant",
         };
-        out.push(json!({
+        let mut row = json!({
             "role": role,
             "text": text,
             "reasoning": (!reasoning.is_empty()).then_some(reasoning),
             "timestamp": timestamp,
             "row_id": row_id,
-        }));
+        });
+        // A failed turn is a Hermes boundary, not the model's reply: the page paints the
+        // styled card it already knows from the error and the descriptor, not a text row.
+        if let Some(metadata) = failed_turn {
+            row["display_kind"] = json!("failed_turn");
+            row["display_metadata"] = metadata;
+        }
+        out.push(row);
     }
     out
+}
+
+/// Whether a turn that failed called a tool (your failed-turn notice says so, as Hermes's
+/// `failed_turn_notice` — a tool may have run before the provider error ended the turn).
+fn has_tool(message: &Message) -> bool {
+    message
+        .content
+        .iter()
+        .any(|c| matches!(c, MessageContent::ToolRequest(_)))
 }
 
 fn tool_result_text(content: &MessageContent) -> String {
@@ -334,8 +392,9 @@ mod tests {
             Message::user().with_text("hello"),
             Message::assistant().with_text("partial answer"),
             Message::from_provider_error(&ProviderError::RateLimitExceeded {
-                details: "user daily request limit reached (800 of 800). Retry after 19919 seconds."
-                    .into(),
+                details:
+                    "user daily request limit reached (800 of 800). Retry after 19919 seconds."
+                        .into(),
                 retry_delay: Some(Duration::from_secs(19919)),
             }),
         ];
@@ -365,9 +424,24 @@ mod tests {
 
         for (kind, layer, code, retryable) in [
             (MessageErrorKind::Authentication, "auth", "auth", false),
-            (MessageErrorKind::ContextLengthExceeded, "provider", "context_overflow", false),
-            (MessageErrorKind::CreditsExhausted, "billing", "billing", false),
-            (MessageErrorKind::ServerError, "provider", "server_error", true),
+            (
+                MessageErrorKind::ContextLengthExceeded,
+                "provider",
+                "context_overflow",
+                false,
+            ),
+            (
+                MessageErrorKind::CreditsExhausted,
+                "billing",
+                "billing",
+                false,
+            ),
+            (
+                MessageErrorKind::ServerError,
+                "provider",
+                "server_error",
+                true,
+            ),
             (MessageErrorKind::Network, "endpoint", "timeout", true),
             (MessageErrorKind::Other, "provider", "provider_error", true),
         ] {
@@ -392,7 +466,11 @@ mod tests {
 
     #[test]
     fn the_account_names_the_fix_and_carries_the_detail() {
-        let account = turn_error_text(MessageErrorKind::RateLimit, "user daily request limit reached (800 of 800).", "error-mock");
+        let account = turn_error_text(
+            MessageErrorKind::RateLimit,
+            "user daily request limit reached (800 of 800).",
+            "error-mock",
+        );
         assert!(account.starts_with("The model provider is rate-limiting requests (error-mock). Your message was not answered."), "{account}");
         assert!(account.contains("Details: user daily request limit reached"));
         // A quota limit reproduces on retry: the next step says so.
@@ -401,11 +479,14 @@ mod tests {
         // A transient rate limit's next step is the retry.
         let account = turn_error_text(MessageErrorKind::RateLimit, "please try again in 1s", "");
         assert!(account.contains("Wait a moment, then retry."), "{account}");
-        assert!(!account.contains('('), "no identity without a provider: {account}");
+        assert!(
+            !account.contains('('),
+            "no identity without a provider: {account}"
+        );
     }
 
     #[test]
-    fn the_transcript_renders_the_error_account_for_a_reopened_session() {
+    fn the_transcript_redraws_the_error_card_for_a_reopened_session() {
         let stored = vec![
             Message::user().with_text("hello"),
             Message::assistant().with_text("partial answer"),
@@ -414,13 +495,25 @@ mod tests {
                 retry_delay: Some(Duration::from_secs(19919)),
             }),
         ];
-        let rows = messages(&stored);
+        let rows = messages(&stored, "error-mock", "mock-error");
         let last = rows.last().expect("the error row is kept");
         assert_eq!(last["role"], "assistant");
-        let text = last["text"].as_str().unwrap();
-        assert!(text.starts_with("The model provider is rate-limiting requests."), "{text}");
-        assert!(text.contains("Your message was not answered."));
-        assert!(text.contains("Details: "));
+        // Hermes's failed-turn boundary: the page redraws the styled card from the descriptor,
+        // so the row is a boundary (display_kind/display_metadata), not a plain-text account.
+        assert_eq!(last["display_kind"], "failed_turn");
+        let metadata = &last["display_metadata"];
+        assert_eq!(metadata["error_surface"]["layer"], "provider");
+        assert_eq!(metadata["error_surface"]["code"], "rate_limit");
+        assert_eq!(metadata["error_surface"]["retryable"], false);
+        assert_eq!(metadata["error_surface"]["provider"], "error-mock");
+        assert_eq!(metadata["error_surface"]["model"], "mock-error");
+        assert!(
+            metadata["error"]
+                .as_str()
+                .unwrap()
+                .contains("daily request limit reached"),
+            "{metadata}"
+        );
     }
 
     #[test]
@@ -431,7 +524,7 @@ mod tests {
             Message::user().with_text("second"),
             Message::assistant().with_text("two"),
         ];
-        let rows = messages(&stored);
+        let rows = messages(&stored, "", "");
         let users: Vec<_> = rows.iter().filter(|r| r["role"] == "user").collect();
         assert_eq!(users[1]["text"], "second");
         assert_eq!(users[1]["row_id"], 3);

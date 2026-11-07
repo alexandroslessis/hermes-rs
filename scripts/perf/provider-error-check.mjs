@@ -72,6 +72,10 @@ check('the failure status', complete?.status === 'error', complete?.status)
 // the frame's text is non-empty — an empty frame ended the turn in silence).
 check('the failure account in the text', typeof complete?.text === 'string' && complete.text.includes('Your message was not answered'), complete?.text)
 check('the provider error text', typeof complete?.error === 'string' && complete.error.includes('daily request limit reached'), complete?.error)
+// The page's completion path appends the turn's message only when the frame's text is
+// non-empty, and its partial=false strips the account from the message: the error card is
+// the only thing rendered (no text rows beside it).
+check('partial=false, so the card is the only element', complete?.partial === false)
 check('the descriptor names the layer and code', complete?.error_surface?.layer === 'provider' && complete.error_surface?.code === 'rate_limit', complete?.error_surface)
 // A quota limit reproduces on retry: the card's Retry action hides.
 check('a quota limit is not retryable', complete?.error_surface?.retryable === false, complete?.error_surface)

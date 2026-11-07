@@ -47,7 +47,7 @@ Not from Hermes, so not in the map:
 | `server.rs` | `hermes_cli/web_server_dashboard.py` (page globals, token), `tui_gateway/ws.py` |
 | `gateway.rs` | `tui_gateway/server.py`, `methods_prompt.py`, `methods_session.py`, `ws.py`; `agent/context_breakdown.py`; the page's side: `apps/desktop/src/api/canonical-protocol.ts`, `apps/shared/src/gateway-contract.openrpc.json` |
 | `hub.rs` | event fan-out: `apps/desktop/src/api/canonical-protocol.ts` |
-| `transcript.rs` | `tui_gateway/methods_session.py`, `tui_gateway/prompt_turn.py` |
+| `transcript.rs` | `tui_gateway/methods_session.py`, `tui_gateway/prompt_turn.py`, `agent/conversation_loop.py` (`_close_durable_failed_turn`), `agent/turn_failure_copy.py` (`failed_turn_notice`) |
 | `rest.rs` | `hermes_cli/config.py` (config schema), `hermes_cli/web_routers/*.py`, `apps/desktop/src/types/hermes.ts` |
 | `commands.rs` | `tui_gateway/command_discovery.py`, `tui_gateway/methods_complete.py` |
 | `paths.rs` | `tui_gateway/methods_complete.py` (`@` paths), `/api/fs/list` |

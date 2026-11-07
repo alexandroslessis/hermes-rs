@@ -90,13 +90,22 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, headers, payload)
 
 
+class Server(ThreadingHTTPServer):
+    # Refuse a second instance: Windows's SO_REUSEADDR would silently
+    # co-bind both and the older one keeps answering.
+    allow_reuse_address = False
+    # Worker threads never block exit: a client holding a connection open
+    # can't keep the process alive past Ctrl+C.
+    daemon_threads = True
+
+
 def main():
     global ARGS
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8901)
     parser.add_argument("--kind", choices=["quota", "server", "drop"], default="quota")
     ARGS = parser.parse_args()
-    server = ThreadingHTTPServer(("127.0.0.1", ARGS.port), Handler)
+    server = Server(("127.0.0.1", ARGS.port), Handler)
     print(f"error mock ({ARGS.kind}) on http://127.0.0.1:{ARGS.port}/v1 — Ctrl+C to stop")
     try:
         server.serve_forever()
