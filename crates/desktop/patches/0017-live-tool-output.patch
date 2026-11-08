@@ -56,3 +56,126 @@
  function TerminalTranscript({ command, exitCode }: TerminalTranscriptProps) {
    if (!command && exitCode === undefined) {
      return null
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/index.ts
+@@ -55,6 +55,20 @@ import { currentResponseParts, mergeCurrentResponseText } from './response-parts
+ import { admitSegmentDelta, admitSegmentSeal, type SegmentCursor, type SegmentStamp } from './segment-identity'
+ import { completionErrorText, delegateTaskPayloads, MAX_STREAM_FLUSH_GAP_MS, STREAM_DELTA_FLUSH_MS } from './utils'
+ 
++/** The interrupted terminal's real result: the backend answers the stop with the output the
++ *  command had printed (`interrupted: true` in the result's JSON). That completion is the
++ *  Stop's own production, not a late frame of the cancelled turn to drop. */
++function isStoppedCallCompletion(payload: GatewayEventPayload | undefined): boolean {
++  const result = payload?.result
++
++  return (
++    typeof result === 'object' &&
++    result !== null &&
++    !Array.isArray(result) &&
++    (result as Record<string, unknown>).interrupted === true
++  )
++}
++
+ interface MessageStreamOptions {
+   activeGatewayProfile?: string
+   activeSessionIdRef: MutableRefObject<string | null>
+@@ -171,6 +185,11 @@ export function useMessageStream({
+         // that crosses an interim/settle boundary must attach to the bubble
+         // that still owns the call, wherever that bubble now sits.
+         eventTarget?: (state: ClientSessionState) => string | null
++        // Write past the Stop latch: only the interrupted terminal's real
++        // result uses this (upsertToolCall), whose caller has already
++        // verified the bubble that owns the call still exists — no new
++        // bubble may be seeded past a Stop.
++        acceptInterrupted?: boolean
+       } = {},
+       occurredAt = Date.now() / 1000
+     ) => {
+@@ -179,8 +198,11 @@ export function useMessageStream({
+           // After a stop, drop any late deltas / tool events for the
+           // cancelled turn so they don't keep growing the (now finalized)
+           // assistant bubble or, worse, seed a brand-new bubble that
+-          // appears to belong to the next user message.
+-          if (state.interrupted) {
++          // appears to belong to the next user message. The interrupted
++          // terminal's real result opts in (acceptInterrupted): it may only
++          // patch the bubble that still owns the call, which its caller
++          // has already verified.
++          if (state.interrupted && !opts.acceptInterrupted) {
+             return state
+           }
+ 
+@@ -610,7 +632,21 @@ export function useMessageStream({
+         }
+       }
+ 
+-      if (sessionInterrupted(sessionId)) {
++      // The interrupted terminal's real result is the Stop's own production:
++      // the backend answers the stop with the output the command had printed
++      // (interrupted: true in its result), and it must paint now — the row
++      // otherwise reads empty until the chat rehydrates. It may only patch
++      // the bubble that still owns the call, never seed a brand-new one,
++      // which is what this gate exists to prevent. Every other late write
++      // of the cancelled turn stays dropped.
++      const acceptInterrupted =
++        sessionInterrupted(sessionId) &&
++        isStoppedCallCompletion(payload) &&
++        Boolean(
++          toolCallOwnerMessageId(sessionStateByRuntimeIdRef.current.get(sessionId)?.messages ?? [], payload)
++        )
++
++      if (sessionInterrupted(sessionId) && !acceptInterrupted) {
+         return
+       }
+ 
+@@ -628,7 +664,8 @@ export function useMessageStream({
+           // the sealed one keeps reading "Result unavailable", and a running
+           // event for the same id seeds a second live row with its own timer
+           // under the user's message (#113035). Both phases route by id.
+-          eventTarget: state => toolCallOwnerMessageId(state.messages, payload)
++          eventTarget: state => toolCallOwnerMessageId(state.messages, payload),
++          acceptInterrupted
+         },
+         occurredAt
+       )
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/interrupted-status-sync.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/interrupted-status-sync.test.tsx
+@@ -8,6 +8,7 @@ import { act, cleanup } from '@testing-library/react'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { finalizeUserInterruptedMessages } from '@/app/session/hooks/use-prompt-actions/rewind'
++import type { ChatMessagePart } from '@/lib/chat-messages'
+ import { $subagentsBySession } from '@/store/subagents'
+ 
+ import { type MessageStreamHarness, renderMessageStream } from './test-harness'
+@@ -91,4 +92,30 @@ describe('interrupted turn still retires status rows (#81114)', () => {
+ 
+     expect(JSON.stringify(stream.state().messages)).toBe(sealed)
+   })
++
++  it("the interrupted terminal's real result paints into the bubble that owns the call", () => {
++    emit({ payload: {}, session_id: SID, type: 'message.start' })
++    emit({
++      payload: { args: { command: 'echo hi; sleep 60' }, name: 'terminal', tool_id: 'call-1' },
++      session_id: SID,
++      type: 'tool.start'
++    })
++    pressStop()
++
++    emit({
++      payload: {
++        name: 'terminal',
++        result: { output: 'hi', exit_code: null, interrupted: true, note: 'The command was stopped before it finished' },
++        tool_id: 'call-1'
++      },
++      session_id: SID,
++      type: 'tool.complete'
++    })
++
++    const part = stream
++      .state()
++      .messages.flatMap(message => message.parts)
++      .find((p): p is Extract<ChatMessagePart, { type: 'tool-call' }> => p.type === 'tool-call' && p.toolCallId === 'call-1')
++    expect(part?.result).toMatchObject({ output: 'hi' })
++  })
+ })

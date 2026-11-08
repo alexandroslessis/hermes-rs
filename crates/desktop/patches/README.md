@@ -135,14 +135,21 @@ files before 0003/0004, 6.6 MB in 109 after.
   (`scripts/perf/file-tree-open-check.mjs`).
 
 - **0017-live-tool-output.patch** (`store/tool-progress.ts`,
-  `components/assistant-ui/tool/fallback.tsx`): the running terminal call's output is shown live.
-  The backend relays each captured line (masked, the accumulated tail) as a `tool.progress` event
-  while the command works (`shell.rs`); the page already shows the progress message beside the
-  running row's timer (`ToolRunningMeta`), so this patch adds the clicked-open row's rendering —
-  a "stdout — live" block under the command row that grows until the finished result's own stdout
-  block replaces it — and `formatToolProgress` takes the multi-line tail's last line, so the
-  one-line header ticker doesn't show the whole output. Hermes relays live progress for MCP tools
-  only (`agent/tool_progress_relay.py`); extending it to the terminal is the feature. Tested live
+  `components/assistant-ui/tool/fallback.tsx`,
+  `app/session/hooks/use-message-stream/index.ts`,
+  `app/session/hooks/use-message-stream/interrupted-status-sync.test.tsx`): the running terminal
+  call's output is shown live. The backend relays each captured line (masked, the accumulated
+  tail) as a `tool.progress` event while the command works (`shell.rs`); the page already shows
+  the progress message beside the running row's timer (`ToolRunningMeta`), so this patch adds the
+  clicked-open row's rendering — a "stdout — live" block under the command row that grows until
+  the finished result's own stdout block replaces it — and `formatToolProgress` takes the
+  multi-line tail's last line, so the one-line header ticker doesn't show the whole output. It
+  also accepts the stopped call's real completion past the Stop latch: the backend answers a stop
+  mid-command with the output it had printed (`interrupted: true` in its result), and that
+  completion is production, not a late frame to drop — it may only patch the bubble that still
+  owns the call, never seed a new one, so the partial output paints immediately instead of after
+  the chat rehydrates. Hermes relays live progress for MCP tools only
+  (`agent/tool_progress_relay.py`); extending it to the terminal is the feature. Tested live
   2026-11-08 (`scripts/perf/tool-stream-check.mjs`).
 
 ## To do
