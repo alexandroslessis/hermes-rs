@@ -68,6 +68,10 @@ backend code · **L** = a port of a Hermes subsystem.
 ## 4. Known small issues
 
 - ✅ **Done 2026-11-06.** A provider rate-limit error froze the turn: the chat's timer ran while the retry loop slept out the Retry-After (up to an hour per attempt, three times). Now a daily/usage-limit 429 ("user daily request limit reached (800 of 800)", Hermes's `_USAGE_LIMIT_MESSAGE_TOKENS`) ends the turn with the error the chat shows, and a transient 429's Retry-After is honored up to 600s (Hermes's `RETRY_AFTER_CAP_S`).
+- ✅ **Done 2026-11-08.** The file trees' right-click menu offered only copy-path and Download
+  (the page sees our backend as remote, so Reveal/Rename/Delete hide). "Open in default app"
+  (patches 0015) asks `POST /api/hermes-rs/open-file`: the file opens with its default app, a
+  folder in Explorer, a program or script only selected in Explorer.
 - Steering a queued message shows it only after the reply (`crates/desktop/patches/README.md`).
 - Tokens/s isn't shown for sessions from before the stats file existed.
 - `/timeline` (conversation timeline rail) is unanswered.

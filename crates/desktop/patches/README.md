@@ -113,6 +113,18 @@ files before 0003/0004, 6.6 MB in 109 after.
   2026-11-06 (`scripts/perf/workspace-check.mjs`: the move, the tree filing the session into
   Home).
 
+- **0015-open-in-default-app.patch** (`app/right-sidebar/file-actions.tsx`,
+  `store/file-actions.ts`, `i18n/types.ts`, every `i18n` locale, `locales/_keys.desktop.json`):
+  "Open in default app" at the top of both file trees' right-click menu. The page sees our
+  backend as remote (no Electron bridge, so `nativeHostFiles` is missing), which hides
+  Reveal/Rename/Delete and offers only copy-path and Download; the action asks
+  `POST /api/hermes-rs/open-file` (`open_file.rs`, the route patch 0013 added for the Artifacts
+  gallery) with the row's plain absolute path — the backend opens the file with its default app,
+  a folder in Explorer, and shows a program or script selected in Explorer instead (a menu never
+  runs one). A backend without the route (a real remote Hermes) reports the failure as a toast.
+  The review/git tree keeps Hermes's menu shape (its "Open file" opens the in-app preview).
+  Tested live 2026-11-08 (`scripts/perf/file-tree-open-check.mjs`).
+
 ## To do
 
 - **Skill hub** (install from Capabilities ▸ Skills ▸ Discover): `tools/skills_hub*.py` and
