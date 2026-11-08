@@ -49,6 +49,8 @@ backend code · **L** = a port of a Hermes subsystem.
 | 2.10 | ✅ **Done 2026-11-04** (Command Center ▸ Maintenance; the curator also runs on its schedule again, which the desktop never did). Curator and background-review controls. | `/api/curator`, `/api/curator/paused`, `/api/curator/run` | `runtime::curator`, `set_background_review` | S |
 | 2.11 | ✅ **Done 2026-11-04** for insights (`usage.bars` turned out to be Nous subscription limits: not needed). Usage bars in the status bar, insights page. | `usage.bars`, `insights.get`, `/api/analytics/usage` | `usage_report`, `insights_report`, store usage table | S |
 
+| 2.12 | ✅ **Done 2026-11-08** (each captured line of a running `terminal` call is masked and relayed as a `tool.progress` event — the accumulated tail, throttled to one per 500 ms like Hermes's `tool_progress_relay.py` — the running row shows the message beside its timer and the clicked-open row renders a growing "stdout — live" block until the finished result replaces it, patch 0017). The tool's output was shown only after the call finished; live progress existed for MCP tools only, and we serve no MCP. | `tool.progress` never fired for our tools | the page's `tool.progress` store (Hermes's), `Emitter` | S |
+
 ## 3. Sessions, memory, settings
 
 | # | Gap | Evidence | Already in hermes-rs | Effort |

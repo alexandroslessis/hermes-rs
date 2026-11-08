@@ -134,6 +134,17 @@ files before 0003/0004, 6.6 MB in 109 after.
   review/git tree keeps Hermes's menu shape. Tested live 2026-11-08
   (`scripts/perf/file-tree-open-check.mjs`).
 
+- **0017-live-tool-output.patch** (`store/tool-progress.ts`,
+  `components/assistant-ui/tool/fallback.tsx`): the running terminal call's output is shown live.
+  The backend relays each captured line (masked, the accumulated tail) as a `tool.progress` event
+  while the command works (`shell.rs`); the page already shows the progress message beside the
+  running row's timer (`ToolRunningMeta`), so this patch adds the clicked-open row's rendering —
+  a "stdout — live" block under the command row that grows until the finished result's own stdout
+  block replaces it — and `formatToolProgress` takes the multi-line tail's last line, so the
+  one-line header ticker doesn't show the whole output. Hermes relays live progress for MCP tools
+  only (`agent/tool_progress_relay.py`); extending it to the terminal is the feature. Tested live
+  2026-11-08 (`scripts/perf/tool-stream-check.mjs`).
+
 ## To do
 
 - **Skill hub** (install from Capabilities ▸ Skills ▸ Discover): `tools/skills_hub*.py` and

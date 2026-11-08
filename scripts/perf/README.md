@@ -79,6 +79,9 @@ its own provider on :47900.
 with its own provider on :47900.
 `toolsets-check.mjs` checks Capabilities ▸ Tools (list, switch off and on, the next turn's tools, a refused
 call) with its own provider on :47900.
+`tool-stream-check.mjs` checks the terminal's live output against the page (what the terminal sends
+as `tool.progress` frames reaches it; a command that prints in two bursts must produce relay frames
+before the `tool.complete` answer carries the result, patches/0017).
 `memory-check.mjs` checks the Star map's routes (graph, node detail, edit, delete, a stale id) and that
 Settings ▸ Memory reaches the store; it restores the perf instance's memory files after.
 `artifacts-check.mjs` checks the Artifacts view through the page (a written file named in a reply

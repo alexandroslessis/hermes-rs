@@ -2790,6 +2790,29 @@ impl Gateway {
                     RuntimeEvent::Agent(AgentEvent::Subagent { kind, payload }) => {
                         this.emit(&id, kind, payload);
                     }
+                    // Live progress from inside a running tool call (the terminal's output
+                    // tail): the running row shows the message beside its timer, and the
+                    // clicked-open row renders it as its output while the call works
+                    // (patches/0017). The payload is the contract's ToolProgressPayload.
+                    RuntimeEvent::Agent(AgentEvent::ToolProgress {
+                        tool_call_id,
+                        name,
+                        progress,
+                        message,
+                    }) => {
+                        this.emit(
+                            &id,
+                            "tool.progress",
+                            json!({
+                                "tool_id": tool_call_id,
+                                "name": name,
+                                "progress": progress,
+                                "total": Value::Null,
+                                "percent": Value::Null,
+                                "message": message,
+                            }),
+                        );
+                    }
                     // Compression before a model call can take minutes on a local model; the
                     // page shows its "summarizing" indicator for the `compacting` /
                     // `compacted` pair, else the turn looks hung (Hermes:

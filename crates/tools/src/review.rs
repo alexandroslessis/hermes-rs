@@ -156,7 +156,7 @@ impl ReviewTools {
                     return refusal;
                 }
                 let Some(skills) = &self.tools.skills else {
-                    return self.tools.dispatch(name, args).await;
+                    return self.tools.dispatch(name, args, None).await;
                 };
                 let result = skills.manage_with(&args, self.origin());
                 let failed = result.get("success") == Some(&Value::Bool(false));
@@ -166,7 +166,7 @@ impl ReviewTools {
                 }
             }
             "skill_view" => {
-                let output = self.tools.dispatch(name, args.clone()).await;
+                let output = self.tools.dispatch(name, args.clone(), None).await;
                 if !output.is_error {
                     if let Some(path) = self.viewed_path(&args) {
                         self.mark_read(&path);
@@ -179,7 +179,7 @@ impl ReviewTools {
                     .get("path")
                     .and_then(Value::as_str)
                     .map(|p| self.tools.resolve(p));
-                let output = self.tools.dispatch(name, args).await;
+                let output = self.tools.dispatch(name, args, None).await;
                 if let (false, Some(path)) = (output.is_error, path) {
                     self.mark_read(&path);
                 }
@@ -187,7 +187,7 @@ impl ReviewTools {
             }
             "memory" if !self.attended => {
                 let Some(memory) = &self.tools.memory else {
-                    return self.tools.dispatch(name, args).await;
+                    return self.tools.dispatch(name, args, None).await;
                 };
                 let result = memory.unattended_tool(&args, &mut self.tools.memory_failures.lock());
                 let failed = result.get("success") == Some(&Value::Bool(false));
@@ -196,7 +196,7 @@ impl ReviewTools {
                     is_error: failed,
                 }
             }
-            _ => self.tools.dispatch(name, args).await,
+            _ => self.tools.dispatch(name, args, None).await,
         }
     }
 

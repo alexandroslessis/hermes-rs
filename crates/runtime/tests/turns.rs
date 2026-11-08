@@ -2940,3 +2940,32 @@ async fn live_smart_review_tells_safe_from_dangerous() {
     assert_eq!(safe, Verdict::Approve);
     assert_ne!(dangerous, Verdict::Approve);
 }
+
+#[tokio::test]
+async fn terminal_output_is_relayed_live_while_the_command_runs() {
+    let h = harness(vec![
+        tool_reply(&[("t1", "terminal", json!({"command": "echo hi"}))]),
+        text_reply("Done."),
+    ])
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "run echo hi").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    // The command's output was relayed as `tool.progress` events before the result: the
+    // running row shows the message live, and the clicked-open row renders it growing.
+    let relayed = events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::Agent(AgentEvent::ToolProgress { message, .. }) => Some(message.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!relayed.is_empty(), "no live output was relayed");
+    assert!(relayed.iter().any(|m| m.contains("hi")), "{relayed:?}");
+    // The relay is the accumulated tail: every earlier relay's text is inside the last one.
+    let last = relayed.last().unwrap();
+    assert!(
+        relayed.iter().all(|m| last.contains(m.as_str())),
+        "{relayed:?}"
+    );
+}

@@ -1,0 +1,58 @@
+--- a/apps/desktop/src/store/tool-progress.ts
++++ b/apps/desktop/src/store/tool-progress.ts
+@@ -69,5 +69,9 @@ export function formatToolProgress(progress: ToolProgress | undefined): string {
+     return ''
+   }
+ 
+-  return [progress.percent === null ? '' : `${progress.percent}%`, progress.message ?? ''].filter(Boolean).join(' · ')
++  // hermes-rs: a terminal result's relayed message is the accumulated output's tail,
++  // multi-line; the one-line header ticker shows its last line.
++  const message = progress.message?.split('\n').findLast(line => line.trim()) ?? ''
++
++  return [progress.percent === null ? '' : `${progress.percent}%`, message].filter(Boolean).join(' · ')
+ }
+--- a/apps/desktop/src/components/assistant-ui/tool/fallback.tsx
++++ b/apps/desktop/src/components/assistant-ui/tool/fallback.tsx
+@@ -692,6 +692,9 @@ function ToolEntry({ part }: ToolEntryProps) {
+           {part.toolName === 'terminal' && toolViewMode !== 'technical' && (
+             <TerminalTranscript command={view.terminalCommand} exitCode={view.terminalExitCode} />
+           )}
++          {part.toolName === 'terminal' && isPending && toolViewMode !== 'technical' && (
++            <LiveTerminalOutput toolCallId={toolCallId} />
++          )}
+           {view.imageUrl && (
+             <div className="max-w-72 overflow-hidden rounded-[0.25rem] border border-(--ui-stroke-tertiary)">
+               <MarkdownImage alt={copy.outputAlt} src={view.imageUrl} />
+@@ -795,6 +798,32 @@ interface TerminalTranscriptProps {
+   exitCode?: number
+ }
+ 
++/** hermes-rs: the running command's output, relayed as `tool.progress` events (the
++ *  accumulated tail, masked) — the clicked-open row shows it growing while the call
++ *  works; the finished result's own stdout block replaces it. */
++function LiveTerminalOutput({ toolCallId = '' }: { toolCallId?: string }) {
++  const sessionId = useStore(useSessionView().$runtimeId) ?? ''
++  const progress = useStore(useMemo(() => $toolProgressFor(sessionId, toolCallId), [sessionId, toolCallId]))
++
++  if (!progress?.message) {
++    return null
++  }
++
++  return (
++    <div className="space-y-0.5">
++      <p className={TOOL_SECTION_LABEL_CLASS}>stdout — live</p>
++      <pre
++        className={cn(
++          TOOL_SECTION_PRE_CLASS,
++          'max-h-56 overflow-auto whitespace-pre-wrap wrap-anywhere text-(--ui-text-secondary)'
++        )}
++      >
++        {progress.message}
++      </pre>
++    </div>
++  )
++}
++
+ function TerminalTranscript({ command, exitCode }: TerminalTranscriptProps) {
+   if (!command && exitCode === undefined) {
+     return null
