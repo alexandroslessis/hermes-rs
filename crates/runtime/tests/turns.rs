@@ -512,6 +512,59 @@ async fn cancelling_stops_a_running_command_and_answers_its_call() {
 }
 
 #[tokio::test]
+async fn stopping_mid_command_keeps_the_output_it_had_printed() {
+    if !matches!(detect_shell(), hermes_tools::ShellKind::GitBash(_)) {
+        return;
+    }
+    let h = harness(vec![tool_reply(&[(
+        "call_1",
+        "terminal",
+        json!({"command": "echo first; sleep 60"}),
+    )])])
+    .await;
+    let session = h
+        .runtime
+        .create_session(&h.provider, "test-model", None, h.work.path())
+        .unwrap();
+    let mut turn = h
+        .runtime
+        .start_turn(
+            &session.id,
+            &h.provider,
+            TurnOptions::default(),
+            "run the command",
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    h.runtime.cancel(&session.id);
+    let mut status = None;
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(20), turn.events.recv())
+        .await
+        .unwrap()
+    {
+        if let RuntimeEvent::TurnFinished(finished) = event {
+            status = Some(finished);
+            break;
+        }
+    }
+    assert_eq!(status, Some(TurnStatus::Cancelled));
+    // The stopped call's response is the command's real result, not the machinery's
+    // synthesized "interrupted" stub: the output it had printed is kept in the chat.
+    let messages = h.runtime.messages(&session.id).unwrap();
+    let last = messages.last().unwrap();
+    assert!(last.is_tool_response());
+    let text = last
+        .content
+        .iter()
+        .filter_map(hermes_llm::conversation::message::MessageContent::as_tool_response_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("first"), "TEXT={text:?}");
+    assert!(text.contains("stopped before it finished"), "{text}");
+    h.runtime.close(&session.id).await;
+}
+
+#[tokio::test]
 async fn sessions_reopen_from_disk_with_their_todos() {
     let h = harness(vec![
         tool_reply(&[(

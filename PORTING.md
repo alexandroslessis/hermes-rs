@@ -80,7 +80,7 @@ Not from Hermes, so not in the map:
 | `Runtime::side_question`, `Runtime::background` | `agent/side_question.py` (one-shot path only; the cache-parity fork isn't ported), `tui_gateway/methods_prompt.py` (`prompt.btw`, `prompt.background`; `/bg` runs as a subagent rather than a full agent) |
 | `subagents.rs`, `delegate.rs` (events) | `tools/delegate_tool_registry.py`, `tui_gateway` `subagent.*` and `delegation.status/pause`; `spawn_tree.*` not ported |
 | **Tools** (`crates/tools`) | |
-| `shell.rs` | `tools/terminal_tool.py`; the live-output relay is `agent/tool_progress_relay.py` (Hermes relays MCP tools only; ours covers the terminal, throttled the same) |
+| `shell.rs` | `tools/terminal_tool.py`; the live-output relay is `agent/tool_progress_relay.py` (Hermes relays MCP tools only; ours covers the terminal, throttled the same), and stopping a mid-run command keeps its output, the spirit of `tool_executor.py`'s sequential interrupt grace (ours ends the command instead of waiting 3 s) |
 | `process.rs` | `tools/process_registry.py` |
 | `search.rs` | `tools/file_tools.py`, `tools/file_operations_search.py` |
 | `lint.rs` | `tools/file_operations_lint.py` |

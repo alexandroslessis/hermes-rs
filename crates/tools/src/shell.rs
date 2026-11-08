@@ -20,6 +20,7 @@ use hermes_agent::operation::Emitter;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio_util::sync::CancellationToken;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::job::Job;
@@ -198,10 +199,21 @@ pub struct RunResult {
     pub timed_out: bool,
     /// The shell process ended (an `exit` in the command, or a kill) and will be restarted.
     pub shell_restarted: bool,
+    /// The turn was stopped while the command ran; the output is what it had printed.
+    pub interrupted: bool,
 }
 
 fn bash_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// The turn's cancel, or a future that never resolves (no turn to observe: the review path's
+/// and background spawns' runs are stopped by nothing but their timeout).
+async fn stopped(cancel: Option<&CancellationToken>) {
+    match cancel {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
 }
 
 fn powershell_quote(text: &str) -> String {
@@ -242,12 +254,19 @@ impl ShellSession {
         command: &str,
         workdir: Option<&Path>,
         timeout: Duration,
+        cancel: Option<&CancellationToken>,
         on_chunk: &(dyn Fn(&str) + Send + Sync),
     ) -> RunResult {
         let _ = std::fs::create_dir_all(&self.scratch_dir);
         match &self.kind {
-            ShellKind::GitBash(bash) => self.run_bash(bash, command, workdir, timeout, on_chunk).await,
-            ShellKind::PowerShell => self.run_powershell(command, workdir, timeout, on_chunk).await,
+            ShellKind::GitBash(bash) => {
+                self.run_bash(bash, command, workdir, timeout, cancel, on_chunk)
+                    .await
+            }
+            ShellKind::PowerShell => {
+                self.run_powershell(command, workdir, timeout, cancel, on_chunk)
+                    .await
+            }
         }
     }
 
@@ -281,6 +300,7 @@ impl ShellSession {
         command: &str,
         workdir: Option<&Path>,
         timeout: Duration,
+        cancel: Option<&CancellationToken>,
         on_chunk: &(dyn Fn(&str) + Send + Sync),
     ) -> RunResult {
         let mut slot = self.process.lock().await;
@@ -298,6 +318,7 @@ impl ShellSession {
                         exit_code: None,
                         timed_out: false,
                         shell_restarted: false,
+                        interrupted: false,
                     };
                 }
             }
@@ -326,6 +347,7 @@ impl ShellSession {
                 exit_code: None,
                 timed_out: false,
                 shell_restarted: true,
+                interrupted: false,
             };
         }
 
@@ -360,8 +382,21 @@ impl ShellSession {
                 }
             }
         };
-        let timed_out = tokio::time::timeout(timeout, read).await.is_err();
-
+        let (timed_out, interrupted) = match tokio::time::timeout(
+            timeout,
+            async {
+                tokio::select! {
+                    biased;
+                    _ = read => false,
+                    _ = stopped(cancel) => true,
+                }
+            },
+        )
+        .await
+        {
+            Ok(interrupted) => (false, interrupted),
+            Err(_) => (true, false),
+        };
         // The sentinel is printed after a newline of its own, so trailing newlines are framing.
         let mut output = String::from_utf8_lossy(&captured)
             .trim_end_matches(['\n', '\r'])
@@ -382,6 +417,7 @@ impl ShellSession {
                     exit_code: Some(exit_code),
                     timed_out: false,
                     shell_restarted: false,
+                    interrupted: false,
                 }
             }
             None => {
@@ -392,6 +428,7 @@ impl ShellSession {
                     exit_code: None,
                     timed_out,
                     shell_restarted: true,
+                    interrupted,
                 }
             }
         }
@@ -402,6 +439,7 @@ impl ShellSession {
         command: &str,
         workdir: Option<&Path>,
         timeout: Duration,
+        cancel: Option<&CancellationToken>,
         on_chunk: &(dyn Fn(&str) + Send + Sync),
     ) -> RunResult {
         let nonce = uuid::Uuid::new_v4().simple().to_string();
@@ -437,6 +475,7 @@ impl ShellSession {
                     exit_code: None,
                     timed_out: false,
                     shell_restarted: false,
+                    interrupted: false,
                 };
             }
         };
@@ -484,7 +523,21 @@ impl ShellSession {
                 }
             }
         };
-        let timed_out = tokio::time::timeout(timeout, read).await.is_err();
+        let (timed_out, interrupted) = match tokio::time::timeout(
+            timeout,
+            async {
+                tokio::select! {
+                    biased;
+                    _ = read => false,
+                    _ = stopped(cancel) => true,
+                }
+            },
+        )
+        .await
+        {
+            Ok(interrupted) => (false, interrupted),
+            Err(_) => (true, false),
+        };
         let mut text = String::from_utf8_lossy(&captured).into_owned();
         if dropped_bytes > 0 {
             // The sentinel line is in the dropped part: keep only whole lines, and say so.
@@ -513,7 +566,7 @@ impl ShellSession {
                 lines.push(line);
             }
         }
-        if timed_out {
+        if timed_out || interrupted {
             drop(killer);
         } else {
             killer.disarm();
@@ -524,6 +577,7 @@ impl ShellSession {
             exit_code,
             timed_out,
             shell_restarted: false,
+            interrupted,
         }
     }
 }
@@ -661,7 +715,13 @@ pub async fn terminal(tools: &SessionTools, args: Value, live: Option<(&str, &Em
     };
     let result = tools
         .shell
-        .run(&args.command, workdir.as_deref(), timeout, &on_chunk)
+        .run(
+            &args.command,
+            workdir.as_deref(),
+            timeout,
+            live.map(|(_, emit)| emit.cancel_token()),
+            &on_chunk,
+        )
         .await;
     // Secrets are masked before the output is trimmed or saved (Hermes redacts the spill too).
     let output = crate::redact::redact_terminal_output(&result.output, &args.command);
@@ -693,6 +753,14 @@ pub async fn terminal(tools: &SessionTools, args: Value, live: Option<(&str, &Em
     if result.shell_restarted {
         value["note"] = json!(
             "The shell exited during this command and will restart in the same directory; exported variables were lost."
+        );
+    }
+    // The turn was stopped while the command ran; the output is what it had printed. The tool
+    // response is kept (the state machine saves it), so the row shows the partial output too.
+    if result.interrupted {
+        value["interrupted"] = json!(true);
+        value["note"] = json!(
+            "The command was stopped before it finished; the output above is what it had printed."
         );
     }
     ToolOutput::ok(value)
@@ -810,6 +878,7 @@ mod tests {
                 "Write-Output one; Start-Sleep -Milliseconds 700; Write-Output two",
                 None,
                 Duration::from_secs(30),
+                None,
                 &|line| relayed.lock().unwrap().push(line.to_string()),
             )
             .await;

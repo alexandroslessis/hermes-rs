@@ -12,7 +12,9 @@ const check = (label, ok, detail) => {
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${label}${detail === undefined ? '' : `: ${JSON.stringify(detail).slice(0, 240)}`}`)
 }
 
-// The provider: the first call of the turn answers with the terminal call; the next one ends it.
+// The provider: the first call of a turn answers with the terminal call; the second turn's
+// command sleeps so the check can stop the turn mid-command; the next one ends a turn.
+let calls = 0
 const provider = http.createServer((req, res) => {
   let body = ''
   req.on('data', c => (body += c))
@@ -30,7 +32,9 @@ const provider = http.createServer((req, res) => {
     const chunk = delta => res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`)
     const end = reason => { res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: reason }] })}\n\n`); res.end('data: [DONE]\n\n') }
     if (request.messages.at(-1)?.role === 'user') {
-      chunk({ tool_calls: [{ index: 0, id: `call_${stamp}`, type: 'function', function: { name: 'terminal', arguments: JSON.stringify({ command: 'echo one; sleep 1; echo two' }) } }] })
+      calls++
+      const command = calls === 1 ? 'echo one; sleep 1; echo two' : 'echo stop-print; sleep 60'
+      chunk({ tool_calls: [{ index: 0, id: `call_${stamp}_${calls}`, type: 'function', function: { name: 'terminal', arguments: JSON.stringify({ command }) } }] })
       return end('tool_calls')
     }
     chunk({ role: 'assistant', content: 'Done.' })
@@ -62,10 +66,37 @@ while (
   Date.now() < deadline
 ) await new Promise(r => setTimeout(r, 100))
 
-const progress = events.slice(from).filter(e => e.type === 'tool.progress' && e.payload.tool_id === `call_${stamp}`)
-const complete = events.slice(from).find(e => e.type === 'tool.complete' && e.payload.tool_id === `call_${stamp}`)
+const progress = events.slice(from).filter(e => e.type === 'tool.progress' && e.payload.tool_id === `call_${stamp}_1`)
+const complete = events.slice(from).find(e => e.type === 'tool.complete' && e.payload.tool_id === `call_${stamp}_1`)
 check('tool.progress events arrived before the result', progress.length > 0 && !!complete, progress.map(p => p.payload.tool_id))
 check('the relay carries the output', progress.some(p => String(p.payload.message).includes('one')), progress.map(p => p.payload.message))
 check('the finished result carries the full output', !!complete && String(complete.payload.result_text).includes('one') && String(complete.payload.result_text).includes('two'), complete?.payload?.result_text?.slice(0, 120))
+
+// A stop mid-command keeps the output it had printed: the second turn's command prints and
+// sleeps; the check interrupts once the relay is live and the stopped call's tool.complete must
+// carry the real result, not the machinery's "interrupted" stub. The call id is read off the
+// running row's frames (the session's titling call mints an id of its own before it).
+const fromStop = events.length
+await rpc('prompt.submit', { session_id: sid, text: 'run the sleeping command' })
+const stopDeadline = Date.now() + 60000
+let stopCall = ''
+while (Date.now() < stopDeadline) {
+  const live = events.slice(fromStop).find(e => e.type === 'tool.progress')
+  if (live) {
+    stopCall = live.payload.tool_id
+    break
+  }
+  await new Promise(r => setTimeout(r, 100))
+}
+check('the second turn relayed live output', !!stopCall)
+const interrupted = await rpc('session.interrupt', { session_id: sid })
+const completeDeadline = Date.now() + 30000
+while (
+  !events.slice(fromStop).some(e => e.type === 'tool.complete' && e.payload.tool_id === stopCall) &&
+  Date.now() < completeDeadline
+) await new Promise(r => setTimeout(r, 100))
+const stopComplete = events.slice(fromStop).find(e => e.type === 'tool.complete' && e.payload.tool_id === stopCall)
+check('the stop interrupted the turn', interrupted.interrupted === true)
+check('the stopped call kept its output', !!stopComplete && String(stopComplete.payload.result_text).includes('stop-print'), stopComplete?.payload?.result_text?.slice(0, 120))
 ws.close()
 provider.close()
