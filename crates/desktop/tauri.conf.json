@@ -25,7 +25,8 @@
       "webviewInstallMode": { "type": "downloadBootstrapper" },
       "nsis": {
         "installMode": "currentUser",
-        "installerIcon": "icons/icon.ico"
+        "installerIcon": "icons/icon.ico",
+        "template": "nsis/installer.nsi"
       }
     }
   }
