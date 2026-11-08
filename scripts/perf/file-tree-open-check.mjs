@@ -29,5 +29,13 @@ check('an empty path is refused', empty.status === 400 && empty.body.detail.star
 const link = await open('file:///C:/definitely/not/here.md')
 check("the file:// form (the artifacts gallery's) is still served", link.status === 400 && link.body.detail.endsWith("doesn't exist"), link.body)
 
+// The reveal route (patches/0016): same shapes; the happy path opens a window, so
+// refusal paths only (the open itself is covered by the run() normalization test).
+const reveal = url => rest('POST', '/api/hermes-rs/reveal', { url })
+const rMissing = await reveal('C:\\definitely\\not\\here.md')
+check('a missing file is a readable 400, not a 404', rMissing.status === 400 && rMissing.body.detail.endsWith("doesn't exist"), rMissing.body)
+const rRelative = await reveal('relative/path.md')
+check('a relative path is refused', rRelative.status === 400 && rRelative.body.detail.startsWith('Not a local file'), rRelative.body)
+
 console.log(failed ? `${failed} FAILED` : 'all ok')
 process.exit(failed ? 1 : 0)

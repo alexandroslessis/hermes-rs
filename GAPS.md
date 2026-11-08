@@ -73,7 +73,8 @@ backend code · **L** = a port of a Hermes subsystem.
   (patches 0015) asks `POST /api/hermes-rs/open-file`: the file opens with its default app, a
   folder in Explorer, a program or script only selected in Explorer. A first cut handed
   explorer.exe the tree's forward-slash path (`C:/…`); one with a space made explorer fall back
-  to Documents, so `run()` now hands it backslashes only.
+  to Documents, so `run()` now hands it backslashes only. "Reveal in File Explorer" (patches
+  0016, `POST /api/hermes-rs/reveal`) shows the path selected in its containing folder.
 - Steering a queued message shows it only after the reply (`crates/desktop/patches/README.md`).
 - Tokens/s isn't shown for sessions from before the stats file existed.
 - `/timeline` (conversation timeline rail) is unanswered.

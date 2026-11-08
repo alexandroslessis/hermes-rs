@@ -41,6 +41,17 @@ pub fn plan(link: &str) -> Result<Open, String> {
     Ok(if runs { Open::Reveal(path) } else { Open::Launch(path) })
 }
 
+/// What to do for a "reveal in Explorer" ask (`patches/0016`): show it selected in
+/// its containing folder, a folder included; an error for anything else or a file
+/// that isn't there.
+pub fn reveal_plan(link: &str) -> Result<Open, String> {
+    let path = file_path(link).ok_or_else(|| format!("Not a local file: {link}"))?;
+    if !path.exists() {
+        return Err(format!("{} doesn't exist", path.display()));
+    }
+    Ok(Open::Reveal(path))
+}
+
 /// `file:///C:/a%20b/c.md`, `file://C:/x`, `file:///c:\x` or `C:\x` → `C:\a b\c.md`. Only
 /// absolute paths on this machine (no `file://server/share` hosts other than `localhost`).
 fn file_path(link: &str) -> Option<PathBuf> {
@@ -123,5 +134,15 @@ mod tests {
         // plan, and explorer falls back to Documents for one with a space.
         assert_eq!(native(Path::new("C:/a b/c.md")), r"C:\a b\c.md");
         assert_eq!(native(Path::new("C:/Users/x/report.md")), r"C:\Users\x\report.md");
+    }
+
+    #[test]
+    fn reveal_shows_what_is_there_and_refuses_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("my report.md");
+        std::fs::write(&doc, "# hi").unwrap();
+        assert_eq!(reveal_plan(&link_to(&doc)), Ok(Open::Reveal(doc)));
+        assert!(reveal_plan("relative/a.md").is_err());
+        assert!(reveal_plan("file:///C:/definitely/not/here.md").is_err());
     }
 }

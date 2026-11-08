@@ -95,9 +95,10 @@ one as missing, another profile name refused like Hermes); it restores the SOUL.
 `provider-error-check.mjs` checks the provider-error card's contract (its own provider on :47900 answers a
 429 daily limit): the turn's `message.complete` carries status "error", the provider's text and the
 descriptor — layer/code, a quota limit not retryable.
-`file-tree-open-check.mjs` checks the file trees' "Open in default app" route (patches/0015): a missing
-file, a relative path, an empty path and the `file:` form answer 400 with a readable detail — the
-open itself is exercised by `artifacts-check.mjs` and the `open_file.rs` unit tests.
+`file-tree-open-check.mjs` checks the file trees' "Open in default app" route (patches/0015) and the
+"Reveal in File Explorer" route (patches/0016): a missing file, a relative path, an empty path and the
+`file:` form answer 400 with a readable detail — the open itself is exercised by `artifacts-check.mjs`
+and the `open_file.rs` unit tests.
 `import-check.mjs` checks the Hermes importer (list, preview, import, `/import-hermes`, continuing an
 imported chat) against a home built by `make-hermes-db.py` with Hermes's own SessionDB; start the
 instance with `HERMES_HOME` set to it.

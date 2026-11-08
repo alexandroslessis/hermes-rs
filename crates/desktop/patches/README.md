@@ -125,6 +125,15 @@ files before 0003/0004, 6.6 MB in 109 after.
   The review/git tree keeps Hermes's menu shape (its "Open file" opens the in-app preview).
   Tested live 2026-11-08 (`scripts/perf/file-tree-open-check.mjs`).
 
+- **0016-reveal-in-explorer.patch** (`app/right-sidebar/file-actions.tsx`,
+  `store/file-actions.ts`): "Reveal in File Explorer" beside "Open in default app" in the file
+  trees' right-click menu. The label reuses Hermes's `fileMenu.revealExplorer` (translated in
+  every locale); the action asks `POST /api/hermes-rs/reveal` (`open_file.rs` `reveal_plan`: the
+  path shown selected in its containing folder, `explorer.exe /select`), which the Electron
+  bridge's `revealPath` has no shim answer for, so Hermes's local-only Reveal item hides. The
+  review/git tree keeps Hermes's menu shape. Tested live 2026-11-08
+  (`scripts/perf/file-tree-open-check.mjs`).
+
 ## To do
 
 - **Skill hub** (install from Capabilities ▸ Skills ▸ Discover): `tools/skills_hub*.py` and

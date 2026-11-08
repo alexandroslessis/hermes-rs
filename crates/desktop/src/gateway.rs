@@ -3398,6 +3398,22 @@ impl Gateway {
             self.apply_settings();
             return answer;
         }
+        // "Reveal in File Explorer" (patches/0016): show it selected in its containing
+        // folder, as the Electron bridge's revealPath does, which the page's shim has
+        // no answer for (so the local-only menu item hides).
+        if (method, path) == ("POST", "/api/hermes-rs/reveal") {
+            let body: Value = serde_json::from_slice(body).unwrap_or_default();
+            let link = body["url"].as_str().unwrap_or_default().to_string();
+            let done = tokio::task::spawn_blocking(move || {
+                crate::open_file::reveal_plan(&link).and_then(|open| crate::open_file::run(&open))
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+            return Some(match done {
+                Ok(()) => (200, json!({"ok": true})),
+                Err(error) => (400, json!({"detail": error})),
+            });
+        }
         // A `file:` link opened from the page (patches/0013, `open_file.rs`): its default app,
         // or Explorer with it selected when it's a program.
         if (method, path) == ("POST", "/api/hermes-rs/open-file") {
