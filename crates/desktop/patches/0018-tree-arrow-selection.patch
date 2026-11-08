@@ -66,9 +66,15 @@
        ref={containerRef}
      >
        {size.height > 0 && size.width > 0 ? (
-@@ -332,7 +385,11 @@ function ProjectTreeRow({
+@@ -331,8 +384,17 @@ function ProjectTreeRow({
+ 
          if (isFolder) {
            node.toggle()
++          // toggle() moves no cursor at all — the first arrow key would walk on
++          // from the last selected row (or jump to the tree's start) instead of
++          // from this directory; focus() pins the cursor here, as the file
++          // branch's select+focus does.
++          node.focus()
          } else {
 +          // select() alone leaves arborist's focus cursor elsewhere, so the
 +          // first arrow key would jump to the tree's start instead of walking
