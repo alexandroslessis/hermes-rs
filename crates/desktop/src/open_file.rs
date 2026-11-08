@@ -9,7 +9,7 @@
 //!
 //! Hermes: `apps/desktop/electron/` opener rule (`openExternal`), `apps/shared/src/external-url.ts`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Extensions Windows runs instead of opening (`PATHEXT` and the other shell-executable types).
 const RUNS: [&str; 34] = [
@@ -59,14 +59,21 @@ fn file_path(link: &str) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
+/// explorer.exe reads `/` as its own switch delimiter: a forward-slash path with a
+/// space (the page's tree paths are `C:/…`, `/api/fs/list`'s shape) makes it fall
+/// back to the Documents folder instead. Hand it backslashes only.
+fn native(path: &Path) -> String {
+    path.display().to_string().replace('/', "\\")
+}
+
 /// Does it (Explorer runs the default app for a file, opens a folder, or selects with
 /// `/select,`). Explorer's exit code doesn't say whether it worked, so only a failure to start
 /// it is an error.
 pub fn run(open: &Open) -> Result<(), String> {
     let mut command = std::process::Command::new("explorer.exe");
     match open {
-        Open::Launch(path) => command.arg(path),
-        Open::Reveal(path) => command.arg(format!("/select,{}", path.display())),
+        Open::Launch(path) => command.arg(native(path)),
+        Open::Reveal(path) => command.arg(format!("/select,{}", native(path))),
     };
     command.spawn().map(drop).map_err(|e| format!("Couldn't start Explorer: {e}"))
 }
@@ -107,5 +114,14 @@ mod tests {
         assert_eq!(file_path("FILE://C:/x"), Some(PathBuf::from(r"C:\x")));
         assert_eq!(file_path("file://localhost/C:/x"), Some(PathBuf::from(r"C:\x")));
         assert_eq!(file_path(r"C:\x\y.txt"), Some(PathBuf::from(r"C:\x\y.txt")));
+    }
+
+    #[test]
+    fn explorer_gets_backslashes() {
+        assert_eq!(native(Path::new(r"C:\a b\c.md")), r"C:\a b\c.md");
+        // The page's tree paths (`/api/fs/list`'s shape): forward slashes survive the
+        // plan, and explorer falls back to Documents for one with a space.
+        assert_eq!(native(Path::new("C:/a b/c.md")), r"C:\a b\c.md");
+        assert_eq!(native(Path::new("C:/Users/x/report.md")), r"C:\Users\x\report.md");
     }
 }

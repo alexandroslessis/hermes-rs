@@ -71,7 +71,9 @@ backend code · **L** = a port of a Hermes subsystem.
 - ✅ **Done 2026-11-08.** The file trees' right-click menu offered only copy-path and Download
   (the page sees our backend as remote, so Reveal/Rename/Delete hide). "Open in default app"
   (patches 0015) asks `POST /api/hermes-rs/open-file`: the file opens with its default app, a
-  folder in Explorer, a program or script only selected in Explorer.
+  folder in Explorer, a program or script only selected in Explorer. A first cut handed
+  explorer.exe the tree's forward-slash path (`C:/…`); one with a space made explorer fall back
+  to Documents, so `run()` now hands it backslashes only.
 - Steering a queued message shows it only after the reply (`crates/desktop/patches/README.md`).
 - Tokens/s isn't shown for sessions from before the stats file existed.
 - `/timeline` (conversation timeline rail) is unanswered.
