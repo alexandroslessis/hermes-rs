@@ -1,0 +1,73 @@
+--- a/apps/desktop/src/app/overlays/overlay-split-layout.tsx
++++ b/apps/desktop/src/app/overlays/overlay-split-layout.tsx
+@@ -1,4 +1,4 @@
+-import { Fragment, memo, type ReactNode, useEffect, useId, useState } from 'react'
++import { Fragment, memo, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useCallback, useEffect, useId, useState } from 'react'
+ 
+ import { Button } from '@/components/ui/button'
+ import { DisclosureCaret } from '@/components/ui/disclosure-caret'
+@@ -67,6 +67,47 @@ export function OverlaySplitLayout({ children, className }: OverlaySplitLayoutPr
+ }
+ 
+ export function OverlaySidebar({ children, className }: OverlaySidebarProps) {
++  // Arrow keys walk the rail's rows (roving focus, wrap-around). The rows are
++  // plain buttons - Tab reaches them but arrows did nothing - and every overlay
++  // that renders a left nav (settings, command center, the catalog facets) goes
++  // through this aside. Enter/Space still activate (native buttons); hidden
++  // rows (hermes-rs's hide.css) and the icon-only footer buttons are skipped.
++  // Arrows only move focus: the row's own click decides what opens, so a stray
++  // chord never navigates a surface the user didn't aim at.
++  const handleRailArrows = useCallback((event: ReactKeyboardEvent<HTMLElement>) => {
++    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') {
++      return
++    }
++
++    if (event.metaKey || event.ctrlKey || event.altKey) {
++      return
++    }
++
++    const target = event.target instanceof Element ? event.target.closest('button') : null
++
++    if (!target || !event.currentTarget.contains(target)) {
++      return
++    }
++
++    const rows = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('button:not([disabled])'))
++      .filter(row => row.offsetParent !== null)
++      // The disclosure carets are secondary: selecting the section row reveals
++      // its branch, so the walk goes section → its sub-pages → next section.
++      .filter(row => !row.dataset.tour?.startsWith('nav-toggle-'))
++      .filter(row => !row.closest('[data-rail-footer]'))
++
++    if (!rows.includes(target)) {
++      return
++    }
++
++    const down = event.key === 'ArrowDown'
++    const at = rows.indexOf(target)
++    const next = rows[(at + (down ? 1 : -1) + rows.length) % rows.length]
++
++    event.preventDefault()
++    next.focus()
++  }, [])
++
+   return (
+     <aside
+       className={cn(
+@@ -82,6 +123,7 @@ export function OverlaySidebar({ children, className }: OverlaySidebarProps) {
+       // one name, so a tour can point at "the nav" without knowing which
+       // overlay is open. See lib/tour.
+       data-tour="overlay-nav"
++      onKeyDown={handleRailArrows}
+     >
+       {children}
+     </aside>
+@@ -304,7 +346,7 @@ export function OverlayNav({ footer, groups }: { footer?: ReactNode; groups: Ove
+             </Fragment>
+           )
+         })}
+-        {footer && <div className="mt-auto flex items-center gap-1 pt-2">{footer}</div>}
++        {footer && <div className="mt-auto flex items-center gap-1 pt-2" data-rail-footer="">{footer}</div>}
+       </OverlaySidebar>
+ 
+       {/* Narrow: ride the OverlayView titlebar strip so the dropdown shares the

@@ -1,0 +1,80 @@
+--- a/apps/desktop/src/app/right-sidebar/files/tree.tsx
++++ b/apps/desktop/src/app/right-sidebar/files/tree.tsx
+@@ -177,11 +177,64 @@ export function ProjectTree({
+     beginInlineRename(node.data.id)
+   }, [])
+ 
++  // Arrow keys move the selection. Arborist's own arrow handling moves only its
++  // focus cursor (plus DOM focus onto the row), and no style follows focused-but-
++  // unselected nodes — the highlight (`node.isSelected`) stayed behind, so the
++  // keys looked dead. Capture-phase on this wrapper, before arborist's container
++  // handler: plain Up/Down walk the visible rows (placeholders skipped, clamped
++  // at the ends) and select + focus the next one, so the highlight moves and
++  // arborist's row effect lands DOM focus on it. Its own Left/Right (fold/parent,
++  // off the synced focus) and shift-arrows (multi-selection) pass through, and
++  // the click's `node.focus()` keeps the cursor on the row a click selected.
++  const handleArrowSelection = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
++    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') {
++      return
++    }
++
++    if (event.shiftKey || event.metaKey || event.ctrlKey || event.altKey) {
++      return
++    }
++
++    const tree = treeRef.current
++
++    if (!tree || tree.isEditing || $renamingPath.get()) {
++      return
++    }
++
++    const visible = tree.visibleNodes.filter(node => !node.data?.placeholder)
++
++    if (!visible.length) {
++      return
++    }
++
++    const down = event.key === 'ArrowDown'
++    const current = tree.focusedNode ?? tree.selectedNodes[0] ?? null
++    const at = current ? visible.findIndex(node => node.id === current.id) : -1
++    const next = at === -1 ? visible[down ? 0 : visible.length - 1] : visible[Math.min(visible.length - 1, Math.max(0, at + (down ? 1 : -1)))]
++
++    if (!next) {
++      return
++    }
++
++    event.preventDefault()
++    event.stopPropagation()
++
++    if (next === current) {
++      return
++    }
++
++    tree.select(next.id)
++    tree.focus(next)
++  }, [])
++
+   return (
+     <div
+       className="min-h-0 flex-1 overflow-hidden"
+       data-project-tree=""
+-      onKeyDownCapture={handleRenameShortcut}
++      onKeyDownCapture={event => {
++        handleRenameShortcut(event)
++        handleArrowSelection(event)
++      }}
+       ref={containerRef}
+     >
+       {size.height > 0 && size.width > 0 ? (
+@@ -332,7 +385,11 @@ function ProjectTreeRow({
+         if (isFolder) {
+           node.toggle()
+         } else {
++          // select() alone leaves arborist's focus cursor elsewhere, so the
++          // first arrow key would jump to the tree's start instead of walking
++          // on from this row; focus() pins the cursor here.
+           node.select()
++          node.focus()
+         }
+       }}
+       onDoubleClick={event => {

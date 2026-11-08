@@ -111,6 +111,12 @@ instance with `HERMES_HOME` set to it.
 a title and a compression model with its own and an inherited effort reaching their requests,
 reset).
 
+`keyboard-nav-check.mjs` checks arrow-key navigation through the page (DevTools, patches/0018 and
+0019): the file tree's ↑/↓ move the visible selection and ←/→ fold the selected folder, and the
+Settings rail's rows walk with ↑/↓ (wrap-around; arrows only move focus, the hash never changes).
+It reloads the page first — arborist's focus cursor drifts under synthetic keydowns with no real
+DOM focus, which real usage never produces.
+
 `cdp.mjs '<expression>'` evaluates JavaScript in the instance's page (DevTools port 9223) and
 prints the result; `hover.mjs '<selector|label|text>' [click]` moves the mouse onto an element and
 lists the popovers, tooltips and menus that appear, with their boxes. Together they check UI

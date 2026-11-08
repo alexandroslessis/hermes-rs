@@ -77,6 +77,16 @@ backend code · **L** = a port of a Hermes subsystem.
   explorer.exe the tree's forward-slash path (`C:/…`); one with a space made explorer fall back
   to Documents, so `run()` now hands it backslashes only. "Reveal in File Explorer" (patches
   0016, `POST /api/hermes-rs/reveal`) shows the path selected in its containing folder.
+- ✅ **Done 2026-11-08.** Arrow keys didn't navigate the file tree or the Settings rail.
+  The tree (react-arborist) moved only its internal focus cursor, which nothing styles
+  follows — the highlight (`isSelected`) stayed behind, so the keys looked dead (patches/0018:
+  a capture-phase handler moves the selection, placeholder rows skipped, clamped; arborist's
+  own ←/→ fold and Space-activate keep working off the synced focus). The Settings rail's rows
+  were plain buttons with no arrow handling (patches/0019: roving ↑/↓ with wrap-around on the
+  shared `OverlaySidebar` — Settings, Command Center, Skills facets; disclosure carets and the
+  icon-only footer skipped; arrows only move focus, Enter still activates). Radix menus
+  (dropdowns, context menus, the palette) arrow-navigate natively — unchanged. Checked live
+  (`scripts/perf/keyboard-nav-check.mjs`).
 - Steering a queued message shows it only after the reply (`crates/desktop/patches/README.md`).
 - Tokens/s isn't shown for sessions from before the stats file existed.
 - `/timeline` (conversation timeline rail) is unanswered.

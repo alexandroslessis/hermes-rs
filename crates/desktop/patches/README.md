@@ -152,6 +152,27 @@ files before 0003/0004, 6.6 MB in 109 after.
   (`agent/tool_progress_relay.py`); extending it to the terminal is the feature. Tested live
   2026-11-08 (`scripts/perf/tool-stream-check.mjs`).
 
+- **0018-tree-arrow-selection.patch** (`app/right-sidebar/files/tree.tsx`): the file tree's
+  ↑/↓ move the visible selection. react-arborist's own arrow handling moves only its focus
+  cursor — a state nothing styles follows (`node.isSelected` paints the highlight), and its
+  rows are `tabIndex: -1`, so the keys looked dead. A capture-phase handler on the wrapper
+  (before arborist's own) walks the visible rows — placeholder rows skipped, clamped at the
+  ends — and selects + focuses the next one, so arborist's row effect lands DOM focus on the
+  row and its own ←/→ (fold/unfold, parent) keep working off the synced focus. Shift-arrows
+  stay arborist's multi-selection; F2/Enter keep the inline rename; Space keeps activate. The
+  folder click's `node.focus()` keeps the cursor on the row a click toggled, so the first
+  arrow continues from it instead of jumping to the tree's start. Tested live 2026-11-08
+  (`scripts/perf/keyboard-nav-check.mjs`).
+
+- **0019-overlay-nav-arrow-keys.patch** (`app/overlays/overlay-split-layout.tsx`): ↑/↓ walk
+  the overlay nav rails (roving focus, wrap-around). The rows are plain buttons — Tab reached
+  them, arrows did nothing — and every left nav (Settings, Command Center, the Skills facets)
+  renders through this `OverlaySidebar`. The disclosure carets and the icon-only footer are
+  skipped (a section row reveals its branch on select; footer buttons aren't nav rows), and
+  rows hidden by `hide.css` via `offsetParent`. Arrows only move focus — Enter/Space still
+  activate, the hash never changes, so a stray chord never navigates a surface the user
+  didn't aim at. Tested live 2026-11-08 (`scripts/perf/keyboard-nav-check.mjs`).
+
 ## To do
 
 - **Skill hub** (install from Capabilities ▸ Skills ▸ Discover): `tools/skills_hub*.py` and
