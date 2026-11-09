@@ -86,7 +86,11 @@ backend code · **L** = a port of a Hermes subsystem.
   shared `OverlaySidebar` — Settings, Command Center, Skills facets; disclosure carets and the
   icon-only footer skipped; arrows only move focus, Enter still activates). Radix menus
   (dropdowns, context menus, the palette) arrow-navigate natively — unchanged. Checked live
-  (`scripts/perf/keyboard-nav-check.mjs`).
+  (`scripts/perf/keyboard-nav-check.mjs`). Follow-ups 2026-11-09 (patches/0018, 0020): a
+  directory click now pins the cursor too, ←/→ fold/unfold and climb with the selection
+  following (arborist's own moved an invisible cursor), and exiting the inline rename with
+  the keyboard returns focus to the tree — without it every arrow fired nowhere until the
+  user clicked back in.
 - Steering a queued message shows it only after the reply (`crates/desktop/patches/README.md`).
 - Tokens/s isn't shown for sessions from before the stats file existed.
 - `/timeline` (conversation timeline rail) is unanswered.
