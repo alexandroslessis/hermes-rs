@@ -52,8 +52,15 @@ struct Inner {
     forms: bool,
     /// The editor draws terminal cards from `_meta` (Zed's extension).
     terminal_cards: bool,
+    /// The provider's model list (`model.options` asks the provider over the network, seconds on a
+    /// slow one) and when it was fetched: a thread opens with what is cached and gets the full
+    /// picker in a `config_option_update` when the list arrives.
+    model_options: Option<(std::time::Instant, Value)>,
     sessions: HashMap<String, Session>,
 }
+
+/// How long a fetched model list is used without asking the provider again.
+const MODEL_LIST_FRESH: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// What `/undo` and `/retry` came to.
 enum Rewound {
@@ -400,17 +407,21 @@ impl AcpServer {
     }
 
     /// What the editor can change in a thread: its modes, and its model and effort pickers.
+    /// Instant: the model picker is built from the cached provider list (just the thread's own model
+    /// until one has been fetched; `refresh_model_options` sends the full picker later), because
+    /// asking the provider for its models took seconds and the editor waits for this answer.
     async fn controls(&self, session: &str) -> Value {
-        // A provider that doesn't answer must not hold up opening a thread.
-        let options = tokio::time::timeout(
-            std::time::Duration::from_secs(4),
-            self.call("model.options", json!({"session_id": session})),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok);
+        let mut options = self
+            .lock()
+            .model_options
+            .as_ref()
+            .map_or_else(|| json!({"providers": []}), |(_, options)| options.clone());
+        if let Some(record) = self.gateway.runtime.store().session(session).ok().flatten() {
+            options["provider"] = json!(record.provider);
+            options["model"] = json!(record.model);
+        }
         let mut config = Vec::new();
-        if let Some(options) = options {
+        if options["model"].is_string() {
             config.push(controls::model_option(&options));
         }
         config.push(controls::effort_option(&self.gateway.effort(session)));
@@ -549,8 +560,44 @@ impl AcpServer {
         )))
     }
 
+    /// Fetches the provider's model list when none is cached (or it is old) and sends the editor the
+    /// full picker. Runs after the thread is open, off the request's path.
+    fn refresh_model_options(self: &Arc<Self>, session: &str) {
+        let fresh = self
+            .lock()
+            .model_options
+            .as_ref()
+            .is_some_and(|(at, _)| at.elapsed() < MODEL_LIST_FRESH);
+        if fresh {
+            return;
+        }
+        let server = self.clone();
+        let session = session.to_string();
+        tokio::spawn(async move {
+            // A provider that doesn't answer is given a while, never forever.
+            let fetched = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                server.call("model.options", json!({"session_id": session})),
+            )
+            .await;
+            let Ok(Ok(options)) = fetched else {
+                return;
+            };
+            server.lock().model_options = Some((std::time::Instant::now(), options));
+            let controls = server.controls(&session).await;
+            server.update(
+                &session,
+                json!({
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": controls["configOptions"],
+                }),
+            );
+        });
+    }
+
     /// After `session/new` or `session/load` is answered: the commands the editor can offer.
-    async fn after_open(&self, session: &str) {
+    async fn after_open(self: &Arc<Self>, session: &str) {
+        self.refresh_model_options(session);
         let catalog = self.call("commands.catalog", json!({})).await;
         let Ok(catalog) = catalog else {
             return;

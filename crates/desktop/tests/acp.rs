@@ -1271,29 +1271,50 @@ fn option<'a>(options: &'a Value, id: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("no option {id} in {options}"))
 }
 
+fn model_values(options: &Value) -> Vec<String> {
+    option(options, "model")["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["value"].as_str().unwrap().to_string())
+        .collect()
+}
+
 #[tokio::test]
-async fn a_new_session_lists_the_models_the_modes_and_the_efforts() {
+async fn a_new_session_answers_at_once_and_the_full_model_picker_follows() {
     let mut agent = Agent::start(Vec::new()).await;
     agent.initialize(json!({})).await;
+    // The answer doesn't wait for the provider's model list: the thread's own model, then an update.
     let answer = agent.new_session_answer().await;
     let result = &answer["result"];
     let model = option(&result["configOptions"], "model");
     assert_eq!(model["category"], "model");
     assert_eq!(model["currentValue"], "mock/mock");
-    let values: Vec<&str> = model["options"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|o| o["value"].as_str().unwrap())
-        .collect();
-    assert!(
-        values.contains(&"mock/mock") && values.contains(&"mock/other"),
-        "{values:?}"
-    );
+    let session = result["sessionId"].as_str().unwrap().to_string();
     let effort = option(&result["configOptions"], "effort");
     assert_eq!(effort["category"], "thought_level");
     assert_eq!(effort["currentValue"], "medium");
     assert_eq!(result["modes"]["currentModeId"], "accept_edits");
+    // The full picker arrives as a config_option_update.
+    let sid = session.clone();
+    let full = agent
+        .wait_for(move |seen, _| {
+            seen.iter()
+                .find(|m| {
+                    m["params"]["sessionId"] == sid.as_str()
+                        && m["params"]["update"]["sessionUpdate"] == "config_option_update"
+                })
+                .map(|m| m["params"]["update"]["configOptions"].clone())
+        })
+        .await;
+    let values = model_values(&full);
+    assert!(
+        values.contains(&"mock/mock".to_string()) && values.contains(&"mock/other".to_string()),
+        "{values:?}"
+    );
+    // Once fetched, the list is kept: the next thread opens with it.
+    let second = agent.new_session_answer().await;
+    assert!(model_values(&second["result"]["configOptions"]).contains(&"mock/other".to_string()));
 }
 
 #[tokio::test]

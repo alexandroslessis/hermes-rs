@@ -22,6 +22,11 @@ processes):
   any new write path on a cached conversation must do the same.
 
 ACP mode (`--acp`, [docs/acp/](acp/README.md)):
+- **`session/new` and `session/load` must not wait on the network.** The editor blocks on their
+  answer, and `model.options` asks the provider for its model list (seconds: it made a thread take
+  ~3 s to open in Zed). `AcpServer::controls` is instant (cached list, else the thread's own model);
+  `refresh_model_options` fetches in the background and sends a `config_option_update`. Time it with
+  `scripts/acp/acp-probe.mjs` (the ms column) on a copy of the real `config.json`.
 - **Zed shows only what the agent lists.** Modes must also be a config option (`category: "mode"`,
   `controls::mode_option`), or Zed shows no mode selector; a slash command must be in
   `available_commands_update` (`controls::GATEWAY_COMMANDS` for the ones `slash.exec` runs that the
