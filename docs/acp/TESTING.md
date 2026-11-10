@@ -144,7 +144,7 @@ For seeing what actually goes over the wire, and for runs against a real model.
 ```powershell
 # a conversation script: JSON array of messages to send; "$session" is replaced by the id session/new returned
 tools/node/node.exe scripts/acp/acp-probe.mjs `
-  --exe target/claude/debug/hermes-desktop.exe `
+  --exe target/claude/debug/hermes-acp.exe `
   --home target/acp-home `
   --script scripts/acp/scripts/hello.json `
   [--allow allow_once]            # how to answer permission requests (default: deny)

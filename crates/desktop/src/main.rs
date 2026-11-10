@@ -5,39 +5,11 @@
 // Release builds are GUI-only (no console window); debug builds keep the console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod acp;
-mod archive;
-mod attachments;
-mod aux_models;
-mod branch;
-mod commands;
-mod endpoints;
-mod export;
-mod files;
-mod gateway;
-mod git;
-mod git_review;
-mod hermes_import;
-mod hub;
-mod learning;
-mod maintenance;
-mod open_file;
-mod paths;
-mod profiles;
-mod projects;
-mod providers;
-mod rest;
-mod server;
-mod skills;
-mod terminal;
-mod toolsets;
-mod transcript;
-mod workspace;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
+use hermes_desktop::{acp, gateway, hub, server, terminal, wants_git_bash};
 use hermes_runtime::{Runtime, RuntimeConfig};
 use tauri::{WebviewUrl, WebviewWindowBuilder};
 
@@ -287,12 +259,4 @@ fn fail(error: &str) -> ! {
         .set_description(format!("Hermes couldn't start its backend:\n\n{error}"))
         .show();
     std::process::exit(1)
-}
-
-/// Whether Settings' config record asks for Git Bash (`terminal.shell: "bash"`).
-pub(crate) fn wants_git_bash(data_dir: &std::path::Path) -> bool {
-    std::fs::read(data_dir.join("desktop-config.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .is_some_and(|config| config["terminal"]["shell"] == "bash")
 }

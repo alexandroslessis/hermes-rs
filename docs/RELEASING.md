@@ -66,6 +66,15 @@ You can't run the installer against the user's data. Check what you can:
 3. Give the user a checklist for installing on the other computer (install, start from the Start
    menu, set up the endpoint, import Hermes sessions, send a prompt).
 
+## What the installer contains
+
+`hermes-desktop.exe` (the app), `webapp\` (Hermes's frontend) and `hermes-acp.exe`, the console
+program editors (Zed) start for ACP. Tauri bundles every binary of the package next to the main
+one, so `hermes-acp.exe` (`crates/desktop/src/bin/hermes-acp.rs`) needs no setting of its own: a
+`tauri build` builds and ships it. (Check: `targetelease
+sisd\installer.nsi` has a
+`File ... hermes-acp.exe` line under "Copy external binaries".)
+
 ## Publish (a GitHub Release)
 
 ```powershell

@@ -118,7 +118,8 @@ is the contract (257 methods), `apps/desktop/src/api/` is how the page calls the
 
 ## ACP mode (`--acp`, `crates/desktop/src/acp/`)
 
-`hermes-desktop.exe --acp` is the agent for an editor (Zed): no window, no web server, JSON-RPC
+`hermes-acp.exe` (a console program in the installer; `hermes-desktop.exe --acp` is the same, for
+debug builds) is the agent for an editor (Zed): no window, no web server, JSON-RPC
 lines on stdin/stdout (Agent Client Protocol). It builds the same `Runtime` and `Gateway` as the
 app (`Gateway::new_for_acp`: no curator, no auto-archive) and is a *client of that gateway* in its
 own process: `Gateway::call(method, params, outbox)` is the page's socket without the socket, and

@@ -209,7 +209,7 @@ impl Agent {
     }
 
     fn spawn(model: Model, home: tempfile::TempDir, work: tempfile::TempDir) -> Self {
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_hermes-desktop"))
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_hermes-acp"))
             .arg("--acp")
             .env("HERMES_RS_HOME", home.path())
             .env("RUST_LOG", "info,hermes_desktop::acp=debug")

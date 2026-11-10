@@ -3,6 +3,11 @@
 Things that cost hours once. Read this before debugging; check here first when something is odd.
 
 ACP mode (`--acp`, [docs/acp/](acp/README.md)):
+- **Editors need `hermes-acp.exe`, not the release `hermes-desktop.exe`.** The release app is a
+  Windows GUI-subsystem program; launched by Zed with pipes it exits (code 0) right after
+  `initialize`, while the debug build (a console program) works. `hermes-acp.exe`
+  (`src/bin/hermes-acp.rs`, a console program over the `hermes_desktop` library) is built and
+  shipped by the installer (Tauri bundles every bin of the package). `tests/acp.rs` runs it.
 - **stdout is the protocol.** `main.rs`'s `init_logging` writes to stdout, so `--acp` returns
   before it and logs through `acp::init_logging` (stderr + `logs\acp.log`). One stray `println!`
   breaks the editor; `tests/acp.rs` `the_stdout_rule_holds_through_a_whole_tool_turn` guards it.

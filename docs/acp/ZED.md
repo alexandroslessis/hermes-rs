@@ -17,7 +17,7 @@ machine (`%LOCALAPPDATA%\Programs\Zed`) and Zed's source (`../zed`,
      "Hermes (rs)": {
        "type": "custom",
        "command": "C:\\Users\\alexandros\\repos\\hermes-rs\\target\\claude\\debug\\hermes-desktop.exe",
-       "args": ["--acp"],
+       "args": [],
        "env": {
          // Optional. Without it the agent uses the desktop app's data (%APPDATA%\hermes-rs):
          // the same sessions, memory, providers. Point it elsewhere to experiment safely.
@@ -29,8 +29,11 @@ machine (`%LOCALAPPDATA%\Programs\Zed`) and Zed's source (`../zed`,
      }
    }
    ```
-   For the installed app, `command` is the installed `hermes-desktop.exe` (see
-   docs/RELEASING.md for the install folder).
+   For the installed app, `command` is `hermes-acp.exe` in the install folder, next to the app
+   (`C:/Users/<you>/AppData/Local/Hermes/hermes-acp.exe`), with no args. **Not**
+   `hermes-desktop.exe --acp`: the release `hermes-desktop.exe` is a GUI program without a console,
+   and Zed on Windows cannot drive it (it exits right after `initialize`, "Server exited with
+   status exit code: 0"). `hermes-acp.exe` is the same agent as a console program (found 2026-11-10).
 3. Agent panel (right dock) → `+` / new-thread menu → **New Hermes (rs) Thread**.
 
 The data-folder choice matters: with the default (the desktop app's folder), a thread made in Zed

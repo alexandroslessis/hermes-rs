@@ -37,7 +37,7 @@ A Windows desktop app that runs **Hermes** (NousResearch's agent, `../hermes-age
 | Changing Hermes's frontend | [crates/desktop/patches/README.md](crates/desktop/patches/README.md) |
 | Building the installer / shipping | [docs/RELEASING.md](docs/RELEASING.md); the user's step-by-step: [docs/INSTALLER-TUTORIAL.md](docs/INSTALLER-TUTORIAL.md) |
 | Performance work | [scripts/perf/README.md](scripts/perf/README.md) |
-| ACP (using the agent from Zed / t3code: `hermes-desktop.exe --acp`) | [docs/acp/README.md](docs/acp/README.md), then [docs/acp/PHASES.md](docs/acp/PHASES.md) — built 2026-11-10 (Zed; t3code later) |
+| ACP (using the agent from Zed / t3code: `hermes-acp.exe`) | [docs/acp/README.md](docs/acp/README.md), then [docs/acp/PHASES.md](docs/acp/PHASES.md) — built 2026-11-10 (Zed; t3code later) |
 
 `PLAN.md` and `FEATURES.md` are from the GPUI era (2026-10/11). `FEATURES.md`'s keep/later/drop
 scope still holds; `PLAN.md`'s milestones are history. `GAPS.md` is the live to-do list.
