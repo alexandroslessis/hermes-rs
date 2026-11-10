@@ -103,6 +103,17 @@ pub struct Gateway {
 
 impl Gateway {
     pub fn new(runtime: Arc<Runtime>, hub: Arc<Hub>, data_dir: PathBuf) -> Self {
+        Self::build(runtime, hub, data_dir, true)
+    }
+
+    /// The gateway the `--acp` process (`acp/`) talks to: the same, without the background jobs
+    /// (the curator, the auto-archive sweep). The desktop app, which may run at the same time on
+    /// the same data folder, owns those.
+    pub fn new_for_acp(runtime: Arc<Runtime>, hub: Arc<Hub>, data_dir: PathBuf) -> Self {
+        Self::build(runtime, hub, data_dir, false)
+    }
+
+    fn build(runtime: Arc<Runtime>, hub: Arc<Hub>, data_dir: PathBuf, background: bool) -> Self {
         let data_dir_for_stats = data_dir.clone();
         let gateway = Self {
             runtime,
@@ -135,7 +146,9 @@ impl Gateway {
         };
         // The runtime keeps the approval policy in memory: Settings' choice applies from the start.
         gateway.apply_settings();
-        crate::maintenance::schedule_curator(gateway.runtime.clone(), gateway.actions.clone());
+        if background {
+            crate::maintenance::schedule_curator(gateway.runtime.clone(), gateway.actions.clone());
+        }
         // So are the skills switched off in Capabilities ▸ Skills.
         crate::skills::apply_config(&gateway.runtime.skills(), &gateway.rest);
         gateway
@@ -326,17 +339,40 @@ impl Gateway {
         send(&outbox, reply);
         // A started turn's events follow its admission receipt.
         if method == "prompt.submit" {
-            if let Some(admission) = admission_id(&params) {
-                let start = self
-                    .starts
-                    .lock()
-                    .ok()
-                    .and_then(|mut s| s.remove(&admission));
-                if let Some(start) = start {
-                    let _ = start.send(());
-                }
-            }
+            self.release_admission(&params);
         }
+    }
+
+    /// Lets a started turn's events flow: they wait for the receipt of the `prompt.submit` that
+    /// started them to be sent.
+    fn release_admission(&self, params: &Value) {
+        let Some(admission) = admission_id(params) else {
+            return;
+        };
+        let start = self
+            .starts
+            .lock()
+            .ok()
+            .and_then(|mut s| s.remove(&admission));
+        if let Some(start) = start {
+            let _ = start.send(());
+        }
+    }
+
+    /// One call, as the page's socket makes it, for another client in this process (the ACP
+    /// server): the answer is returned instead of sent, and a started turn's events are released
+    /// at once. Events follow on `outbox`.
+    pub async fn call(
+        self: Arc<Self>,
+        method: &str,
+        params: Value,
+        outbox: &Outbox,
+    ) -> Result<Value, (i64, String)> {
+        let result = self.clone().dispatch(method, &params, outbox).await;
+        if method == "prompt.submit" {
+            self.release_admission(&params);
+        }
+        result
     }
 
     async fn dispatch(self: Arc<Self>, method: &str, params: &Value, outbox: &Outbox) -> RpcResult {

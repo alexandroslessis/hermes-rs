@@ -5,6 +5,7 @@
 // Release builds are GUI-only (no console window); debug builds keep the console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod acp;
 mod archive;
 mod attachments;
 mod aux_models;
@@ -61,6 +62,10 @@ fn webapp_dist() -> PathBuf {
 }
 
 fn main() -> Result<()> {
+    // `--acp`: an agent for an editor (Zed, t3code) on stdin and stdout; no window, no server.
+    if std::env::args().skip(1).any(|arg| arg == "--acp") {
+        return acp::run();
+    }
     let config = RuntimeConfig::for_current_user();
     init_logging(config.as_ref().ok().map(|c| c.data_dir.as_path()));
 
@@ -285,7 +290,7 @@ fn fail(error: &str) -> ! {
 }
 
 /// Whether Settings' config record asks for Git Bash (`terminal.shell: "bash"`).
-fn wants_git_bash(data_dir: &std::path::Path) -> bool {
+pub(crate) fn wants_git_bash(data_dir: &std::path::Path) -> bool {
     std::fs::read(data_dir.join("desktop-config.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
