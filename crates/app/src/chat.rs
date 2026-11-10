@@ -184,8 +184,10 @@ impl ChatView {
         let known_commands: Rc<RefCell<HashMap<String, String>>> = Rc::default();
         let confirmed_mentions: Rc<RefCell<HashSet<String>>> = Rc::default();
         let composer = cx.new(|cx| {
-            TextArea::new(COMPOSER_PLACEHOLDER, cx)
-                .with_decorations(composer_decorations(known_commands.clone(), confirmed_mentions.clone()))
+            TextArea::new(COMPOSER_PLACEHOLDER, cx).with_decorations(composer_decorations(
+                known_commands.clone(),
+                confirmed_mentions.clone(),
+            ))
         });
         let subscription = cx.subscribe_in(
             &composer,
@@ -301,9 +303,16 @@ impl ChatView {
 
     /// A slash command from the command palette: sent at once when `run`, else left in the
     /// composer for its arguments.
-    pub fn run_command(&mut self, name: &str, run: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.composer
-            .update(cx, |composer, cx| composer.set_text(format!("/{name} "), cx));
+    pub fn run_command(
+        &mut self,
+        name: &str,
+        run: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |composer, cx| {
+            composer.set_text(format!("/{name} "), cx)
+        });
         self.composer.focus_handle(cx).focus(window, cx);
         if run {
             self.submit(window, cx);
@@ -456,7 +465,11 @@ impl ChatView {
         let colors = cx.theme().colors();
         let has_query = !find.query.read(cx).text().is_empty();
         let count = if find.total == 0 {
-            if has_query { "No results".to_string() } else { String::new() }
+            if has_query {
+                "No results".to_string()
+            } else {
+                String::new()
+            }
         } else {
             format!("{} of {}", find.current + 1, find.total)
         };
@@ -479,7 +492,11 @@ impl ChatView {
                 .border_b_1()
                 .border_color(colors.border_variant)
                 .bg(colors.toolbar_background)
-                .child(Icon::new(IconName::MagnifyingGlass).size(IconSize::Small).color(Color::Muted))
+                .child(
+                    Icon::new(IconName::MagnifyingGlass)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
                 .child(
                     div()
                         .flex_1()
@@ -495,15 +512,13 @@ impl ChatView {
                         .bg(colors.editor_background)
                         .child(find.query.clone()),
                 )
-                .child(
-                    Label::new(count)
-                        .size(LabelSize::Small)
-                        .color(if has_query && find.total == 0 {
-                            Color::Error
-                        } else {
-                            Color::Muted
-                        }),
-                )
+                .child(Label::new(count).size(LabelSize::Small).color(
+                    if has_query && find.total == 0 {
+                        Color::Error
+                    } else {
+                        Color::Muted
+                    },
+                ))
                 .child(
                     IconButton::new("find-previous", IconName::ChevronUp)
                         .icon_size(IconSize::Small)
@@ -1112,8 +1127,9 @@ impl ChatView {
             if message.role != Role::User {
                 continue;
             }
-            for (_, reference) in
-                hermes_tools::references::spans(&shown_user_text(message)).into_iter().rev()
+            for (_, reference) in hermes_tools::references::spans(&shown_user_text(message))
+                .into_iter()
+                .rev()
             {
                 let is_dir = match reference.kind.as_str() {
                     "file" => false,
@@ -1138,8 +1154,11 @@ impl ChatView {
             let mut known = self.known_commands.borrow_mut();
             for (name, description) in BUILTIN_COMMANDS {
                 known.insert(name.to_string(), format!("command:{name}"));
-                self.command_list
-                    .push((name.to_string(), description.to_string(), IconName::Terminal));
+                self.command_list.push((
+                    name.to_string(),
+                    description.to_string(),
+                    IconName::Terminal,
+                ));
             }
             for bundle in skills.bundles() {
                 known.insert(bundle.slug.clone(), format!("bundle:{}", bundle.slug));
@@ -1203,7 +1222,9 @@ impl ChatView {
         if suggestion.text.ends_with(' ') {
             if let Some(token) = suggestion.text.split_whitespace().last() {
                 if token.starts_with('@') {
-                    self.confirmed_mentions.borrow_mut().insert(token.to_string());
+                    self.confirmed_mentions
+                        .borrow_mut()
+                        .insert(token.to_string());
                 }
             }
         }
@@ -1269,7 +1290,12 @@ impl ChatView {
         true
     }
 
-    fn set_completions(&mut self, completions: Vec<Suggestion>, start: usize, cx: &mut Context<Self>) {
+    fn set_completions(
+        &mut self,
+        completions: Vec<Suggestion>,
+        start: usize,
+        cx: &mut Context<Self>,
+    ) {
         self.slash_matches = completions;
         self.completion_start = start;
         self.suggestion_selected = 0;
@@ -1485,18 +1511,21 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.inline_edit.as_ref().is_some_and(|e| e.target == target) {
+        if self
+            .inline_edit
+            .as_ref()
+            .is_some_and(|e| e.target == target)
+        {
             if let Some(edit) = &self.inline_edit {
                 edit.editor.focus_handle(cx).focus(window, cx);
             }
             return;
         }
         let editor = cx.new(|cx| {
-            let mut editor = TextArea::new("", cx)
-                .with_decorations(composer_decorations(
-                    self.known_commands.clone(),
-                    self.confirmed_mentions.clone(),
-                ));
+            let mut editor = TextArea::new("", cx).with_decorations(composer_decorations(
+                self.known_commands.clone(),
+                self.confirmed_mentions.clone(),
+            ));
             editor.set_text(text.clone(), cx);
             editor
         });
@@ -1507,7 +1536,8 @@ impl ChatView {
                 TextAreaEvent::MentionClicked(target) => this.open_mention(target, cx),
                 _ => {
                     // The editor grows as it's typed in: its list row is measured again.
-                    if let Some(EditTarget::Sent(index)) = this.inline_edit.as_ref().map(|e| e.target)
+                    if let Some(EditTarget::Sent(index)) =
+                        this.inline_edit.as_ref().map(|e| e.target)
                     {
                         if let Some(row) = this.entries.iter().position(|&m| m == index) {
                             this.list_state.remeasure_items(row..row + 1);
@@ -2526,9 +2556,11 @@ impl ChatView {
                                     .icon_color(Color::Error)
                                     .icon_size(IconSize::XSmall)
                                     .tooltip(Tooltip::text("Cancel Editing (Escape)"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.finish_inline_edit(false, window, cx)
-                                    })),
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.finish_inline_edit(false, window, cx)
+                                        },
+                                    )),
                                 )
                                 .child(
                                     IconButton::new(
@@ -2540,50 +2572,54 @@ impl ChatView {
                                     .tooltip(Tooltip::text(
                                         "Editing will restart the thread from this point.",
                                     ))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.finish_inline_edit(true, window, cx)
-                                    })),
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.finish_inline_edit(true, window, cx)
+                                        },
+                                    )),
                                 ),
                         )
                     })
-                    .when(!editing, |this| this.child(
-                        h_flex()
-                            .absolute()
-                            .top_neg_3p5()
-                            .right_3()
-                            .gap_1()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(colors.border)
-                            .bg(colors.editor_background)
-                            .overflow_hidden()
-                            .visible_on_hover(group)
-                            .child(action("copy-message", IconName::Copy, "Copy").on_click(
-                                move |_, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        copy_text.clone(),
-                                    ))
-                                },
-                            ))
-                            .child(
-                                action("edit-message", IconName::Pencil, "Edit and Resend")
-                                    .disabled(running)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.edit_message(message_index, window, cx)
-                                    })),
-                            )
-                            .child(
-                                action(
-                                    "resend-message",
-                                    IconName::Return,
-                                    "Resend: restarts the thread from this point",
+                    .when(!editing, |this| {
+                        this.child(
+                            h_flex()
+                                .absolute()
+                                .top_neg_3p5()
+                                .right_3()
+                                .gap_1()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(colors.border)
+                                .bg(colors.editor_background)
+                                .overflow_hidden()
+                                .visible_on_hover(group)
+                                .child(action("copy-message", IconName::Copy, "Copy").on_click(
+                                    move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy_text.clone(),
+                                        ))
+                                    },
+                                ))
+                                .child(
+                                    action("edit-message", IconName::Pencil, "Edit and Resend")
+                                        .disabled(running)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.edit_message(message_index, window, cx)
+                                        })),
                                 )
-                                .disabled(running)
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| this.resend(message_index, None, cx),
-                                )),
-                            ),
-                    )),
+                                .child(
+                                    action(
+                                        "resend-message",
+                                        IconName::Return,
+                                        "Resend: restarts the thread from this point",
+                                    )
+                                    .disabled(running)
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| this.resend(message_index, None, cx),
+                                    )),
+                                ),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -3052,18 +3088,13 @@ impl ChatView {
                 this.p_0p5().rounded_t(rems_from_px(5_f32)).bg(header_bg)
             })
             .child(label_row)
-            .child(
-                h_flex()
-                    .pr_0p5()
-                    .gap_1()
-                    .when(failed, |this| {
-                        this.child(
-                            Icon::new(IconName::Close)
-                                .color(Color::Error)
-                                .size(IconSize::Small),
-                        )
-                    }),
-            )
+            .child(h_flex().pr_0p5().gap_1().when(failed, |this| {
+                this.child(
+                    Icon::new(IconName::Close)
+                        .color(Color::Error)
+                        .size(IconSize::Small),
+                )
+            }))
             .on_click(cx.listener(move |this, _, _, cx| this.toggle(toggle_key.clone(), cx)));
 
         let border_color = tool_card_border_color(cx);
@@ -3919,8 +3950,7 @@ impl ChatView {
         Some(
             PopoverMenu::new("token-usage")
                 .trigger(
-                    ButtonLike::new("circular_progress_tokens")
-                        .child(div().mt_px().child(ring)),
+                    ButtonLike::new("circular_progress_tokens").child(div().mt_px().child(ring)),
                 )
                 .anchor(gpui::Anchor::BottomRight)
                 .offset(gpui::Point {
@@ -4300,7 +4330,9 @@ impl ChatView {
                                         h_flex()
                                             .flex_grow_1()
                                             .gap_1()
-                                            .child(div().flex_none().whitespace_nowrap().child(label))
+                                            .child(
+                                                div().flex_none().whitespace_nowrap().child(label),
+                                            )
                                             .when_some(detail, |this, detail| {
                                                 this.child(div().truncate().child(detail))
                                             }),
@@ -4333,11 +4365,11 @@ impl ChatView {
                     .offset(gpui::point(px(-4.), px(-4.)))
                     .snap_to_window_with_margin(px(8.))
                     .child(
-                        ui::Popover::new().child(
-                            div()
-                                .child(list)
-                                .vertical_scrollbar_for(&self.completion_scroll, window, cx),
-                        ),
+                        ui::Popover::new().child(div().child(list).vertical_scrollbar_for(
+                            &self.completion_scroll,
+                            window,
+                            cx,
+                        )),
                     ),
             )
             .with_priority(1)
@@ -4866,7 +4898,11 @@ struct Suggestion {
 /// The project's entries for an `@` mention, best first: the name starting with what's typed,
 /// then containing it, then the path containing it, then its letters in order; folders before
 /// files, then shallower and shorter paths. `only` keeps folders (true) or files (false).
-fn rank_entries(entries: &[(String, bool)], query: &str, only: Option<bool>) -> Vec<(String, bool)> {
+fn rank_entries(
+    entries: &[(String, bool)],
+    query: &str,
+    only: Option<bool>,
+) -> Vec<(String, bool)> {
     let mut ranked: Vec<(u8, bool, usize, usize, &String)> = entries
         .iter()
         .filter(|(_, is_dir)| only.is_none_or(|folders| *is_dir == folders))
@@ -5002,7 +5038,6 @@ struct Candidate {
     suggestion: Suggestion,
 }
 
-
 /// A `/rollback` or `/diff` report: shown like a reply, but no turn ends with it.
 fn is_command_output(message: &Message) -> bool {
     message
@@ -5065,9 +5100,11 @@ mod tests {
         assert_eq!(main[0], ("src/maintenance".to_string(), true));
         assert_eq!(main[1], ("src/main.rs".to_string(), false));
         // Letters in order still find it.
-        assert!(rank_entries(&entries, "rdme", Some(false))
-            .iter()
-            .any(|e| e.0 == "README.md"));
+        assert!(
+            rank_entries(&entries, "rdme", Some(false))
+                .iter()
+                .any(|e| e.0 == "README.md")
+        );
     }
 
     #[test]

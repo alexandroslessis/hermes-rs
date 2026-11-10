@@ -27,9 +27,21 @@ struct Task {
 }
 
 const TASKS: [Task; 4] = [
-    Task { slot: "compression", key: "compression", label: None },
-    Task { slot: "approval", key: "approval", label: None },
-    Task { slot: "title_generation", key: "titles", label: None },
+    Task {
+        slot: "compression",
+        key: "compression",
+        label: None,
+    },
+    Task {
+        slot: "approval",
+        key: "approval",
+        label: None,
+    },
+    Task {
+        slot: "title_generation",
+        key: "titles",
+        label: None,
+    },
     Task {
         slot: "background_review",
         key: "review",
@@ -91,7 +103,10 @@ pub fn assign(data_dir: &Path, body: &Value) -> (u16, Value) {
             aux[t.key] = Value::Null;
         }
         return match write_config(data_dir, &config) {
-            Ok(()) => (200, json!({"ok": true, "scope": "auxiliary", "reset": true})),
+            Ok(()) => (
+                200,
+                json!({"ok": true, "scope": "auxiliary", "reset": true}),
+            ),
             Err(error) => (500, json!({"detail": error})),
         };
     }
@@ -100,7 +115,12 @@ pub fn assign(data_dir: &Path, body: &Value) -> (u16, Value) {
     } else {
         match TASKS.iter().find(|t| t.slot == task) {
             Some(t) => vec![t],
-            None => return (400, json!({"detail": format!("unknown auxiliary task: {task}")})),
+            None => {
+                return (
+                    400,
+                    json!({"detail": format!("unknown auxiliary task: {task}")}),
+                );
+            }
         }
     };
     let provider = body["provider"].as_str().unwrap_or_default().trim();
@@ -108,7 +128,10 @@ pub fn assign(data_dir: &Path, body: &Value) -> (u16, Value) {
     let follow_main = provider.is_empty() || provider == "auto";
     if !follow_main {
         if Settings::load(data_dir).provider(provider).is_none() {
-            return (400, json!({"detail": format!("Unknown provider {provider}")}));
+            return (
+                400,
+                json!({"detail": format!("Unknown provider {provider}")}),
+            );
         }
         if model.is_empty() {
             return (400, json!({"detail": "Choose a model for this task"}));
@@ -118,7 +141,9 @@ pub fn assign(data_dir: &Path, body: &Value) -> (u16, Value) {
         None => Effort::Keep,
         Some(Value::Null) => Effort::Clear,
         Some(Value::String(level)) if level.is_empty() => Effort::Clear,
-        Some(Value::String(level)) if EFFORTS.contains(&level.as_str()) => Effort::Set(level.clone()),
+        Some(Value::String(level)) if EFFORTS.contains(&level.as_str()) => {
+            Effort::Set(level.clone())
+        }
         Some(other) => {
             return (
                 400,
@@ -205,7 +230,8 @@ fn read_config(data_dir: &Path) -> Value {
 /// app's settings) is kept as read.
 fn write_config(data_dir: &Path, config: &Value) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?;
-    std::fs::write(data_dir.join("config.json"), bytes).map_err(|e| format!("Saving config.json: {e}"))
+    std::fs::write(data_dir.join("config.json"), bytes)
+        .map_err(|e| format!("Saving config.json: {e}"))
 }
 
 #[cfg(test)]
@@ -226,7 +252,12 @@ mod tests {
     }
 
     fn row<'a>(list: &'a Value, slot: &str) -> &'a Value {
-        list["tasks"].as_array().unwrap().iter().find(|r| r["task"] == slot).unwrap()
+        list["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["task"] == slot)
+            .unwrap()
     }
 
     #[test]
@@ -234,11 +265,31 @@ mod tests {
         let dir = home();
         let list = list(dir.path());
         assert_eq!(list["main"], json!({"provider": "local", "model": "big"}));
-        let slots: Vec<&str> = list["tasks"].as_array().unwrap().iter().map(|r| r["task"].as_str().unwrap()).collect();
-        assert_eq!(slots, ["compression", "approval", "title_generation", "background_review"]);
+        let slots: Vec<&str> = list["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["task"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            slots,
+            [
+                "compression",
+                "approval",
+                "title_generation",
+                "background_review"
+            ]
+        );
         assert_eq!(row(&list, "compression")["provider"], "auto");
-        assert_eq!(row(&list, "background_review")["label"], "Background review");
-        assert!(runtime_models(&Settings::load(dir.path()), &|_, _| None).compression.is_none());
+        assert_eq!(
+            row(&list, "background_review")["label"],
+            "Background review"
+        );
+        assert!(
+            runtime_models(&Settings::load(dir.path()), &|_, _| None)
+                .compression
+                .is_none()
+        );
     }
 
     #[test]
@@ -248,19 +299,46 @@ mod tests {
         assert_eq!(assign(dir.path(), &body).0, 200);
         let list = list(dir.path());
         let compression = row(&list, "compression");
-        assert_eq!((compression["provider"].as_str(), compression["model"].as_str()), (Some("remote"), Some("small")));
+        assert_eq!(
+            (
+                compression["provider"].as_str(),
+                compression["model"].as_str()
+            ),
+            (Some("remote"), Some("small"))
+        );
         assert_eq!(compression["reasoning_effort"], "low");
         assert_eq!(compression["base_url"], "https://example.com/v1");
         assert_eq!(compression["local_endpoint"], false);
-        let models = runtime_models(&Settings::load(dir.path()), &|_, model| (model == "small").then_some(32_000));
+        let models = runtime_models(&Settings::load(dir.path()), &|_, model| {
+            (model == "small").then_some(32_000)
+        });
         let aux = models.compression.unwrap();
-        assert_eq!((aux.model.as_str(), aux.context_length, aux.effort.as_deref()), ("small", Some(32_000), Some("low")));
+        assert_eq!(
+            (
+                aux.model.as_str(),
+                aux.context_length,
+                aux.effort.as_deref()
+            ),
+            ("small", Some(32_000), Some("low"))
+        );
         assert!(models.review.is_none());
         // Picking another model without an effort keeps the job's effort; null clears it.
-        assign(dir.path(), &json!({"task": "compression", "provider": "local", "model": "tiny"}));
-        assert_eq!(row(&list_of(&dir), "compression")["reasoning_effort"], "low");
-        assign(dir.path(), &json!({"task": "compression", "provider": "local", "model": "tiny", "reasoning_effort": null}));
-        assert_eq!(row(&list_of(&dir), "compression")["reasoning_effort"], Value::Null);
+        assign(
+            dir.path(),
+            &json!({"task": "compression", "provider": "local", "model": "tiny"}),
+        );
+        assert_eq!(
+            row(&list_of(&dir), "compression")["reasoning_effort"],
+            "low"
+        );
+        assign(
+            dir.path(),
+            &json!({"task": "compression", "provider": "local", "model": "tiny", "reasoning_effort": null}),
+        );
+        assert_eq!(
+            row(&list_of(&dir), "compression")["reasoning_effort"],
+            Value::Null
+        );
         // The rest of config.json is untouched, the GPUI app's curator choice included.
         let config = read_config(dir.path());
         assert_eq!(config["window"], json!({"w": 1}));
@@ -274,8 +352,14 @@ mod tests {
     #[test]
     fn titles_and_review_use_the_gpui_app_s_names() {
         let dir = home();
-        assign(dir.path(), &json!({"task": "title_generation", "provider": "local", "model": "t"}));
-        assign(dir.path(), &json!({"task": "background_review", "provider": "local", "model": "r"}));
+        assign(
+            dir.path(),
+            &json!({"task": "title_generation", "provider": "local", "model": "t"}),
+        );
+        assign(
+            dir.path(),
+            &json!({"task": "background_review", "provider": "local", "model": "r"}),
+        );
         let settings = Settings::load(dir.path());
         assert_eq!(settings.aux_models.titles.unwrap().model, "t");
         assert_eq!(settings.aux_models.review.unwrap().model, "r");
@@ -284,25 +368,63 @@ mod tests {
     #[test]
     fn auto_and_reset_go_back_to_the_main_model() {
         let dir = home();
-        assign(dir.path(), &json!({"task": "", "provider": "remote", "model": "m"}));
-        assert!(list_of(&dir)["tasks"].as_array().unwrap().iter().all(|r| r["model"] == "m"));
-        assign(dir.path(), &json!({"task": "approval", "provider": "auto", "model": ""}));
+        assign(
+            dir.path(),
+            &json!({"task": "", "provider": "remote", "model": "m"}),
+        );
+        assert!(
+            list_of(&dir)["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["model"] == "m")
+        );
+        assign(
+            dir.path(),
+            &json!({"task": "approval", "provider": "auto", "model": ""}),
+        );
         assert_eq!(row(&list_of(&dir), "approval")["provider"], "auto");
         assert_eq!(row(&list_of(&dir), "compression")["model"], "m");
-        let (status, body) = assign(dir.path(), &json!({"task": "__reset__", "provider": "local", "model": "big"}));
+        let (status, body) = assign(
+            dir.path(),
+            &json!({"task": "__reset__", "provider": "local", "model": "big"}),
+        );
         assert_eq!((status, body["reset"].clone()), (200, json!(true)));
-        assert!(list_of(&dir)["tasks"].as_array().unwrap().iter().all(|r| r["provider"] == "auto"));
-        assert_eq!(read_config(dir.path())["aux_models"]["curator"]["model"], "c");
+        assert!(
+            list_of(&dir)["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["provider"] == "auto")
+        );
+        assert_eq!(
+            read_config(dir.path())["aux_models"]["curator"]["model"],
+            "c"
+        );
     }
 
     #[test]
     fn bad_requests_are_refused() {
         let dir = home();
         let refused = |body: Value| assign(dir.path(), &body).0;
-        assert_eq!(refused(json!({"task": "vision", "provider": "local", "model": "m"})), 400);
-        assert_eq!(refused(json!({"task": "compression", "provider": "nowhere", "model": "m"})), 400);
-        assert_eq!(refused(json!({"task": "compression", "provider": "local", "model": ""})), 400);
-        assert_eq!(refused(json!({"task": "compression", "provider": "local", "model": "m", "reasoning_effort": "max"})), 400);
+        assert_eq!(
+            refused(json!({"task": "vision", "provider": "local", "model": "m"})),
+            400
+        );
+        assert_eq!(
+            refused(json!({"task": "compression", "provider": "nowhere", "model": "m"})),
+            400
+        );
+        assert_eq!(
+            refused(json!({"task": "compression", "provider": "local", "model": ""})),
+            400
+        );
+        assert_eq!(
+            refused(
+                json!({"task": "compression", "provider": "local", "model": "m", "reasoning_effort": "max"})
+            ),
+            400
+        );
         assert_eq!(row(&list_of(&dir), "compression")["provider"], "auto");
     }
 }

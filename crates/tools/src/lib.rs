@@ -317,7 +317,12 @@ impl SessionTools {
         self.processes.kill_all().await;
     }
 
-    async fn dispatch(&self, name: &str, args: Value, live: Option<(&str, &Emitter)>) -> ToolOutput {
+    async fn dispatch(
+        &self,
+        name: &str,
+        args: Value,
+        live: Option<(&str, &Emitter)>,
+    ) -> ToolOutput {
         let read_path = (name == "read_file")
             .then(|| {
                 args.get("path")
@@ -365,7 +370,12 @@ impl SessionTools {
         output
     }
 
-    async fn dispatch_unredacted(&self, name: &str, args: Value, live: Option<(&str, &Emitter)>) -> ToolOutput {
+    async fn dispatch_unredacted(
+        &self,
+        name: &str,
+        args: Value,
+        live: Option<(&str, &Emitter)>,
+    ) -> ToolOutput {
         match name {
             "read_file" => files::read_file(self, args).await,
             "write_file" => files::write_file(self, args).await,
@@ -623,7 +633,9 @@ pub(crate) mod tests {
             "DB_PASSWORD=hunter2hunter2\nOPENAI_KEY=sk-abcdefghijklmnop1234\n",
         )
         .unwrap();
-        let read = tools.dispatch("read_file", json!({"path": ".env"}), None).await;
+        let read = tools
+            .dispatch("read_file", json!({"path": ".env"}), None)
+            .await;
         let content = read.value["content"].as_str().unwrap();
         assert!(
             !content.contains("hunter2") && !content.contains("sk-abcdefghij"),

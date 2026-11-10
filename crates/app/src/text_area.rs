@@ -156,7 +156,10 @@ fn non_overlapping(mut spans: Vec<Span>, len: usize) -> Vec<Span> {
     spans.sort_by_key(|s| (s.range.start, std::cmp::Reverse(s.range.end)));
     let mut kept: Vec<Span> = Vec::new();
     for span in spans {
-        if kept.last().is_none_or(|last| span.range.start >= last.range.end) {
+        if kept
+            .last()
+            .is_none_or(|last| span.range.start >= last.range.end)
+        {
             kept.push(span);
         }
     }
@@ -1056,7 +1059,11 @@ impl IntoElement for TextAreaElement {
 }
 
 /// Where a mention chip is drawn: its text's box, padded a little (only when it fits one row).
-fn chip_bounds(layout: &TextLayout, range: &Range<usize>, origin: Point<Pixels>) -> Vec<Bounds<Pixels>> {
+fn chip_bounds(
+    layout: &TextLayout,
+    range: &Range<usize>,
+    origin: Point<Pixels>,
+) -> Vec<Bounds<Pixels>> {
     let start = layout.position_for_index(range.start);
     let end = layout.position_for_index(range.end);
     if start.y != end.y || end.x <= start.x {
@@ -1091,7 +1098,15 @@ fn display_text(
     let code_font = theme::theme_settings(cx).buffer_font(cx).clone();
     let filler_width = window
         .text_system()
-        .shape_line("_".into(), font_size, &[TextRun { len: 1, ..base.clone() }], None)
+        .shape_line(
+            "_".into(),
+            font_size,
+            &[TextRun {
+                len: 1,
+                ..base.clone()
+            }],
+            None,
+        )
         .width
         .max(px(1.));
     let mut text = String::with_capacity(content.len());
@@ -1160,7 +1175,10 @@ fn display_text(
 /// The code font at Zed's agent buffer size, which creases use.
 fn crease_font(cx: &App) -> (gpui::Font, Pixels) {
     let settings = theme::theme_settings(cx);
-    (settings.buffer_font(cx).clone(), settings.buffer_font_size(cx))
+    (
+        settings.buffer_font(cx).clone(),
+        settings.buffer_font_size(cx),
+    )
 }
 
 /// A crease button's width: Zed's compact outlined `ButtonLike` (4px padding each side and a
@@ -1223,7 +1241,9 @@ fn crease_element(
     ButtonLike::new(("crease", index))
         .style(ButtonStyle::Outlined)
         .size(ButtonSize::Compact)
-        .height(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(height)))
+        .height(gpui::DefiniteLength::Absolute(
+            gpui::AbsoluteLength::Pixels(height),
+        ))
         // Exactly over its placeholder, so the text after it doesn't leave a gap.
         .width(width)
         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
@@ -1470,16 +1490,10 @@ impl Element for TextAreaElement {
             .enumerate()
             .filter_map(|(index, fold)| {
                 let chip = fold_bounds(&layout, fold, origin)?;
-                let selected = selection.start < fold.content.end
-                    && fold.content.start < selection.end;
-                let mut element = crease_element(
-                    index,
-                    &fold.crease,
-                    selected,
-                    chip.size,
-                    input.clone(),
-                    cx,
-                );
+                let selected =
+                    selection.start < fold.content.end && fold.content.start < selection.end;
+                let mut element =
+                    crease_element(index, &fold.crease, selected, chip.size, input.clone(), cx);
                 element.prepaint_as_root(
                     chip.origin,
                     size(

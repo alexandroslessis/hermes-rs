@@ -69,7 +69,10 @@ fn sources_in(homes: &[PathBuf]) -> Vec<Source> {
     for home in homes {
         let db = home.join("state.db");
         if db.is_file() && seen.insert(db.clone()) {
-            out.push(Source { profile: "default".into(), db });
+            out.push(Source {
+                profile: "default".into(),
+                db,
+            });
         }
         let Ok(profiles) = std::fs::read_dir(home.join("profiles")) else {
             continue;
@@ -78,7 +81,10 @@ fn sources_in(homes: &[PathBuf]) -> Vec<Source> {
         profiles.sort();
         for profile in profiles {
             let db = profile.join("state.db");
-            let name = profile.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let name = profile
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
             if db.is_file() && !name.starts_with('.') && seen.insert(db.clone()) {
                 out.push(Source { profile: name, db });
             }
@@ -89,7 +95,10 @@ fn sources_in(homes: &[PathBuf]) -> Vec<Source> {
 
 /// The database, read-only (Hermes may be running; nothing of it is changed).
 fn open(db: &Path) -> rusqlite::Result<Connection> {
-    Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+    Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
 }
 
 fn columns(conn: &Connection, table: &str) -> HashSet<String> {
@@ -128,7 +137,9 @@ fn content_text(content: Option<String>) -> String {
                 return parts
                     .iter()
                     .map(|part| match part["type"].as_str() {
-                        Some("text" | "input_text" | "output_text") => part["text"].as_str().unwrap_or_default().to_string(),
+                        Some("text" | "input_text" | "output_text") => {
+                            part["text"].as_str().unwrap_or_default().to_string()
+                        }
                         Some(kind) if kind.contains("image") => "[image]".into(),
                         Some(kind) => format!("[{kind}]"),
                         None => String::new(),
@@ -143,13 +154,21 @@ fn content_text(content: Option<String>) -> String {
 }
 
 /// One Hermes session in the Import screen's list (`ForeignSession`).
-fn summary(conn: &Connection, source: &Source, ours: &HashMap<String, String>) -> rusqlite::Result<Vec<(f64, Value)>> {
+fn summary(
+    conn: &Connection,
+    source: &Source,
+    ours: &HashMap<String, String>,
+) -> rusqlite::Result<Vec<(f64, Value)>> {
     let session_columns = columns(conn, "sessions");
     let message_columns = columns(conn, "messages");
     let has = |c: &str| session_columns.contains(c);
     let title = if has("title") { "title" } else { "NULL" };
     let cwd = if has("cwd") { "cwd" } else { "NULL" };
-    let last = if has("last_activity_at") { "COALESCE(last_activity_at, ended_at, started_at)" } else { "COALESCE(ended_at, started_at)" };
+    let last = if has("last_activity_at") {
+        "COALESCE(last_activity_at, ended_at, started_at)"
+    } else {
+        "COALESCE(ended_at, started_at)"
+    };
     let rows = history_rows(&message_columns);
     let sql = format!(
         "SELECT id, {title}, {cwd}, {last},
@@ -176,7 +195,13 @@ fn summary(conn: &Connection, source: &Source, ours: &HashMap<String, String>) -
         }
         let first = content_text(first);
         let key = key(source, &id);
-        let excerpt: String = first.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect();
+        let excerpt: String = first
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(160)
+            .collect();
         let title = title
             .filter(|t| !t.trim().is_empty())
             .unwrap_or_else(|| excerpt.chars().take(60).collect());
@@ -203,7 +228,8 @@ fn parse_key(key: &str) -> Option<(String, String)> {
 }
 
 fn find(key: &str) -> Result<(Source, String), String> {
-    let (profile, session) = parse_key(key).ok_or_else(|| format!("Not a Hermes session: {key}"))?;
+    let (profile, session) =
+        parse_key(key).ok_or_else(|| format!("Not a Hermes session: {key}"))?;
     let source = sources()
         .into_iter()
         .find(|s| s.profile == profile)
@@ -244,7 +270,12 @@ pub fn list(data_dir: &Path, source: Option<&str>, offset: usize) -> Value {
         }
     }
     all.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let page: Vec<Value> = all.iter().skip(offset).take(PAGE).map(|(_, row)| row.clone()).collect();
+    let page: Vec<Value> = all
+        .iter()
+        .skip(offset)
+        .take(PAGE)
+        .map(|(_, row)| row.clone())
+        .collect();
     let next = (offset + PAGE < all.len()).then_some(offset + PAGE);
     json!({"sessions": page, "next_offset": next, "host": host, "unreadable": unreadable})
 }
@@ -280,7 +311,11 @@ fn rows(conn: &Connection, session: &str) -> rusqlite::Result<Vec<Row>> {
     } else {
         ("1", "")
     };
-    let summary = if has("_compressed_summary") { "_compressed_summary = 1" } else { "0" };
+    let summary = if has("_compressed_summary") {
+        "_compressed_summary = 1"
+    } else {
+        "0"
+    };
     let mut statement = conn.prepare(&format!(
         "SELECT role, content, tool_call_id, tool_calls, timestamp, {model}, {summary} FROM messages
          WHERE session_id = ?1 AND role IN ('user', 'assistant', 'tool') {filter} ORDER BY id"
@@ -313,9 +348,18 @@ fn conversation(rows: &[Row]) -> Vec<Message> {
     let mut open_calls: Vec<String> = Vec::new();
     // Results are seen by whoever saw their calls, so a call and its result never part.
     let mut calls_seen = (true, true);
-    let close = |out: &mut Vec<Message>, open_calls: &mut Vec<String>, results: Option<Message>, seen: (bool, bool)| {
-        let mut message = results.unwrap_or_else(Message::user).with_visibility(seen.0, seen.1);
-        let answered: HashSet<String> = message.get_tool_response_ids().into_iter().map(str::to_string).collect();
+    let close = |out: &mut Vec<Message>,
+                 open_calls: &mut Vec<String>,
+                 results: Option<Message>,
+                 seen: (bool, bool)| {
+        let mut message = results
+            .unwrap_or_else(Message::user)
+            .with_visibility(seen.0, seen.1);
+        let answered: HashSet<String> = message
+            .get_tool_response_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         for id in open_calls.drain(..) {
             if !answered.contains(&id) {
                 message = message.with_tool_response(
@@ -341,10 +385,16 @@ fn conversation(rows: &[Row]) -> Vec<Message> {
                 results.created = created;
                 while index < rows.len() && rows[index].role == "tool" {
                     let result = &rows[index];
-                    if let Some(id) = result.tool_call_id.as_deref().filter(|id| open_calls.iter().any(|c| c == id)) {
+                    if let Some(id) = result
+                        .tool_call_id
+                        .as_deref()
+                        .filter(|id| open_calls.iter().any(|c| c == id))
+                    {
                         results = results.with_tool_response(
                             id.to_string(),
-                            Ok(CallToolResult::success(vec![ContentBlock::text(result.content.clone())])),
+                            Ok(CallToolResult::success(vec![ContentBlock::text(
+                                result.content.clone(),
+                            )])),
                         );
                     }
                     index += 1;
@@ -358,7 +408,9 @@ fn conversation(rows: &[Row]) -> Vec<Message> {
                 }
                 if !row.content.trim().is_empty() {
                     let (shown, model) = visibility(row);
-                    let mut message = Message::user().with_text(row.content.clone()).with_visibility(shown, model);
+                    let mut message = Message::user()
+                        .with_text(row.content.clone())
+                        .with_visibility(shown, model);
                     message.created = created;
                     out.push(message.with_generated_id_if_missing());
                 }
@@ -378,7 +430,9 @@ fn conversation(rows: &[Row]) -> Vec<Message> {
                     .and_then(|calls| serde_json::from_str(calls).ok())
                     .unwrap_or_default();
                 for call in calls {
-                    let (Some(id), Some(name)) = (call["id"].as_str(), call["function"]["name"].as_str()) else {
+                    let (Some(id), Some(name)) =
+                        (call["id"].as_str(), call["function"]["name"].as_str())
+                    else {
                         continue;
                     };
                     let arguments = match &call["function"]["arguments"] {
@@ -395,7 +449,11 @@ fn conversation(rows: &[Row]) -> Vec<Message> {
                 }
                 calls_seen = visibility(row);
                 if !message.content.is_empty() {
-                    out.push(message.with_visibility(calls_seen.0, calls_seen.1).with_generated_id_if_missing());
+                    out.push(
+                        message
+                            .with_visibility(calls_seen.0, calls_seen.1)
+                            .with_generated_id_if_missing(),
+                    );
                 }
             }
             _ => {}
@@ -415,11 +473,19 @@ pub fn preview(data_dir: &Path, id: &str) -> Result<Value, String> {
     let rows = rows(&conn, &session).map_err(|e| e.to_string())?;
     let texts: Vec<Value> = rows
         .iter()
-        .filter(|r| matches!(r.role.as_str(), "user" | "assistant") && !r.summary && !r.content.trim().is_empty())
+        .filter(|r| {
+            matches!(r.role.as_str(), "user" | "assistant")
+                && !r.summary
+                && !r.content.trim().is_empty()
+        })
         .map(|r| json!({"role": r.role, "content": r.content}))
         .collect();
     let cwd: Option<String> = conn
-        .query_row("SELECT cwd FROM sessions WHERE id = ?1", [&session], |row| row.get(0))
+        .query_row(
+            "SELECT cwd FROM sessions WHERE id = ?1",
+            [&session],
+            |row| row.get(0),
+        )
         .optional()
         .ok()
         .flatten()
@@ -445,7 +511,14 @@ pub struct Target<'a> {
 pub fn import(target: &Target, id: &str) -> Result<Value, String> {
     let mut imports = load_imports(target.data_dir);
     if let Some(ours) = imports.get(id) {
-        if target.runtime.store().session(ours).ok().flatten().is_some() {
+        if target
+            .runtime
+            .store()
+            .session(ours)
+            .ok()
+            .flatten()
+            .is_some()
+        {
             return Ok(json!({"session_id": ours, "already_imported": true}));
         }
     }
@@ -457,10 +530,16 @@ pub fn import(target: &Target, id: &str) -> Result<Value, String> {
         "SELECT {}, {}, started_at, {} FROM sessions WHERE id = ?1",
         if has("title") { "title" } else { "NULL" },
         if has("cwd") { "cwd" } else { "NULL" },
-        if has("last_activity_at") { "COALESCE(last_activity_at, ended_at, started_at)" } else { "COALESCE(ended_at, started_at)" },
+        if has("last_activity_at") {
+            "COALESCE(last_activity_at, ended_at, started_at)"
+        } else {
+            "COALESCE(ended_at, started_at)"
+        },
     );
     let (title, cwd, started, last): (Option<String>, Option<String>, f64, Option<f64>) = conn
-        .query_row(&sql, [&session], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .query_row(&sql, [&session], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
         .map_err(|e| format!("Hermes session {session}: {e}"))?;
     let messages = conversation(&rows(&conn, &session).map_err(|e| e.to_string())?);
     if messages.is_empty() {
@@ -477,7 +556,9 @@ pub fn import(target: &Target, id: &str) -> Result<Value, String> {
         .create_session(&target.provider, &target.model, None, &folder)
         .map_err(|e| format!("{e:#}"))?;
     let store = target.runtime.store();
-    store.replace_messages(&made.id, &messages).map_err(|e| format!("{e:#}"))?;
+    store
+        .replace_messages(&made.id, &messages)
+        .map_err(|e| format!("{e:#}"))?;
     let first_user = messages
         .iter()
         .find(|m| m.role == Role::User && m.is_user_visible())
@@ -491,9 +572,15 @@ pub fn import(target: &Target, id: &str) -> Result<Value, String> {
                 .collect::<String>()
         })
         .unwrap_or_default();
-    let title = title
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| first_user.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect());
+    let title = title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| {
+        first_user
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(60)
+            .collect()
+    });
     if !title.is_empty() {
         let _ = store.set_title(&made.id, &title);
     }
@@ -524,7 +611,9 @@ pub fn import_all(target: &Target) -> (usize, usize, Vec<String>) {
             match import(target, id) {
                 Ok(result) if result["already_imported"] == true => already += 1,
                 Ok(_) => imported += 1,
-                Err(error) => failed.push(format!("{}: {error}", row["title"].as_str().unwrap_or(id))),
+                Err(error) => {
+                    failed.push(format!("{}: {error}", row["title"].as_str().unwrap_or(id)))
+                }
             }
         }
     }
@@ -570,7 +659,13 @@ mod tests {
         let messages = conversation(&rows(&conn, "s").unwrap());
         let seen: Vec<(String, bool, bool)> = messages
             .iter()
-            .map(|m| (m.as_concat_text(), m.is_user_visible(), m.is_agent_visible()))
+            .map(|m| {
+                (
+                    m.as_concat_text(),
+                    m.is_user_visible(),
+                    m.is_agent_visible(),
+                )
+            })
             .collect();
         let expect = |text: &str, user: bool, model: bool| (text.to_string(), user, model);
         assert_eq!(seen[0], expect("old question", true, false));
@@ -580,7 +675,10 @@ mod tests {
         assert_eq!(messages[2].get_tool_response_ids(), HashSet::from(["c0"]));
         assert_eq!(seen[3], expect("old answer", true, false));
         // A rewound row (neither active nor compacted) isn't imported; the summary is the model's.
-        assert_eq!(seen[4], expect("Summary of the earlier conversation", false, true));
+        assert_eq!(
+            seen[4],
+            expect("Summary of the earlier conversation", false, true)
+        );
         assert_eq!(seen[5], expect("new question", true, true));
         assert_eq!(seen[6], expect("new answer", true, true));
         assert_eq!(messages.len(), 7);
@@ -598,7 +696,11 @@ mod tests {
         .unwrap();
         let messages = conversation(&rows(&conn, "s").unwrap());
         assert_eq!(messages.len(), 2);
-        assert!(messages.iter().all(|m| m.is_user_visible() && m.is_agent_visible()));
+        assert!(
+            messages
+                .iter()
+                .all(|m| m.is_user_visible() && m.is_agent_visible())
+        );
     }
 
     #[test]
@@ -612,10 +714,26 @@ mod tests {
             row("tool", "orphan", Some("zz"), None),
             row("assistant", "It says hello.", None, None),
             row("user", "and now?", None, None),
-            row("assistant", "Running.", None, Some(r#"[{"id":"c3","function":{"name":"terminal","arguments":"{}"}}]"#)),
+            row(
+                "assistant",
+                "Running.",
+                None,
+                Some(r#"[{"id":"c3","function":{"name":"terminal","arguments":"{}"}}]"#),
+            ),
         ]);
         let roles: Vec<Role> = messages.iter().map(|m| m.role.clone()).collect();
-        assert_eq!(roles, [Role::User, Role::Assistant, Role::User, Role::Assistant, Role::User, Role::Assistant, Role::User]);
+        assert_eq!(
+            roles,
+            [
+                Role::User,
+                Role::Assistant,
+                Role::User,
+                Role::Assistant,
+                Role::User,
+                Role::Assistant,
+                Role::User
+            ]
+        );
         // c1 answered, c2 given a placeholder, the orphan dropped.
         let ids = messages[2].get_tool_response_ids();
         assert_eq!(ids, HashSet::from(["c1", "c2"]));
@@ -648,6 +766,9 @@ mod tests {
         let profiles: Vec<&str> = found.iter().map(|s| s.profile.as_str()).collect();
         assert_eq!(profiles, ["default", "work"]);
         assert_eq!(found[1].label(), "Hermes (work)");
-        assert_eq!(parse_key("hermes:work:abc:d"), Some(("work".into(), "abc:d".into())));
+        assert_eq!(
+            parse_key("hermes:work:abc:d"),
+            Some(("work".into(), "abc:d".into()))
+        );
     }
 }

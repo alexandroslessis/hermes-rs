@@ -71,7 +71,11 @@ fn clean_name(name: &str, fallback: &str) -> String {
         })
         .collect();
     let cleaned = cleaned.trim().trim_matches('.').to_string();
-    if cleaned.is_empty() { fallback.to_string() } else { cleaned }
+    if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// A path in `folder` for `name` that doesn't exist yet (`name`, `name (2)`, …).
@@ -81,7 +85,10 @@ fn unique_path(folder: &Path, name: &str) -> PathBuf {
         return candidate;
     }
     let path = Path::new(name);
-    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
     let ext = path
         .extension()
         .map(|e| format!(".{}", e.to_string_lossy()))
@@ -109,7 +116,13 @@ pub fn upload_image(data_dir: &Path, body: &Value) -> Answer {
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload.trim()) else {
         return error(400, "The image data isn't valid base64.");
     };
-    save_image(data_dir, &bytes, &mime, ext, body["filename"].as_str().unwrap_or_default())
+    save_image(
+        data_dir,
+        &bytes,
+        &mime,
+        ext,
+        body["filename"].as_str().unwrap_or_default(),
+    )
 }
 
 /// The image type of `bytes`, by their first bytes: `(mime, extension)`.
@@ -118,7 +131,21 @@ fn sniff_image(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
         [0x89, b'P', b'N', b'G', ..] => "image/png",
         [0xFF, 0xD8, 0xFF, ..] => "image/jpeg",
         [b'G', b'I', b'F', b'8', ..] => "image/gif",
-        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => "image/webp",
         [b'B', b'M', ..] => "image/bmp",
         [b'I', b'I', 42, 0, ..] | [b'M', b'M', 0, 42, ..] => "image/tiff",
         _ => return None,
@@ -135,7 +162,13 @@ pub fn image_from_base64(data_dir: &Path, params: &Value) -> Answer {
     let Some((mime, ext)) = sniff_image(&bytes) else {
         return error(400, "Attach a PNG, JPEG, GIF, WebP, BMP or TIFF image.");
     };
-    save_image(data_dir, &bytes, mime, ext, params["filename"].as_str().unwrap_or_default())
+    save_image(
+        data_dir,
+        &bytes,
+        mime,
+        ext,
+        params["filename"].as_str().unwrap_or_default(),
+    )
 }
 
 /// Whether `path` names an image the model can be sent (`image.attach`).
@@ -145,7 +178,10 @@ pub fn is_image(path: &Path) -> bool {
 
 fn save_image(data_dir: &Path, bytes: &[u8], mime: &str, ext: &str, filename: &str) -> Answer {
     if bytes.len() > MAX_BYTES {
-        return error(413, format!("The image is larger than {} MiB.", MAX_BYTES >> 20));
+        return error(
+            413,
+            format!("The image is larger than {} MiB.", MAX_BYTES >> 20),
+        );
     }
     let folder = data_dir.join("images");
     if let Err(e) = std::fs::create_dir_all(&folder) {
@@ -176,7 +212,10 @@ fn save_image(data_dir: &Path, bytes: &[u8], mime: &str, ext: &str, filename: &s
 /// receipt `file.attach` takes back (`staged_upload`).
 pub fn store_upload(data_dir: &Path, name: &str, bytes: &[u8]) -> Answer {
     if bytes.len() > MAX_BYTES {
-        return error(413, format!("The file is larger than {} MiB.", MAX_BYTES >> 20));
+        return error(
+            413,
+            format!("The file is larger than {} MiB.", MAX_BYTES >> 20),
+        );
     }
     let folder = data_dir
         .join("uploads")
@@ -204,7 +243,10 @@ pub fn read_data_url(path: &str) -> Answer {
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() && meta.len() as usize <= MAX_BYTES => {}
         Ok(meta) if meta.is_file() => {
-            return error(413, format!("The file is larger than {} MiB.", MAX_BYTES >> 20));
+            return error(
+                413,
+                format!("The file is larger than {} MiB.", MAX_BYTES >> 20),
+            );
         }
         _ => return error(404, "No such file."),
     }
@@ -250,12 +292,19 @@ pub fn attach_file(cwd: &Path, params: &Value) -> Result<Value, String> {
         .or_else(|| params["path"].as_str())
         .filter(|p| !p.is_empty())
     {
-        let size = std::fs::metadata(path).map_err(|e| format!("Can't read {path}: {e}"))?.len();
+        let size = std::fs::metadata(path)
+            .map_err(|e| format!("Can't read {path}: {e}"))?
+            .len();
         if size as usize > MAX_BYTES {
             return Err(format!("The file is larger than {} MiB.", MAX_BYTES >> 20));
         }
         let bytes = std::fs::read(path).map_err(|e| format!("Can't read {path}: {e}"))?;
-        (bytes, Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()))
+        (
+            bytes,
+            Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string()),
+        )
     } else if let Some(data_url) = params["data_url"].as_str() {
         let payload = data_url.split_once(',').map_or(data_url, |(_, p)| p);
         let bytes = base64::engine::general_purpose::STANDARD
@@ -266,13 +315,19 @@ pub fn attach_file(cwd: &Path, params: &Value) -> Result<Value, String> {
         return Err("path or data_url required".into());
     };
     let folder = cwd.join(".hermes").join("attachments");
-    std::fs::create_dir_all(&folder).map_err(|e| format!("Can't create {}: {e}", folder.display()))?;
+    std::fs::create_dir_all(&folder)
+        .map_err(|e| format!("Can't create {}: {e}", folder.display()))?;
     let name = clean_name(
-        if name.is_empty() { source_name.as_deref().unwrap_or_default() } else { name },
+        if name.is_empty() {
+            source_name.as_deref().unwrap_or_default()
+        } else {
+            name
+        },
         "attachment",
     );
     let target = unique_path(&folder, &name);
-    std::fs::write(&target, &bytes).map_err(|e| format!("Can't write {}: {e}", target.display()))?;
+    std::fs::write(&target, &bytes)
+        .map_err(|e| format!("Can't write {}: {e}", target.display()))?;
     let reference = target
         .strip_prefix(cwd)
         .map(|rel| rel.to_string_lossy().replace('\\', "/"))
@@ -307,14 +362,27 @@ mod tests {
         let images = image_bytes(&json!([{"path": path, "mime": "image/png"}])).unwrap();
         assert_eq!(images.len(), 1);
         assert!(images[0].starts_with(b"\x89PNG"));
-        assert!(read_data_url(path).1["dataUrl"].as_str().unwrap().starts_with("data:image/png;base64,"));
+        assert!(
+            read_data_url(path).1["dataUrl"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
         // Bytes alone (`image.attach_bytes`): the type comes from the bytes.
-        let (status, sniffed) = image_from_base64(dir.path(), &json!({"content_base64": PNG, "filename": "x"}));
+        let (status, sniffed) =
+            image_from_base64(dir.path(), &json!({"content_base64": PNG, "filename": "x"}));
         assert_eq!(status, 200);
         assert!(sniffed["path"].as_str().unwrap().ends_with("_x.png"));
         assert!(is_image(Path::new("a.JPG")) && !is_image(Path::new("a.svg")));
         // Not an image type: refused.
-        assert_eq!(upload_image(dir.path(), &json!({"data_url": "data:text/plain;base64,aGk="})).0, 400);
+        assert_eq!(
+            upload_image(
+                dir.path(),
+                &json!({"data_url": "data:text/plain;base64,aGk="})
+            )
+            .0,
+            400
+        );
         assert!(image_bytes(&json!([{"path": "C:/no/such.png"}])).is_err());
     }
 
@@ -325,18 +393,34 @@ mod tests {
         let (status, body) = store_upload(data.path(), "my notes.txt", b"hello");
         assert_eq!(status, 200);
         let staged = body["staged_upload"].clone();
-        let attached = attach_file(session.path(), &json!({"name": "my notes.txt", "staged_upload": staged})).unwrap();
+        let attached = attach_file(
+            session.path(),
+            &json!({"name": "my notes.txt", "staged_upload": staged}),
+        )
+        .unwrap();
         assert_eq!(attached["ref_path"], ".hermes/attachments/my notes.txt");
-        assert_eq!(attached["ref_text"], "@file:`.hermes/attachments/my notes.txt`");
         assert_eq!(
-            std::fs::read_to_string(session.path().join(".hermes/attachments/my notes.txt")).unwrap(),
+            attached["ref_text"],
+            "@file:`.hermes/attachments/my notes.txt`"
+        );
+        assert_eq!(
+            std::fs::read_to_string(session.path().join(".hermes/attachments/my notes.txt"))
+                .unwrap(),
             "hello"
         );
         // The same name again gets its own copy.
-        let again = attach_file(session.path(), &json!({"name": "my notes.txt", "staged_upload": staged})).unwrap();
+        let again = attach_file(
+            session.path(),
+            &json!({"name": "my notes.txt", "staged_upload": staged}),
+        )
+        .unwrap();
         assert_eq!(again["ref_path"], ".hermes/attachments/my notes (2).txt");
         // Bytes from the page (data_url) work too; nothing at all is refused.
-        let inline = attach_file(session.path(), &json!({"name": "a.md", "data_url": "data:text/plain;base64,aGk="})).unwrap();
+        let inline = attach_file(
+            session.path(),
+            &json!({"name": "a.md", "data_url": "data:text/plain;base64,aGk="}),
+        )
+        .unwrap();
         assert_eq!(inline["ref_text"], "@file:.hermes/attachments/a.md");
         assert!(attach_file(session.path(), &json!({"name": "x"})).is_err());
     }

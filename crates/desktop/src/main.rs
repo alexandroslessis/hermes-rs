@@ -55,7 +55,8 @@ fn webapp_dist() -> PathBuf {
         .and_then(|exe| exe.parent().map(|dir| dir.join("webapp")))
         .filter(|dir| dir.join("index.html").is_file());
     installed.unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/hermes-src/apps/desktop/dist-webapp")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/hermes-src/apps/desktop/dist-webapp")
     })
 }
 
@@ -216,7 +217,10 @@ fn set_window_icons(window: &tauri::WebviewWindow) {
     unsafe {
         let dpi = GetDpiForWindow(hwnd);
         let module = GetModuleHandleW(std::ptr::null());
-        let kinds = [(ICON_BIG, SM_CXICON, SM_CYICON), (ICON_SMALL, SM_CXSMICON, SM_CYSMICON)];
+        let kinds = [
+            (ICON_BIG, SM_CXICON, SM_CYICON),
+            (ICON_SMALL, SM_CXSMICON, SM_CYSMICON),
+        ];
         for (slot, (kind, metric_x, metric_y)) in kinds.into_iter().enumerate() {
             let (width, height) = (
                 GetSystemMetricsForDpi(metric_x, dpi),

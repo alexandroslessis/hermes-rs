@@ -21,8 +21,8 @@ use crate::chat::{ChatEvent, ChatView};
 use crate::memory_view::MemoryView;
 use crate::notification::{AgentNotification, AgentNotificationEvent};
 use crate::palette::{Palette, PaletteItem, PalettePicked};
-use crate::review_pane::{ReviewEvent, ReviewPane};
 use crate::project_dialog::{ProjectDialog, ProjectDialogEvent};
+use crate::review_pane::{ReviewEvent, ReviewPane};
 use crate::settings::SettingsView;
 use crate::sidebar::{ProjectGroup, folder_name, group_sessions, project_root};
 use crate::skills_view::SkillsView;
@@ -148,12 +148,13 @@ impl Workspace {
         let memory = cx.new(|cx| MemoryView::new(window, cx));
         let skills = cx.new(SkillsView::new);
         let review = cx.new(|_| ReviewPane::new());
-        let review_subscription = cx.subscribe(&review, |this: &mut Self, _, event, cx| match event {
-            ReviewEvent::Close => {
-                this.review_open = false;
-                cx.notify();
-            }
-        });
+        let review_subscription =
+            cx.subscribe(&review, |this: &mut Self, _, event, cx| match event {
+                ReviewEvent::Close => {
+                    this.review_open = false;
+                    cx.notify();
+                }
+            });
         let search = cx.new(|cx| TextArea::new("Search sessions…", cx).single_line());
         let search_subscription = cx.subscribe(&search, |this: &mut Self, _, event, cx| {
             if matches!(event, TextAreaEvent::Changed) {
@@ -848,14 +849,18 @@ impl Workspace {
         });
         let in_chat = matches!(self.main, Main::Chat) && self.active.is_some();
         if in_chat {
-            actions.extend(crate::chat::BUILTIN_COMMANDS.iter().map(|(name, description)| {
-                PaletteItem::Command {
-                    name,
-                    description,
-                    // These need their arguments typed.
-                    run: !matches!(*name, "learn" | "steer" | "queue"),
-                }
-            }));
+            actions.extend(
+                crate::chat::BUILTIN_COMMANDS
+                    .iter()
+                    .map(|(name, description)| {
+                        PaletteItem::Command {
+                            name,
+                            description,
+                            // These need their arguments typed.
+                            run: !matches!(*name, "learn" | "steer" | "queue"),
+                        }
+                    }),
+            );
         }
         self.open_palette("Execute a command…", actions, window, cx);
     }
@@ -898,12 +903,16 @@ impl Workspace {
         let previous = window.focused(cx);
         let palette = cx.new(|cx| Palette::new(placeholder, items, window, cx));
         let subscriptions = vec![
-            cx.subscribe_in(&palette, window, |this, _, PalettePicked(item), window, cx| {
-                this.palette_picked(item, window, cx)
-            }),
-            cx.subscribe_in(&palette, window, |this, _, _: &gpui::DismissEvent, window, cx| {
-                this.close_palette(window, cx)
-            }),
+            cx.subscribe_in(
+                &palette,
+                window,
+                |this, _, PalettePicked(item), window, cx| this.palette_picked(item, window, cx),
+            ),
+            cx.subscribe_in(
+                &palette,
+                window,
+                |this, _, _: &gpui::DismissEvent, window, cx| this.close_palette(window, cx),
+            ),
         ];
         palette.focus_handle(cx).focus(window, cx);
         self.palette = Some((palette, previous, subscriptions));
@@ -1434,10 +1443,12 @@ impl Workspace {
                         .hover_background(button_hover)
                         .active_background(button_active)
                         .tooltip(Tooltip::text("Rename session"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.start_rename(rename_id.clone(), window, cx)
-                        })),
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.start_rename(rename_id.clone(), window, cx)
+                            },
+                        )),
                     )
                     .child(
                         IconButton::new(
@@ -1451,10 +1462,12 @@ impl Workspace {
                         .hover_background(button_hover)
                         .active_background(button_active)
                         .tooltip(Tooltip::text("Delete session"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.delete_session(delete_id.clone(), window, cx)
-                        })),
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.delete_session(delete_id.clone(), window, cx)
+                            },
+                        )),
                     ),
             )
         })

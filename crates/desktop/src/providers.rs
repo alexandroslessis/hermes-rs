@@ -117,8 +117,14 @@ pub fn save_default(data_dir: &Path, provider: &str, model: &str) -> anyhow::Res
         .ok_or_else(|| anyhow::anyhow!("config.json isn't an object"))?;
     // The endpoint that stops being the default keeps its model (else it lists none, and its
     // edit form opens without one).
-    let previous = object.get("provider").and_then(|p| p.as_str()).map(str::to_string);
-    let previous_model = object.get("model").and_then(|m| m.as_str()).map(str::to_string);
+    let previous = object
+        .get("provider")
+        .and_then(|p| p.as_str())
+        .map(str::to_string);
+    let previous_model = object
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(str::to_string);
     if let (Some(previous), Some(previous_model)) = (previous, previous_model)
         && previous != provider
         && !previous_model.is_empty()

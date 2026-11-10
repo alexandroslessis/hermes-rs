@@ -679,11 +679,16 @@ impl Checkpoints {
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
         {
-            return Err(format!("File path must be relative to the project: {file:?}"));
+            return Err(format!(
+                "File path must be relative to the project: {file:?}"
+            ));
         }
         let _guard = self.lock.lock();
-        self.take(&canonical_dir, &format!("pre-revert snapshot (removing {file})"))
-            .ok();
+        self.take(
+            &canonical_dir,
+            &format!("pre-revert snapshot (removing {file})"),
+        )
+        .ok();
         std::fs::remove_file(canonical_dir.join(path)).map_err(|e| format!("{file}: {e}"))
     }
 

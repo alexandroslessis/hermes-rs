@@ -2,8 +2,8 @@
 //! bundled highlight queries. Capture names (`keyword`, `string.special`, …) map to the active
 //! theme's syntax colors through Zed's `SyntaxTheme`, so code looks the way it does in Zed.
 
-use std::ops::Range;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use markdown::language::{HighlightId, Highlighter, Language, LanguageRegistry};

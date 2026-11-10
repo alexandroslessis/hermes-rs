@@ -136,7 +136,10 @@ async fn window_control(
     let result = match action {
         // The text size (patches/0010-native-zoom.patch): WebView2's own zoom, as Electron's,
         // so the page lays out at the new size and its popovers measure right.
-        "zoom" => match request["factor"].as_f64().filter(|f| (0.5..=2.0).contains(f)) {
+        "zoom" => match request["factor"]
+            .as_f64()
+            .filter(|f| (0.5..=2.0).contains(f))
+        {
             Some(factor) => window.set_zoom(factor),
             None => return StatusCode::BAD_REQUEST.into_response(),
         },
@@ -210,7 +213,10 @@ async fn file_bytes(State(state): State<Arc<ServerState>>, request: Request) -> 
     if let Some(ticket) = param("ticket")
         && !state.gateway.ticket_allows(&ticket, &file)
     {
-        return json_error(403, serde_json::json!({"detail": "The file ticket doesn't match."}));
+        return json_error(
+            403,
+            serde_json::json!({"detail": "The file ticket doesn't match."}),
+        );
     }
     let checked = file.clone();
     match tokio::task::spawn_blocking(move || crate::files::readable(&checked)).await {
@@ -235,7 +241,10 @@ async fn file_bytes(State(state): State<Arc<ServerState>>, request: Request) -> 
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    let mut response = match tower_http::services::ServeFile::new(&file).oneshot(request).await {
+    let mut response = match tower_http::services::ServeFile::new(&file)
+        .oneshot(request)
+        .await
+    {
         Ok(response) => response.map(Body::new),
         Err(error) => return json_error(500, serde_json::json!({"detail": error.to_string()})),
     };
@@ -253,7 +262,10 @@ async fn file_bytes(State(state): State<Arc<ServerState>>, request: Request) -> 
     if let Ok(value) = header::HeaderValue::from_str(&disposition) {
         headers.insert(header::CONTENT_DISPOSITION, value);
     }
-    headers.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
     response
 }
 
@@ -276,7 +288,8 @@ async fn host_terminal(
     request: Request,
 ) -> Response {
     let query = request.uri().query().map(str::to_string);
-    let param = |name: &str| crate::rest::query_param(query.as_deref(), name).filter(|v| !v.is_empty());
+    let param =
+        |name: &str| crate::rest::query_param(query.as_deref(), name).filter(|v| !v.is_empty());
     let (attach, action, cwd) = (param("attach"), param("action"), param("cwd"));
     let cols = crate::terminal::dimension(param("cols").as_deref(), 80, 1000);
     let rows = crate::terminal::dimension(param("rows").as_deref(), 24, 500);
@@ -305,7 +318,10 @@ async fn file_upload(
                 .await
                 .unwrap_or((500, serde_json::json!({"detail": "The upload failed."})))
             }
-            Err(e) => (413, serde_json::json!({"detail": format!("The upload failed: {e}")})),
+            Err(e) => (
+                413,
+                serde_json::json!({"detail": format!("The upload failed: {e}")}),
+            ),
         };
         break;
     }

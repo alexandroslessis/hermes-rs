@@ -227,7 +227,10 @@ struct Relay {
 impl Relay {
     fn send(&self, kind: &'static str, extra: Value) {
         if let Some(emit) = &self.emit {
-            emit.emit(AgentEvent::Subagent { kind, payload: with(&self.base, extra) });
+            emit.emit(AgentEvent::Subagent {
+                kind,
+                payload: with(&self.base, extra),
+            });
         }
     }
 
@@ -259,7 +262,9 @@ impl Relay {
                             self.thinking.push_str(&t.thinking);
                         }
                         MessageContent::ToolRequest(request) => {
-                            let Ok(call) = &request.tool_call else { continue };
+                            let Ok(call) = &request.tool_call else {
+                                continue;
+                            };
                             self.flush();
                             let args = call.arguments.clone().unwrap_or_default();
                             let detail = tool_detail(&args);
@@ -276,7 +281,9 @@ impl Relay {
                                 ("read_file", Some(path)) if !self.files_read.contains(&path) => {
                                     self.files_read.push(path)
                                 }
-                                ("write_file" | "patch", Some(path)) if !self.files_written.contains(&path) => {
+                                ("write_file" | "patch", Some(path))
+                                    if !self.files_written.contains(&path) =>
+                                {
                                     self.files_written.push(path)
                                 }
                                 _ => {}
@@ -441,7 +448,13 @@ impl Delegator {
         request_id: &str,
         parent_emit: &Emitter,
     ) -> Value {
-        let ChildTask { index, task_count, goal, context, delegation_id } = task;
+        let ChildTask {
+            index,
+            task_count,
+            goal,
+            context,
+            delegation_id,
+        } = task;
         let started = Instant::now();
         let subagent_id = format!(
             "sa-{index}-{}",
@@ -564,7 +577,10 @@ impl Delegator {
                 tool_names: tool_names.clone(),
             })),
             Step::Operation(Arc::new(ToolOperation::new().with_provider(provider))),
-            Step::Operation(Arc::new(ops::UnhandledToolCalls { tool_names, disabled: self.disabled.clone() })),
+            Step::Operation(Arc::new(ops::UnhandledToolCalls {
+                tool_names,
+                disabled: self.disabled.clone(),
+            })),
             // A steer from the page's subagent row, after the child's next tool results.
             Step::Operation(Arc::new(ops::DeliverSteer {
                 state: state.clone(),

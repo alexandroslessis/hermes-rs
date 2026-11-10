@@ -13,9 +13,40 @@ use std::path::{Path, PathBuf};
 
 /// Extensions Windows runs instead of opening (`PATHEXT` and the other shell-executable types).
 const RUNS: [&str; 34] = [
-    "exe", "com", "bat", "cmd", "ps1", "psm1", "psd1", "ps1xml", "vbs", "vbe", "js", "jse", "wsf",
-    "wsh", "msi", "msp", "mst", "scr", "hta", "cpl", "lnk", "url", "reg", "jar", "pif", "appx",
-    "msix", "appxbundle", "application", "gadget", "inf", "scf", "sys", "dll",
+    "exe",
+    "com",
+    "bat",
+    "cmd",
+    "ps1",
+    "psm1",
+    "psd1",
+    "ps1xml",
+    "vbs",
+    "vbe",
+    "js",
+    "jse",
+    "wsf",
+    "wsh",
+    "msi",
+    "msp",
+    "mst",
+    "scr",
+    "hta",
+    "cpl",
+    "lnk",
+    "url",
+    "reg",
+    "jar",
+    "pif",
+    "appx",
+    "msix",
+    "appxbundle",
+    "application",
+    "gadget",
+    "inf",
+    "scf",
+    "sys",
+    "dll",
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -38,7 +69,11 @@ pub fn plan(link: &str) -> Result<Open, String> {
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| RUNS.contains(&e.to_ascii_lowercase().as_str()));
-    Ok(if runs { Open::Reveal(path) } else { Open::Launch(path) })
+    Ok(if runs {
+        Open::Reveal(path)
+    } else {
+        Open::Launch(path)
+    })
 }
 
 /// What to do for a "reveal in Explorer" ask (`patches/0016`): show it selected in
@@ -86,7 +121,10 @@ pub fn run(open: &Open) -> Result<(), String> {
         Open::Launch(path) => command.arg(native(path)),
         Open::Reveal(path) => command.arg(format!("/select,{}", native(path))),
     };
-    command.spawn().map(drop).map_err(|e| format!("Couldn't start Explorer: {e}"))
+    command
+        .spawn()
+        .map(drop)
+        .map_err(|e| format!("Couldn't start Explorer: {e}"))
 }
 
 #[cfg(test)]
@@ -95,7 +133,13 @@ mod tests {
     use std::path::Path;
 
     fn link_to(path: &Path) -> String {
-        format!("file:///{}", path.display().to_string().replace('\\', "/").replace(' ', "%20"))
+        format!(
+            "file:///{}",
+            path.display()
+                .to_string()
+                .replace('\\', "/")
+                .replace(' ', "%20")
+        )
     }
 
     #[test]
@@ -108,7 +152,10 @@ mod tests {
         assert_eq!(plan(&link_to(&doc)), Ok(Open::Launch(doc.clone())));
         assert_eq!(plan(&link_to(&script)), Ok(Open::Reveal(script.clone())));
         assert_eq!(plan(&doc.display().to_string()), Ok(Open::Launch(doc)));
-        assert_eq!(plan(&link_to(dir.path())), Ok(Open::Launch(dir.path().to_path_buf())));
+        assert_eq!(
+            plan(&link_to(dir.path())),
+            Ok(Open::Launch(dir.path().to_path_buf()))
+        );
     }
 
     #[test]
@@ -121,9 +168,15 @@ mod tests {
 
     #[test]
     fn link_forms() {
-        assert_eq!(file_path("file:///C:/a%20b/c.md"), Some(PathBuf::from(r"C:\a b\c.md")));
+        assert_eq!(
+            file_path("file:///C:/a%20b/c.md"),
+            Some(PathBuf::from(r"C:\a b\c.md"))
+        );
         assert_eq!(file_path("FILE://C:/x"), Some(PathBuf::from(r"C:\x")));
-        assert_eq!(file_path("file://localhost/C:/x"), Some(PathBuf::from(r"C:\x")));
+        assert_eq!(
+            file_path("file://localhost/C:/x"),
+            Some(PathBuf::from(r"C:\x"))
+        );
         assert_eq!(file_path(r"C:\x\y.txt"), Some(PathBuf::from(r"C:\x\y.txt")));
     }
 
@@ -133,7 +186,10 @@ mod tests {
         // The page's tree paths (`/api/fs/list`'s shape): forward slashes survive the
         // plan, and explorer falls back to Documents for one with a space.
         assert_eq!(native(Path::new("C:/a b/c.md")), r"C:\a b\c.md");
-        assert_eq!(native(Path::new("C:/Users/x/report.md")), r"C:\Users\x\report.md");
+        assert_eq!(
+            native(Path::new("C:/Users/x/report.md")),
+            r"C:\Users\x\report.md"
+        );
     }
 
     #[test]

@@ -207,7 +207,10 @@ async fn review(job: ReviewJob) -> Result<Vec<String>> {
             tool_names: tool_names.clone(),
         })),
         Step::Operation(Arc::new(ToolOperation::new().with_provider(tools))),
-        Step::Operation(Arc::new(ops::UnhandledToolCalls { tool_names, disabled: Default::default() })),
+        Step::Operation(Arc::new(ops::UnhandledToolCalls {
+            tool_names,
+            disabled: Default::default(),
+        })),
         Step::Operation(Arc::new(ops::LengthContinuation {
             state: state.clone(),
         })),

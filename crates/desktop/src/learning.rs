@@ -100,15 +100,21 @@ fn learned_skills(skills: &SkillStore) -> Vec<Skill> {
         .filter(|entry| !entry.external)
         .filter_map(|entry| {
             let record = skills.record(&entry.name);
-            let learned = matches!(record.created_by.as_deref(), Some("agent" | "learn")) || record.uses > 0;
+            let learned =
+                matches!(record.created_by.as_deref(), Some("agent" | "learn")) || record.uses > 0;
             if !learned {
                 return None;
             }
             let text = std::fs::read_to_string(entry.skill_md()).unwrap_or_default();
-            let timestamp = [&record.last_used, &record.last_viewed, &record.last_patched, &record.created_at]
-                .into_iter()
-                .find_map(|t| epoch(t.as_deref()))
-                .or_else(|| modified(&entry.skill_md()));
+            let timestamp = [
+                &record.last_used,
+                &record.last_viewed,
+                &record.last_patched,
+                &record.created_at,
+            ]
+            .into_iter()
+            .find_map(|t| epoch(t.as_deref()))
+            .or_else(|| modified(&entry.skill_md()));
             Some(Skill {
                 category: entry.category.clone().unwrap_or_else(|| "general".into()),
                 timestamp,
@@ -172,7 +178,12 @@ fn memory_edges(cards: &[Card], skills: &[Skill]) -> Vec<(String, String)> {
             })
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
-        edges.extend(scored.into_iter().take(4).map(|(_, name)| (card_id(card, index), name.to_string())));
+        edges.extend(
+            scored
+                .into_iter()
+                .take(4)
+                .map(|(_, name)| (card_id(card, index), name.to_string())),
+        );
     }
     edges
 }
@@ -211,7 +222,10 @@ pub fn graph(skills: &SkillStore, memory: &MemoryStore) -> Value {
     }));
 
     // `density_stats`.
-    let linked: BTreeSet<&str> = links.iter().flat_map(|(a, b)| [a.as_str(), b.as_str()]).collect();
+    let linked: BTreeSet<&str> = links
+        .iter()
+        .flat_map(|(a, b)| [a.as_str(), b.as_str()])
+        .collect();
     let total = learned.len().max(1) as f64;
     let mut categories: Vec<(String, usize)> = Vec::new();
     for skill in &learned {
@@ -269,7 +283,9 @@ fn locate_memory(memory: &MemoryStore, id: &str) -> Result<(Target, String), Str
     }
     // An id from before fingerprints: its place in the combined list.
     let cards = memory_cards(memory);
-    let card = cards.get(index).ok_or_else(|| format!("memory index {index} out of range"))?;
+    let card = cards
+        .get(index)
+        .ok_or_else(|| format!("memory index {index} out of range"))?;
     if card.source != source {
         return Err("memory node id is stale — refresh the graph".into());
     }
@@ -280,7 +296,10 @@ type Answer = (u16, Value);
 
 fn failure(status: u16, message: impl Into<String>) -> Answer {
     let message = message.into();
-    (status, json!({"ok": false, "message": message, "detail": message}))
+    (
+        status,
+        json!({"ok": false, "message": message, "detail": message}),
+    )
 }
 
 /// `GET /api/learning/node?id=`: a node's content, for the edit form (`node_detail`).
@@ -313,7 +332,10 @@ fn memory_outcome(result: Value) -> Answer {
     if result["success"] == true {
         (200, json!({"ok": true, "message": result["message"]}))
     } else {
-        failure(400, result["error"].as_str().unwrap_or("memory write failed"))
+        failure(
+            400,
+            result["error"].as_str().unwrap_or("memory write failed"),
+        )
     }
 }
 
@@ -329,7 +351,10 @@ pub fn delete(skills: &SkillStore, memory: &MemoryStore, id: &str) -> Answer {
         return failure(400, format!("'{id}' is pinned — unpin it first"));
     }
     match skills.archive_by_user(id) {
-        Ok(()) => (200, json!({"ok": true, "message": format!("archived '{id}' — it can be restored from the skills archive")})),
+        Ok(()) => (
+            200,
+            json!({"ok": true, "message": format!("archived '{id}' — it can be restored from the skills archive")}),
+        ),
         Err(message) => failure(400, message),
     }
 }
@@ -353,7 +378,10 @@ pub fn edit(skills: &SkillStore, memory: &MemoryStore, id: &str, content: &str) 
         ..Default::default()
     });
     if result["success"] == true {
-        (200, json!({"ok": true, "message": format!("updated '{id}'")}))
+        (
+            200,
+            json!({"ok": true, "message": format!("updated '{id}'")}),
+        )
     } else {
         failure(400, result["error"].as_str().unwrap_or("edit failed"))
     }
@@ -386,14 +414,24 @@ mod tests {
     #[test]
     fn memories_are_cards_and_nodes_and_edit_by_their_text() {
         let (_dir, skills, memory) = stores();
-        remember(&memory, Target::Memory, &["# Build\nRun cargo build in the repo root.", "Ports: 47731 for the app."]);
+        remember(
+            &memory,
+            Target::Memory,
+            &[
+                "# Build\nRun cargo build in the repo root.",
+                "Ports: 47731 for the app.",
+            ],
+        );
         remember(&memory, Target::User, &["The user prefers short answers."]);
         let graph = graph(&skills, &memory);
         let nodes = graph["nodes"].as_array().unwrap();
         assert_eq!(nodes.len(), 3);
         assert_eq!(nodes[0]["label"], "Build");
         assert_eq!(nodes[2]["memorySource"], "profile");
-        assert_eq!(graph["clusters"], json!([{"category": "memory", "count": 3}]));
+        assert_eq!(
+            graph["clusters"],
+            json!([{"category": "memory", "count": 3}])
+        );
         let second = nodes[1]["id"].as_str().unwrap().to_string();
         assert!(second.starts_with("memory:memory:1:"));
 
@@ -403,9 +441,17 @@ mod tests {
 
         // An entry removed before this one shifts it; its id still names it.
         remember(&memory, Target::Memory, &["Ports: 47731 for the app."]);
-        let (status, edited) = edit(&skills, &memory, &second, "Ports: 47731 (app), 47810 (perf).");
+        let (status, edited) = edit(
+            &skills,
+            &memory,
+            &second,
+            "Ports: 47731 (app), 47810 (perf).",
+        );
         assert_eq!(status, 200, "{edited}");
-        assert_eq!(memory.entries(Target::Memory), ["Ports: 47731 (app), 47810 (perf)."]);
+        assert_eq!(
+            memory.entries(Target::Memory),
+            ["Ports: 47731 (app), 47810 (perf)."]
+        );
         // The old text is gone: its id is stale now.
         assert_eq!(edit(&skills, &memory, &second, "x").0, 400);
         assert_eq!(edit(&skills, &memory, &second, "  ").0, 400);
@@ -429,7 +475,11 @@ mod tests {
     #[test]
     fn only_learned_skills_are_nodes_linked_to_memories() {
         let (_dir, skills, memory) = stores();
-        for (name, related) in [("release-steps", "[deploy-checks]"), ("deploy-checks", "[]"), ("unused", "[]")] {
+        for (name, related) in [
+            ("release-steps", "[deploy-checks]"),
+            ("deploy-checks", "[]"),
+            ("unused", "[]"),
+        ] {
             let dir = skills.root().join("devops").join(name);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
@@ -438,21 +488,52 @@ mod tests {
             )
             .unwrap();
         }
-        std::fs::write(skills.root().join(".usage.json"), r#"{"release-steps": {"uses": 2}, "deploy-checks": {"uses": 1}}"#).unwrap();
-        remember(&memory, Target::Memory, &["Always run the release-steps before tagging."]);
+        std::fs::write(
+            skills.root().join(".usage.json"),
+            r#"{"release-steps": {"uses": 2}, "deploy-checks": {"uses": 1}}"#,
+        )
+        .unwrap();
+        remember(
+            &memory,
+            Target::Memory,
+            &["Always run the release-steps before tagging."],
+        );
         let graph = graph(&skills, &memory);
-        let ids: Vec<&str> = graph["nodes"].as_array().unwrap().iter().map(|n| n["id"].as_str().unwrap()).collect();
+        let ids: Vec<&str> = graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap())
+            .collect();
         assert!(ids.contains(&"release-steps") && ids.contains(&"deploy-checks"));
-        assert!(!ids.contains(&"unused"), "never used, not made by the agent");
+        assert!(
+            !ids.contains(&"unused"),
+            "never used, not made by the agent"
+        );
         let edges = graph["edges"].as_array().unwrap();
         assert!(edges.contains(&json!({"source": "deploy-checks", "target": "release-steps"})));
-        assert!(edges.iter().any(|e| e["source"].as_str().unwrap().starts_with("memory:") && e["target"] == "release-steps"));
+        assert!(
+            edges
+                .iter()
+                .any(|e| e["source"].as_str().unwrap().starts_with("memory:")
+                    && e["target"] == "release-steps")
+        );
         assert_eq!(graph["stats"]["learned_skills"], 2);
 
         // Edit and archive by the user.
-        let (status, _) = edit(&skills, &memory, "deploy-checks", "---\nname: deploy-checks\ndescription: Checks a deploy.\n---\n# Deploy checks\n");
+        let (status, _) = edit(
+            &skills,
+            &memory,
+            "deploy-checks",
+            "---\nname: deploy-checks\ndescription: Checks a deploy.\n---\n# Deploy checks\n",
+        );
         assert_eq!(status, 200);
-        assert!(detail(&skills, &memory, "deploy-checks").1["content"].as_str().unwrap().contains("Checks a deploy."));
+        assert!(
+            detail(&skills, &memory, "deploy-checks").1["content"]
+                .as_str()
+                .unwrap()
+                .contains("Checks a deploy.")
+        );
         assert_eq!(delete(&skills, &memory, "deploy-checks").0, 200);
         assert!(skills.find_any("deploy-checks").is_none());
     }

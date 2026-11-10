@@ -51,14 +51,19 @@ impl Workspaces {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        Self { path, entries: Mutex::new(entries) }
+        Self {
+            path,
+            entries: Mutex::new(entries),
+        }
     }
 
     /// `(branch, repo root)` of the session's workspace, `None` for a session that never moved
     /// (its grouping follows the stored cwd alone).
     pub fn identity(&self, id: &str) -> Option<(Option<String>, Option<String>)> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries.get(id).map(|entry| (entry.branch.clone(), entry.repo_root.clone()))
+        entries
+            .get(id)
+            .map(|entry| (entry.branch.clone(), entry.repo_root.clone()))
     }
 
     fn set(&self, id: &str, branch: Option<String>, repo_root: Option<String>) {
@@ -93,7 +98,10 @@ fn probe_branch(cwd: &Path) -> Option<String> {
 /// what the page's cache holds (native `\` on Windows made the main checkout look like a
 /// worktree).
 fn probe_repo_root(cwd: &Path) -> Option<String> {
-    let gitdir = git_line(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    let gitdir = git_line(
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
     if !gitdir.is_empty() {
         let gitdir = PathBuf::from(&gitdir);
         if gitdir.file_name().is_some_and(|name| name == ".git") {
@@ -282,7 +290,13 @@ mod tests {
         let name = worktree.path().join("linked");
         git(
             main_dir.path(),
-            &["worktree", "add", &name.display().to_string(), "-b", "linked"],
+            &[
+                "worktree",
+                "add",
+                &name.display().to_string(),
+                "-b",
+                "linked",
+            ],
         );
 
         let branch = probe_branch(&name);

@@ -15,11 +15,26 @@ use serde_json::{Value, json};
 /// (`coding_command`), as `hermes_cli/commands.py` describes them, and `/import-hermes`
 /// (`Gateway::builtin_command`).
 const CODING_COMMANDS: [(&str, &str); 5] = [
-    ("plan", "Write a markdown implementation plan to .hermes/plans/ without executing anything"),
-    ("init", "Generate or update AGENTS.md project instructions from a repo scan"),
-    ("review", "Spawn an independent subagent to review the work just discussed (PR, code, docs)"),
-    ("learn", "Learn a reusable skill from anything you describe (dirs, URLs, this chat, notes)"),
-    ("import-hermes", "Import every session from the original Hermes on this computer"),
+    (
+        "plan",
+        "Write a markdown implementation plan to .hermes/plans/ without executing anything",
+    ),
+    (
+        "init",
+        "Generate or update AGENTS.md project instructions from a repo scan",
+    ),
+    (
+        "review",
+        "Spawn an independent subagent to review the work just discussed (PR, code, docs)",
+    ),
+    (
+        "learn",
+        "Learn a reusable skill from anything you describe (dirs, URLs, this chat, notes)",
+    ),
+    (
+        "import-hermes",
+        "Import every session from the original Hermes on this computer",
+    ),
 ];
 
 /// A command the `/` menu offers: `(name, description, origin)`: the coding commands, then the
@@ -194,11 +209,22 @@ mod tests {
         assert_eq!(typed_command(message).as_deref(), Some("/plan add a cache"));
 
         let init = coding_command("/init", "", "C:/r", Some("# Mine")).unwrap();
-        assert!(init["message"].as_str().unwrap().contains("MERGE DISCIPLINE"));
-        assert_eq!(typed_command(init["message"].as_str().unwrap()).as_deref(), Some("/init"));
+        assert!(
+            init["message"]
+                .as_str()
+                .unwrap()
+                .contains("MERGE DISCIPLINE")
+        );
+        assert_eq!(
+            typed_command(init["message"].as_str().unwrap()).as_deref(),
+            Some("/init")
+        );
 
         let learn = coding_command("learn", "the build steps", "", None).unwrap();
-        assert_eq!(typed_command(learn["message"].as_str().unwrap()).as_deref(), Some("/learn the build steps"));
+        assert_eq!(
+            typed_command(learn["message"].as_str().unwrap()).as_deref(),
+            Some("/learn the build steps")
+        );
 
         let review = coding_command("review", "edge cases", "", None).unwrap();
         assert_eq!(review["message"], "/review edge cases");
@@ -208,7 +234,10 @@ mod tests {
     #[test]
     fn review_messages_are_recognised() {
         assert_eq!(review_instructions("/review"), Some(""));
-        assert_eq!(review_instructions("/review  look at tests "), Some("look at tests"));
+        assert_eq!(
+            review_instructions("/review  look at tests "),
+            Some("look at tests")
+        );
         assert_eq!(review_instructions("/reviewer x"), None);
         assert_eq!(review_instructions("please /review"), None);
     }
@@ -259,7 +288,10 @@ mod tests {
         // A skill named like a command (`review`) yields to it.
         assert_eq!(catalog(&store)["skill_count"], 2);
         assert_eq!(catalog(&store)["pairs"][0][0], "/plan");
-        let reviews = complete(&store, "/review")["items"].as_array().unwrap().len();
+        let reviews = complete(&store, "/review")["items"]
+            .as_array()
+            .unwrap()
+            .len();
         assert_eq!(reviews, 1);
         let _ = std::fs::remove_dir_all(root);
     }

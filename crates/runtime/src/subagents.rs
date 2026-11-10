@@ -157,7 +157,9 @@ impl Subagents {
         match live.get(subagent_id).filter(|c| c.session_id == session_id) {
             Some(child) => json!({"subagent_id": subagent_id, "available": true,
                                   "text": child.tail, "truncated": child.tail_truncated}),
-            None => json!({"subagent_id": subagent_id, "available": false, "text": "", "truncated": false}),
+            None => {
+                json!({"subagent_id": subagent_id, "available": false, "text": "", "truncated": false})
+            }
         }
     }
 
@@ -227,12 +229,19 @@ mod tests {
 
         registry.append_tail("sa-0", "hello");
         assert_eq!(registry.tail("s1", "sa-0")["text"], "hello");
-        assert_eq!(registry.tail("s2", "sa-0")["available"], false, "another session's child");
+        assert_eq!(
+            registry.tail("s2", "sa-0")["available"],
+            false,
+            "another session's child"
+        );
 
         assert!(registry.steer("s1", "sa-0", "focus on tests"));
         assert!(registry.steer("s1", "sa-0", "and docs"));
         let state = registry.live.lock().get("sa-0").unwrap().state.clone();
-        assert_eq!(state.lock().pending_steer.as_deref(), Some("focus on tests\n\nand docs"));
+        assert_eq!(
+            state.lock().pending_steer.as_deref(),
+            Some("focus on tests\n\nand docs")
+        );
 
         assert!(registry.interrupt("s1", "sa-0"));
         assert_eq!(registry.list("s1")[0]["status"], "interrupted");

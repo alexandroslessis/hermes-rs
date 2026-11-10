@@ -20,8 +20,8 @@ use hermes_agent::operation::Emitter;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio_util::sync::CancellationToken;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio_util::sync::CancellationToken;
 
 use crate::job::Job;
 use crate::{SessionTools, ToolOutput, display_path, parse_args};
@@ -382,16 +382,13 @@ impl ShellSession {
                 }
             }
         };
-        let (timed_out, interrupted) = match tokio::time::timeout(
-            timeout,
-            async {
-                tokio::select! {
-                    biased;
-                    _ = read => false,
-                    _ = stopped(cancel) => true,
-                }
-            },
-        )
+        let (timed_out, interrupted) = match tokio::time::timeout(timeout, async {
+            tokio::select! {
+                biased;
+                _ = read => false,
+                _ = stopped(cancel) => true,
+            }
+        })
         .await
         {
             Ok(interrupted) => (false, interrupted),
@@ -523,16 +520,13 @@ impl ShellSession {
                 }
             }
         };
-        let (timed_out, interrupted) = match tokio::time::timeout(
-            timeout,
-            async {
-                tokio::select! {
-                    biased;
-                    _ = read => false,
-                    _ = stopped(cancel) => true,
-                }
-            },
-        )
+        let (timed_out, interrupted) = match tokio::time::timeout(timeout, async {
+            tokio::select! {
+                biased;
+                _ = read => false,
+                _ = stopped(cancel) => true,
+            }
+        })
         .await
         {
             Ok(interrupted) => (false, interrupted),
@@ -633,7 +627,11 @@ struct TerminalArgs {
     notify: bool,
 }
 
-pub async fn terminal(tools: &SessionTools, args: Value, live: Option<(&str, &Emitter)>) -> ToolOutput {
+pub async fn terminal(
+    tools: &SessionTools,
+    args: Value,
+    live: Option<(&str, &Emitter)>,
+) -> ToolOutput {
     let args: TerminalArgs = match parse_args("terminal", args) {
         Ok(args) => args,
         Err(error) => return error,
@@ -702,7 +700,10 @@ pub async fn terminal(tools: &SessionTools, args: Value, live: Option<(&str, &Em
         }
         relay.bytes += chunk.len() as u64;
         let now = Instant::now();
-        if relay.last.is_some_and(|last| now.duration_since(last) < RELAY_INTERVAL) {
+        if relay
+            .last
+            .is_some_and(|last| now.duration_since(last) < RELAY_INTERVAL)
+        {
             return;
         }
         relay.last = Some(now);
@@ -803,7 +804,12 @@ mod tests {
         if !bash_available(&tools) {
             return;
         }
-        let out = terminal(&tools, json!({"command": "echo out; echo err >&2; false"}), None).await;
+        let out = terminal(
+            &tools,
+            json!({"command": "echo out; echo err >&2; false"}),
+            None,
+        )
+        .await;
         assert_eq!(out.value["exit_code"], 1);
         let text = out.value["output"].as_str().unwrap();
         assert!(text.contains("out") && text.contains("err"), "{text}");
@@ -818,7 +824,12 @@ mod tests {
         }
         std::fs::create_dir(dir.path().join("other")).unwrap();
         let before = tools.cwd();
-        let out = terminal(&tools, json!({"command": "pwd -W", "workdir": "other"}), None).await;
+        let out = terminal(
+            &tools,
+            json!({"command": "pwd -W", "workdir": "other"}),
+            None,
+        )
+        .await;
         assert!(out.value["output"].as_str().unwrap().ends_with("/other"));
         assert_eq!(tools.cwd(), before);
         tools.shutdown().await;
@@ -885,8 +896,14 @@ mod tests {
         assert_eq!(result.exit_code, Some(0), "{:?}", result.output);
         let relayed = relayed.into_inner().unwrap();
         assert!(!relayed.is_empty(), "no live output was relayed");
-        assert!(relayed.iter().any(|line| line.contains("one")), "{relayed:?}");
-        assert!(relayed.iter().any(|line| line.contains("two")), "{relayed:?}");
+        assert!(
+            relayed.iter().any(|line| line.contains("one")),
+            "{relayed:?}"
+        );
+        assert!(
+            relayed.iter().any(|line| line.contains("two")),
+            "{relayed:?}"
+        );
         assert!(
             relayed.iter().all(|line| !line.contains("__HERMES_DONE_")),
             "{relayed:?}"

@@ -86,7 +86,9 @@ fn status_letter(tag: char, xy: &str) -> String {
     let mut codes = xy.chars();
     let (x, y) = (codes.next().unwrap_or('.'), codes.next().unwrap_or('.'));
     let code = if x != '.' { x } else { y };
-    (if code == '.' { 'M' } else { code }).to_ascii_uppercase().to_string()
+    (if code == '.' { 'M' } else { code })
+        .to_ascii_uppercase()
+        .to_string()
 }
 
 /// `git diff --numstat args` by path: `(added, removed)`, binary files 0 (`_numstat`).
@@ -104,7 +106,10 @@ fn numstat(cwd: &Path, args: &[&str]) -> Vec<(String, (u64, u64))> {
 }
 
 fn lookup(counts: &[(String, (u64, u64))], path: &str) -> (u64, u64) {
-    counts.iter().find(|(p, _)| p == path).map_or((0, 0), |(_, c)| *c)
+    counts
+        .iter()
+        .find(|(p, _)| p == path)
+        .map_or((0, 0), |(_, c)| *c)
 }
 
 /// The merge-base with the remote default branch, for "all branch changes" (`_branch_base`).
@@ -128,17 +133,28 @@ pub fn review_list(cwd: &Path, scope: &str, base_ref: Option<&str>) -> Value {
         return empty;
     }
     let (files, base) = if matches!(scope, "branch" | "lastTurn") {
-        let base = if scope == "branch" { branch_base(cwd) } else { base_ref.map(str::to_string) };
+        let base = if scope == "branch" {
+            branch_base(cwd)
+        } else {
+            base_ref.map(str::to_string)
+        };
         let Some(base) = base.filter(|b| !b.is_empty()) else {
             return empty;
         };
-        let range = if scope == "branch" { format!("{base}...HEAD") } else { base.clone() };
+        let range = if scope == "branch" {
+            format!("{base}...HEAD")
+        } else {
+            base.clone()
+        };
         let mut files: Vec<Value> = numstat(cwd, &[&range])
             .into_iter()
             .map(|(path, (a, r))| json!({"path": path, "added": a, "removed": r, "status": "M", "staged": false}))
             .collect();
         if scope == "lastTurn" {
-            let seen: Vec<String> = files.iter().filter_map(|f| f["path"].as_str().map(str::to_string)).collect();
+            let seen: Vec<String> = files
+                .iter()
+                .filter_map(|f| f["path"].as_str().map(str::to_string))
+                .collect();
             for (tag, _, path) in entries(&status_z(cwd).1) {
                 if tag == '?' && !seen.contains(&path) {
                     files.push(json!({"path": path, "added": 0, "removed": 0, "status": "?", "staged": false}));
@@ -167,7 +183,10 @@ pub fn review_list(cwd: &Path, scope: &str, base_ref: Option<&str>) -> Value {
     files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
     for file in &mut files {
         if file["status"] == "?" && file["added"] == 0 && file["removed"] == 0 {
-            file["added"] = json!(untracked_lines(cwd, file["path"].as_str().unwrap_or_default()));
+            file["added"] = json!(untracked_lines(
+                cwd,
+                file["path"].as_str().unwrap_or_default()
+            ));
         }
     }
     json!({"files": files, "base": base})
@@ -179,8 +198,17 @@ fn all_added(cwd: &Path, file: &Path) -> String {
         return String::new();
     }
     // Named relative to the repository folder, as git names tracked files.
-    let file = file.strip_prefix(cwd).unwrap_or(file).to_string_lossy().replace('\\', "/");
-    run("git", cwd, &["diff", "--no-index", "--", "/dev/null", &file]).1
+    let file = file
+        .strip_prefix(cwd)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    run(
+        "git",
+        cwd,
+        &["diff", "--no-index", "--", "/dev/null", &file],
+    )
+    .1
 }
 
 /// One file's diff, refusing a path that names a folder (`_single_file_diff`).
@@ -225,7 +253,13 @@ fn dunce_canonical(path: &Path) -> PathBuf {
 }
 
 /// `GET /api/git/review/diff` `?file=&scope=&base=&staged=`: a changed file's diff.
-pub fn review_diff(cwd: &Path, file: &Path, scope: &str, base_ref: Option<&str>, cached: bool) -> Outcome {
+pub fn review_diff(
+    cwd: &Path,
+    file: &Path,
+    scope: &str,
+    base_ref: Option<&str>,
+    cached: bool,
+) -> Outcome {
     if !cwd.is_dir() {
         return Ok(json!(""));
     }
@@ -241,7 +275,11 @@ pub fn review_diff(cwd: &Path, file: &Path, scope: &str, base_ref: Option<&str>,
         _ if cached => single_file_diff(cwd, &["--cached"], file)?,
         _ => {
             let worktree = single_file_diff(cwd, &[], file)?;
-            if worktree.trim().is_empty() { all_added(cwd, file) } else { worktree }
+            if worktree.trim().is_empty() {
+                all_added(cwd, file)
+            } else {
+                worktree
+            }
         }
     };
     Ok(json!(diff))
@@ -259,7 +297,11 @@ pub fn file_diff(cwd: &Path, file: &Path) -> Outcome {
     }
     let literal = format!(":(literal){}", file.display());
     let status = git_out(cwd, &["status", "--porcelain", "--", &literal]);
-    Ok(json!(if status.trim_start().starts_with("??") { all_added(cwd, file) } else { String::new() }))
+    Ok(json!(if status.trim_start().starts_with("??") {
+        all_added(cwd, file)
+    } else {
+        String::new()
+    }))
 }
 
 /// `POST /api/git/review/stage` `{file?}`: one file, or everything.
@@ -290,7 +332,12 @@ pub fn revert(cwd: &Path, file: Option<&str>) -> Outcome {
 }
 
 fn push_branch(cwd: &Path) -> Result<(), String> {
-    if !git_line(cwd, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).is_empty() {
+    if !git_line(
+        cwd,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .is_empty()
+    {
         return git_ok(cwd, &["push"]);
     }
     let branch = git_line(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]);
@@ -324,12 +371,20 @@ pub fn push(cwd: &Path) -> Outcome {
 /// `GET /api/git/review/commit-context`: the diff that will commit and the recent subjects, for
 /// drafting a message. Credential files are left out of the diff.
 pub fn commit_context(cwd: &Path) -> Value {
-    let (ok, raw) = if cwd.is_dir() { status_z(cwd) } else { (false, String::new()) };
+    let (ok, raw) = if cwd.is_dir() {
+        status_z(cwd)
+    } else {
+        (false, String::new())
+    };
     let repo = PathBuf::from(git_line(cwd, &["rev-parse", "--show-toplevel"]));
     if !ok || repo.as_os_str().is_empty() {
         return json!({"diff": "", "recent": ""});
     }
-    let base: &[&str] = if has_staged(&raw) { &["diff", "--cached"] } else { &["diff", "HEAD"] };
+    let base: &[&str] = if has_staged(&raw) {
+        &["diff", "--cached"]
+    } else {
+        &["diff", "HEAD"]
+    };
     let mut names_args = base.to_vec();
     names_args.extend(["--no-renames", "--name-only", "-z"]);
     let allowed: Vec<String> = git_out(&repo, &names_args)
@@ -365,7 +420,10 @@ pub fn commit_context(cwd: &Path) -> Value {
             diff.push_str(&format!("#   {path}\n"));
         }
         if untracked.len() > CONTEXT_UNTRACKED_MAX {
-            diff.push_str(&format!("#   ... {} more omitted\n", untracked.len() - CONTEXT_UNTRACKED_MAX));
+            diff.push_str(&format!(
+                "#   ... {} more omitted\n",
+                untracked.len() - CONTEXT_UNTRACKED_MAX
+            ));
         }
     }
     json!({"diff": diff, "recent": git_line(cwd, &["log", "-n", "10", "--pretty=format:%s"])})
@@ -375,7 +433,11 @@ pub fn commit_context(cwd: &Path) -> Value {
 
 fn gh_json(cwd: &Path, args: &[&str]) -> Option<Value> {
     let (ok, out, _) = run("gh", cwd, args);
-    if ok { serde_json::from_str(&out).ok() } else { None }
+    if ok {
+        serde_json::from_str(&out).ok()
+    } else {
+        None
+    }
 }
 
 /// `GET /api/git/gh-auth`: whether `gh` is installed and signed in.
@@ -409,17 +471,36 @@ pub fn pr_list(cwd: &Path, branches: &[String], numbers: &[u64]) -> Value {
             wanted.push(branch);
         }
     }
-    let numbers: Vec<u64> = numbers.iter().copied().filter(|n| *n > 0).take(300).collect();
+    let numbers: Vec<u64> = numbers
+        .iter()
+        .copied()
+        .filter(|n| *n > 0)
+        .take(300)
+        .collect();
     if !cwd.is_dir() || (wanted.is_empty() && numbers.is_empty()) {
         return not_ready;
     }
-    let (ok, out, _) = run("gh", cwd, &["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]);
+    let (ok, out, _) = run(
+        "gh",
+        cwd,
+        &[
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "-q",
+            ".nameWithOwner",
+        ],
+    );
     let Some((owner, name)) = out.trim().split_once('/').filter(|_| ok) else {
         return not_ready;
     };
     let quote = |s: &str| Value::String(s.to_string()).to_string();
     let mut prs = Vec::new();
-    let mut chunks: Vec<(Vec<&String>, Vec<u64>)> = wanted.chunks(50).map(|c| (c.to_vec(), Vec::new())).collect();
+    let mut chunks: Vec<(Vec<&String>, Vec<u64>)> = wanted
+        .chunks(50)
+        .map(|c| (c.to_vec(), Vec::new()))
+        .collect();
     chunks.extend(numbers.chunks(50).map(|c| (Vec::new(), c.to_vec())));
     for (branch_chunk, number_chunk) in chunks {
         let mut fields: Vec<String> = branch_chunk
@@ -432,7 +513,12 @@ pub fn pr_list(cwd: &Path, branches: &[String], numbers: &[u64]) -> Value {
                 )
             })
             .collect();
-        fields.extend(number_chunk.iter().enumerate().map(|(i, n)| format!("n{i}: pullRequest(number: {n}) {{ {PR_FIELDS} }}")));
+        fields.extend(
+            number_chunk
+                .iter()
+                .enumerate()
+                .map(|(i, n)| format!("n{i}: pullRequest(number: {n}) {{ {PR_FIELDS} }}")),
+        );
         let query = format!(
             "query={{ repository(owner: {}, name: {}) {{\n{}\n}} }}",
             quote(owner),
@@ -451,9 +537,12 @@ pub fn pr_list(cwd: &Path, branches: &[String], numbers: &[u64]) -> Value {
             let pr = if key.starts_with('n') {
                 Some(field.clone()).filter(|f| !f.is_null())
             } else {
-                field["nodes"]
-                    .as_array()
-                    .and_then(|nodes| nodes.iter().find(|n| n["isCrossRepository"] != true).cloned())
+                field["nodes"].as_array().and_then(|nodes| {
+                    nodes
+                        .iter()
+                        .find(|n| n["isCrossRepository"] != true)
+                        .cloned()
+                })
             };
             if let Some(pr) = pr.filter(|pr| pr["headRefName"].is_string()) {
                 prs.push(json!({
@@ -477,10 +566,19 @@ pub fn create_pr(cwd: &Path) -> Outcome {
     if !ok {
         let err = err.trim();
         let tail = &err[err.len().saturating_sub(GH_ERROR_TAIL)..];
-        let tail = if tail.is_empty() { "is gh installed and authenticated?" } else { tail };
+        let tail = if tail.is_empty() {
+            "is gh installed and authenticated?"
+        } else {
+            tail
+        };
         return Err(format!("gh pr create failed: {tail}"));
     }
-    let url = out.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or_default().trim();
+    let url = out
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
     Ok(json!({"url": url}))
 }
 
@@ -491,8 +589,10 @@ pub fn worktrees(cwd: &Path) -> Vec<Value> {
     let mut trees: Vec<Value> = Vec::new();
     for line in git_out(cwd, &["worktree", "list", "--porcelain"]).lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
-            trees.push(json!({"path": path.trim(), "branch": null, "isMain": trees.is_empty(),
-                              "detached": false, "locked": false}));
+            trees.push(
+                json!({"path": path.trim(), "branch": null, "isMain": trees.is_empty(),
+                              "detached": false, "locked": false}),
+            );
         } else if let Some(tree) = trees.last_mut() {
             if let Some(branch) = line.strip_prefix("branch ") {
                 tree["branch"] = json!(branch.trim().trim_start_matches("refs/heads/"));
@@ -552,7 +652,15 @@ fn unique_dir(base: PathBuf) -> PathBuf {
 
 /// The trunk to branch from: origin's default, `init.defaultBranch`, else main or master.
 fn trunk(cwd: &Path) -> String {
-    let origin = git_line(cwd, &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
+    let origin = git_line(
+        cwd,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    );
     if !origin.is_empty() {
         return origin.trim_start_matches("origin/").to_string();
     }
@@ -560,7 +668,11 @@ fn trunk(cwd: &Path) -> String {
     // a global `master` would hide a repository's `main`).
     let configured = git_line(cwd, &["config", "--get", "init.defaultBranch"]);
     if !configured.is_empty()
-        && git(cwd, &["show-ref", "--verify", &format!("refs/heads/{configured}")]).0
+        && git(
+            cwd,
+            &["show-ref", "--verify", &format!("refs/heads/{configured}")],
+        )
+        .0
     {
         return configured;
     }
@@ -581,8 +693,19 @@ fn ensure_repo(cwd: &Path) -> Result<(), String> {
         !git(cwd, &["rev-parse", "--verify", "--quiet", "HEAD"]).0
     };
     if needs_root {
-        git_ok(cwd, &["-c", "user.email=hermes@localhost", "-c", "user.name=Hermes",
-                      "commit", "--allow-empty", "-m", "Initial commit"])?;
+        git_ok(
+            cwd,
+            &[
+                "-c",
+                "user.email=hermes@localhost",
+                "-c",
+                "user.name=Hermes",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Initial commit",
+            ],
+        )?;
     }
     Ok(())
 }
@@ -602,24 +725,58 @@ pub fn worktree_add(cwd: &Path, options: &Value) -> Outcome {
         // "origin/feature" is a remote-tracking ref: check it out as a local branch tracking it.
         let remote = requested
             .split_once('/')
-            .filter(|_| git(&root, &["show-ref", "--verify", "--quiet", &format!("refs/remotes/{requested}")]).0)
+            .filter(|_| {
+                git(
+                    &root,
+                    &[
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        &format!("refs/remotes/{requested}"),
+                    ],
+                )
+                .0
+            })
             .map(|(remote, branch)| (remote.to_string(), branch.to_string()));
-        let local = remote.as_ref().map_or(requested.clone(), |(_, branch)| branch.clone());
+        let local = remote
+            .as_ref()
+            .map_or(requested.clone(), |(_, branch)| branch.clone());
         if remote.is_none() && local == trunk(&root) {
             git_ok(&root, &["switch", &local])?;
-            return Ok(json!({"path": root.display().to_string(), "branch": local, "repoRoot": root.display().to_string()}));
+            return Ok(
+                json!({"path": root.display().to_string(), "branch": local, "repoRoot": root.display().to_string()}),
+            );
         }
         let target = unique_dir(root.join(".worktrees").join(slugify(&local)));
         let target_text = target.display().to_string().replace('\\', "/");
         if let Some((remote, branch)) = &remote {
             let _ = run("git", &root, &["fetch", remote, branch]);
-            if !run("git", &root, &["worktree", "add", "--track", "-b", &local, &target_text, &requested]).0 {
-                git_ok(&root, &["worktree", "add", "-b", &local, &target_text, &requested])?;
+            if !run(
+                "git",
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "--track",
+                    "-b",
+                    &local,
+                    &target_text,
+                    &requested,
+                ],
+            )
+            .0
+            {
+                git_ok(
+                    &root,
+                    &["worktree", "add", "-b", &local, &target_text, &requested],
+                )?;
             }
         } else {
             git_ok(&root, &["worktree", "add", &target_text, &local])?;
         }
-        return Ok(json!({"path": target_text, "branch": local, "repoRoot": root.display().to_string()}));
+        return Ok(
+            json!({"path": target_text, "branch": local, "repoRoot": root.display().to_string()}),
+        );
     }
     let name = text("name");
     // (Unnamed: `work-<8 hex>`, as Hermes's `work-{os.urandom(4).hex()}`.)
@@ -650,7 +807,9 @@ pub fn worktree_add(cwd: &Path, options: &Value) -> Outcome {
     let (ok, _, err) = run("git", &root, &args);
     if !ok {
         if !err.to_lowercase().contains("already exists") {
-            return Err(Some(err.trim().to_string()).filter(|e| !e.is_empty()).unwrap_or("git worktree add failed".into()));
+            return Err(Some(err.trim().to_string())
+                .filter(|e| !e.is_empty())
+                .unwrap_or("git worktree add failed".into()));
         }
         git_ok(&root, &["worktree", "add", &target_text, &branch])?;
     }
@@ -718,8 +877,20 @@ pub fn base_branches(cwd: &Path) -> Vec<Value> {
     if names.is_empty() {
         return Vec::new();
     }
-    let origin = git_line(cwd, &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
-    let default = if origin.is_empty() { trunk(cwd) } else { origin };
+    let origin = git_line(
+        cwd,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    );
+    let default = if origin.is_empty() {
+        trunk(cwd)
+    } else {
+        origin
+    };
     names
         .into_iter()
         .map(|name| json!({"name": name, "isRemote": name.starts_with("origin/"), "isDefault": !default.is_empty() && name == default}))
@@ -743,13 +914,28 @@ pub fn route(method: &str, path: &str, query: Option<&str>, body: &[u8]) -> Opti
     let route = path.strip_prefix("/api/git/")?;
     let param = |name: &str| crate::rest::query_param(query, name).filter(|v| !v.is_empty());
     let body: Value = serde_json::from_slice(body).unwrap_or_default();
-    let field = |name: &str| body[name].as_str().filter(|v| !v.is_empty()).map(str::to_string);
-    let folder = PathBuf::from(if method == "GET" { param("path") } else { field("path") }.unwrap_or_default());
+    let field = |name: &str| {
+        body[name]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let folder = PathBuf::from(
+        if method == "GET" {
+            param("path")
+        } else {
+            field("path")
+        }
+        .unwrap_or_default(),
+    );
     // A file named by the page, against the repository folder.
-    let file = |name: Option<String>| crate::files::resolve(&name.unwrap_or_default(), Some(&folder));
+    let file =
+        |name: Option<String>| crate::files::resolve(&name.unwrap_or_default(), Some(&folder));
     let outcome: Outcome = match (method, route) {
         ("GET", "status") => Ok(crate::git::repo_status(&folder).unwrap_or(Value::Null)),
-        ("GET", "review/rev-parse") => Ok(json!({"sha": crate::git::rev_parse(&folder, param("ref").as_deref())})),
+        ("GET", "review/rev-parse") => {
+            Ok(json!({"sha": crate::git::rev_parse(&folder, param("ref").as_deref())}))
+        }
         ("GET", "gh-auth") => Ok(gh_auth()),
         ("GET", "worktrees") => Ok(json!({"worktrees": worktrees(&folder)})),
         ("GET", "branches") => Ok(json!({"branches": branches(&folder)})),
@@ -762,7 +948,10 @@ pub fn route(method: &str, path: &str, query: Option<&str>, body: &[u8]) -> Opti
         ("GET", "review/diff") => {
             let target = file(param("file"));
             if crate::files::is_sensitive(&target) {
-                return Some((403, json!({"detail": "That file holds credentials and isn't shown."})));
+                return Some((
+                    403,
+                    json!({"detail": "That file holds credentials and isn't shown."}),
+                ));
             }
             review_diff(
                 &folder,
@@ -776,7 +965,10 @@ pub fn route(method: &str, path: &str, query: Option<&str>, body: &[u8]) -> Opti
         ("GET", "file-diff") => {
             let target = file(param("file"));
             if crate::files::is_sensitive(&target) {
-                return Some((403, json!({"detail": "That file holds credentials and isn't shown."})));
+                return Some((
+                    403,
+                    json!({"detail": "That file holds credentials and isn't shown."}),
+                ));
             }
             file_diff(&folder, &target).map(|diff| json!({"diff": diff}))
         }
@@ -795,7 +987,11 @@ pub fn route(method: &str, path: &str, query: Option<&str>, body: &[u8]) -> Opti
         ("POST", "review/pr-list") => {
             let branches: Vec<String> = body["branches"]
                 .as_array()
-                .map(|b| b.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .map(|b| {
+                    b.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default();
             let numbers: Vec<u64> = body["numbers"]
                 .as_array()
@@ -853,8 +1049,17 @@ mod tests {
         let diff = review_diff(cwd, Path::new("a.txt"), "uncommitted", None, false).unwrap();
         assert!(diff.as_str().unwrap().contains("+two"), "{diff}");
         let added = review_diff(cwd, Path::new("new.txt"), "uncommitted", None, false).unwrap();
-        assert!(added.as_str().unwrap().contains("+y"), "untracked: an all-added diff: {added}");
-        assert!(file_diff(cwd, Path::new("a.txt")).unwrap().as_str().unwrap().contains("+two"));
+        assert!(
+            added.as_str().unwrap().contains("+y"),
+            "untracked: an all-added diff: {added}"
+        );
+        assert!(
+            file_diff(cwd, Path::new("a.txt"))
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("+two")
+        );
 
         stage(cwd, Some("a.txt")).unwrap();
         let list = review_list(cwd, "uncommitted", None);
@@ -862,7 +1067,10 @@ mod tests {
         let cached = review_diff(cwd, Path::new("a.txt"), "uncommitted", None, true).unwrap();
         assert!(cached.as_str().unwrap().contains("+two"));
         unstage(cwd, Some("a.txt")).unwrap();
-        assert_eq!(review_list(cwd, "uncommitted", None)["files"][0]["staged"], false);
+        assert_eq!(
+            review_list(cwd, "uncommitted", None)["files"][0]["staged"],
+            false
+        );
 
         let context = commit_context(cwd);
         assert!(context["diff"].as_str().unwrap().contains("+two"));
@@ -871,7 +1079,12 @@ mod tests {
 
         // Nothing staged: everything goes in.
         commit(cwd, "second", false).unwrap();
-        assert!(review_list(cwd, "uncommitted", None)["files"].as_array().unwrap().is_empty());
+        assert!(
+            review_list(cwd, "uncommitted", None)["files"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert!(commit(cwd, "  ", false).is_err());
     }
 
@@ -882,7 +1095,12 @@ mod tests {
         std::fs::write(cwd.join("a.txt"), "changed\n").unwrap();
         std::fs::write(cwd.join("stray.txt"), "x").unwrap();
         revert(cwd, None).unwrap();
-        assert_eq!(std::fs::read_to_string(cwd.join("a.txt")).unwrap().replace("\r\n", "\n"), "one\n");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "one\n"
+        );
         assert!(!cwd.join("stray.txt").exists());
     }
 
@@ -918,7 +1136,10 @@ mod tests {
         assert_eq!(worktrees(cwd).len(), 1);
 
         branch_switch(cwd, "feature").unwrap();
-        assert_eq!(git_line(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]), "feature");
+        assert_eq!(
+            git_line(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "feature"
+        );
         assert!(branch_switch(cwd, "  ").is_err());
     }
 
@@ -936,7 +1157,10 @@ mod tests {
     #[test]
     fn a_folder_that_is_not_a_repository_reads_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(review_list(dir.path(), "uncommitted", None)["files"], json!([]));
+        assert_eq!(
+            review_list(dir.path(), "uncommitted", None)["files"],
+            json!([])
+        );
         assert!(branches(dir.path()).is_empty());
         assert_eq!(commit_context(dir.path())["diff"], "");
     }

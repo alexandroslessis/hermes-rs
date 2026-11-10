@@ -226,7 +226,10 @@ impl AppState {
     /// automatic checks are on.
     pub fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
         use crate::update::{CHECK_INTERVAL_MS, UpdateStatus};
-        if matches!(self.update, UpdateStatus::Checking | UpdateStatus::Downloading(_)) {
+        if matches!(
+            self.update,
+            UpdateStatus::Checking | UpdateStatus::Downloading(_)
+        ) {
             return;
         }
         let now = chrono::Utc::now().timestamp_millis();

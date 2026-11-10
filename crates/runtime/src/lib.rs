@@ -143,11 +143,17 @@ impl hermes_tools::approval::ApprovalGuard for SmartGuard {
     async fn assess(&self, command: &str, description: &str) -> hermes_tools::approval::Verdict {
         use hermes_tools::approval::{self, Verdict};
         // One word, but a reasoning model needs room to think first when effort is on.
-        let thinking = self.effort.as_deref().is_some_and(|effort| effort != "none");
+        let thinking = self
+            .effort
+            .as_deref()
+            .is_some_and(|effort| effort != "none");
         let config = ModelConfig::new(&self.model)
             .with_max_tokens(Some(if thinking { 4096 } else { 64 }))
             .with_temperature(Some(0.0))
-            .with_merged_request_params(effort_request_params(&self.base_url, self.effort.as_deref().unwrap_or("none")));
+            .with_merged_request_params(effort_request_params(
+                &self.base_url,
+                self.effort.as_deref().unwrap_or("none"),
+            ));
         let request =
             [Message::user().with_text(approval::smart_user_prompt(command, description))];
         let reply = tokio::time::timeout(
@@ -242,7 +248,10 @@ pub async fn generate_title_with_effort(
         } else {
             titles::TITLE_MAX_TOKENS
         }))
-        .with_merged_request_params(effort_request_params(&provider.base_url, effort.unwrap_or("none")));
+        .with_merged_request_params(effort_request_params(
+            &provider.base_url,
+            effort.unwrap_or("none"),
+        ));
     let (reply, _) = llm
         .complete(
             &config,
@@ -801,8 +810,16 @@ impl Runtime {
         tool: &str,
         arguments: serde_json::Map<String, serde_json::Value>,
     ) -> Result<Turn> {
-        let call = rmcp::model::CallToolRequestParams::new(tool.to_string()).with_arguments(arguments);
-        self.begin_turn(session_id, provider, options, Some(text), Vec::new(), Some(call))
+        let call =
+            rmcp::model::CallToolRequestParams::new(tool.to_string()).with_arguments(arguments);
+        self.begin_turn(
+            session_id,
+            provider,
+            options,
+            Some(text),
+            Vec::new(),
+            Some(call),
+        )
     }
 
     /// [`Self::start_turn`] with images the user attached (raw file bytes, any common format).
@@ -944,7 +961,8 @@ impl Runtime {
                     // A scripted first step: the assistant's tool call, which the turn's tool
                     // step runs before any model call.
                     if let Some(call) = prelude {
-                        let id = format!("call_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+                        let id =
+                            format!("call_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
                         let request = Message::assistant()
                             .with_tool_request(id, Ok(call))
                             .with_generated_id_if_missing();
@@ -1077,7 +1095,10 @@ impl Runtime {
                     tool_names: tool_names.clone(),
                 })),
                 Step::Operation(Arc::new(ToolOperation::new().with_provider(tools))),
-                Step::Operation(Arc::new(ops::UnhandledToolCalls { tool_names, disabled: disabled.clone() })),
+                Step::Operation(Arc::new(ops::UnhandledToolCalls {
+                    tool_names,
+                    disabled: disabled.clone(),
+                })),
                 Step::Operation(Arc::new(ops::DeliverSteer {
                     state: state.clone(),
                 })),
@@ -1643,11 +1664,17 @@ impl Runtime {
                 Some("interrupted") => "error: stopped".to_string(),
                 _ => format!(
                     "error: {}",
-                    result["error"].as_str().unwrap_or("the background task failed")
+                    result["error"]
+                        .as_str()
+                        .unwrap_or("the background task failed")
                 ),
             }
         });
-        Ok(Background { task_id, events, done })
+        Ok(Background {
+            task_id,
+            events,
+            done,
+        })
     }
 
     /// Hermes's `/btw <question>`: a question about the conversation answered from a snapshot of
@@ -1695,12 +1722,21 @@ impl Runtime {
                     if !tools.is_empty() {
                         lines.push(Line::CalledTools(tools));
                     }
-                    lines.push(Line::Said { label: "ASSISTANT", text });
+                    lines.push(Line::Said {
+                        label: "ASSISTANT",
+                        text,
+                    });
                 }
                 rmcp::model::Role::User if !results.is_empty() => {
-                    lines.push(Line::Said { label: "TOOL RESULT", text: results.join("\n") });
+                    lines.push(Line::Said {
+                        label: "TOOL RESULT",
+                        text: results.join("\n"),
+                    });
                 }
-                rmcp::model::Role::User => lines.push(Line::Said { label: "USER", text }),
+                rmcp::model::Role::User => lines.push(Line::Said {
+                    label: "USER",
+                    text,
+                }),
             }
         }
         let llm = provider.provider()?;
@@ -1709,7 +1745,10 @@ impl Runtime {
             .complete(
                 &config,
                 side::INSTRUCTIONS,
-                &[Message::user().with_text(side::user_input(&side::transcript(&lines), question))],
+                &[
+                    Message::user()
+                        .with_text(side::user_input(&side::transcript(&lines), question)),
+                ],
                 &[],
             )
             .await

@@ -65,7 +65,10 @@ impl Archive {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        Self { path, state: Mutex::new(state) }
+        Self {
+            path,
+            state: Mutex::new(state),
+        }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -91,7 +94,16 @@ impl Archive {
     pub fn set(&self, id: &str, archived: bool, now: i64) -> bool {
         let mut state = self.state();
         let changed = if archived {
-            state.sessions.insert(id.to_string(), Entry { at: now, auto: false }).is_none()
+            state
+                .sessions
+                .insert(
+                    id.to_string(),
+                    Entry {
+                        at: now,
+                        auto: false,
+                    },
+                )
+                .is_none()
         } else {
             state.sessions.remove(id).is_some()
         };
@@ -125,7 +137,11 @@ impl Archive {
     /// once per [`SWEEP_INTERVAL_MS`]. Returns the ids it archived.
     pub fn sweep(&self, candidates: &[Candidate<'_>], idle_days: f64, now: i64) -> Vec<String> {
         let mut state = self.state();
-        if state.last_sweep.is_some_and(|last| now - last < SWEEP_INTERVAL_MS) || idle_days < 0.0 {
+        if state
+            .last_sweep
+            .is_some_and(|last| now - last < SWEEP_INTERVAL_MS)
+            || idle_days < 0.0
+        {
             return Vec::new();
         }
         let cutoff = now - (idle_days * 86_400_000.0) as i64;
@@ -138,7 +154,13 @@ impl Archive {
             {
                 continue;
             }
-            state.sessions.insert(candidate.id.to_string(), Entry { at: now, auto: true });
+            state.sessions.insert(
+                candidate.id.to_string(),
+                Entry {
+                    at: now,
+                    auto: true,
+                },
+            );
             archived.push(candidate.id.to_string());
         }
         // Recorded even when nothing went, so the sweep doesn't repeat until the interval passes.
@@ -182,7 +204,12 @@ mod tests {
     const DAY: i64 = 86_400_000;
 
     fn candidate(id: &str, last_active: i64) -> Candidate<'_> {
-        Candidate { id, last_active, pinned: false, running: false }
+        Candidate {
+            id,
+            last_active,
+            pinned: false,
+            running: false,
+        }
     }
 
     #[test]
@@ -190,7 +217,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let archive = Archive::load(dir.path());
         assert!(archive.set("a", true, 1));
-        assert!(!archive.set("a", true, 2), "archiving twice changes nothing");
+        assert!(
+            !archive.set("a", true, 2),
+            "archiving twice changes nothing"
+        );
         assert!(Archive::load(dir.path()).is_archived("a"));
         assert!(archive.set("a", false, 3));
         assert!(!Archive::load(dir.path()).is_archived("a"));
@@ -208,12 +238,24 @@ mod tests {
         pinned.pinned = true;
         let mut running = candidate("running", now - 10 * DAY);
         running.running = true;
-        let all = [candidate("old", now - 4 * DAY), candidate("recent", now - DAY), pinned, running];
+        let all = [
+            candidate("old", now - 4 * DAY),
+            candidate("recent", now - DAY),
+            pinned,
+            running,
+        ];
         assert_eq!(archive.sweep(&all, 3.0, now), ["old"]);
         assert!(archive.is_archived("old") && !archive.is_archived("recent"));
         // Within the day nothing more happens, even for a session now idle long enough.
-        assert!(archive.sweep(&[candidate("recent", now - 5 * DAY)], 3.0, now + DAY / 2).is_empty());
-        assert_eq!(archive.sweep(&[candidate("recent", now - 5 * DAY)], 3.0, now + DAY + 1), ["recent"]);
+        assert!(
+            archive
+                .sweep(&[candidate("recent", now - 5 * DAY)], 3.0, now + DAY / 2)
+                .is_empty()
+        );
+        assert_eq!(
+            archive.sweep(&[candidate("recent", now - 5 * DAY)], 3.0, now + DAY + 1),
+            ["recent"]
+        );
     }
 
     #[test]

@@ -4,7 +4,8 @@
 //! cache-parity fork of the live agent is not ported.
 
 /// The instructions the side question is asked under (`_ONESHOT_INSTRUCTIONS`).
-pub const INSTRUCTIONS: &str = include_str!("../../../prompts/hermes/agent.side_question/ONESHOT_INSTRUCTIONS.txt");
+pub const INSTRUCTIONS: &str =
+    include_str!("../../../prompts/hermes/agent.side_question/ONESHOT_INSTRUCTIONS.txt");
 
 /// Each message's cap in the transcript (`_PER_MESSAGE_CHAR_CAP`) and the transcript's
 /// (`_TRANSCRIPT_CHAR_BUDGET`).
@@ -22,11 +23,14 @@ pub fn transcript(lines: &[Line]) -> String {
     let rendered: Vec<String> = lines
         .iter()
         .filter_map(|line| match line {
-            Line::Said { label, text } if !text.trim().is_empty() => {
-                Some(format!("{label}: {}", text.chars().take(PER_MESSAGE_CHARS).collect::<String>()))
-            }
+            Line::Said { label, text } if !text.trim().is_empty() => Some(format!(
+                "{label}: {}",
+                text.chars().take(PER_MESSAGE_CHARS).collect::<String>()
+            )),
             Line::Said { .. } => None,
-            Line::CalledTools(names) => Some(format!("ASSISTANT [called tools: {}]", names.join(", "))),
+            Line::CalledTools(names) => {
+                Some(format!("ASSISTANT [called tools: {}]", names.join(", ")))
+            }
         })
         .collect();
     let mut kept: Vec<&str> = Vec::new();
@@ -42,7 +46,11 @@ pub fn transcript(lines: &[Line]) -> String {
     if kept.is_empty() {
         return "(no prior conversation)".to_string();
     }
-    let prefix = if kept.len() < rendered.len() { "[...older conversation omitted...]\n" } else { "" };
+    let prefix = if kept.len() < rendered.len() {
+        "[...older conversation omitted...]\n"
+    } else {
+        ""
+    };
     kept.reverse();
     format!("{prefix}{}", kept.join("\n"))
 }
@@ -61,7 +69,10 @@ mod tests {
 
     #[test]
     fn the_transcript_keeps_the_newest_lines_within_budget() {
-        let said = |label, text: &str| Line::Said { label, text: text.to_string() };
+        let said = |label, text: &str| Line::Said {
+            label,
+            text: text.to_string(),
+        };
         let small = transcript(&[
             said("USER", "fix the build"),
             Line::CalledTools(vec!["terminal".into(), "read_file".into()]),
@@ -73,7 +84,9 @@ mod tests {
             "USER: fix the build\nASSISTANT [called tools: terminal, read_file]\nASSISTANT: Fixed: a missing import."
         );
         assert_eq!(transcript(&[]), "(no prior conversation)");
-        let many: Vec<Line> = (0..30).map(|i| said("USER", &format!("{i} {}", "x".repeat(1500)))).collect();
+        let many: Vec<Line> = (0..30)
+            .map(|i| said("USER", &format!("{i} {}", "x".repeat(1500))))
+            .collect();
         let long = transcript(&many);
         assert!(long.starts_with("[...older conversation omitted...]\n"));
         assert!(long.ends_with(&"x".repeat(100)));

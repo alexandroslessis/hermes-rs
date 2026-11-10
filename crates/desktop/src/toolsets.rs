@@ -13,15 +13,30 @@ pub const CONFIG_KEY: &str = "disabled_toolsets";
 
 /// `(name, label, description, tools)`: Hermes's toolsets that this runtime has tools for.
 pub const TOOLSETS: [(&str, &str, &str, &[&str]); 10] = [
-    ("web", "Web Search & Scraping", "web_search, web_extract", &["web_search", "web_extract"]),
-    ("terminal", "Terminal & Processes", "terminal, process", &["terminal", "process_manage"]),
+    (
+        "web",
+        "Web Search & Scraping",
+        "web_search, web_extract",
+        &["web_search", "web_extract"],
+    ),
+    (
+        "terminal",
+        "Terminal & Processes",
+        "terminal, process",
+        &["terminal", "process_manage"],
+    ),
     (
         "file",
         "File Operations",
         "read, write, patch, search",
         &["read_file", "write_file", "patch", "search_files"],
     ),
-    ("vision", "Vision / Image Analysis", "vision_analyze", &["vision_analyze"]),
+    (
+        "vision",
+        "Vision / Image Analysis",
+        "vision_analyze",
+        &["vision_analyze"],
+    ),
     (
         "skills",
         "Skills",
@@ -29,17 +44,38 @@ pub const TOOLSETS: [(&str, &str, &str, &[&str]); 10] = [
         &["skills_list", "skill_view", "skill_manage"],
     ),
     ("todo", "Task Planning", "todo_list", &["todo_list"]),
-    ("memory", "Memory", "persistent memory across sessions", &["memory"]),
-    ("session_search", "Session Search", "search past conversations", &["session_search"]),
+    (
+        "memory",
+        "Memory",
+        "persistent memory across sessions",
+        &["memory"],
+    ),
+    (
+        "session_search",
+        "Session Search",
+        "search past conversations",
+        &["session_search"],
+    ),
     ("clarify", "Clarifying Questions", "clarify", &["clarify"]),
-    ("delegation", "Task Delegation", "delegate_task", &["delegate_task"]),
+    (
+        "delegation",
+        "Task Delegation",
+        "delegate_task",
+        &["delegate_task"],
+    ),
 ];
 
 /// The switched-off toolsets in `config` (`disabled_toolsets`).
 pub fn disabled_toolsets(config: &Value) -> Vec<String> {
     config
         .as_array()
-        .map(|names| names.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -73,7 +109,11 @@ pub fn switch(disabled_toolsets: &[String], name: &str, enabled: bool) -> Option
     if !TOOLSETS.iter().any(|(known, ..)| *known == name) {
         return None;
     }
-    let mut next: Vec<String> = disabled_toolsets.iter().filter(|d| *d != name).cloned().collect();
+    let mut next: Vec<String> = disabled_toolsets
+        .iter()
+        .filter(|d| *d != name)
+        .cloned()
+        .collect();
     if !enabled {
         next.push(name.to_string());
     }
@@ -106,7 +146,10 @@ mod tests {
 
     #[test]
     fn every_tool_belongs_to_one_toolset() {
-        let mut seen: Vec<&str> = TOOLSETS.iter().flat_map(|(_, _, _, tools)| tools.iter().copied()).collect();
+        let mut seen: Vec<&str> = TOOLSETS
+            .iter()
+            .flat_map(|(_, _, _, tools)| tools.iter().copied())
+            .collect();
         let total = seen.len();
         seen.sort_unstable();
         seen.dedup();
@@ -124,8 +167,14 @@ mod tests {
         assert_eq!(list(&off)[1]["enabled"], false);
         assert_eq!(list(&off)[0]["enabled"], true);
         assert!(switch(&off, "terminal", true).unwrap().is_empty());
-        assert!(switch(&off, "browser", false).is_none(), "not a toolset here");
-        assert_eq!(disabled_toolsets(&json!(["web", 3, "file"])), ["web", "file"]);
+        assert!(
+            switch(&off, "browser", false).is_none(),
+            "not a toolset here"
+        );
+        assert_eq!(
+            disabled_toolsets(&json!(["web", 3, "file"])),
+            ["web", "file"]
+        );
         assert_eq!(disabled_toolsets(&Value::Null), Vec::<String>::new());
     }
 }

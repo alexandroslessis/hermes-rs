@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use hermes_llm::conversation::message::{Message, MessageContent};
-use std::sync::Mutex;
 use rmcp::model::Role;
+use std::sync::Mutex;
 
 const FILE: &str = "branches.json";
 
@@ -28,11 +28,18 @@ impl Links {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        Self { path, parents: Mutex::new(parents) }
+        Self {
+            path,
+            parents: Mutex::new(parents),
+        }
     }
 
     pub fn parent(&self, child: &str) -> Option<String> {
-        self.parents.lock().unwrap_or_else(|e| e.into_inner()).get(child).cloned()
+        self.parents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(child)
+            .cloned()
     }
 
     pub fn link(&self, child: &str, parent: &str) {
@@ -50,7 +57,10 @@ pub fn cut(messages: &[Message], keep: usize) -> Vec<Message> {
     let mut kept: Vec<Message> = messages[..keep.min(messages.len())].to_vec();
     while kept.last().is_some_and(|last| {
         last.role == Role::Assistant
-            && last.content.iter().any(|c| matches!(c, MessageContent::ToolRequest(_)))
+            && last
+                .content
+                .iter()
+                .any(|c| matches!(c, MessageContent::ToolRequest(_)))
     }) {
         kept.pop();
     }
@@ -59,7 +69,10 @@ pub fn cut(messages: &[Message], keep: usize) -> Vec<Message> {
 
 /// The title of a new branch of `parent`: `<parent> (branch)`, numbered when that's taken.
 pub fn title(parent: Option<&str>, taken: &[String]) -> String {
-    let base = format!("{} (branch)", parent.filter(|t| !t.trim().is_empty()).unwrap_or("Chat"));
+    let base = format!(
+        "{} (branch)",
+        parent.filter(|t| !t.trim().is_empty()).unwrap_or("Chat")
+    );
     if !taken.contains(&base) {
         return base;
     }
@@ -77,7 +90,8 @@ mod tests {
 
     #[test]
     fn a_cut_never_ends_on_an_unanswered_tool_call() {
-        let call = Message::assistant().with_tool_request("c1", Ok(CallToolRequestParams::new("read_file")));
+        let call = Message::assistant()
+            .with_tool_request("c1", Ok(CallToolRequestParams::new("read_file")));
         let messages = vec![
             Message::user().with_text("hi"),
             Message::assistant().with_text("hello"),
@@ -92,9 +106,18 @@ mod tests {
 
     #[test]
     fn titles_follow_the_parent() {
-        assert_eq!(title(Some("Fix the parser"), &[]), "Fix the parser (branch)");
-        let taken = vec!["Fix the parser (branch)".to_string(), "Fix the parser (branch 2)".to_string()];
-        assert_eq!(title(Some("Fix the parser"), &taken), "Fix the parser (branch 3)");
+        assert_eq!(
+            title(Some("Fix the parser"), &[]),
+            "Fix the parser (branch)"
+        );
+        let taken = vec![
+            "Fix the parser (branch)".to_string(),
+            "Fix the parser (branch 2)".to_string(),
+        ];
+        assert_eq!(
+            title(Some("Fix the parser"), &taken),
+            "Fix the parser (branch 3)"
+        );
         assert_eq!(title(None, &[]), "Chat (branch)");
     }
 
@@ -102,7 +125,10 @@ mod tests {
     fn links_survive_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         Links::load(dir.path()).link("child", "parent");
-        assert_eq!(Links::load(dir.path()).parent("child").as_deref(), Some("parent"));
+        assert_eq!(
+            Links::load(dir.path()).parent("child").as_deref(),
+            Some("parent")
+        );
         assert_eq!(Links::load(dir.path()).parent("other"), None);
     }
 }

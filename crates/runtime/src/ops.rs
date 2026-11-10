@@ -693,7 +693,9 @@ impl ToolProvider<TurnSession> for GuardedTools {
                 "success": false,
                 "error": format!("{name} is turned off by the user (Capabilities ▸ Tools); do without it."),
             });
-            return Ok(CallToolResult::error(vec![rmcp::model::ContentBlock::text(text.to_string())]));
+            return Ok(CallToolResult::error(vec![
+                rmcp::model::ContentBlock::text(text.to_string()),
+            ]));
         }
         let args = Value::Object(call.arguments.clone().unwrap_or_default());
         let result = self.inner.call(session, request_id, call, emit).await;

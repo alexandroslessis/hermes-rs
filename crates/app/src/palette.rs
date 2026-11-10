@@ -190,9 +190,11 @@ impl Palette {
             .toggle_state(position == self.focused)
             .on_click(cx.listener(move |this, _, _, cx| this.pick(position, cx)));
         match item {
-            PaletteItem::Action { label, action } => row
-                .child(Label::new(label.clone()))
-                .end_slot(div().pr_2().child(KeyBinding::for_action(action.as_ref(), cx))),
+            PaletteItem::Action { label, action } => row.child(Label::new(label.clone())).end_slot(
+                div()
+                    .pr_2()
+                    .child(KeyBinding::for_action(action.as_ref(), cx)),
+            ),
             PaletteItem::Command {
                 name, description, ..
             } => row.child(

@@ -525,7 +525,10 @@ mod tests {
         ];
         let rows = messages(&stored, "", "");
         let notice = rows.last().unwrap()["text"].as_str().unwrap();
-        assert!(notice.starts_with("Your request was not processed"), "{notice}");
+        assert!(
+            notice.starts_with("Your request was not processed"),
+            "{notice}"
+        );
     }
 
     #[test]

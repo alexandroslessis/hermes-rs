@@ -34,7 +34,12 @@ impl Appearance {
             buffer_font: Font {
                 features: FontFeatures::disable_ligatures(),
                 weight: FontWeight::NORMAL,
-                ..font(fonts.code_family.clone().unwrap_or(DEFAULT_CODE_FONT.into()))
+                ..font(
+                    fonts
+                        .code_family
+                        .clone()
+                        .unwrap_or(DEFAULT_CODE_FONT.into()),
+                )
             },
             ui_size: size(fonts.ui_size, DEFAULT_UI_SIZE),
             buffer_size: size(fonts.code_size, DEFAULT_CODE_SIZE),

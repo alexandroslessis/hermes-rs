@@ -47,7 +47,10 @@ pub fn soul(data_dir: &Path, name: &str) -> (u16, Value) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 (200, json!({"content": "", "exists": false}))
             }
-            Err(e) => (500, json!({"detail": format!("Could not read SOUL.md: {e}")})),
+            Err(e) => (
+                500,
+                json!({"detail": format!("Could not read SOUL.md: {e}")}),
+            ),
         },
     }
 }
@@ -61,10 +64,14 @@ pub fn save_soul(data_dir: &Path, name: &str, content: &str) -> (u16, Value) {
         Err(answer) => answer,
         Ok(path) => {
             let temp = path.with_file_name(format!(".SOUL.md.hermes-tmp-{}", std::process::id()));
-            let written = std::fs::write(&temp, content).and_then(|()| std::fs::rename(&temp, &path));
+            let written =
+                std::fs::write(&temp, content).and_then(|()| std::fs::rename(&temp, &path));
             if let Err(e) = written {
                 let _ = std::fs::remove_file(&temp);
-                return (500, json!({"detail": format!("Could not write SOUL.md: {e}")}));
+                return (
+                    500,
+                    json!({"detail": format!("Could not write SOUL.md: {e}")}),
+                );
             }
             (200, json!({"ok": true}))
         }

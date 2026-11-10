@@ -5,7 +5,13 @@
 
 macro_rules! hermes {
     ($module:literal, $name:literal) => {
-        include_str!(concat!("../../../prompts/hermes/", $module, "/", $name, ".txt"))
+        include_str!(concat!(
+            "../../../prompts/hermes/",
+            $module,
+            "/",
+            $name,
+            ".txt"
+        ))
     };
 }
 
@@ -43,7 +49,11 @@ pub fn init_message(cwd: &str, existing: Option<&str>, extra: &str) -> String {
     let mut parts = vec![
         format!(
             "[/init] The user wants you to {} AGENTS.md project-instructions file for the project at: {cwd}\n",
-            if update { "UPDATE the existing" } else { "generate an" }
+            if update {
+                "UPDATE the existing"
+            } else {
+                "generate an"
+            }
         ),
         "AGENTS.md is the instruction file coding agents (Hermes included) load as project \
 context every session. It should teach an agent how to work in THIS repo: what the project is, how \
@@ -95,7 +105,13 @@ pub fn plan_request(message: &str) -> Option<String> {
         return Some(String::new());
     };
     let first_craft_line = PLAN_CRAFT.lines().next().unwrap_or_default();
-    Some(task.split(first_craft_line).next().unwrap_or_default().trim().to_string())
+    Some(
+        task.split(first_craft_line)
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    )
 }
 
 /// The notes a stored `/init` message was sent with (`Some("")` for none).
@@ -113,8 +129,15 @@ pub fn init_request(message: &str) -> Option<String> {
 /// `build_review_task`: the reviewer's short goal (its live label) and its full briefing, from
 /// the conversation's recent `(is_user, text)` messages, oldest first, and the skills the
 /// primary agent loaded (its review must hold the work to them).
-pub fn review_task(recent: &[(bool, String)], instructions: &str, skills: &[String]) -> (String, String) {
-    let focus = instructions.split_whitespace().collect::<Vec<_>>().join(" ");
+pub fn review_task(
+    recent: &[(bool, String)],
+    instructions: &str,
+    skills: &[String],
+) -> (String, String) {
+    let focus = instructions
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut goal = if focus.is_empty() {
         "Review recent work".to_string()
     } else {
@@ -135,11 +158,17 @@ review is referenced in it."
     ];
     for (is_user, text) in recent {
         let text = if text.chars().count() > REVIEW_MESSAGE_CHARS {
-            format!("{}\n[... truncated ...]", text.chars().take(REVIEW_MESSAGE_CHARS).collect::<String>())
+            format!(
+                "{}\n[... truncated ...]",
+                text.chars().take(REVIEW_MESSAGE_CHARS).collect::<String>()
+            )
         } else {
             text.clone()
         };
-        lines.push(format!("[{}]", if *is_user { "USER" } else { "PRIMARY AGENT" }));
+        lines.push(format!(
+            "[{}]",
+            if *is_user { "USER" } else { "PRIMARY AGENT" }
+        ));
         lines.push(text);
         lines.push(String::new());
     }
@@ -190,17 +219,30 @@ mod tests {
         assert!(update.contains("UPDATE the existing AGENTS.md"));
         assert!(update.contains("<<<EXISTING_AGENTS_MD\n# Old\nEXISTING_AGENTS_MD"));
         assert!(update.contains("USER NOTES"));
-        assert!(update.contains("C:/work/repo/AGENTS.md"), "no doubled slash");
+        assert!(
+            update.contains("C:/work/repo/AGENTS.md"),
+            "no doubled slash"
+        );
     }
 
     #[test]
     fn the_reviewer_gets_the_excerpt_and_a_short_label() {
-        let recent = vec![(true, "fix the parser".to_string()), (false, "Done: patched lexer.rs".to_string())];
-        let (goal, context) = review_task(&recent, "focus on   edge cases", &["rust-style".to_string()]);
+        let recent = vec![
+            (true, "fix the parser".to_string()),
+            (false, "Done: patched lexer.rs".to_string()),
+        ];
+        let (goal, context) = review_task(
+            &recent,
+            "focus on   edge cases",
+            &["rust-style".to_string()],
+        );
         assert_eq!(goal, "Review: focus on edge cases");
         assert!(context.contains("[USER]\nfix the parser"));
         assert!(context.contains("[PRIMARY AGENT]\nDone: patched lexer.rs"));
-        assert!(context.contains("Additional review instructions from the user:\nfocus on   edge cases"));
+        assert!(
+            context
+                .contains("Additional review instructions from the user:\nfocus on   edge cases")
+        );
         assert!(context.contains("these loaded skills: rust-style."));
         let (long, _) = review_task(&recent, &"x".repeat(200), &[]);
         assert_eq!(long.chars().count(), 80);
@@ -209,11 +251,20 @@ mod tests {
 
     #[test]
     fn stored_messages_read_back_as_their_commands() {
-        assert_eq!(plan_request(&plan_message("add a cache\nwith TTLs")).as_deref(), Some("add a cache\nwith TTLs"));
+        assert_eq!(
+            plan_request(&plan_message("add a cache\nwith TTLs")).as_deref(),
+            Some("add a cache\nwith TTLs")
+        );
         assert_eq!(plan_request(&plan_message("")).as_deref(), Some(""));
         assert_eq!(plan_request("plan this"), None);
-        assert_eq!(init_request(&init_message("C:/r", None, "keep it short")).as_deref(), Some("keep it short"));
-        assert_eq!(init_request(&init_message("C:/r", Some("# x"), "")).as_deref(), Some(""));
+        assert_eq!(
+            init_request(&init_message("C:/r", None, "keep it short")).as_deref(),
+            Some("keep it short")
+        );
+        assert_eq!(
+            init_request(&init_message("C:/r", Some("# x"), "")).as_deref(),
+            Some("")
+        );
         assert_eq!(init_request("[/initial] x"), None);
     }
 }

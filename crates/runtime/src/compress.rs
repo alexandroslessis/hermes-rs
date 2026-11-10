@@ -937,7 +937,8 @@ pub fn undo(conversation: &mut Conversation) -> bool {
 /// One summarizer call: the prompt as the only message, no tools; the reply's text without
 /// reasoning, redacted (the summarizer may echo secrets).
 async fn summarize(summarizer: &Summarizer, prompt: &str) -> Result<String> {
-    let mut config = ModelConfig::new(&summarizer.model).with_context_limit(summarizer.context_length);
+    let mut config =
+        ModelConfig::new(&summarizer.model).with_context_limit(summarizer.context_length);
     if let Some(params) = &summarizer.request_params {
         config = config.with_merged_request_params(params.clone());
     }

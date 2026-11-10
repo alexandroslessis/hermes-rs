@@ -83,7 +83,10 @@ pub fn import_soul(home: &Path, data_dir: &Path) -> Result<bool, String> {
 /// anything went wrong.
 pub fn import_all(cx: &App) -> (String, bool) {
     let Some(home) = hermes_home() else {
-        return ("No Hermes install found (~/.hermes or HERMES_HOME).".into(), true);
+        return (
+            "No Hermes install found (~/.hermes or HERMES_HOME).".into(),
+            true,
+        );
     };
     let backend = backend(cx);
     let mut lines = Vec::new();

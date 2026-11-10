@@ -196,7 +196,11 @@ impl ReviewPane {
                             }),
                     )
                     .when(file.created, |this| {
-                        this.child(Label::new("new").size(LabelSize::XSmall).color(Color::Created))
+                        this.child(
+                            Label::new("new")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Created),
+                        )
                     })
                     .when(file.deleted, |this| {
                         this.child(
@@ -315,7 +319,10 @@ impl Render for ReviewPane {
                         this.child(Label::new(note).size(LabelSize::Small).color(Color::Muted))
                     })
                     .when(
-                        self.changes.is_some() && files.is_empty() && self.error.is_none() && !has_note,
+                        self.changes.is_some()
+                            && files.is_empty()
+                            && self.error.is_none()
+                            && !has_note,
                         |this| {
                             this.child(
                                 Label::new("No changes.")

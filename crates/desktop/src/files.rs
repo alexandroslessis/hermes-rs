@@ -27,7 +27,10 @@ fn error(status: u16, detail: impl Into<String>) -> Answer {
 /// session's folder (`cwd`).
 pub fn resolve(path: &str, cwd: Option<&Path>) -> PathBuf {
     let path = path.trim();
-    let path = match path.strip_prefix("file://").or_else(|| path.strip_prefix("file:")) {
+    let path = match path
+        .strip_prefix("file://")
+        .or_else(|| path.strip_prefix("file:"))
+    {
         // `file:///C:/x` → `C:/x`; `file:///home/x` stays rooted.
         Some(rest) => {
             let decoded = crate::rest::percent_decode(rest);
@@ -293,10 +296,22 @@ mod tests {
     #[test]
     fn paths_resolve_against_the_session_folder() {
         let cwd = Path::new("C:/work/repo");
-        assert_eq!(resolve("src/main.rs", Some(cwd)), PathBuf::from(r"C:\work\repo\src\main.rs"));
-        assert_eq!(resolve("D:/other/x.txt", Some(cwd)), PathBuf::from(r"D:\other\x.txt"));
-        assert_eq!(resolve("file:///C:/a%20b/x.md", None), PathBuf::from(r"C:\a b\x.md"));
-        assert_eq!(resolve("~/notes.md", None), dirs::home_dir().unwrap().join("notes.md"));
+        assert_eq!(
+            resolve("src/main.rs", Some(cwd)),
+            PathBuf::from(r"C:\work\repo\src\main.rs")
+        );
+        assert_eq!(
+            resolve("D:/other/x.txt", Some(cwd)),
+            PathBuf::from(r"D:\other\x.txt")
+        );
+        assert_eq!(
+            resolve("file:///C:/a%20b/x.md", None),
+            PathBuf::from(r"C:\a b\x.md")
+        );
+        assert_eq!(
+            resolve("~/notes.md", None),
+            dirs::home_dir().unwrap().join("notes.md")
+        );
     }
 
     #[test]
@@ -322,13 +337,19 @@ mod tests {
         assert_eq!(read["binary"], false);
         assert_eq!(read["text"], "fn main() {}\n");
         assert_eq!(write_text(&file, "fn main() { println!(); }\n").0, 200);
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "fn main() { println!(); }\n");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "fn main() { println!(); }\n"
+        );
         // A new file in an existing folder, yes; in a missing one, no; a folder, never.
         assert_eq!(write_text(&dir.path().join("new.txt"), "x").0, 200);
         assert_eq!(write_text(&dir.path().join("missing/new.txt"), "x").0, 400);
         assert_eq!(write_text(dir.path(), "x").0, 400);
         // No temporary files left behind.
-        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         assert_eq!(names.len(), 2, "{names:?}");
         // Binary content is flagged.
         let blob = dir.path().join("blob.bin");

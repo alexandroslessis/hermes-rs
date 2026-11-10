@@ -424,7 +424,9 @@ async fn a_daily_limit_429_ends_the_turn_instead_of_retrying_for_hours() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(RateLimited { requests: requests.clone() })
+        .respond_with(RateLimited {
+            requests: requests.clone(),
+        })
         .mount(&server)
         .await;
     let data = tempfile::tempdir().unwrap();
@@ -435,7 +437,9 @@ async fn a_daily_limit_429_ends_the_turn_instead_of_retrying_for_hours() {
         base_url: format!("{}/v1", server.uri()),
         api_key: Some("key".into()),
     };
-    let session = runtime.create_session(&provider, "test-model", None, work.path()).unwrap();
+    let session = runtime
+        .create_session(&provider, "test-model", None, work.path())
+        .unwrap();
     // The same store the runtime writes to: it is moved into the harness below.
     let store = hermes_store::Store::open(&data.path().join("sessions.db")).unwrap();
 
@@ -458,7 +462,10 @@ async fn a_daily_limit_429_ends_the_turn_instead_of_retrying_for_hours() {
     // The quota is reached: the turn ends (the provider error is shown as a message) instead of
     // sleeping out the Retry-After (up to the retry cap, three times) while the chat's timer runs.
     assert_eq!(finished_status(&events), TurnStatus::Completed);
-    assert!(elapsed < Duration::from_secs(30), "the turn waited {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "the turn waited {elapsed:?}"
+    );
     // One request: a quota 429 is not transient, the provider layer does not retry it.
     assert_eq!(requests.lock().len(), 1);
     // The error card carries the provider's message (in its Error block, not plain text).
@@ -2357,11 +2364,20 @@ async fn a_subagent_reports_its_start_tools_text_and_end() {
     let kinds: Vec<&str> = subagent.iter().map(|(k, _)| *k).collect();
     assert_eq!(
         kinds,
-        ["subagent.start", "subagent.tool", "subagent.progress", "subagent.complete"],
+        [
+            "subagent.start",
+            "subagent.tool",
+            "subagent.progress",
+            "subagent.complete"
+        ],
         "{subagent:?}"
     );
     let id = subagent[0].1["subagent_id"].as_str().unwrap();
-    assert!(subagent.iter().all(|(_, p)| p["subagent_id"] == id && p["goal"] == "read the notes"));
+    assert!(
+        subagent
+            .iter()
+            .all(|(_, p)| p["subagent_id"] == id && p["goal"] == "read the notes")
+    );
     assert_eq!(subagent[0].1["task_count"], 1);
     assert_eq!(subagent[1].1["tool_name"], "read_file");
     assert_eq!(subagent[1].1["tool_preview"], "notes.md");
@@ -2410,15 +2426,32 @@ async fn a_turn_can_start_with_a_tool_call_made_for_the_user() {
     }
     assert_eq!(finished_status(&events), TurnStatus::Completed);
     let requests = h.requests.lock().clone();
-    assert_eq!(requests.len(), 2, "the child, then the parent: no model call before the review");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the child, then the parent: no model call before the review"
+    );
     let child = sent_messages(&requests[0]);
-    assert!(child[0]["content"].to_string().contains("You are a focused subagent"));
-    assert!(requests[1].to_string().contains("Verdict: no defects found."));
+    assert!(
+        child[0]["content"]
+            .to_string()
+            .contains("You are a focused subagent")
+    );
+    assert!(
+        requests[1]
+            .to_string()
+            .contains("Verdict: no defects found.")
+    );
     assert_eq!(last_text(&h, &session), "The reviewer found no defects.");
     // Stored in order: the user's command, the scripted call, its result, the answer.
     let messages = h.runtime.messages(&session).unwrap();
     assert_eq!(messages[0].as_concat_text(), "/review");
-    assert!(messages[1].content.iter().any(|c| c.as_tool_request().is_some()));
+    assert!(
+        messages[1]
+            .content
+            .iter()
+            .any(|c| c.as_tool_request().is_some())
+    );
 }
 
 #[tokio::test]
@@ -2444,8 +2477,15 @@ async fn a_side_question_reads_the_conversation_without_changing_it() {
     assert!(asked.contains("USER: rename lexer.rs"), "{asked}");
     assert!(asked.contains("ASSISTANT: I renamed the module to parser.rs."));
     assert!(asked.contains("Side question: what did we rename it to?"));
-    assert!(request["tools"].as_array().is_none_or(|t| t.is_empty()), "no tools");
-    assert_eq!(h.runtime.messages(&session).unwrap().len(), before, "conversation untouched");
+    assert!(
+        request["tools"].as_array().is_none_or(|t| t.is_empty()),
+        "no tools"
+    );
+    assert_eq!(
+        h.runtime.messages(&session).unwrap().len(),
+        before,
+        "conversation untouched"
+    );
 }
 
 #[tokio::test]
@@ -2454,7 +2494,12 @@ async fn a_background_prompt_runs_as_a_subagent_and_returns_its_answer() {
     let session = session_in(&h);
     let mut task = h
         .runtime
-        .background(&session, &h.provider, TurnOptions::default(), "compute the answer")
+        .background(
+            &session,
+            &h.provider,
+            TurnOptions::default(),
+            "compute the answer",
+        )
         .unwrap();
     assert!(task.task_id.starts_with("bg_"));
     let mut kinds = Vec::new();
@@ -2467,9 +2512,15 @@ async fn a_background_prompt_runs_as_a_subagent_and_returns_its_answer() {
             kinds.push(kind);
         }
     }
-    assert_eq!(kinds, ["subagent.start", "subagent.progress", "subagent.complete"]);
+    assert_eq!(
+        kinds,
+        ["subagent.start", "subagent.progress", "subagent.complete"]
+    );
     assert_eq!(task.done.await.unwrap(), "Background answer: 42.");
-    assert!(h.runtime.messages(&session).unwrap().is_empty(), "the session's own conversation is untouched");
+    assert!(
+        h.runtime.messages(&session).unwrap().is_empty(),
+        "the session's own conversation is untouched"
+    );
 }
 
 #[tokio::test]
@@ -2479,7 +2530,8 @@ async fn a_tool_switched_off_is_not_offered_and_refused_if_called() {
         text_reply("I couldn't run it."),
     ])
     .await;
-    h.runtime.set_disabled_tools(["terminal".to_string(), "process_manage".to_string()]);
+    h.runtime
+        .set_disabled_tools(["terminal".to_string(), "process_manage".to_string()]);
     let session = session_in(&h);
     let events = run_turn(&h, &session, "run echo hi").await;
     assert_eq!(finished_status(&events), TurnStatus::Completed);
@@ -2490,7 +2542,10 @@ async fn a_tool_switched_off_is_not_offered_and_refused_if_called() {
         .iter()
         .map(|t| t["function"]["name"].as_str().unwrap().to_string())
         .collect();
-    assert!(!offered.contains(&"terminal".to_string()) && !offered.contains(&"process_manage".to_string()));
+    assert!(
+        !offered.contains(&"terminal".to_string())
+            && !offered.contains(&"process_manage".to_string())
+    );
     assert!(offered.contains(&"read_file".to_string()));
     // The model called it anyway: refused, and told why.
     let second = requests[1].to_string();

@@ -118,7 +118,9 @@ const USAGE_LIMIT_MARKERS: &[&str] = &[
 /// (hidden for these) share this classification.
 pub fn is_usage_limit(message: &str) -> bool {
     let lower = message.to_lowercase();
-    USAGE_LIMIT_MARKERS.iter().any(|marker| lower.contains(marker))
+    USAGE_LIMIT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 /// How long a rate limit's own Retry-After is slept: as given, up to [`MAX_RETRY_WAIT_SECS`].
@@ -444,6 +446,9 @@ mod tests {
             Duration::from_secs(MAX_RETRY_WAIT_SECS)
         );
         // A short hint is honored as given.
-        assert_eq!(capped_retry_wait(Duration::from_secs(2)), Duration::from_secs(2));
+        assert_eq!(
+            capped_retry_wait(Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
     }
 }

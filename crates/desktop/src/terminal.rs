@@ -88,12 +88,16 @@ pub struct Terminals {
 /// `shell_spec`): `(argv, name)`.
 fn shell_spec() -> (Vec<String>, String) {
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    let windows_powershell = Path::new(&system_root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let windows_powershell =
+        Path::new(&system_root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
     let ladder = [
         on_path("pwsh.exe"),
         Some(windows_powershell).filter(|p| p.is_file()),
         on_path("powershell.exe"),
-        std::env::var("COMSPEC").ok().map(PathBuf::from).filter(|p| p.is_file()),
+        std::env::var("COMSPEC")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|p| p.is_file()),
     ];
     let command = ladder
         .into_iter()
@@ -137,7 +141,9 @@ fn safe_cwd(requested: Option<&str>) -> PathBuf {
 
 /// A `cols`/`rows` query value, kept within 2..=max.
 pub fn dimension(raw: Option<&str>, default: u16, max: u16) -> u16 {
-    raw.and_then(|r| r.parse::<u16>().ok()).unwrap_or(default).clamp(2, max)
+    raw.and_then(|r| r.parse::<u16>().ok())
+        .unwrap_or(default)
+        .clamp(2, max)
 }
 
 impl Terminals {
@@ -164,7 +170,12 @@ impl Terminals {
             return Err("capacity".into());
         }
         let pty = portable_pty::native_pty_system()
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(|e| format!("Could not open a terminal: {e}"))?;
         let (argv, name) = shell_spec();
         let cwd = safe_cwd(cwd);
@@ -209,7 +220,11 @@ impl Terminals {
         });
         std::thread::spawn(move || {
             for data in keystrokes {
-                if writer.write_all(&data).and_then(|()| writer.flush()).is_err() {
+                if writer
+                    .write_all(&data)
+                    .and_then(|()| writer.flush())
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -243,14 +258,24 @@ impl Terminals {
     }
 
     fn remove(&self, id: &str) {
-        if let Some(shell) = self.shells.lock().unwrap_or_else(|e| e.into_inner()).remove(id) {
+        if let Some(shell) = self
+            .shells
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+        {
             shell.kill();
         }
     }
 
     /// Ends every shell (the app is closing).
     pub fn close_all(&self) {
-        for (_, shell) in self.shells.lock().unwrap_or_else(|e| e.into_inner()).drain() {
+        for (_, shell) in self
+            .shells
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+        {
             shell.kill();
         }
     }
@@ -266,7 +291,10 @@ impl Terminals {
         cwd: Option<String>,
     ) {
         let close = |code: u16, reason: &str| {
-            Message::Close(Some(CloseFrame { code, reason: reason.to_string().into() }))
+            Message::Close(Some(CloseFrame {
+                code,
+                reason: reason.to_string().into(),
+            }))
         };
         if action.as_deref() == Some("close") {
             if let Some(id) = &attach {
@@ -289,20 +317,28 @@ impl Terminals {
             (Some(_), Some(shell)) => shell,
             (Some(_), None) => {
                 let _ = socket
-                    .send(close(4410, "Terminal or profile expired; open a new terminal"))
+                    .send(close(
+                        4410,
+                        "Terminal or profile expired; open a new terminal",
+                    ))
                     .await;
                 return;
             }
             (None, _) => {
                 let terminals = self.clone();
-                let spawned = tokio::task::spawn_blocking(move || terminals.spawn(cols, rows, cwd.as_deref()))
-                    .await
-                    .unwrap_or_else(|e| Err(e.to_string()));
+                let spawned = tokio::task::spawn_blocking(move || {
+                    terminals.spawn(cols, rows, cwd.as_deref())
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
                 match spawned {
                     Ok(shell) => shell,
                     Err(error) if error == "capacity" => {
                         let _ = socket
-                            .send(close(1013, "Terminal capacity reached; close a terminal and retry"))
+                            .send(close(
+                                1013,
+                                "Terminal capacity reached; close a terminal and retry",
+                            ))
                             .await;
                         return;
                     }
@@ -319,14 +355,21 @@ impl Terminals {
         // The snapshot and the live feed from the same instant.
         let (snapshot, truncated, mut live) = {
             let history = shell.history.lock().unwrap_or_else(|e| e.into_inner());
-            (history.bytes.clone(), history.truncated, shell.live.subscribe())
+            (
+                history.bytes.clone(),
+                history.truncated,
+                shell.live.subscribe(),
+            )
         };
         let meta = json!({
             "shell": shell.name, "terminalId": shell.id, "cwd": shell.cwd,
             "reconnected": attach.is_some(), "retentionSeconds": RETENTION.as_secs(),
             "truncated": truncated,
         });
-        let opened = socket.send(Message::Text(format!("{META}{meta}").into())).await.is_ok()
+        let opened = socket
+            .send(Message::Text(format!("{META}{meta}").into()))
+            .await
+            .is_ok()
             && socket.send(Message::Binary(snapshot.into())).await.is_ok();
         if opened {
             self.pump(&shell, &mut socket, &mut live, me).await;
@@ -344,7 +387,10 @@ impl Terminals {
         me: u64,
     ) {
         let close = |code: u16, reason: &str| {
-            Message::Close(Some(CloseFrame { code, reason: reason.to_string().into() }))
+            Message::Close(Some(CloseFrame {
+                code,
+                reason: reason.to_string().into(),
+            }))
         };
         loop {
             if shell.viewer.load(Ordering::SeqCst) != me {
@@ -388,7 +434,12 @@ impl Terminals {
     fn input(&self, shell: &Shell, data: &[u8]) {
         if let Some((cols, rows)) = parse_resize(data) {
             if let Ok(master) = shell.master.lock() {
-                let _ = master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+                let _ = master.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
             }
             return;
         }
@@ -399,7 +450,10 @@ impl Terminals {
 /// `\x1b[RESIZE:<cols>;<rows>]` → `(cols, rows)`.
 fn parse_resize(data: &[u8]) -> Option<(u16, u16)> {
     let text = std::str::from_utf8(data).ok()?;
-    let (cols, rows) = text.strip_prefix("\x1b[RESIZE:")?.strip_suffix(']')?.split_once(';')?;
+    let (cols, rows) = text
+        .strip_prefix("\x1b[RESIZE:")?
+        .strip_suffix(']')?
+        .split_once(';')?;
     Some((
         cols.trim().parse::<u16>().ok()?.clamp(2, 1000),
         rows.trim().parse::<u16>().ok()?.clamp(2, 500),
@@ -434,9 +488,17 @@ mod tests {
     #[test]
     fn the_shell_is_powershell_or_cmd() {
         let (argv, name) = shell_spec();
-        assert!(Path::new(&argv[0]).is_file() || argv[0] == "cmd.exe", "{argv:?}");
-        assert!(name.starts_with("pwsh") || name.starts_with("powershell") || name.starts_with("cmd"));
-        assert_eq!(safe_cwd(Some("C:/no/such/folder")), dirs::home_dir().unwrap());
+        assert!(
+            Path::new(&argv[0]).is_file() || argv[0] == "cmd.exe",
+            "{argv:?}"
+        );
+        assert!(
+            name.starts_with("pwsh") || name.starts_with("powershell") || name.starts_with("cmd")
+        );
+        assert_eq!(
+            safe_cwd(Some("C:/no/such/folder")),
+            dirs::home_dir().unwrap()
+        );
     }
 
     #[test]
@@ -446,14 +508,26 @@ mod tests {
         // The pseudo-console asks where the cursor is (`ESC[6n`) and waits for the answer, which
         // the page's xterm.js gives; answer as it would.
         let deadline = Instant::now() + Duration::from_secs(20);
-        while !shell.history.lock().unwrap().bytes.windows(4).any(|w| w == b"\x1b[6n") && Instant::now() < deadline {
+        while !shell
+            .history
+            .lock()
+            .unwrap()
+            .bytes
+            .windows(4)
+            .any(|w| w == b"\x1b[6n")
+            && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(50));
         }
         shell.input.send(b"\x1b[1;1R".to_vec()).unwrap();
-        shell.input.send(b"echo hermes-terminal-check\r".to_vec()).unwrap();
+        shell
+            .input
+            .send(b"echo hermes-terminal-check\r".to_vec())
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
-            let seen = String::from_utf8_lossy(&shell.history.lock().unwrap().bytes).contains("hermes-terminal-check\r\n");
+            let seen = String::from_utf8_lossy(&shell.history.lock().unwrap().bytes)
+                .contains("hermes-terminal-check\r\n");
             if seen {
                 break;
             }

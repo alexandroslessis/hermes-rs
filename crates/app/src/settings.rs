@@ -296,10 +296,9 @@ impl SettingsView {
                 format!("Version {} is available.", release.version),
                 Color::Accent,
             ),
-            UpdateStatus::Downloading(release) => (
-                format!("Downloading {}…", release.version),
-                Color::Muted,
-            ),
+            UpdateStatus::Downloading(release) => {
+                (format!("Downloading {}…", release.version), Color::Muted)
+            }
             UpdateStatus::Failed(error) => (format!("Couldn't check: {error}"), Color::Error),
         };
         let action = match &status {
@@ -426,7 +425,15 @@ impl SettingsView {
                 .collect()
         };
         let ui_families = available(
-            &["Segoe UI", "Segoe UI Variable", "Inter", "Arial", "Calibri", "Verdana", "Tahoma"],
+            &[
+                "Segoe UI",
+                "Segoe UI Variable",
+                "Inter",
+                "Arial",
+                "Calibri",
+                "Verdana",
+                "Tahoma",
+            ],
             DEFAULT_UI_FONT,
         );
         let code_families = available(
@@ -548,8 +555,10 @@ impl SettingsView {
             .child(row(
                 "Interface",
                 ui_picker.into_any_element(),
-                stepper("ui-size", fonts.ui_size, DEFAULT_UI_SIZE, |f, v| f.ui_size = v)
-                    .into_any_element(),
+                stepper("ui-size", fonts.ui_size, DEFAULT_UI_SIZE, |f, v| {
+                    f.ui_size = v
+                })
+                .into_any_element(),
             ))
             .child(row(
                 "Code",
@@ -802,7 +811,11 @@ impl SettingsView {
 
     /// The line between sections (Zed's `Divider` is too faint on this background).
     fn divider(cx: &App) -> impl IntoElement {
-        div().w_full().h_px().flex_none().bg(cx.theme().colors().border)
+        div()
+            .w_full()
+            .h_px()
+            .flex_none()
+            .bg(cx.theme().colors().border)
     }
 
     /// One setting: its name and what it does on the left, its switch on the right.
@@ -816,15 +829,11 @@ impl SettingsView {
             .items_center()
             .gap_4()
             .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Label::new(title))
-                    .child(
-                        Label::new(description)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
+                v_flex().flex_1().min_w_0().child(Label::new(title)).child(
+                    Label::new(description)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
             )
             .child(div().flex_none().child(switch))
     }
