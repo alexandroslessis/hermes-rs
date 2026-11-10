@@ -25,7 +25,21 @@ use hermes_runtime::{Runtime, RuntimeConfig};
 /// The log: stderr (which the editor keeps) and `logs\acp.log` in the data folder; a log past
 /// 5 MB moves to `acp.log.1` at startup. `RUST_LOG` filters it (default `info`).
 fn init_logging(data_dir: &std::path::Path) {
-    use tracing_subscriber::fmt::writer::MakeWriterExt;
+    use std::io::Write;
+    /// The file first, then stderr; a stderr the editor has closed must not lose the file's line.
+    struct Both(Option<std::fs::File>);
+    impl Write for Both {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(file) = &mut self.0 {
+                let _ = file.write_all(buf);
+            }
+            let _ = std::io::stderr().write_all(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let file = (|| {
@@ -41,16 +55,11 @@ fn init_logging(data_dir: &std::path::Path) {
             .open(path)
             .ok()
     })();
-    let builder = tracing_subscriber::fmt()
+    tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(false)
-        .with_writer(std::io::stderr);
-    match file {
-        Some(file) => builder
-            .with_writer(std::io::stderr.and(std::sync::Mutex::new(file)))
-            .init(),
-        None => builder.init(),
-    }
+        .with_writer(std::sync::Mutex::new(Both(file)))
+        .init();
 }
 
 /// Runs the agent until the editor closes stdin.

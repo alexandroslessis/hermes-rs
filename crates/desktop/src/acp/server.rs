@@ -151,6 +151,7 @@ impl AcpServer {
     }
 
     async fn request(self: &Arc<Self>, method: &str, params: &Value) -> Result<Value, RpcError> {
+        tracing::info!("request {method}");
         match method {
             "initialize" => Ok(self.initialize(params)),
             "session/new" => self.new_session(params).await,
