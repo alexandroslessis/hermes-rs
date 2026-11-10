@@ -1228,3 +1228,150 @@ fn url_for(path: &Path) -> String {
         .replace(' ', "%20");
     format!("file:///{text}")
 }
+
+// ---- Phase 4: model, effort and mode ----
+
+impl Agent {
+    /// `session/new` in the working folder, the whole answer.
+    async fn new_session_answer(&mut self) -> Value {
+        let cwd = self.work.path().display().to_string();
+        self.request("session/new", json!({"cwd": cwd, "mcpServers": []}))
+            .await
+    }
+}
+
+fn option<'a>(options: &'a Value, id: &str) -> &'a Value {
+    options
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"] == id)
+        .unwrap_or_else(|| panic!("no option {id} in {options}"))
+}
+
+#[tokio::test]
+async fn a_new_session_lists_the_models_the_modes_and_the_efforts() {
+    let mut agent = Agent::start(Vec::new()).await;
+    agent.initialize(json!({})).await;
+    let answer = agent.new_session_answer().await;
+    let result = &answer["result"];
+    let model = option(&result["configOptions"], "model");
+    assert_eq!(model["category"], "model");
+    assert_eq!(model["currentValue"], "mock/mock");
+    let values: Vec<&str> = model["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["value"].as_str().unwrap())
+        .collect();
+    assert!(
+        values.contains(&"mock/mock") && values.contains(&"mock/other"),
+        "{values:?}"
+    );
+    let effort = option(&result["configOptions"], "effort");
+    assert_eq!(effort["category"], "thought_level");
+    assert_eq!(effort["currentValue"], "default");
+    assert_eq!(result["modes"]["currentModeId"], "default");
+}
+
+#[tokio::test]
+async fn picking_a_model_routes_the_next_turn_to_it() {
+    let (mut agent, session) = Agent::with_session(vec![text_reply("From the other model")]).await;
+    let answer = agent
+        .request(
+            "session/set_config_option",
+            json!({"sessionId": session, "configId": "model", "value": "mock/other"}),
+        )
+        .await;
+    let model = option(&answer["result"]["configOptions"], "model");
+    assert_eq!(model["currentValue"], "mock/other", "{answer}");
+    agent.prompt(&session, "who are you?").await;
+    assert_eq!(agent.model.requests()[0]["model"], "other");
+}
+
+#[tokio::test]
+async fn picking_an_effort_is_kept() {
+    let (mut agent, session) = Agent::with_session(Vec::new()).await;
+    let answer = agent
+        .request(
+            "session/set_config_option",
+            json!({"sessionId": session, "configId": "effort", "value": "high"}),
+        )
+        .await;
+    assert_eq!(
+        option(&answer["result"]["configOptions"], "effort")["currentValue"],
+        "high"
+    );
+    let back = agent
+        .request(
+            "session/set_config_option",
+            json!({"sessionId": session, "configId": "effort", "value": "default"}),
+        )
+        .await;
+    assert_eq!(
+        option(&back["result"]["configOptions"], "effort")["currentValue"],
+        "default"
+    );
+}
+
+#[tokio::test]
+async fn an_option_or_value_we_never_offered_is_refused() {
+    let (mut agent, session) = Agent::with_session(Vec::new()).await;
+    for (id, value) in [
+        ("effort", "extreme"),
+        ("model", "no-slash"),
+        ("colour", "red"),
+    ] {
+        let answer = agent
+            .request(
+                "session/set_config_option",
+                json!({"sessionId": session, "configId": id, "value": value}),
+            )
+            .await;
+        assert_eq!(answer["error"]["code"], -32602, "{id}: {answer}");
+    }
+}
+
+#[tokio::test]
+async fn yolo_mode_runs_a_flagged_command_without_asking() {
+    let (mut agent, session) = Agent::with_session(Vec::new()).await;
+    let victim = work_file(&agent, "victim");
+    std::fs::create_dir(&victim).unwrap();
+    agent.model.set_replies(vec![
+        tool_reply(&[(
+            "c1",
+            "terminal",
+            json!({"command": flagged_command(&victim)}),
+        )]),
+        text_reply("Gone."),
+    ]);
+    let set = agent
+        .request(
+            "session/set_mode",
+            json!({"sessionId": session, "modeId": "yolo"}),
+        )
+        .await;
+    assert!(set["result"].is_object(), "{set}");
+    let answer = agent.prompt(&session, "clean up").await;
+    assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
+    assert!(!victim.exists(), "YOLO runs the flagged command");
+    assert!(
+        !agent
+            .seen
+            .iter()
+            .any(|m| m["method"] == "session/request_permission"),
+        "no card in YOLO mode"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_mode_is_refused() {
+    let (mut agent, session) = Agent::with_session(Vec::new()).await;
+    let answer = agent
+        .request(
+            "session/set_mode",
+            json!({"sessionId": session, "modeId": "chaos"}),
+        )
+        .await;
+    assert_eq!(answer["error"]["code"], -32602, "{answer}");
+}

@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::rpc::{self, Incoming, RpcError, Sender};
 use super::translate::{self, Action};
-use super::{history, permissions, prompt};
+use super::{controls, history, permissions, prompt};
 use crate::gateway::Gateway;
 use crate::hub::Outbox;
 
@@ -156,6 +156,8 @@ impl AcpServer {
             "session/new" => self.new_session(params).await,
             "session/load" => self.load_session(params).await,
             "session/list" => self.list_sessions(params).await,
+            "session/set_mode" => self.set_mode(params).await,
+            "session/set_config_option" => self.set_config_option(params).await,
             "session/prompt" => self.prompt(params).await,
             // Liveness probes some clients send: not ours, and not worth a warning.
             "ping" | "health" | "healthcheck" => {
@@ -245,7 +247,9 @@ impl AcpServer {
             },
         );
         tracing::info!("new session {id} in {cwd}");
-        Ok(json!({"sessionId": id}))
+        let mut answer = self.controls(&id).await;
+        answer["sessionId"] = json!(id);
+        Ok(answer)
     }
 
     /// `session/load`: the thread's history is replayed as updates *before* the answer (the editor
@@ -293,7 +297,7 @@ impl AcpServer {
             self.update(id, update);
         }
         tracing::info!("loaded session {id}: {} rows", rows.len());
-        Ok(json!({}))
+        Ok(self.controls(id).await)
     }
 
     /// `session/list`: this folder's threads (all of them without a `cwd`), newest first, a page
@@ -354,6 +358,88 @@ impl AcpServer {
             .then(|| page.last().map(|last| last["sessionId"].clone()))
             .flatten();
         Ok(json!({"sessions": page, "nextCursor": next}))
+    }
+
+    /// What the editor can change in a thread: its modes, and its model and effort pickers.
+    async fn controls(&self, session: &str) -> Value {
+        // A provider that doesn't answer must not hold up opening a thread.
+        let options = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            self.call("model.options", json!({"session_id": session})),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
+        let mut config = Vec::new();
+        if let Some(options) = options {
+            config.push(controls::model_option(&options));
+        }
+        config.push(controls::effort_option(&self.gateway.effort(session)));
+        json!({
+            "modes": controls::modes(self.gateway.runtime.yolo(session)),
+            "configOptions": config,
+        })
+    }
+
+    /// `session/set_mode`: Default asks before dangerous commands, YOLO doesn't (`/yolo`).
+    async fn set_mode(self: &Arc<Self>, params: &Value) -> Result<Value, RpcError> {
+        let id = param(params, "sessionId")?;
+        let want = match param(params, "modeId")? {
+            controls::YOLO_MODE => true,
+            controls::DEFAULT_MODE => false,
+            other => return Err(RpcError::invalid_params(format!("Unknown mode {other}"))),
+        };
+        self.session_handle(id).await?;
+        let gateway = self.gateway.clone();
+        let session = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            if gateway.runtime.yolo(&session) != want {
+                gateway.runtime.toggle_yolo(&session)?;
+            }
+            anyhow::Ok(())
+        })
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?
+        .map_err(|e| RpcError::internal(format!("{e:#}")))?;
+        Ok(json!({}))
+    }
+
+    /// `session/set_config_option`: the model or the effort, through the calls the page's pickers
+    /// make. A model picked mid-turn applies from the next one (the gateway defers it).
+    async fn set_config_option(self: &Arc<Self>, params: &Value) -> Result<Value, RpcError> {
+        let id = param(params, "sessionId")?;
+        let option = param(params, "configId")?;
+        let value = param(params, "value")?;
+        self.session_handle(id).await?;
+        match option {
+            "model" => {
+                let (provider, model) = controls::split_model(value)
+                    .ok_or_else(|| RpcError::invalid_params(format!("Not a model: {value}")))?;
+                self.call(
+                    "config.set",
+                    json!({
+                        "session_id": id,
+                        "key": "model",
+                        "value": format!("{model} --provider {provider} --session"),
+                    }),
+                )
+                .await?;
+            }
+            "effort" => {
+                let effort = controls::gateway_effort(value)
+                    .ok_or_else(|| RpcError::invalid_params(format!("Not an effort: {value}")))?;
+                self.call(
+                    "config.set",
+                    json!({"session_id": id, "key": "reasoning", "value": effort}),
+                )
+                .await?;
+            }
+            other => {
+                return Err(RpcError::invalid_params(format!("Unknown option {other}")));
+            }
+        }
+        let controls = self.controls(id).await;
+        Ok(json!({"configOptions": controls["configOptions"]}))
     }
 
     /// After `session/new` or `session/load` is answered: the commands the editor can offer.
@@ -513,11 +599,32 @@ impl AcpServer {
             }
             return Err(error);
         }
-        finished.await.unwrap_or_else(|_| {
-            Err(RpcError::internal(
-                "the agent stopped before the turn ended",
-            ))
-        })
+        // The turn ends with the gateway's `message.complete`. Should its loop ever end without
+        // one (the runtime failing under it), the prompt must not wait forever: a session the
+        // runtime no longer runs, two checks in a row, has no turn left to wait for.
+        let mut finished = std::pin::pin!(finished);
+        let mut idle = 0;
+        let mut check = tokio::time::interval(std::time::Duration::from_secs(3));
+        check.tick().await;
+        loop {
+            tokio::select! {
+                answer = &mut finished => {
+                    return answer.unwrap_or_else(|_| {
+                        Err(RpcError::internal("the agent stopped before the turn ended"))
+                    });
+                }
+                _ = check.tick() => {
+                    idle = if self.gateway.runtime.is_running(id) { 0 } else { idle + 1 };
+                    if idle >= 2 {
+                        if let Some(session) = self.lock().sessions.get_mut(id) {
+                            session.turn = None;
+                        }
+                        tracing::warn!("{id}: the turn stopped without a result");
+                        return Err(RpcError::internal("The turn ended without a result."));
+                    }
+                }
+            }
+        }
     }
 
     // ---- the gateway's events ----

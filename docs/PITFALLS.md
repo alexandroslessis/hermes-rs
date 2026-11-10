@@ -2,10 +2,18 @@
 
 Things that cost hours once. Read this before debugging; check here first when something is odd.
 
-ACP mode (`--acp`, planned in [docs/acp/](acp/README.md)) has its own known traps, listed there
-before they bite: stdout is the protocol, so `main.rs`'s `init_logging` (which writes to stdout)
-must not run in that mode; an event for a session the gateway's `Hub` doesn't route to us is
-dropped, and an approval nobody sees is denied. Add what you learn while building it here.
+ACP mode (`--acp`, [docs/acp/](acp/README.md)):
+- **stdout is the protocol.** `main.rs`'s `init_logging` writes to stdout, so `--acp` returns
+  before it and logs through `acp::init_logging` (stderr + `logs\acp.log`). One stray `println!`
+  breaks the editor; `tests/acp.rs` `the_stdout_rule_holds_through_a_whole_tool_turn` guards it.
+- **Call the gateway through `Gateway::call`**, not `dispatch`: a started turn's events wait for the
+  page's admission receipt, which only `handle` (the socket path) and `call` release.
+- An event for a session the gateway's `Hub` doesn't route to us is dropped, and an approval
+  nobody sees is denied. `session.create` / `session.resume` / `prompt.submit` subscribe our outbox.
+- **Tests that need a flagged command** use PowerShell syntax (`Remove-Item -Recurse -Force`): the
+  terminal tool runs PowerShell unless `desktop-config.json` says bash, and `rm -rf` is not valid there.
+- **The test model must tell a title request from a turn** (a turn offers tools, a title doesn't);
+  both are chat completions, and a title request that eats a scripted reply fails the next turn.
 
 ## Shell and tooling (Windows)
 

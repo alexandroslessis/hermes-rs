@@ -116,6 +116,28 @@ is the contract (257 methods), `apps/desktop/src/api/` is how the page calls the
   `/api/tools/*` → `toolsets.rs`, `/api/learning/*` → `learning.rs`, `/api/skills*` → `skills.rs`,
   `/api/sessions/{id}` → `session_route`, `/api/sessions/{id}/messages` → `stored_messages`.
 
+## ACP mode (`--acp`, `crates/desktop/src/acp/`)
+
+`hermes-desktop.exe --acp` is the agent for an editor (Zed): no window, no web server, JSON-RPC
+lines on stdin/stdout (Agent Client Protocol). It builds the same `Runtime` and `Gateway` as the
+app (`Gateway::new_for_acp`: no curator, no auto-archive) and is a *client of that gateway* in its
+own process: `Gateway::call(method, params, outbox)` is the page's socket without the socket, and
+the page events that arrive on the outbox (`message.delta`, `tool.start`, `approval.request`, …)
+become `session/update`s. Plan and reference: [acp/README.md](acp/README.md),
+[acp/PROTOCOL.md](acp/PROTOCOL.md).
+
+| Module | Role |
+|---|---|
+| `mod.rs` | `run()`: logging to `logs\acp.log` + stderr (**stdout is the protocol**), runtime, gateway, serve stdio |
+| `rpc.rs` | Line framing, requests both ways (`Sender::request` waits for the editor's answer), one writer |
+| `server.rs` | `AcpServer`: the methods, per-session state, the event pump, approval/clarify tasks |
+| `translate.rs` | One turn's events → updates (pure) |
+| `tools.rs`, `history.rs`, `prompt.rs`, `permissions.rs`, `controls.rs` | Pure mappings: tool cards and diffs; stored rows → replay; ACP content blocks → text and images; approvals and questions; model/effort/mode options |
+
+It shares `%APPDATA%\hermes-rs` with the app, which may run at the same time (SQLite is in WAL
+mode): a thread started in Zed is in the app's sidebar. Tests: `crates/desktop/tests/acp.rs`
+(the real exe on pipes against a scripted model), probe: `scripts/acp/acp-probe.mjs`.
+
 ## Feature map: screen → code → check
 
 Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`.)

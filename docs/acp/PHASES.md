@@ -28,6 +28,8 @@ Rules that matter most here:
 
 ## Phase 0 — The `--acp` mode answers `initialize`
 
+✅ **Done 2026-11-10.**
+
 **Goal:** `hermes-desktop.exe --acp` starts without a window, reads JSON-RPC lines from stdin,
 answers `initialize`, answers -32601 to everything else, and exits when stdin closes. Zed lists the
 agent and connects to it (creating a thread fails with "method not found", which is expected).
@@ -123,6 +125,8 @@ startup section: one paragraph on `--acp`; `docs/PITFALLS.md`: "stdout is the pr
 
 ## Phase 1 — Chat: new session, prompt, streaming, cancel
 
+✅ **Done 2026-11-10.**
+
 **Goal:** in Zed, a new Hermes thread, type a message, the reply streams in (with thinking shown as
 thoughts), Stop works, errors show as errors.
 
@@ -199,6 +203,12 @@ messageId per reply, empty deltas skipped, complete/interrupted/error → the th
 
 ## Phase 2 — Tools, diffs, approvals, clarify, plan
 
+✅ **Done 2026-11-10.** As built: a `patch` card's diff comes from the tool's own result (one `diff`
+item per hunk, like Hermes); a `write_file` card's "before" is read by the server when the call
+starts (`Action::Snapshot`), which can lose a race with a very fast write, in which case the card
+shows the file as new. `Gateway::call` (not `dispatch` directly) is the way in: it releases a
+started turn's events, which otherwise wait for the page's receipt.
+
 **Goal:** tool calls show as Zed tool cards with the right icon (kind), title and file location;
 file edits show as diffs; dangerous commands ask in Zed; clarify questions can be answered;
 the todo list shows as Zed's plan.
@@ -251,6 +261,8 @@ plan entries); `tests/acp.rs`: `a_tool_call_shows_start_and_completion`,
 
 ## Phase 3 — Sessions: history, list, titles, usage, commands, context
 
+✅ **Done 2026-11-10.** As built: every command in `commands.catalog` is offered with an input hint; a command the gateway answers with output is shown as one message, a `send`/`skill` one is submitted as the turn's text, an unknown one goes to the model as typed. A thread nobody wrote in isn't listed.
+
 **Goal:** past threads reopen with their history; Zed's thread history lists hermes sessions for
 this folder; titles appear; the context-usage meter fills; `/` commands are offered and work;
 `@`-mentioned files and pasted images reach the model.
@@ -288,6 +300,8 @@ drive letters, a resource without a name); `tests/acp.rs`: `load_replays_history
 
 ## Phase 4 — Model picker, effort, modes
 
+✅ **Done 2026-11-10.** As built: the model list comes from `model.options` (bounded to 4 s, so an unreachable provider doesn't hold up opening a thread); the mode is the runtime's per-session YOLO flag, which lasts as long as the process (a reloaded thread starts in Default).
+
 **Goal:** Zed's model picker lists the desktop's models and switches the thread's model; the
 effort selector works; a "YOLO" mode switches off approvals for the thread.
 
@@ -307,6 +321,8 @@ effort selector works; a "YOLO" mode switches off approvals for the thread.
 ---
 
 ## Phase 5 — Hardening and living alongside the desktop app
+
+Open. Done so far: EOF on stdin interrupts every turn and stops the session's processes; a request handler that fails answers an error (each request is its own task).
 
 1. **Both apps at once** (README D5): run the desktop instance (`perf.ps1`, data `target/perf/home`)
    and an ACP process on the same `HERMES_RS_HOME`; create a session in each; check both see both

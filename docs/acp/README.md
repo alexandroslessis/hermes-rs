@@ -1,8 +1,8 @@
 # ACP: using hermes-rs from Zed (and later t3code)
 
-Status: **planned** (2026-11-10). Nothing here is implemented yet. This folder is the plan and the
-reference for implementing it; read it whole before writing code, then follow
-[PHASES.md](PHASES.md) step by step.
+Status: **phases 0-4 built** (2026-11-10), checked by the test suite, not yet by the user in Zed
+(the checklists in [ZED.md](ZED.md)); phases 5 (hardening) and 6 (t3code) are open. This folder
+is the plan and the reference: read it before changing the code, and keep it true.
 
 | File | What it is |
 |---|---|

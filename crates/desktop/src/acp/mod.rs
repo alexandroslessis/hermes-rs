@@ -8,6 +8,7 @@
 //!
 //! Hermes: `acp_adapter/entry.py` (stdio only, logging to stderr).
 
+mod controls;
 mod history;
 mod permissions;
 mod prompt;

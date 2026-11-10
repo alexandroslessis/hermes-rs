@@ -3089,8 +3089,10 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "windows-sys 0.59.0",
+ "wiremock",
 ]
 
 [[package]]

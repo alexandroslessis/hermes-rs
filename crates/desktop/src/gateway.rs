@@ -2201,7 +2201,7 @@ impl Gateway {
     }
 
     /// The session's reasoning effort: picked in the composer, else Settings' default.
-    fn effort(&self, id: &str) -> String {
+    pub(crate) fn effort(&self, id: &str) -> String {
         self.efforts
             .lock()
             .ok()
