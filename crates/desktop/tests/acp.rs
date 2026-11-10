@@ -1375,3 +1375,129 @@ async fn an_unknown_mode_is_refused() {
         .await;
     assert_eq!(answer["error"]["code"], -32602, "{answer}");
 }
+
+// ---- Zed's first real session: what it showed (and didn't) ----
+
+#[tokio::test]
+async fn the_mode_is_a_config_option_that_switches_yolo() {
+    // Zed shows config options and ignores `modes` when it gets them.
+    let (mut agent, session) = Agent::with_session(Vec::new()).await;
+    let answer = agent.new_session_answer().await;
+    let mode = option(&answer["result"]["configOptions"], "mode");
+    assert_eq!(mode["category"], "mode");
+    assert_eq!(mode["currentValue"], "default");
+    let set = agent
+        .request(
+            "session/set_config_option",
+            json!({"sessionId": session, "configId": "mode", "value": "yolo"}),
+        )
+        .await;
+    assert_eq!(
+        option(&set["result"]["configOptions"], "mode")["currentValue"],
+        "yolo",
+        "{set}"
+    );
+    let bad = agent
+        .request(
+            "session/set_config_option",
+            json!({"sessionId": session, "configId": "mode", "value": "chaos"}),
+        )
+        .await;
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+}
+
+#[tokio::test]
+async fn the_efforts_are_hermes_levels_and_off_is_sent_as_none() {
+    let (mut agent, session) = Agent::with_session(vec![text_reply("ok")]).await;
+    let answer = agent.new_session_answer().await;
+    let effort = option(&answer["result"]["configOptions"], "effort");
+    let values: Vec<&str> = effort["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["value"].as_str().unwrap())
+        .collect();
+    for wanted in [
+        "default", "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    ] {
+        assert!(values.contains(&wanted), "{wanted} in {values:?}");
+    }
+    let set = agent
+        .request(
+            "session/set_config_option",
+            json!({"sessionId": session, "configId": "effort", "value": "off"}),
+        )
+        .await;
+    assert_eq!(
+        option(&set["result"]["configOptions"], "effort")["currentValue"],
+        "off",
+        "{set}"
+    );
+    agent.prompt(&session, "think?").await;
+    assert_eq!(
+        agent.model.requests()[0]["reasoning_effort"],
+        "none",
+        "{}",
+        agent.model.requests()[0]
+    );
+}
+
+#[tokio::test]
+async fn the_gateways_own_commands_are_offered_and_usage_runs_without_the_model() {
+    let (mut agent, session) = Agent::with_session(Vec::new()).await;
+    let sid = session.clone();
+    let commands = agent
+        .wait_for(move |seen, _| {
+            seen.iter()
+                .find(|m| {
+                    m["params"]["sessionId"] == sid.as_str()
+                        && m["params"]["update"]["sessionUpdate"] == "available_commands_update"
+                })
+                .map(|m| m["params"]["update"]["availableCommands"].clone())
+        })
+        .await;
+    let names: Vec<&str> = commands
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    for wanted in ["usage", "status", "context", "tools"] {
+        assert!(names.contains(&wanted), "{wanted} in {names:?}");
+    }
+    let answer = agent.prompt(&session, "/usage").await;
+    assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
+    assert!(agent.model.requests().is_empty());
+    assert!(!agent.reply_text(&session).is_empty());
+}
+
+#[tokio::test]
+async fn an_editor_with_terminal_cards_gets_the_command_output_in_one() {
+    let mut agent = Agent::start(vec![
+        tool_reply(&[("t1", "terminal", json!({"command": "echo card-output"}))]),
+        text_reply("Done."),
+    ])
+    .await;
+    agent
+        .initialize(json!({"_meta": {"terminal_output": true}}))
+        .await;
+    let session = agent.new_session_answer().await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    agent.prompt(&session, "run it").await;
+    let started = &agent.updates_of(&session, "tool_call")[0];
+    assert_eq!(started["_meta"]["terminal_info"]["terminal_id"], "t1");
+    assert_eq!(started["content"][0]["type"], "terminal");
+    assert_eq!(started["content"][0]["terminalId"], "t1");
+    let finished = agent.updates_of(&session, "tool_call_update");
+    let last = finished.last().unwrap();
+    assert!(
+        last["_meta"]["terminal_output"]["data"]
+            .as_str()
+            .unwrap()
+            .contains("card-output"),
+        "{last}"
+    );
+    assert_eq!(last["_meta"]["terminal_exit"]["exit_code"], 0);
+}

@@ -55,6 +55,9 @@ pub struct Turn {
     before: HashMap<String, Option<String>>,
     /// Whether any reply text was streamed (else the completion's text is sent).
     streamed: bool,
+    /// The editor draws terminal cards from `_meta` (Zed's `terminal_output` extension): a
+    /// `terminal` call is then a terminal card with the output in it, not a text card.
+    terminal_cards: bool,
 }
 
 fn chunk(kind: &str, id: &str, text: &str) -> Action {
@@ -90,7 +93,14 @@ impl Turn {
             open: Vec::new(),
             before: HashMap::new(),
             streamed: false,
+            terminal_cards: false,
         }
+    }
+
+    /// Turns the editor's terminal cards on (it announced `_meta.terminal_output`).
+    pub fn with_terminal_cards(mut self, on: bool) -> Self {
+        self.terminal_cards = on;
+        self
     }
 
     /// The text a `write_file` call found on disk when it started (`None`: no such file).
@@ -192,6 +202,10 @@ impl Turn {
         if !locations.is_empty() {
             update["locations"] = json!(locations);
         }
+        if self.terminal_cards && name == "terminal" {
+            update["_meta"] = json!({"terminal_info": {"terminal_id": id}});
+            update["content"] = json!([{"type": "terminal", "terminalId": id}]);
+        }
         let mut actions = vec![Action::Update(update)];
         if let Some(path) = tools::snapshot_path(&name, &args, &self.cwd) {
             actions.push(Action::Snapshot {
@@ -233,7 +247,17 @@ impl Turn {
             "status": if failed { "failed" } else { "completed" },
             "rawOutput": raw_output,
         });
-        if !content.is_empty() {
+        if self.terminal_cards && name == "terminal" && position.is_some() {
+            // The output goes into the terminal card that `tool_start` opened.
+            update["_meta"] = json!({
+                "terminal_output": {"terminal_id": id, "data": tools::terminal_text(&result, raw)},
+                "terminal_exit": {
+                    "terminal_id": id,
+                    "exit_code": result.get("exit_code").and_then(Value::as_i64).unwrap_or(i64::from(failed)),
+                    "signal": Value::Null,
+                },
+            });
+        } else if !content.is_empty() {
             update["content"] = json!(content);
         }
         let mut actions = vec![Action::Update(update)];

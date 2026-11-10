@@ -89,8 +89,8 @@ relevant part of `dev: open acp logs`.
 1. Restart Zed, open the thread history (Agent panel) → your Hermes threads for this project are
    listed with titles.
 2. Open an old one → its messages and tool calls are shown; continue it → the agent remembers.
-3. Type `/` → hermes commands are offered (`/compress`, `/usage`, …); `/usage` answers without a
-   model call.
+3. Type `/` → the commands are offered (`/status`, `/usage`, `/context`, `/tools`, `/plan`, skills, …);
+   `/usage` answers without a model call. (Zed refuses a command the agent didn't list.)
 4. `@`-mention a file and ask about it → the agent answers about that file's content.
 5. Paste a screenshot and ask what's in it → described (with a vision model) or read through
    `vision_analyze`.
@@ -99,5 +99,7 @@ relevant part of `dev: open acp logs`.
 ### Phase 4
 1. The model picker in the thread lists the models the desktop app offers; pick another → the
    next reply comes from it (ask "which model are you?" if the model knows).
-2. The effort selector changes the reasoning effort (visible with a reasoning model).
-3. Mode menu → YOLO → a flagged command runs without asking; back to Default → it asks again.
+2. The effort selector lists Default, Off, Minimal, Low, Medium, High, Extra High, Max, Ultra (Hermes's
+   own list, the same for every model); a pick is sent as `reasoning_effort` (Off as `none`).
+3. The **Mode** selector (a config option, category `mode`: Zed shows config options and ignores the
+   legacy `modes`) → YOLO → a flagged command runs without asking; back to Default → it asks again.

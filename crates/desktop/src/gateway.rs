@@ -522,7 +522,12 @@ impl Gateway {
                     ("reasoning", Some(id)) => {
                         let effort = value.as_str().unwrap_or_default().to_lowercase();
                         if let Ok(mut efforts) = self.efforts.lock() {
-                            efforts.insert(id.to_string(), effort.clone());
+                            // Nothing picked (an editor's "Default"): Settings' effort again.
+                            if effort.is_empty() {
+                                efforts.remove(id);
+                            } else {
+                                efforts.insert(id.to_string(), effort.clone());
+                            }
                         }
                         self.emit(id, "session.info", self.session_info(id));
                         Ok(json!({"key": key, "value": effort, "ok": true}))
@@ -1336,7 +1341,8 @@ impl Gateway {
             .lock()
             .ok()
             .and_then(|efforts| efforts.get(session).cloned())
-            .filter(|e| e != "none");
+            // "ultra" is Hermes's own step above max: the wire has no more than max.
+            .map(|e| if e == "ultra" { "max".to_string() } else { e });
         let mut aux = crate::aux_models::runtime_models(&settings, &context);
         // "Inherit main model effort" (the Auxiliary page's default): compression and the
         // background review think as hard as the chat. The approval judge and titles keep

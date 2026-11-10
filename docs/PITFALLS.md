@@ -3,6 +3,17 @@
 Things that cost hours once. Read this before debugging; check here first when something is odd.
 
 ACP mode (`--acp`, [docs/acp/](acp/README.md)):
+- **Zed shows only what the agent lists.** Modes must also be a config option (`category: "mode"`,
+  `controls::mode_option`), or Zed shows no mode selector; a slash command must be in
+  `available_commands_update` (`controls::GATEWAY_COMMANDS` for the ones `slash.exec` runs that the
+  catalog doesn't list), or Zed refuses it before it reaches us.
+- **Terminal output needs Zed's terminal card.** When the client announces
+  `clientCapabilities._meta.terminal_output`, a `terminal` call is a terminal card
+  (`_meta.terminal_info` on the call, `terminal_output` + `terminal_exit` on the result), else a
+  text card. Unverified in Zed 1.26 until the user checks (checklist Phase 2, item 1).
+- **"Editing previous messages is not available"** (Zed, on a hermes thread): ACP v1 has no
+  rewind/edit request (the `session/rewind` proposal was closed, superseded by the v2 prompt
+  lifecycle), so there is nothing to implement. Hermes's `session.rewind` exists for the desktop page.
 - **Editors need `hermes-acp.exe`, not the release `hermes-desktop.exe`.** The release app is a
   Windows GUI-subsystem program; launched by Zed with pipes it exits (code 0) right after
   `initialize`, while the debug build (a console program) works. `hermes-acp.exe`

@@ -50,6 +50,8 @@ struct Session {
 struct Inner {
     /// The editor takes forms (`elicitation/create`).
     forms: bool,
+    /// The editor draws terminal cards from `_meta` (Zed's extension).
+    terminal_cards: bool,
     sessions: HashMap<String, Session>,
 }
 
@@ -186,6 +188,8 @@ impl AcpServer {
             .get("form")
             .is_some_and(|form| !form.is_null());
         self.lock().forms = forms;
+        self.lock().terminal_cards =
+            params["clientCapabilities"]["_meta"]["terminal_output"] == true;
         json!({
             "protocolVersion": 1,
             "agentCapabilities": {
@@ -376,6 +380,7 @@ impl AcpServer {
             config.push(controls::model_option(&options));
         }
         config.push(controls::effort_option(&self.gateway.effort(session)));
+        config.push(controls::mode_option(self.gateway.runtime.yolo(session)));
         json!({
             "modes": controls::modes(self.gateway.runtime.yolo(session)),
             "configOptions": config,
@@ -426,6 +431,10 @@ impl AcpServer {
                 )
                 .await?;
             }
+            "mode" => {
+                self.set_mode(&json!({"sessionId": id, "modeId": value}))
+                    .await?;
+            }
             "effort" => {
                 let effort = controls::gateway_effort(value)
                     .ok_or_else(|| RpcError::invalid_params(format!("Not an effort: {value}")))?;
@@ -449,7 +458,7 @@ impl AcpServer {
         let Ok(catalog) = catalog else {
             return;
         };
-        let commands: Vec<Value> = catalog["pairs"]
+        let mut commands: Vec<Value> = catalog["pairs"]
             .as_array()
             .map(|pairs| {
                 pairs
@@ -467,6 +476,16 @@ impl AcpServer {
                     .collect()
             })
             .unwrap_or_default();
+        // The editor refuses a command that isn't listed, so the gateway's own are added.
+        for (name, description) in controls::GATEWAY_COMMANDS {
+            if !commands.iter().any(|c| c["name"] == name) {
+                commands.push(json!({
+                    "name": name,
+                    "description": description,
+                    "input": {"hint": "arguments, if it takes any"},
+                }));
+            }
+        }
         self.update(
             session,
             json!({"sessionUpdate": "available_commands_update", "availableCommands": commands}),
@@ -577,10 +596,11 @@ impl AcpServer {
             }
         }
         let (done, finished) = oneshot::channel();
+        let terminal_cards = self.lock().terminal_cards;
         self.lock().sessions.get_mut(id).map(|session| {
             session.turn = Some(Turn {
                 done: Some(done),
-                translate: translate::Turn::new(&cwd),
+                translate: translate::Turn::new(&cwd).with_terminal_cards(terminal_cards),
                 asking: HashMap::new(),
             });
         });

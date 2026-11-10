@@ -172,6 +172,15 @@ fn result_text(result: &Value, raw: &str) -> String {
     text
 }
 
+/// What a `terminal` call printed, for the editor's terminal card (no exit-code line: the card
+/// shows the exit status itself).
+pub fn terminal_text(result: &Value, raw: &str) -> String {
+    match result.get("output").and_then(Value::as_str) {
+        Some(output) => output.to_string(),
+        None => result_text(result, raw),
+    }
+}
+
 fn text_content(text: &str) -> Value {
     json!({"type": "content", "content": {"type": "text", "text": text}})
 }
