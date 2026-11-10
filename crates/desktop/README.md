@@ -58,10 +58,13 @@ bundles in the `/` menu; rename, delete, pin, branch; model and effort per sessi
 restore-and-rerun, `/undo`, `/retry`, checkpoints and `/rollback`; built-in commands (`/compress`,
 `/status`, `/diff`, `/usage`, `/insights`, `/context`, `/tools`, `/save`), coding commands
 (`/plan`, `/init`, `/review`, `/learn`), `/btw`, `/bg`; custom endpoints and keys in Settings;
-attachments (images, files, paste, drop); the side panel's file preview/edit, git review and
+attachments (images, files, paste, drop); moving a session between projects (drag onto a project
+row, the folder picker on an open chat, or the Home bucket); the file tree's "Open in default app"
+(right-click, patches 0015); the profiles window's SOUL.md editor; the side panel's file preview/edit, git review and
 terminal; live subagents; archiving and Settings ▸ Sessions; the Artifacts gallery; Capabilities ▸ Skills and Tools; the Star map and Settings ▸ Memory;
 Command Center (maintenance, curator, logs, insights); Settings ▸ Model ▸ Auxiliary (side jobs'
-models); importing Hermes sessions; the installer.
+models); arrow-key navigation in the file tree and the Settings rail (patches 0018/0019);
+importing Hermes sessions; the installer.
 
 Not here (hidden or answering "not here"): MCP connectors, goals and loops, fallbacks, scheduled jobs, messaging, bots, kanban, pets, voice. The
 list with evidence is [GAPS.md](../../GAPS.md); how to build each is

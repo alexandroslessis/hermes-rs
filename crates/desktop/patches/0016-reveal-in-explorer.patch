@@ -1,0 +1,45 @@
+--- a/apps/desktop/src/store/file-actions.ts
++++ b/apps/desktop/src/store/file-actions.ts
+@@ -82,6 +82,21 @@ export async function openFileInDefaultApp(path: string): Promise<void> {
+   }
+ }
+ 
++/** Show a path selected in its containing folder (hermes-rs: the backend runs on
++ *  this machine, and the Electron bridge's revealPath has no shim answer, so the
++ *  local-only Reveal item hides). A backend without the route reports the failure. */
++export async function revealFileInExplorer(path: string): Promise<void> {
++  try {
++    await hermesApi<{ ok?: boolean }>({
++      body: { url: path },
++      method: 'POST',
++      path: '/api/hermes-rs/reveal'
++    })
++  } catch (error) {
++    notifyError(error, translateNow('errors.genericFailure'))
++  }
++}
++
+ export async function copyFilePath(path: string): Promise<void> {
+   try {
+     await copyTextToClipboard(path)
+--- a/apps/desktop/src/app/right-sidebar/file-actions.tsx
++++ b/apps/desktop/src/app/right-sidebar/file-actions.tsx
+@@ -27,6 +27,7 @@ import {
+   openFileInDefaultApp,
+   requestFileDelete,
+   revealFile,
++  revealFileInExplorer,
+   shouldOfferRemoteFileDownload,
+   toRelativePath
+ } from '@/store/file-actions'
+@@ -79,6 +80,10 @@ export function FileEntryContextMenu({ children, isDirectory, name, path, relati
+             shown selected in Explorer. Hermes's browser build has no such
+             route, so this item is ours. */}
+         <ContextMenuItem onSelect={() => void openFileInDefaultApp(path)}>{m.openInDefaultApp}</ContextMenuItem>
++        {/* hermes-rs: the backend runs on this machine, so a path is shown selected
++            in its containing folder (the Electron bridge's revealPath has no shim
++            answer, so Hermes's local-only Reveal item hides above). */}
++        <ContextMenuItem onSelect={() => void revealFileInExplorer(path)}>{m.revealExplorer}</ContextMenuItem>
+         <ContextMenuSeparator />
+         {localFs && (
+           <>

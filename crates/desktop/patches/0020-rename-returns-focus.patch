@@ -1,0 +1,39 @@
+--- a/apps/desktop/src/app/right-sidebar/file-actions.tsx
++++ b/apps/desktop/src/app/right-sidebar/file-actions.tsx
+@@ -161,7 +161,7 @@ export function InlineRenameInput({ className, name, path }: InlineRenameInputPr
+   // blurs in this window and grab focus back instead.
+   const mountedAt = useRef(Date.now())
+ 
+-  const finish = async (commit: boolean) => {
++  const finish = async (commit: boolean, returnFocus = false) => {
+     if (done.current) {
+       return
+     }
+@@ -178,6 +178,14 @@ export function InlineRenameInput({ className, name, path }: InlineRenameInputPr
+     }
+ 
+     cancelInlineRename()
++
++    // Exiting via the keyboard unmounts this input with the row and drops DOM
++    // focus on the body — no arrow key then fires anywhere in the tree. Return
++    // focus to it, as VS Code's rename does. (A blur-origin finish leaves focus
++    // where the user clicked.)
++    if (returnFocus) {
++      document.querySelector<HTMLElement>('[data-project-tree] [role="tree"]')?.focus()
++    }
+   }
+ 
+   return (
+@@ -212,10 +220,10 @@ export function InlineRenameInput({ className, name, path }: InlineRenameInputPr
+ 
+         if (isSubmitEnter(event)) {
+           event.preventDefault()
+-          void finish(true)
++          void finish(true, true)
+         } else if (event.key === 'Escape') {
+           event.preventDefault()
+-          void finish(false)
++          void finish(false, true)
+         }
+       }}
+       spellCheck={false}

@@ -36,6 +36,14 @@ What `crates/desktop/tauri.conf.json` sets:
 The installed app uses the same data folder as a developer build (`%APPDATA%\hermes-rs`), so an
 installed copy and a built copy share settings and sessions on one machine.
 
+**Custom NSIS template** (`nsis/installer.nsi`, set by `bundle ▸ windows ▸ nsis ▸ template`): the
+desktop shortcut is removed from the installer — no "Add desktop shortcut" checkbox on the finish
+page, and silent/passive installs don't create one (the Start menu shortcut is unchanged; the
+uninstaller still cleans up a leftover desktop shortcut from an older install). The file is
+Tauri's own template (copied from `tauri-bundler` at the CLI's version, `tauri-cli-v2.12.4`) with
+those pieces taken out. When the Tauri CLI updates, refresh the copy against the new version's
+template — a stale one can break the bundle — and re-check the changes still read honestly.
+
 `scripts/build-msi.ps1` and `installer/hermes-rs.wxs` are the old WiX MSI for the frozen GPUI
 app; not used for hermes-desktop.
 

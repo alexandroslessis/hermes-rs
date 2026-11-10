@@ -36,4 +36,13 @@ pub enum AgentEvent {
         kind: &'static str,
         payload: serde_json::Value,
     },
+    /// Live progress from inside a running tool call (the terminal's output tail; Hermes's
+    /// `agent/tool_progress_relay.py` fires the same `tool.progress` wire event for MCP tools).
+    /// Emitted from the tool's own thread, throttled there.
+    ToolProgress {
+        tool_call_id: String,
+        name: String,
+        progress: f64,
+        message: String,
+    },
 }

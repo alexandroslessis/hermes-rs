@@ -122,7 +122,7 @@ Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`
 
 | Screen / command | Backend | Calls | Live check |
 |---|---|---|---|
-| Chat: send, stream, stop, queue, steer | gw `submit`, `transcript.rs`, runtime `start_turn` | `prompt.submit`, `session.interrupt`, `session.steer`, `prompt.*_queued` | `smoke.mjs`, `stop-check.mjs` |
+| Chat: send, stream, stop, queue, steer | gw `submit`, `transcript.rs`, runtime `start_turn` | `prompt.submit`, `session.interrupt`, `session.steer`, `prompt.*_queued` | `smoke.mjs`, `stop-check.mjs`, `provider-error-check.mjs` |
 | Approvals, clarify | `hub.rs` (`DesktopBridge`), `hermes_tools::approval` | `approval.respond`, `clarify.respond` | `smoke.mjs` |
 | Sidebar: sessions, search, pin, rename, delete | gw `session_list`, `session_route` | `/api/profiles/sessions`, `/api/sessions/*` | — |
 | Artifacts (sidebar), `file:` links | page over `stored_messages`; `open_file.rs` (patch 0013) | `/api/sessions/{id}/messages`, `/api/hermes-rs/open-file` | `artifacts-check.mjs` |
@@ -149,6 +149,7 @@ Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`
 | Capabilities ▸ Tools | `toolsets.rs`, runtime `set_disabled_tools` | `/api/tools/*` | `toolsets-check.mjs` |
 | Command Center ▸ Maintenance, logs, insights | `maintenance.rs`, gw | `/api/curator*`, `/api/logs`, `insights.get` | — |
 | Import Hermes sessions | `hermes_import.rs` | `session.foreign.*`, `/import-hermes` | `import-check.mjs` |
+| Profiles window, SOUL.md editor | `profiles.rs` | `/api/profiles/{name}/soul`, `/api/profiles` | `profiles-check.mjs` |
 | Window caption buttons, zoom, dialogs | `server.rs` `window_control`, `main.rs` | `/api/hermes-rs/window` | — |
 
 ## A turn, end to end

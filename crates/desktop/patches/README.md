@@ -100,6 +100,85 @@ files before 0003/0004, 6.6 MB in 109 after.
   file that's gone, the gallery keeps Hermes's download. Tested live 2026-11-05
   (`scripts/perf/artifacts-check.mjs`).
 
+- **0014-move-to-home.patch** (`app/chat/session-drag.ts`,
+  `app/chat/sidebar/session-actions-menu.tsx`, `store/projects.ts`): a session can be moved to
+  the sidebar's Home bucket — dragged onto its row, or the row's own "Move to project"
+  submenu. Hermes excludes Home from both ("no folder to move into"); here moving there is a
+  deviation the user asked for, and it targets the bare home workspace (the backend's default
+  cwd), which is what Hermes's own tree files into Home ("no cwd, bare home, deleted
+  workspace"). The store hunk fetches that cwd for the Home target; the session's own current
+  bucket (the tree snapshot's owner map) stays a non-target. Hermes's `session-drag.test.ts`
+  "is not a target for Home — there is no folder to move into" fails by design: it checks the
+  exclusion this patch removes, which is the deviation the user asked for. Tested live
+  2026-11-06 (`scripts/perf/workspace-check.mjs`: the move, the tree filing the session into
+  Home).
+
+- **0015-open-in-default-app.patch** (`app/right-sidebar/file-actions.tsx`,
+  `store/file-actions.ts`, `i18n/types.ts`, every `i18n` locale, `locales/_keys.desktop.json`):
+  "Open in default app" at the top of both file trees' right-click menu. The page sees our
+  backend as remote (no Electron bridge, so `nativeHostFiles` is missing), which hides
+  Reveal/Rename/Delete and offers only copy-path and Download; the action asks
+  `POST /api/hermes-rs/open-file` (`open_file.rs`, the route patch 0013 added for the Artifacts
+  gallery) with the row's plain absolute path — the backend opens the file with its default app,
+  a folder in Explorer, and shows a program or script selected in Explorer instead (a menu never
+  runs one). A backend without the route (a real remote Hermes) reports the failure as a toast.
+  The review/git tree keeps Hermes's menu shape (its "Open file" opens the in-app preview).
+  Tested live 2026-11-08 (`scripts/perf/file-tree-open-check.mjs`).
+
+- **0016-reveal-in-explorer.patch** (`app/right-sidebar/file-actions.tsx`,
+  `store/file-actions.ts`): "Reveal in File Explorer" beside "Open in default app" in the file
+  trees' right-click menu. The label reuses Hermes's `fileMenu.revealExplorer` (translated in
+  every locale); the action asks `POST /api/hermes-rs/reveal` (`open_file.rs` `reveal_plan`: the
+  path shown selected in its containing folder, `explorer.exe /select`), which the Electron
+  bridge's `revealPath` has no shim answer for, so Hermes's local-only Reveal item hides. The
+  review/git tree keeps Hermes's menu shape. Tested live 2026-11-08
+  (`scripts/perf/file-tree-open-check.mjs`).
+
+- **0017-live-tool-output.patch** (`store/tool-progress.ts`,
+  `components/assistant-ui/tool/fallback.tsx`,
+  `app/session/hooks/use-message-stream/index.ts`,
+  `app/session/hooks/use-message-stream/interrupted-status-sync.test.tsx`): the running terminal
+  call's output is shown live. The backend relays each captured line (masked, the accumulated
+  tail) as a `tool.progress` event while the command works (`shell.rs`); the page already shows
+  the progress message beside the running row's timer (`ToolRunningMeta`), so this patch adds the
+  clicked-open row's rendering — a "stdout — live" block under the command row that grows until
+  the finished result's own stdout block replaces it — and `formatToolProgress` takes the
+  multi-line tail's last line, so the one-line header ticker doesn't show the whole output. It
+  also accepts the stopped call's real completion past the Stop latch: the backend answers a stop
+  mid-command with the output it had printed (`interrupted: true` in its result), and that
+  completion is production, not a late frame to drop — it may only patch the bubble that still
+  owns the call, never seed a new one, so the partial output paints immediately instead of after
+  the chat rehydrates. Hermes relays live progress for MCP tools only
+  (`agent/tool_progress_relay.py`); extending it to the terminal is the feature. Tested live
+  2026-11-08 (`scripts/perf/tool-stream-check.mjs`).
+
+- **0018-tree-arrow-selection.patch** (`app/right-sidebar/files/tree.tsx`): the tree's arrow
+  keys move the visible selection. react-arborist's own arrow handling moves only its focus
+  cursor — a state nothing styles follows (`node.isSelected` paints the highlight), and its
+  rows are `tabIndex: -1`, so the keys looked dead. A capture-phase handler on the wrapper
+  (before arborist's own) walks the visible rows — placeholder rows skipped — and keeps the
+  highlight on the cursor: ↑/↓ step through the rows clamped at the ends; → unfolds a closed
+  folder and steps into an open one; ← folds an open folder and climbs from a closed one or a
+  file. Shift-arrows stay arborist's multi-selection; F2/Enter keep the inline rename; Space
+  keeps activate. The click's `node.focus()` keeps the cursor on the row a click selected or
+  toggled, so the first arrow continues from it instead of jumping to the tree's start.
+  Tested live 2026-11-09 (`scripts/perf/keyboard-nav-check.mjs`).
+
+- **0019-overlay-nav-arrow-keys.patch** (`app/overlays/overlay-split-layout.tsx`): ↑/↓ walk
+  the overlay nav rails (roving focus, wrap-around). The rows are plain buttons — Tab reached
+  them, arrows did nothing — and every left nav (Settings, Command Center, the Skills facets)
+  renders through this `OverlaySidebar`. The disclosure carets and the icon-only footer are
+  skipped (a section row reveals its branch on select; footer buttons aren't nav rows), and
+  rows hidden by `hide.css` via `offsetParent`. Arrows only move focus — Enter/Space still
+  activate, the hash never changes, so a stray chord never navigates a surface the user
+  didn't aim at. Tested live 2026-11-08 (`scripts/perf/keyboard-nav-check.mjs`).
+
+- **0020-rename-returns-focus.patch** (`app/right-sidebar/file-actions.tsx`): exiting the
+  inline rename with the keyboard returns DOM focus to the tree (VS Code's rename does).
+  Without it the input unmounts with the row and focus drops on the body — no arrow key
+  fired anywhere in the tree until the user clicked back in. A blur-origin finish (the user
+  clicked elsewhere) leaves focus there. Tested live 2026-11-09.
+
 ## To do
 
 - **Skill hub** (install from Capabilities ▸ Skills ▸ Discover): `tools/skills_hub*.py` and

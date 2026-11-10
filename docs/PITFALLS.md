@@ -36,6 +36,14 @@ dropped, and an approval nobody sees is denied. Add what you learn while buildin
   `cargo build -p hermes-desktop` before restarting the instance, or it serves the previous
   page. Check with `cdp.mjs "performance.getEntriesByType('resource').map(e => e.name)"`
   against the hashed file names in `dist-webapp/assets`.
+- **A patch in git's own format is silently skipped by the webapp build.** `git diff
+  --no-index` emits `diff --git` and `index` lines; the build's `git apply` (run inside the
+  hermes-rs repo, on the non-repo `target/hermes-src`) then skips every hunk and exits 0 —
+  the build prints "Applied" but the page still serves the old code, and `--check` says
+  "Skipped patch" instead of "Checking patch". Write patches in the traditional `diff -u`
+  format (`--- a/<path>` / `+++ b/<path>`, no `diff --git`/`index` lines — strip them with a
+  byte-safe `node -e` filter when the diff came from git), and confirm a fresh `--check`
+  prints "Checking patch".
 - **`cargo test` doesn't rebuild the app binary.** Run `cargo build -p hermes-desktop` before a
   live check, or you're testing the old exe.
 - **The user's build locks `target/debug`.** Always `target/claude`.

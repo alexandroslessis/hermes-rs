@@ -49,6 +49,8 @@ backend code · **L** = a port of a Hermes subsystem.
 | 2.10 | ✅ **Done 2026-11-04** (Command Center ▸ Maintenance; the curator also runs on its schedule again, which the desktop never did). Curator and background-review controls. | `/api/curator`, `/api/curator/paused`, `/api/curator/run` | `runtime::curator`, `set_background_review` | S |
 | 2.11 | ✅ **Done 2026-11-04** for insights (`usage.bars` turned out to be Nous subscription limits: not needed). Usage bars in the status bar, insights page. | `usage.bars`, `insights.get`, `/api/analytics/usage` | `usage_report`, `insights_report`, store usage table | S |
 
+| 2.12 | ✅ **Done 2026-11-08** (each captured line of a running `terminal` call is masked and relayed as a `tool.progress` event — the accumulated tail, throttled to one per 500 ms like Hermes's `tool_progress_relay.py` — the running row shows the message beside its timer and the clicked-open row renders a growing "stdout — live" block until the finished result replaces it, patch 0017. Stopping the turn mid-command keeps the output: the tool observes the turn's cancel token, kills the command and answers with the output it had printed plus a note, so the row and the reopened session show it; without that the machine dropped the in-flight call and only its "interrupted" stub was saved.) The tool's output was shown only after the call finished; live progress existed for MCP tools only, and we serve no MCP. | `tool.progress` never fired for our tools | the page's `tool.progress` store (Hermes's), `Emitter` | S |
+
 ## 3. Sessions, memory, settings
 
 | # | Gap | Evidence | Already in hermes-rs | Effort |
@@ -61,9 +63,34 @@ backend code · **L** = a port of a Hermes subsystem.
 | 3.6 | Workspace settings (default folder). | Settings ▸ Workspace hidden | `/api/fs/default-cwd` | S |
 | 3.7 | ✅ **Done 2026-11-05** (the sidebar's Artifacts: links and files from the 30 latest sessions; a file opens in its default app, a program or script is only shown in Explorer: `open_file.rs`, patch 0013. As in Hermes, a `write_file` result isn't indexed: files come from replies, terminal output and producer tools). Artifacts gallery (links and files the agent produced, across sessions). | sidebar entry hidden (by us) | mostly frontend over session messages | S |
 | 3.8 | Model fallbacks (another model when one fails). | Settings ▸ Model ▸ Fallbacks hidden | retry/classification in `llm` | M |
+| 3.9 | ✅ **Done 2026-11-06** (drag a session onto a sidebar project row, or the row's own "Move to project" menu, or the composer's folder picker on an open chat: the stored cwd is replaced with the new folder's git identity, a live session's cached state is dropped so the next turn's tools and shell follow, a busy session refuses with the page's "busy" notice). Also Home: a session can be moved to the Home bucket (patch 0014), which targets the bare home workspace Hermes's tree files into Home. Move a session between projects. | `session.workspace.move` and `session.cwd.set` unanswered ("Workspace isn't available in hermes-rs yet") | store rows (cwd), git in `git.rs` | S |
+| 3.10 | ✅ **Done 2026-11-06** (the profiles window's SOUL.md editor: reads and writes the default profile's persona in the data folder; the runtime uses it as the agent's identity from the next turn; another profile name is Hermes's "does not exist" 404. The multi-profile routes (create, rename, delete, export, import) aren't ported: a single-profile backend has no second profile and no relaunch to switch to one.) Profiles: SOUL.md editor. | `GET/PUT /api/profiles/default/soul` 404 ("No such API endpoint") | the runtime already reads `<data folder>/SOUL.md` as the identity | S |
+| 3.11 | ✅ **Done 2026-11-07** (a turn that ends on a provider error is reported as one: `message.complete` carries status "error", the provider's text, the structured descriptor the page's error card names the fix from — layer/code/retryable, quota limits not retryable — and the frame's text is the failure account (title, what it means, Details, next step), which the page's completion path needs non-empty to append the message at all. `partial=false` strips the account from the bubble, so the card is the only live element. The stored failed-turn row is a Hermes boundary (`display_kind: failed_turn` + `display_metadata` error/error_surface), so a reopened session redraws the same card — no plain-text account block beside it. The error block itself the page drops, which is why nothing showed.) Provider errors ended the turn silently. | `message.complete` status "complete" on a provider-error turn | the error message in the conversation, the page's error card | S |
 
 ## 4. Known small issues
 
+- ✅ **Done 2026-11-06.** A provider rate-limit error froze the turn: the chat's timer ran while the retry loop slept out the Retry-After (up to an hour per attempt, three times). Now a daily/usage-limit 429 ("user daily request limit reached (800 of 800)", Hermes's `_USAGE_LIMIT_MESSAGE_TOKENS`) ends the turn with the error the chat shows, and a transient 429's Retry-After is honored up to 600s (Hermes's `RETRY_AFTER_CAP_S`).
+- ✅ **Done 2026-11-08.** The file trees' right-click menu offered only copy-path and Download
+  (the page sees our backend as remote, so Reveal/Rename/Delete hide). "Open in default app"
+  (patches 0015) asks `POST /api/hermes-rs/open-file`: the file opens with its default app, a
+  folder in Explorer, a program or script only selected in Explorer. A first cut handed
+  explorer.exe the tree's forward-slash path (`C:/…`); one with a space made explorer fall back
+  to Documents, so `run()` now hands it backslashes only. "Reveal in File Explorer" (patches
+  0016, `POST /api/hermes-rs/reveal`) shows the path selected in its containing folder.
+- ✅ **Done 2026-11-08.** Arrow keys didn't navigate the file tree or the Settings rail.
+  The tree (react-arborist) moved only its internal focus cursor, which nothing styles
+  follows — the highlight (`isSelected`) stayed behind, so the keys looked dead (patches/0018:
+  a capture-phase handler moves the selection, placeholder rows skipped, clamped; arborist's
+  own ←/→ fold and Space-activate keep working off the synced focus). The Settings rail's rows
+  were plain buttons with no arrow handling (patches/0019: roving ↑/↓ with wrap-around on the
+  shared `OverlaySidebar` — Settings, Command Center, Skills facets; disclosure carets and the
+  icon-only footer skipped; arrows only move focus, Enter still activates). Radix menus
+  (dropdowns, context menus, the palette) arrow-navigate natively — unchanged. Checked live
+  (`scripts/perf/keyboard-nav-check.mjs`). Follow-ups 2026-11-09 (patches/0018, 0020): a
+  directory click now pins the cursor too, ←/→ fold/unfold and climb with the selection
+  following (arborist's own moved an invisible cursor), and exiting the inline rename with
+  the keyboard returns focus to the tree — without it every arrow fired nowhere until the
+  user clicked back in.
 - Steering a queued message shows it only after the reply (`crates/desktop/patches/README.md`).
 - Tokens/s isn't shown for sessions from before the stats file existed.
 - `/timeline` (conversation timeline rail) is unanswered.
@@ -81,7 +108,7 @@ backend code · **L** = a port of a Hermes subsystem.
 | Browser automation tools (`browser_exec` over CDP) | for web tasks; WebView2/Chrome via CDP | L |
 | `execute_code` (Python sandbox tool) | the terminal covers most of it | M |
 | Tool search (deferred tools) | matters with many MCP tools | M |
-| Git worktrees (per-session branches) | `/api/git/worktrees`, `worktree/add` | M |
+| Git worktrees (per-session branches) | `/api/git/worktrees`, `worktree/add`; the workspace move they'd follow is done (`workspace.rs`) | M |
 | Scheduled jobs while the app runs (`/cron`) | local-only version of Hermes's cron | M |
 | Voice: dictation, read aloud | STT/TTS providers | L |
 | Local model management (download/run GGUFs) | Ollama already covers this | L |
@@ -110,5 +137,6 @@ image generation, computer use, cloud profiles.
 Status 2026-11-05: steps 1–3 done, step 4 done except 1.8 MCP (skipped for now by the user).
 Open, in suggested order: 1.8 MCP, 3.6 workspace,
 3.5 about, 3.8 fallbacks, 2.7 goals/loops, then section 4's small issues.
+Status 2026-11-06: the workspace move (3.9) and the rate-limit capture (section 4) are done.
 
 

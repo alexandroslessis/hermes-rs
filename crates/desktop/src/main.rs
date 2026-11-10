@@ -22,6 +22,7 @@ mod learning;
 mod maintenance;
 mod open_file;
 mod paths;
+mod profiles;
 mod projects;
 mod providers;
 mod rest;
@@ -30,6 +31,7 @@ mod skills;
 mod terminal;
 mod toolsets;
 mod transcript;
+mod workspace;
 
 use std::path::PathBuf;
 use std::sync::Arc;

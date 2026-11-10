@@ -317,7 +317,7 @@ impl SessionTools {
         self.processes.kill_all().await;
     }
 
-    async fn dispatch(&self, name: &str, args: Value) -> ToolOutput {
+    async fn dispatch(&self, name: &str, args: Value, live: Option<(&str, &Emitter)>) -> ToolOutput {
         let read_path = (name == "read_file")
             .then(|| {
                 args.get("path")
@@ -325,7 +325,7 @@ impl SessionTools {
                     .map(|p| self.resolve(p))
             })
             .flatten();
-        let mut output = self.dispatch_unredacted(name, args).await;
+        let mut output = self.dispatch_unredacted(name, args, live).await;
         // Hermes masks secrets in what file reads, searches and process logs hand the model.
         match name {
             "read_file" => {
@@ -365,13 +365,13 @@ impl SessionTools {
         output
     }
 
-    async fn dispatch_unredacted(&self, name: &str, args: Value) -> ToolOutput {
+    async fn dispatch_unredacted(&self, name: &str, args: Value, live: Option<(&str, &Emitter)>) -> ToolOutput {
         match name {
             "read_file" => files::read_file(self, args).await,
             "write_file" => files::write_file(self, args).await,
             "patch" => files::patch(self, args).await,
             "search_files" => search::search_files(self, args).await,
-            "terminal" => shell::terminal(self, args).await,
+            "terminal" => shell::terminal(self, args, live).await,
             "process_manage" => process::process_manage(self, args).await,
             "todo_list" => todo::todo_list(self, args),
             "memory" => self.memory_tool(&args),
@@ -623,7 +623,7 @@ pub(crate) mod tests {
             "DB_PASSWORD=hunter2hunter2\nOPENAI_KEY=sk-abcdefghijklmnop1234\n",
         )
         .unwrap();
-        let read = tools.dispatch("read_file", json!({"path": ".env"})).await;
+        let read = tools.dispatch("read_file", json!({"path": ".env"}), None).await;
         let content = read.value["content"].as_str().unwrap();
         assert!(
             !content.contains("hunter2") && !content.contains("sk-abcdefghij"),
@@ -634,6 +634,7 @@ pub(crate) mod tests {
             .dispatch(
                 "search_files",
                 json!({"pattern": "OPENAI", "target": "content", "path": "."}),
+                None,
             )
             .await;
         assert!(
@@ -662,16 +663,19 @@ impl<S: Send + Sync + 'static> ToolProvider<S> for SessionTools {
     async fn call(
         &self,
         _session: &S,
-        _request_id: &str,
+        request_id: &str,
         call: CallToolRequestParams,
-        _emit: &Emitter,
+        emit: &Emitter,
     ) -> Result<CallToolResult, ErrorData> {
         let args = Value::Object(call.arguments.unwrap_or_else(JsonObject::new));
         if call.name == "vision_analyze" {
             return Ok(self.vision_analyze(&args).await);
         }
         let written = self.checkpoint_before(&call.name, &args);
-        let mut result = self.dispatch(&call.name, args.clone()).await.into_result();
+        let mut result = self
+            .dispatch(&call.name, args.clone(), Some((request_id, emit)))
+            .await
+            .into_result();
         if let (Some(path), Some(checkpoints)) = (written, &self.checkpoints)
             && result.is_error != Some(true)
         {

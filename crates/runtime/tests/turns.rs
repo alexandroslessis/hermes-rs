@@ -398,6 +398,75 @@ async fn retry_without_a_failed_turn_is_refused() {
     assert!(!h.runtime.is_running(&session.id));
 }
 
+/// Answers every chat-completions request with a 429 daily-limit body, and records requests.
+struct RateLimited {
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+impl Respond for RateLimited {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        self.requests.lock().push(request.body_json().unwrap());
+        ResponseTemplate::new(429)
+            .insert_header("retry-after", "19919")
+            .set_body_json(json!({
+                "error": {
+                    "message": "Rate limit exceeded: user daily request limit reached (800 of 800). \
+                                Retry after 19919 seconds.",
+                    "metadata": {"retry_after_seconds": 19919}
+                }
+            }))
+    }
+}
+
+#[tokio::test]
+async fn a_daily_limit_429_ends_the_turn_instead_of_retrying_for_hours() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(RateLimited { requests: requests.clone() })
+        .mount(&server)
+        .await;
+    let data = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let runtime = runtime_with(data.path(), Arc::new(Bridge));
+    let provider = ProviderConfig {
+        id: "mock".into(),
+        base_url: format!("{}/v1", server.uri()),
+        api_key: Some("key".into()),
+    };
+    let session = runtime.create_session(&provider, "test-model", None, work.path()).unwrap();
+    // The same store the runtime writes to: it is moved into the harness below.
+    let store = hermes_store::Store::open(&data.path().join("sessions.db")).unwrap();
+
+    let began = std::time::Instant::now();
+    let events = run_turn(
+        &Harness {
+            _server: server,
+            data,
+            work,
+            runtime,
+            provider,
+            requests: requests.clone(),
+        },
+        &session.id,
+        "hello",
+    )
+    .await;
+    let elapsed = began.elapsed();
+
+    // The quota is reached: the turn ends (the provider error is shown as a message) instead of
+    // sleeping out the Retry-After (up to the retry cap, three times) while the chat's timer runs.
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert!(elapsed < Duration::from_secs(30), "the turn waited {elapsed:?}");
+    // One request: a quota 429 is not transient, the provider layer does not retry it.
+    assert_eq!(requests.lock().len(), 1);
+    // The error card carries the provider's message (in its Error block, not plain text).
+    let last = store.load_messages(&session.id).unwrap().pop().unwrap();
+    let error = last.content.iter().find_map(|c| c.as_error()).unwrap();
+    assert!(error.message.contains("daily request limit reached"));
+}
+
 #[tokio::test]
 async fn cancelling_stops_a_running_command_and_answers_its_call() {
     if !matches!(detect_shell(), hermes_tools::ShellKind::GitBash(_)) {
@@ -439,6 +508,59 @@ async fn cancelling_stops_a_running_command_and_answers_its_call() {
     let last = messages.last().unwrap();
     assert!(last.is_tool_response());
     assert!(format!("{last:?}").contains("interrupted"));
+    h.runtime.close(&session.id).await;
+}
+
+#[tokio::test]
+async fn stopping_mid_command_keeps_the_output_it_had_printed() {
+    if !matches!(detect_shell(), hermes_tools::ShellKind::GitBash(_)) {
+        return;
+    }
+    let h = harness(vec![tool_reply(&[(
+        "call_1",
+        "terminal",
+        json!({"command": "echo first; sleep 60"}),
+    )])])
+    .await;
+    let session = h
+        .runtime
+        .create_session(&h.provider, "test-model", None, h.work.path())
+        .unwrap();
+    let mut turn = h
+        .runtime
+        .start_turn(
+            &session.id,
+            &h.provider,
+            TurnOptions::default(),
+            "run the command",
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    h.runtime.cancel(&session.id);
+    let mut status = None;
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(20), turn.events.recv())
+        .await
+        .unwrap()
+    {
+        if let RuntimeEvent::TurnFinished(finished) = event {
+            status = Some(finished);
+            break;
+        }
+    }
+    assert_eq!(status, Some(TurnStatus::Cancelled));
+    // The stopped call's response is the command's real result, not the machinery's
+    // synthesized "interrupted" stub: the output it had printed is kept in the chat.
+    let messages = h.runtime.messages(&session.id).unwrap();
+    let last = messages.last().unwrap();
+    assert!(last.is_tool_response());
+    let text = last
+        .content
+        .iter()
+        .filter_map(hermes_llm::conversation::message::MessageContent::as_tool_response_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("first"), "TEXT={text:?}");
+    assert!(text.contains("stopped before it finished"), "{text}");
     h.runtime.close(&session.id).await;
 }
 
@@ -2870,4 +2992,33 @@ async fn live_smart_review_tells_safe_from_dangerous() {
     println!("safe: {safe:?}, dangerous: {dangerous:?}");
     assert_eq!(safe, Verdict::Approve);
     assert_ne!(dangerous, Verdict::Approve);
+}
+
+#[tokio::test]
+async fn terminal_output_is_relayed_live_while_the_command_runs() {
+    let h = harness(vec![
+        tool_reply(&[("t1", "terminal", json!({"command": "echo hi"}))]),
+        text_reply("Done."),
+    ])
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "run echo hi").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    // The command's output was relayed as `tool.progress` events before the result: the
+    // running row shows the message live, and the clicked-open row renders it growing.
+    let relayed = events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::Agent(AgentEvent::ToolProgress { message, .. }) => Some(message.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!relayed.is_empty(), "no live output was relayed");
+    assert!(relayed.iter().any(|m| m.contains("hi")), "{relayed:?}");
+    // The relay is the accumulated tail: every earlier relay's text is inside the last one.
+    let last = relayed.last().unwrap();
+    assert!(
+        relayed.iter().all(|m| last.contains(m.as_str())),
+        "{relayed:?}"
+    );
 }

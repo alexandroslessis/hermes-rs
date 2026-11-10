@@ -16,6 +16,11 @@ pub const DEFAULT_INITIAL_RETRY_INTERVAL_MS: u64 = 1000;
 pub const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
 pub const DEFAULT_MAX_RETRY_INTERVAL_MS: u64 = 30_000;
 
+/// The longest Retry-After honored as a sleep (Hermes's `RETRY_AFTER_CAP_S`): 600s covers
+/// realistic provider rate-limit windows while rejecting pathological ones (a daily-limit 429
+/// with `retry_after_seconds: 19919` would otherwise freeze the turn for hours per retry).
+pub const MAX_RETRY_WAIT_SECS: u64 = 600;
+
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts
@@ -97,6 +102,30 @@ const PERMANENT_REQUEST_FAILURE_MARKERS: &[&str] = &[
     "Reasoning is mandatory for this endpoint",
 ];
 
+/// Quota 429s a retry cannot fix within the turn (Hermes's `_USAGE_LIMIT_MESSAGE_TOKENS` and
+/// `usage_limit_reached` reason, plus OpenRouter's per-account shape): a daily/monthly request
+/// limit is reached and the reset is hours away — retrying sleeps out the Retry-After and the
+/// turn's timer runs the whole time, instead of ending with the error the chat shows.
+const USAGE_LIMIT_MARKERS: &[&str] = &[
+    "usage limit reached",
+    "usage limit has been reached",
+    "usage_limit_reached",
+    "request limit reached",
+];
+
+/// True when a rate-limit error says a request/usage limit is reached (a daily or monthly
+/// quota): retrying unchanged reproduces it. `should_retry` and the error card's Retry action
+/// (hidden for these) share this classification.
+pub fn is_usage_limit(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    USAGE_LIMIT_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// How long a rate limit's own Retry-After is slept: as given, up to [`MAX_RETRY_WAIT_SECS`].
+fn capped_retry_wait(hint: Duration) -> Duration {
+    hint.min(Duration::from_secs(MAX_RETRY_WAIT_SECS))
+}
+
 fn is_permanent_request_failure(message: &str) -> bool {
     PERMANENT_REQUEST_FAILURE_MARKERS
         .iter()
@@ -116,6 +145,7 @@ fn is_thinking_signature_error(message: &str) -> bool {
 
 pub fn should_retry(error: &ProviderError, config: &RetryConfig) -> bool {
     match error {
+        ProviderError::RateLimitExceeded { details, .. } if is_usage_limit(details) => false,
         ProviderError::RateLimitExceeded { .. }
         | ProviderError::ServerError(_)
         | ProviderError::NetworkError(_) => true,
@@ -153,7 +183,7 @@ where
                         ProviderError::RateLimitExceeded {
                             retry_delay: Some(d),
                             ..
-                        } => *d,
+                        } => capped_retry_wait(*d),
                         _ => config.delay_for_attempt(attempts),
                     };
 
@@ -364,5 +394,56 @@ mod tests {
             &ProviderError::Authentication("invalid key".into()),
             &config
         ));
+    }
+
+    #[test]
+    fn never_retries_a_daily_request_limit_429() {
+        // OpenRouter's per-account daily limit: the reset is hours away, so a retry sleeps out
+        // the Retry-After instead of ending the turn with the error the chat shows.
+        let config = RetryConfig::default();
+        let error = ProviderError::RateLimitExceeded {
+            details: "user daily request limit reached (800 of 800). Retry after 19919 seconds."
+                .into(),
+            retry_delay: Some(Duration::from_secs(19919)),
+        };
+        assert!(!should_retry(&error, &config));
+    }
+
+    #[test]
+    fn never_retries_usage_limit_429s() {
+        let config = RetryConfig::default();
+        for details in [
+            "usage limit reached for this model",
+            "the usage limit has been reached",
+            "user monthly request limit reached (100 of 100)",
+            "error code 429: usage_limit_reached",
+        ] {
+            let error = ProviderError::RateLimitExceeded {
+                details: details.into(),
+                retry_delay: None,
+            };
+            assert!(!should_retry(&error, &config), "retried: {details}");
+        }
+    }
+
+    #[test]
+    fn still_retries_a_transient_rate_limit() {
+        let config = RetryConfig::default();
+        let error = ProviderError::RateLimitExceeded {
+            details: "please try again in 1s".into(),
+            retry_delay: Some(Duration::from_secs(1)),
+        };
+        assert!(should_retry(&error, &config));
+    }
+
+    #[test]
+    fn a_retry_sleeps_at_most_the_retry_wait_cap() {
+        // A daily-limit hint past the cap degrades to the cap, not to a five-hour sleep.
+        assert_eq!(
+            capped_retry_wait(Duration::from_secs(19919)),
+            Duration::from_secs(MAX_RETRY_WAIT_SECS)
+        );
+        // A short hint is honored as given.
+        assert_eq!(capped_retry_wait(Duration::from_secs(2)), Duration::from_secs(2));
     }
 }

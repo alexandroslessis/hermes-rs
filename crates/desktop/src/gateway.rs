@@ -27,6 +27,11 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const SERVER_ERROR: i64 = -32000;
 
+/// A session whose turn runs refuses edits, restores and moves (the frozen policy would change
+/// under it). The page reads the typed reason off the error's `data` (`canonical-protocol.ts`
+/// `failure()`, the move's "busy" notice) and matches the prose otherwise (`isSessionBusyError`).
+const BUSY: &str = "session busy";
+
 type RpcResult = Result<Value, (i64, String)>;
 
 /// Hermes fences turn control and prompt answers by an execution generation. This backend runs
@@ -43,7 +48,8 @@ const GENERATION_FILE: &str = "generation-stats.json";
 
 /// Hermes's compaction status lines (`agent/conversation_compression.py` `COMPACTION_STATUS`,
 /// `COMPACTION_DONE_STATUS`).
-const COMPACTING_TEXT: &str = "🗜️ Compacting context — summarizing earlier conversation so I can continue...";
+const COMPACTING_TEXT: &str =
+    "🗜️ Compacting context — summarizing earlier conversation so I can continue...";
 const COMPACTED_TEXT: &str = "✓ Context compaction complete — continuing turn...";
 
 /// What a provider's listing (or the bundled catalog) says about a model.
@@ -87,6 +93,8 @@ pub struct Gateway {
     file_tickets: std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
     /// Branch → the session it was branched from (`branch.rs`).
     branches: crate::branch::Links,
+    /// Session id → the git identity of its workspace (`workspace.rs`), kept beside the store.
+    workspaces: std::sync::Arc<crate::workspace::Workspaces>,
     /// A branch request's idempotency key → the branch it made (a retried request gets it again).
     branch_keys: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// Archived sessions and the auto-archive sweep (`archive.rs`).
@@ -113,6 +121,9 @@ impl Gateway {
             pending_images: Default::default(),
             file_tickets: Default::default(),
             branches: crate::branch::Links::load(&data_dir_for_stats),
+            workspaces: std::sync::Arc::new(crate::workspace::Workspaces::load(
+                &data_dir_for_stats,
+            )),
             archive: crate::archive::Archive::load(&data_dir_for_stats),
             branch_keys: Default::default(),
             generation: std::sync::Mutex::new(
@@ -158,7 +169,11 @@ impl Gateway {
             .as_f64()
             .filter(|d| *d >= 1.0)
             .unwrap_or(crate::archive::DEFAULT_IDLE_DAYS);
-        let all = self.runtime.store().list_sessions(100_000).unwrap_or_default();
+        let all = self
+            .runtime
+            .store()
+            .list_sessions(100_000)
+            .unwrap_or_default();
         let candidates: Vec<crate::archive::Candidate<'_>> = all
             .iter()
             .map(|s| crate::archive::Candidate {
@@ -168,9 +183,14 @@ impl Gateway {
                 running: self.runtime.is_running(&s.id),
             })
             .collect();
-        let swept = self.archive.sweep(&candidates, days, chrono::Utc::now().timestamp_millis());
+        let swept = self
+            .archive
+            .sweep(&candidates, days, chrono::Utc::now().timestamp_millis());
         if !swept.is_empty() {
-            tracing::info!("auto-archive: archived {} session(s) idle for {days} days or more", swept.len());
+            tracing::info!(
+                "auto-archive: archived {} session(s) idle for {days} days or more",
+                swept.len()
+            );
         }
     }
 
@@ -187,18 +207,26 @@ impl Gateway {
         let defaults = hermes_memory::MemoryConfig::default();
         let flag = |key: &str, default: bool| memory[key].as_bool().unwrap_or(default);
         let size = |key: &str, default: usize| {
-            memory[key].as_u64().filter(|n| *n > 0).map_or(default, |n| n as usize)
+            memory[key]
+                .as_u64()
+                .filter(|n| *n > 0)
+                .map_or(default, |n| n as usize)
         };
-        self.runtime.memory().set_config(hermes_memory::MemoryConfig {
-            memory_enabled: flag("memory_enabled", defaults.memory_enabled),
-            user_profile_enabled: flag("user_profile_enabled", defaults.user_profile_enabled),
-            memory_char_limit: size("memory_char_limit", defaults.memory_char_limit),
-            user_char_limit: size("user_char_limit", defaults.user_char_limit),
-            write_approval: flag("write_approval", defaults.write_approval),
-        });
+        self.runtime
+            .memory()
+            .set_config(hermes_memory::MemoryConfig {
+                memory_enabled: flag("memory_enabled", defaults.memory_enabled),
+                user_profile_enabled: flag("user_profile_enabled", defaults.user_profile_enabled),
+                memory_char_limit: size("memory_char_limit", defaults.memory_char_limit),
+                user_char_limit: size("user_char_limit", defaults.user_char_limit),
+                write_approval: flag("write_approval", defaults.write_approval),
+            });
         // The tools switched off in Capabilities ▸ Tools.
-        let off = crate::toolsets::disabled_toolsets(&self.rest.config_value(crate::toolsets::CONFIG_KEY));
-        self.runtime.set_disabled_tools(crate::toolsets::disabled_tools(&off));
+        let off = crate::toolsets::disabled_toolsets(
+            &self.rest.config_value(crate::toolsets::CONFIG_KEY),
+        );
+        self.runtime
+            .set_disabled_tools(crate::toolsets::disabled_tools(&off));
         // Auto-archive just switched on sweeps now (it waits a day between sweeps itself).
         self.auto_archive();
     }
@@ -286,7 +314,13 @@ impl Gateway {
                 } else {
                     tracing::warn!("RPC {method} failed: {message}");
                 }
-                json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+                let mut error = json!({"code": code, "message": message});
+                if message == BUSY {
+                    // The page's canonical protocol and the move's notice read the refusal's
+                    // reason (`data.reason`), not just the prose.
+                    error["data"] = json!({"reason": "session_busy"});
+                }
+                json!({"jsonrpc": "2.0", "id": id, "error": error})
             }
         };
         send(&outbox, reply);
@@ -549,13 +583,15 @@ impl Gateway {
                 let output = self.status_text(&id).await?;
                 Ok(json!({"output": output}))
             }
-            "command.dispatch" if self
-                .coding_command(params, params["name"].as_str().unwrap_or_default(), "")
-                .is_some() =>
+            "command.dispatch"
+                if self
+                    .coding_command(params, params["name"].as_str().unwrap_or_default(), "")
+                    .is_some() =>
             {
                 let name = params["name"].as_str().unwrap_or_default();
                 let arg = params["arg"].as_str().unwrap_or_default();
-                self.coding_command(params, name, arg).expect("a coding command")
+                self.coding_command(params, name, arg)
+                    .expect("a coding command")
             }
             "command.dispatch" => commands::dispatch(
                 &self.runtime,
@@ -581,7 +617,7 @@ impl Gateway {
                     .unwrap_or_default();
                 Ok(json!({"title": title, "session_key": id}))
             }
-            "session.mutate" => self.mutate(params, &settings),
+            "session.mutate" => self.mutate(params, &settings).await,
             "session.rewind" => self.rewind_turn(params),
             "rollback.list" | "rollback.diff" | "rollback.restore" => self.rollback(method, params),
             "session.export" => self.export_session(params),
@@ -628,7 +664,11 @@ impl Gateway {
             // `/btw`: a side question about the conversation, answered as `btw.complete`.
             "prompt.btw" => {
                 let id = session_id(params)?;
-                let question = params["text"].as_str().unwrap_or_default().trim().to_string();
+                let question = params["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
                 if question.is_empty() {
                     return Err((INVALID_PARAMS, "text required".to_string()));
                 }
@@ -642,7 +682,11 @@ impl Gateway {
                         Ok(_) => "error: the model gave no answer".to_string(),
                         Err(error) => format!("error: {error:#}"),
                     };
-                    this.emit(&id, "btw.complete", json!({"task_id": task, "question": question, "text": text}));
+                    this.emit(
+                        &id,
+                        "btw.complete",
+                        json!({"task_id": task, "question": question, "text": text}),
+                    );
                 });
                 Ok(json!({"task_id": task_id}))
             }
@@ -650,7 +694,11 @@ impl Gateway {
             // `background.complete`, its progress as its subagent row's events.
             "prompt.background" => {
                 let id = session_id(params)?;
-                let text = params["text"].as_str().unwrap_or_default().trim().to_string();
+                let text = params["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
                 if text.is_empty() {
                     return Err((INVALID_PARAMS, "text required".to_string()));
                 }
@@ -669,7 +717,11 @@ impl Gateway {
                         }
                     }
                     let text = task.done.await.unwrap_or_else(|e| format!("error: {e}"));
-                    this.emit(&id, "background.complete", json!({"task_id": task.task_id, "text": text}));
+                    this.emit(
+                        &id,
+                        "background.complete",
+                        json!({"task_id": task.task_id, "text": text}),
+                    );
                 });
                 Ok(json!({"task_id": task_id}))
             }
@@ -692,7 +744,11 @@ impl Gateway {
             "image.attach" | "image.attach_bytes" => {
                 let id = session_id(params)?;
                 let path = if method == "image.attach" {
-                    let path = params["path"].as_str().unwrap_or_default().trim().to_string();
+                    let path = params["path"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
                     let file = std::path::Path::new(&path);
                     if !file.is_file() {
                         return Err((INVALID_PARAMS, format!("image not found: {path}")));
@@ -705,25 +761,35 @@ impl Gateway {
                     let (status, saved) =
                         crate::attachments::image_from_base64(&self.data_dir, params);
                     if status != 200 {
-                        let detail = saved["detail"].as_str().unwrap_or("The image wasn't saved.");
+                        let detail = saved["detail"]
+                            .as_str()
+                            .unwrap_or("The image wasn't saved.");
                         return Err((INVALID_PARAMS, detail.to_string()));
                     }
                     saved["path"].as_str().unwrap_or_default().to_string()
                 };
-                let mut pending = self.pending_images.lock().unwrap_or_else(|e| e.into_inner());
+                let mut pending = self
+                    .pending_images
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let images = pending.entry(id).or_default();
                 images.push(path.clone());
                 let name = std::path::Path::new(&path)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                Ok(json!({"attached": true, "path": path, "name": name, "count": images.len(),
-                          "text": format!("[User attached image: {name}]")}))
+                Ok(
+                    json!({"attached": true, "path": path, "name": name, "count": images.len(),
+                          "text": format!("[User attached image: {name}]")}),
+                )
             }
             "image.detach" => {
                 let id = session_id(params)?;
                 let path = params["path"].as_str().unwrap_or_default().trim();
-                let mut pending = self.pending_images.lock().unwrap_or_else(|e| e.into_inner());
+                let mut pending = self
+                    .pending_images
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let images = pending.entry(id).or_default();
                 let before = images.len();
                 images.retain(|p| p != path);
@@ -871,7 +937,10 @@ impl Gateway {
             }
             "subagent.tail" | "subagent.steer" | "subagent.interrupt" => {
                 let id = session_id(params)?;
-                let child = params["subagent_id"].as_str().unwrap_or_default().to_string();
+                let child = params["subagent_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
                 let subagents = self.runtime.subagents();
                 Ok(match method {
                     "subagent.tail" => subagents.tail(&id, &child),
@@ -879,12 +948,20 @@ impl Gateway {
                         json!({"found": subagents.interrupt(&id, &child), "subagent_id": child})
                     }
                     _ => {
-                        let text = params["text"].as_str().unwrap_or_default().trim().to_string();
+                        let text = params["text"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
                         if text.is_empty() {
                             return Err((INVALID_PARAMS, "text is required".to_string()));
                         }
                         // (Hermes's `SteerStatus`: queued for the child's next tool results.)
-                        let status = if subagents.steer(&id, &child, &text) { "queued" } else { "rejected" };
+                        let status = if subagents.steer(&id, &child, &text) {
+                            "queued"
+                        } else {
+                            "rejected"
+                        };
                         json!({"status": status, "subagent_id": child, "text": text})
                     }
                 })
@@ -1228,7 +1305,10 @@ impl Gateway {
         // "Inherit main model effort" (the Auxiliary page's default): compression and the
         // background review think as hard as the chat. The approval judge and titles keep
         // reasoning off unless picked, as Hermes runs them.
-        for job in [&mut aux.compression, &mut aux.review].into_iter().flatten() {
+        for job in [&mut aux.compression, &mut aux.review]
+            .into_iter()
+            .flatten()
+        {
             if job.effort.is_none() {
                 job.effort = effort.clone();
             }
@@ -1279,7 +1359,10 @@ impl Gateway {
         let facts = models
             .into_iter()
             .find(|m| m.id == model)
-            .map(|m| ModelFacts { context_length: m.context_length, vision: m.supports_vision })
+            .map(|m| ModelFacts {
+                context_length: m.context_length,
+                vision: m.supports_vision,
+            })
             .unwrap_or_default();
         if let Ok(mut lengths) = self.context_lengths.lock() {
             lengths.insert(key, facts);
@@ -1298,7 +1381,11 @@ impl Gateway {
                 .context_lengths
                 .lock()
                 .ok()
-                .and_then(|facts| facts.get(&format!("{provider}\n{model}")).and_then(|f| f.vision))
+                .and_then(|facts| {
+                    facts
+                        .get(&format!("{provider}\n{model}"))
+                        .and_then(|f| f.vision)
+                })
                 .unwrap_or(false),
         }
     }
@@ -1404,7 +1491,7 @@ impl Gateway {
 
     /// Hermes's canonical `session.mutate`: a session edit presenting the revision the page last
     /// saw. Edits here are one user's, so the revision is reported but not enforced.
-    fn mutate(&self, params: &Value, settings: &Settings) -> RpcResult {
+    async fn mutate(&self, params: &Value, settings: &Settings) -> RpcResult {
         let id = session_id(params)?;
         let payload = &params["payload"];
         let mut receipt = match params["operation"].as_str().unwrap_or_default() {
@@ -1443,13 +1530,47 @@ impl Gateway {
                     .as_u64()
                     .ok_or((INVALID_PARAMS, "target_message_id is required".to_string()))?;
                 if self.runtime.is_running(&id) {
-                    return Err((SERVER_ERROR, "session busy".to_string()));
+                    return Err((SERVER_ERROR, BUSY.to_string()));
                 }
                 let kept = self
                     .runtime
                     .rewind(&id, transcript::kept_before_row(row as usize))
                     .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
                 json!({"status": "applied", "target_message_id": row, "message_count": kept.len()})
+            }
+            // Move to project (`session.workspace.move`, and the composer's folder picker on an
+            // open chat — both become this mutation in the page's canonical protocol): the stored
+            // cwd and git identity move together (`workspace.rs`), idle sessions only. The live
+            // state is dropped so the next turn's tools and shell start in the new folder.
+            "workspace" => {
+                let requested = payload["cwd"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .ok_or((INVALID_PARAMS, "cwd is required".to_string()))?;
+                if self.runtime.is_running(&id) {
+                    return Err((SERVER_ERROR, BUSY.to_string()));
+                }
+                let runtime = self.runtime.clone();
+                let workspaces = self.workspaces.clone();
+                let moved = id.clone();
+                let requested = requested.to_string();
+                let (cwd, branch, root) = tokio::task::spawn_blocking(move || {
+                    crate::workspace::move_session(runtime.store(), &workspaces, &moved, &requested)
+                })
+                .await
+                .map_err(|e| (SERVER_ERROR, format!("the move failed: {e}")))?
+                .map_err(|e| match e {
+                    crate::workspace::MoveError::InvalidFolder(folder) => {
+                        (INVALID_PARAMS, format!("No such folder: {folder}"))
+                    }
+                    crate::workspace::MoveError::Store(message) => (SERVER_ERROR, message),
+                })?;
+                if let Err(e) = self.runtime.evict(&id).await {
+                    tracing::warn!("dropping the moved session's live state: {e:#}");
+                }
+                self.emit(&id, "session.info", self.session_info(&id));
+                json!({"cwd": cwd, "branch": branch, "git_repo_root": root})
             }
             // The keyboard shortcut's `session.archive` (`canonical-protocol.ts`).
             "archive" => {
@@ -1627,7 +1748,9 @@ impl Gateway {
             .flat_map(|m| &m.content)
             .filter_map(MessageContent::as_tool_request)
         {
-            let Ok(call) = &request.tool_call else { continue };
+            let Ok(call) = &request.tool_call else {
+                continue;
+            };
             let args = call.arguments.clone().unwrap_or_default();
             // Whole-skill loads only (a reference file is a detail of the skill).
             if call.name == "skill_view" && args.get("file_path").is_none() {
@@ -1661,7 +1784,10 @@ impl Gateway {
                 "output": "Nothing to review yet — send a message first."})));
         }
         if name == "init" && cwd.is_empty() {
-            return Some(Err((INVALID_PARAMS, "/init needs a session with a folder".to_string())));
+            return Some(Err((
+                INVALID_PARAMS,
+                "/init needs a session with a folder".to_string(),
+            )));
         }
         let existing = (name == "init")
             .then(|| std::fs::read_to_string(std::path::Path::new(&cwd).join("AGENTS.md")).ok())
@@ -1954,7 +2080,7 @@ impl Gateway {
             "after_messages": after.len(),
             "before_tokens": before_tokens,
             "after_tokens": after_tokens,
-            "messages": transcript::messages(&after),
+            "messages": transcript::messages(&after, &record.provider, &record.model),
             "summary": {
                 "headline": headline,
                 "token_line": compressed.then(|| format!("~{before_tokens} → ~{after_tokens} tokens")),
@@ -1976,7 +2102,11 @@ impl Gateway {
             .session(&id)
             .map_err(error)?
             .ok_or((SERVER_ERROR, format!("Session {id} not found")))?;
-        let rows = transcript::messages(&store.load_messages(&id).map_err(error)?);
+        let rows = transcript::messages(
+            &store.load_messages(&id).map_err(error)?,
+            &record.provider,
+            &record.model,
+        );
         let (content, filename) =
             crate::export::export(&record, &rows, format, params["redact"] == true);
         Ok(json!({"content": content, "filename": filename, "format": format.extension()}))
@@ -1993,9 +2123,12 @@ impl Gateway {
             .flatten()
             .ok_or((INVALID_PARAMS, format!("No session {id}.")))?;
         if archived && record.pinned {
-            store.set_pinned(id, false).map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+            store
+                .set_pinned(id, false)
+                .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
         }
-        self.archive.set(id, archived, chrono::Utc::now().timestamp_millis());
+        self.archive
+            .set(id, archived, chrono::Utc::now().timestamp_millis());
         Ok(())
     }
 
@@ -2061,6 +2194,9 @@ impl Gateway {
                 "model": self.pending_route(id).map_or(record.model, |(_, model)| model),
                 "provider": self.pending_route(id).map_or(record.provider, |(provider, _)| provider),
                 "cwd": record.cwd,
+                // The git identity a move recorded; the sidebar groups by the repo root.
+                "git_branch": self.workspaces.identity(id).and_then(|(branch, _)| branch),
+                "git_repo_root": self.workspaces.identity(id).and_then(|(_, root)| root),
                 "title": record.title.unwrap_or_default(),
                 "stored_session_id": record.id,
                 "running": running,
@@ -2150,14 +2286,19 @@ impl Gateway {
         &self,
         settings: &Settings,
     ) -> Result<(hermes_runtime::ProviderConfig, String), (i64, String)> {
-        let provider = settings
-            .active()
-            .ok_or((SERVER_ERROR, "Set up an endpoint first (Settings ▸ Providers): imported sessions use it.".to_string()))?;
+        let provider = settings.active().ok_or((
+            SERVER_ERROR,
+            "Set up an endpoint first (Settings ▸ Providers): imported sessions use it."
+                .to_string(),
+        ))?;
         let model = settings
             .model
             .clone()
             .or_else(|| provider.default_model.clone())
-            .ok_or((SERVER_ERROR, "Choose a model first: imported sessions use it.".to_string()))?;
+            .ok_or((
+                SERVER_ERROR,
+                "Choose a model first: imported sessions use it.".to_string(),
+            ))?;
         Ok((provider.runtime(), model))
     }
 
@@ -2229,7 +2370,7 @@ impl Gateway {
                     row as usize
                 } else if let Some(count) = params["count"].as_u64().filter(|c| *c > 0) {
                     // The page's rows: through the count-th one.
-                    transcript::messages(&messages)
+                    transcript::messages(&messages, &record.provider, &record.model)
                         .get(count as usize - 1)
                         .and_then(|row| row["row_id"].as_u64())
                         .map_or(messages.len(), |row| row as usize)
@@ -2238,7 +2379,10 @@ impl Gateway {
                 };
                 let kept = crate::branch::cut(&messages, keep);
                 if kept.is_empty() {
-                    return Err((INVALID_PARAMS, "nothing to branch — send a message first".to_string()));
+                    return Err((
+                        INVALID_PARAMS,
+                        "nothing to branch — send a message first".to_string(),
+                    ));
                 }
                 let provider = self.session_provider(&parent, settings)?;
                 let cwd = params["cwd"]
@@ -2298,7 +2442,8 @@ impl Gateway {
         if omit_messages {
             answer["messages_omitted"] = json!(true);
         } else {
-            answer["messages"] = json!(transcript::messages(&kept));
+            answer["messages"] =
+                json!(transcript::messages(&kept, &record.provider, &record.model));
         }
         Ok(answer)
     }
@@ -2339,7 +2484,8 @@ impl Gateway {
                         let text = row["content"].as_str().filter(|t| !t.trim().is_empty())?;
                         let message = match row["role"].as_str() {
                             Some("assistant") => {
-                                hermes_llm::conversation::message::Message::assistant().with_text(text)
+                                hermes_llm::conversation::message::Message::assistant()
+                                    .with_text(text)
                             }
                             _ => hermes_llm::conversation::message::Message::user().with_text(text),
                         };
@@ -2354,7 +2500,10 @@ impl Gateway {
                 .replace_messages(&record.id, &seeded)
                 .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
         }
-        if let Some(parent) = params["parent_session_id"].as_str().filter(|p| !p.is_empty()) {
+        if let Some(parent) = params["parent_session_id"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+        {
             self.branches.link(&record.id, parent);
         }
         self.subscribe(&record.id, outbox);
@@ -2362,7 +2511,7 @@ impl Gateway {
             "session_id": record.id,
             "stored_session_id": record.id,
             "message_count": seeded.len(),
-            "messages": transcript::messages(&seeded),
+            "messages": transcript::messages(&seeded, &record.provider, &record.model),
             "info": self.session_info(&record.id),
             "revision": self.revision(&record.id),
             "execution_generation": EXECUTION_GENERATION,
@@ -2372,14 +2521,18 @@ impl Gateway {
     fn resume_session(&self, params: &Value, outbox: &Outbox) -> RpcResult {
         let id = session_id(params)?;
         // Hermes's wording: the page drops an id it doesn't know to a fresh draft.
-        if self.runtime.store().session(&id).ok().flatten().is_none() {
-            return Err((SERVER_ERROR, format!("Session not found: {id}")));
-        }
+        let record = self
+            .runtime
+            .store()
+            .session(&id)
+            .ok()
+            .flatten()
+            .ok_or((SERVER_ERROR, format!("Session not found: {id}")))?;
         let messages = self.runtime.messages(&id).map_err(|e| {
             tracing::warn!("resuming {id}: {e:#}");
             (SERVER_ERROR, format!("{e:#}"))
         })?;
-        let transcript = transcript::messages(&messages);
+        let transcript = transcript::messages(&messages, &record.provider, &record.model);
         self.subscribe(&id, outbox);
         Ok(json!({
             "session_id": id,
@@ -2523,7 +2676,10 @@ impl Gateway {
             .into_iter()
             .map(|path| json!({"path": path}))
             .collect();
-        let mut listed = params["attachments"].as_array().cloned().unwrap_or_default();
+        let mut listed = params["attachments"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         listed.extend(held);
         let images = crate::attachments::image_bytes(&Value::Array(listed))
             .map_err(|e| (INVALID_PARAMS, e))?;
@@ -2634,22 +2790,62 @@ impl Gateway {
                     RuntimeEvent::Agent(AgentEvent::Subagent { kind, payload }) => {
                         this.emit(&id, kind, payload);
                     }
+                    // Live progress from inside a running tool call (the terminal's output
+                    // tail): the running row shows the message beside its timer, and the
+                    // clicked-open row renders it as its output while the call works
+                    // (patches/0017). The payload is the contract's ToolProgressPayload.
+                    RuntimeEvent::Agent(AgentEvent::ToolProgress {
+                        tool_call_id,
+                        name,
+                        progress,
+                        message,
+                    }) => {
+                        this.emit(
+                            &id,
+                            "tool.progress",
+                            json!({
+                                "tool_id": tool_call_id,
+                                "name": name,
+                                "progress": progress,
+                                "total": Value::Null,
+                                "percent": Value::Null,
+                                "message": message,
+                            }),
+                        );
+                    }
                     // Compression before a model call can take minutes on a local model; the
                     // page shows its "summarizing" indicator for the `compacting` /
                     // `compacted` pair, else the turn looks hung (Hermes:
                     // `tui_gateway/server.py` `_status_update`, `agent/conversation_compression.py`).
                     RuntimeEvent::Agent(AgentEvent::Compacting) => {
-                        this.emit(&id, "status.update", json!({"kind": "compacting", "text": COMPACTING_TEXT}));
+                        this.emit(
+                            &id,
+                            "status.update",
+                            json!({"kind": "compacting", "text": COMPACTING_TEXT}),
+                        );
                     }
                     RuntimeEvent::Agent(AgentEvent::Compacted { .. }) => {
-                        this.emit(&id, "status.update", json!({"kind": "compacted", "text": COMPACTED_TEXT}));
+                        this.emit(
+                            &id,
+                            "status.update",
+                            json!({"kind": "compacted", "text": COMPACTED_TEXT}),
+                        );
                     }
                     RuntimeEvent::Agent(AgentEvent::CompactionFailed(error)) => {
                         let text = match error {
-                            Some(error) => format!("Context compression failed ({error}); continuing with the full conversation."),
-                            None => "Context compression couldn't shorten the conversation; continuing.".to_string(),
+                            Some(error) => format!(
+                                "Context compression failed ({error}); continuing with the full conversation."
+                            ),
+                            None => {
+                                "Context compression couldn't shorten the conversation; continuing."
+                                    .to_string()
+                            }
                         };
-                        this.emit(&id, "status.update", json!({"kind": "compacted", "text": text}));
+                        this.emit(
+                            &id,
+                            "status.update",
+                            json!({"kind": "compacted", "text": text}),
+                        );
                     }
                     RuntimeEvent::Agent(event) => {
                         if matches!(&event, AgentEvent::Message(m) if m.is_tool_response()) {
@@ -2664,19 +2860,56 @@ impl Gateway {
                         this.enqueue(&id, json!({"text": text, "shown": true}), true);
                     }
                     RuntimeEvent::TurnFinished(status) => {
-                        let (status, error) = match status {
+                        let (mut status, mut error) = match status {
                             TurnStatus::Completed => ("complete", None),
                             TurnStatus::Cancelled => ("interrupted", None),
                             TurnStatus::Failed(error) => ("error", Some(error)),
                         };
                         let stored = this.runtime.messages(&id).unwrap_or_default();
+                        // A turn that ended on a provider error carries it as the conversation's
+                        // last message (ops::ExitOnError yields it). The page's error card keys
+                        // off the failure status, so the turn is reported like Hermes's failed
+                        // turn result: status "error", the provider's text, and the structured
+                        // descriptor the card names the fix from.
+                        let failure = (status == "complete")
+                            .then(|| crate::transcript::message_error(&stored))
+                            .flatten();
+                        if let Some((_kind, text)) = &failure {
+                            status = "error";
+                            error = Some(text.clone());
+                        }
+                        // Which provider and model failed: the card names them.
+                        let (provider, model) = failure
+                            .as_ref()
+                            .and_then(|_| this.runtime.store().session(&id).ok().flatten())
+                            .map(|record| (record.provider, record.model))
+                            .unwrap_or_default();
+                        let surface = failure.as_ref().map(|(kind, text)| {
+                            crate::transcript::error_surface(*kind, text, &provider, &model)
+                        });
+                        // A turn that also streamed output keeps it: the text is the user's, not
+                        // the error string (Hermes's partial failure settle). One that streamed
+                        // nothing carries the account instead — the page's completion path
+                        // appends the turn's message only when the frame's text is non-empty, so
+                        // an empty frame would end the turn in silence (no card, no bubble), and
+                        // its partial=false strips the account from the bubble: the card is the
+                        // only thing shown.
+                        let text = match (&failure, stream.text().trim().is_empty()) {
+                            (Some((kind, detail)), true) => {
+                                crate::transcript::turn_error_text(*kind, detail, &provider)
+                            }
+                            _ => stream.text().to_string(),
+                        };
+                        let partial = status == "error" && !stream.text().trim().is_empty();
                         this.emit(
                             &id,
                             "message.complete",
                             json!({
-                                "text": stream.text(),
+                                "text": text,
                                 "status": status,
                                 "error": error,
+                                "error_surface": surface,
+                                "partial": partial,
                                 // The rows this turn wrote, so the page can restore or edit them.
                                 "persisted_turn": transcript::persisted_turn(&stored, first_row, &admission),
                                 "usage": this.usage_snapshot(&id, last_input),
@@ -2689,7 +2922,14 @@ impl Gateway {
                         }
                         if let Some((Some((provider, model, effort)), opening)) = titling {
                             if status == "complete" {
-                                this.title_session(&id, &provider, &model, effort.as_deref(), &opening).await;
+                                this.title_session(
+                                    &id,
+                                    &provider,
+                                    &model,
+                                    effort.as_deref(),
+                                    &opening,
+                                )
+                                .await;
                             }
                         }
                         break;
@@ -2868,13 +3108,22 @@ impl Gateway {
         }
         // Capabilities ▸ Tools (`toolsets.rs`).
         if let Some(route) = path.strip_prefix("/api/tools/") {
-            let off = || crate::toolsets::disabled_toolsets(&self.rest.config_value(crate::toolsets::CONFIG_KEY));
+            let off = || {
+                crate::toolsets::disabled_toolsets(
+                    &self.rest.config_value(crate::toolsets::CONFIG_KEY),
+                )
+            };
             return match (method, route) {
                 ("GET", "toolsets") => Some((200, crate::toolsets::list(&off()))),
                 ("GET", "terminal/backends") => Some((200, crate::toolsets::terminal_backends())),
                 ("GET", rest) if rest.starts_with("toolsets/") && rest.ends_with("/config") => {
-                    let name = rest.trim_start_matches("toolsets/").trim_end_matches("/config");
-                    Some((200, crate::toolsets::config(&crate::rest::percent_decode(name))))
+                    let name = rest
+                        .trim_start_matches("toolsets/")
+                        .trim_end_matches("/config");
+                    Some((
+                        200,
+                        crate::toolsets::config(&crate::rest::percent_decode(name)),
+                    ))
                 }
                 ("PUT", rest) if rest.starts_with("toolsets/") && !rest[9..].contains('/') => {
                     let name = crate::rest::percent_decode(&rest[9..]);
@@ -2882,8 +3131,10 @@ impl Gateway {
                     let enabled = body["enabled"].as_bool().unwrap_or(true);
                     match crate::toolsets::switch(&off(), &name, enabled) {
                         Some(next) => {
-                            self.rest.set_config_value(crate::toolsets::CONFIG_KEY, json!(next));
-                            self.runtime.set_disabled_tools(crate::toolsets::disabled_tools(&next));
+                            self.rest
+                                .set_config_value(crate::toolsets::CONFIG_KEY, json!(next));
+                            self.runtime
+                                .set_disabled_tools(crate::toolsets::disabled_tools(&next));
                             Some((200, json!({"ok": true, "name": name, "enabled": enabled})))
                         }
                         None => Some((404, json!({"detail": format!("No toolset {name}.")}))),
@@ -2906,9 +3157,15 @@ impl Gateway {
         // session's folder when the page names a session.
         let param = |name: &str| crate::rest::query_param(query, name);
         if (method, path) == ("GET", "/api/fs/read-data-url") {
-            let file = self.file_path(&param("path").unwrap_or_default(), param("session_id").as_deref());
+            let file = self.file_path(
+                &param("path").unwrap_or_default(),
+                param("session_id").as_deref(),
+            );
             if crate::files::is_sensitive(&file) {
-                return Some((403, json!({"detail": "That file holds credentials and isn't shown."})));
+                return Some((
+                    403,
+                    json!({"detail": "That file holds credentials and isn't shown."}),
+                ));
             }
             let file = file.display().to_string();
             return tokio::task::spawn_blocking(move || crate::attachments::read_data_url(&file))
@@ -2916,7 +3173,10 @@ impl Gateway {
                 .ok();
         }
         if (method, path) == ("GET", "/api/fs/read-text") {
-            let file = self.file_path(&param("path").unwrap_or_default(), param("session_id").as_deref());
+            let file = self.file_path(
+                &param("path").unwrap_or_default(),
+                param("session_id").as_deref(),
+            );
             return tokio::task::spawn_blocking(move || crate::files::read_text(&file))
                 .await
                 .ok();
@@ -2928,7 +3188,10 @@ impl Gateway {
                 .ok();
         }
         if method == "POST"
-            && matches!(path, "/api/fs/write-text" | "/api/files/mkdir" | "/api/files/ticket")
+            && matches!(
+                path,
+                "/api/fs/write-text" | "/api/files/mkdir" | "/api/files/ticket"
+            )
         {
             let body: Value = serde_json::from_slice(body).unwrap_or_default();
             let named = body["path"].as_str().unwrap_or_default();
@@ -2944,7 +3207,9 @@ impl Gateway {
                         .ok()
                 }
                 "/api/files/mkdir" => {
-                    tokio::task::spawn_blocking(move || crate::files::mkdir(&file)).await.ok()
+                    tokio::task::spawn_blocking(move || crate::files::mkdir(&file))
+                        .await
+                        .ok()
                 }
                 // A download link or media element can't send headers: the page asks for a
                 // ticket bound to the file first (Hermes's `issue_file_ticket`).
@@ -2961,6 +3226,33 @@ impl Gateway {
             };
         }
         // Sign-in providers (Nous Portal, Claude, Codex): none here.
+        // The profiles window's SOUL.md editor (profiles.rs): the default profile's persona, read
+        // and written in the data folder. The multi-profile routes (create, rename, delete,
+        // export, import) aren't ported — a single-profile backend has no second profile.
+        if let Some(name) = path
+            .strip_prefix("/api/profiles/")
+            .and_then(|rest| rest.strip_suffix("/soul"))
+        {
+            let name = crate::rest::percent_decode(name);
+            if method == "GET" {
+                let data_dir = self.data_dir.clone();
+                return tokio::task::spawn_blocking(move || {
+                    crate::profiles::soul(&data_dir, &name)
+                })
+                .await
+                .ok();
+            }
+            if method == "PUT" {
+                let body: Value = serde_json::from_slice(body).unwrap_or_default();
+                let content = body["content"].as_str().unwrap_or_default().to_string();
+                let data_dir = self.data_dir.clone();
+                return tokio::task::spawn_blocking(move || {
+                    crate::profiles::save_soul(&data_dir, &name, &content)
+                })
+                .await
+                .ok();
+            }
+        }
         if (method, path) == ("GET", "/api/providers/oauth") {
             return Some((200, json!({"providers": []})));
         }
@@ -3086,7 +3378,10 @@ impl Gateway {
                 None | Some("main") => {}
                 Some("auxiliary") => return Some(crate::aux_models::assign(&self.data_dir, &body)),
                 Some(scope) => {
-                    return Some((400, json!({"detail": format!("Unknown model scope {scope}")})));
+                    return Some((
+                        400,
+                        json!({"detail": format!("Unknown model scope {scope}")}),
+                    ));
                 }
             }
             let (Some(provider), Some(model)) = (body["provider"].as_str(), body["model"].as_str())
@@ -3113,6 +3408,22 @@ impl Gateway {
             let answer = self.rest.handle(method, path, query, body);
             self.apply_settings();
             return answer;
+        }
+        // "Reveal in File Explorer" (patches/0016): show it selected in its containing
+        // folder, as the Electron bridge's revealPath does, which the page's shim has
+        // no answer for (so the local-only menu item hides).
+        if (method, path) == ("POST", "/api/hermes-rs/reveal") {
+            let body: Value = serde_json::from_slice(body).unwrap_or_default();
+            let link = body["url"].as_str().unwrap_or_default().to_string();
+            let done = tokio::task::spawn_blocking(move || {
+                crate::open_file::reveal_plan(&link).and_then(|open| crate::open_file::run(&open))
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+            return Some(match done {
+                Ok(()) => (200, json!({"ok": true})),
+                Err(error) => (400, json!({"detail": error})),
+            });
         }
         // A `file:` link opened from the page (patches/0013, `open_file.rs`): its default app,
         // or Explorer with it selected when it's a program.
@@ -3292,8 +3603,13 @@ impl Gateway {
 
     /// `/api/sessions/{id}/messages`: the stored transcript, a page of it (`SessionMessagesResponse`).
     fn stored_messages(&self, id: &str, query: Option<&str>) -> (u16, Value) {
+        let record = self.runtime.store().session(id).ok().flatten();
         let messages = match self.runtime.messages(id) {
-            Ok(messages) => transcript::messages(&messages),
+            Ok(messages) => transcript::messages(
+                &messages,
+                &record.as_ref().map_or("", |r| r.provider.as_str()),
+                &record.as_ref().map_or("", |r| r.model.as_str()),
+            ),
             Err(error) => return (404, json!({"detail": format!("{error:#}")})),
         };
         let param = |name: &str| {
@@ -3356,6 +3672,10 @@ impl Gateway {
             "pinned": s.pinned,
             "archived": self.archive.is_archived(&s.id),
             "profile": "default",
+            // The git identity a move recorded (the sidebar groups by the repo root); a session
+            // that never moved carries none and groups by its cwd.
+            "git_branch": self.workspaces.identity(&s.id).and_then(|(branch, _)| branch),
+            "git_repo_root": self.workspaces.identity(&s.id).and_then(|(_, root)| root),
             // A branch is listed under the session it came from.
             "parent_session_id": self.branches.parent(&s.id),
         })
@@ -3392,7 +3712,8 @@ impl Gateway {
         let limit = param("limit").unwrap_or(50);
         let offset = param("offset").unwrap_or(0);
         // `archived=exclude` (the sidebar, default), `only` (Settings ▸ Sessions), `include`.
-        let filter = crate::archive::Filter::parse(crate::rest::query_param(query, "archived").as_deref());
+        let filter =
+            crate::archive::Filter::parse(crate::rest::query_param(query, "archived").as_deref());
         let all: Vec<_> = self
             .runtime
             .store()

@@ -16,9 +16,11 @@ use std::time::{Duration, Instant};
 
 use std::sync::Arc;
 
+use hermes_agent::operation::Emitter;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio_util::sync::CancellationToken;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::job::Job;
@@ -28,6 +30,20 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DEFAULT_TIMEOUT_SECS: u64 = 180;
 const MAX_TIMEOUT_SECS: u64 = 600;
 const MAX_OUTPUT_CHARS: usize = 30_000;
+
+/// One `tool.progress` event at most per this interval per call (Hermes's `tool.progress`
+/// `_MIN_INTERVAL_S = 0.5`); the first update always passes.
+const RELAY_INTERVAL: Duration = Duration::from_millis(500);
+/// The relayed message is the accumulated output's tail, this many chars, so the clicked-open
+/// row shows the output growing without flooding the socket on a chatty build.
+const RELAY_TAIL_CHARS: usize = 4_096;
+
+/// The relay's state across a command's captured chunks.
+struct Relay {
+    last: Option<Instant>,
+    text: String,
+    bytes: u64,
+}
 const HEAD_CHARS: usize = 10_000;
 const TAIL_CHARS: usize = 18_000;
 /// Output kept in memory per command; anything beyond is counted but dropped.
@@ -183,10 +199,21 @@ pub struct RunResult {
     pub timed_out: bool,
     /// The shell process ended (an `exit` in the command, or a kill) and will be restarted.
     pub shell_restarted: bool,
+    /// The turn was stopped while the command ran; the output is what it had printed.
+    pub interrupted: bool,
 }
 
 fn bash_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// The turn's cancel, or a future that never resolves (no turn to observe: the review path's
+/// and background spawns' runs are stopped by nothing but their timeout).
+async fn stopped(cancel: Option<&CancellationToken>) {
+    match cancel {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
 }
 
 fn powershell_quote(text: &str) -> String {
@@ -222,11 +249,24 @@ impl ShellSession {
         }
     }
 
-    pub async fn run(&self, command: &str, workdir: Option<&Path>, timeout: Duration) -> RunResult {
+    pub async fn run(
+        &self,
+        command: &str,
+        workdir: Option<&Path>,
+        timeout: Duration,
+        cancel: Option<&CancellationToken>,
+        on_chunk: &(dyn Fn(&str) + Send + Sync),
+    ) -> RunResult {
         let _ = std::fs::create_dir_all(&self.scratch_dir);
         match &self.kind {
-            ShellKind::GitBash(bash) => self.run_bash(bash, command, workdir, timeout).await,
-            ShellKind::PowerShell => self.run_powershell(command, workdir, timeout).await,
+            ShellKind::GitBash(bash) => {
+                self.run_bash(bash, command, workdir, timeout, cancel, on_chunk)
+                    .await
+            }
+            ShellKind::PowerShell => {
+                self.run_powershell(command, workdir, timeout, cancel, on_chunk)
+                    .await
+            }
         }
     }
 
@@ -260,6 +300,8 @@ impl ShellSession {
         command: &str,
         workdir: Option<&Path>,
         timeout: Duration,
+        cancel: Option<&CancellationToken>,
+        on_chunk: &(dyn Fn(&str) + Send + Sync),
     ) -> RunResult {
         let mut slot = self.process.lock().await;
         if let Some(process) = slot.as_mut() {
@@ -276,6 +318,7 @@ impl ShellSession {
                         exit_code: None,
                         timed_out: false,
                         shell_restarted: false,
+                        interrupted: false,
                     };
                 }
             }
@@ -304,6 +347,7 @@ impl ShellSession {
                 exit_code: None,
                 timed_out: false,
                 shell_restarted: true,
+                interrupted: false,
             };
         }
 
@@ -330,13 +374,29 @@ impl ShellSession {
                 }
                 if captured.len() < MAX_CAPTURE_BYTES {
                     captured.extend_from_slice(&line);
+                    // Live output: the line as captured, before the run's own masking of
+                    // the full result (the tool masks each chunk it relays).
+                    on_chunk(&String::from_utf8_lossy(&line));
                 } else {
                     dropped_bytes += line.len();
                 }
             }
         };
-        let timed_out = tokio::time::timeout(timeout, read).await.is_err();
-
+        let (timed_out, interrupted) = match tokio::time::timeout(
+            timeout,
+            async {
+                tokio::select! {
+                    biased;
+                    _ = read => false,
+                    _ = stopped(cancel) => true,
+                }
+            },
+        )
+        .await
+        {
+            Ok(interrupted) => (false, interrupted),
+            Err(_) => (true, false),
+        };
         // The sentinel is printed after a newline of its own, so trailing newlines are framing.
         let mut output = String::from_utf8_lossy(&captured)
             .trim_end_matches(['\n', '\r'])
@@ -357,6 +417,7 @@ impl ShellSession {
                     exit_code: Some(exit_code),
                     timed_out: false,
                     shell_restarted: false,
+                    interrupted: false,
                 }
             }
             None => {
@@ -367,6 +428,7 @@ impl ShellSession {
                     exit_code: None,
                     timed_out,
                     shell_restarted: true,
+                    interrupted,
                 }
             }
         }
@@ -377,6 +439,8 @@ impl ShellSession {
         command: &str,
         workdir: Option<&Path>,
         timeout: Duration,
+        cancel: Option<&CancellationToken>,
+        on_chunk: &(dyn Fn(&str) + Send + Sync),
     ) -> RunResult {
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let sentinel = format!("__HERMES_DONE_{nonce}__ ");
@@ -411,6 +475,7 @@ impl ShellSession {
                     exit_code: None,
                     timed_out: false,
                     shell_restarted: false,
+                    interrupted: false,
                 };
             }
         };
@@ -427,12 +492,27 @@ impl ShellSession {
         let mut dropped_tail: Vec<u8> = Vec::new();
         let read = async {
             let mut chunk = vec![0u8; 64 * 1024];
+            // The relay takes whole lines, as the bash path: a raw chunk can end mid-line
+            // (the sentinel split across a boundary would flash in the relay), so the
+            // trailing partial line is held back until its newline arrives.
+            let mut line_buf = Vec::new();
             loop {
                 match stdout.read(&mut chunk).await {
                     Ok(0) | Err(_) => return,
                     Ok(n) => {
                         let keep = n.min(MAX_CAPTURE_BYTES.saturating_sub(captured.len()));
                         captured.extend_from_slice(&chunk[..keep]);
+                        if keep > 0 {
+                            // Live output, as the bash path: complete lines, the sentinel
+                            // line filtered, before the run's own masking of the full result.
+                            line_buf.extend_from_slice(&chunk[..keep]);
+                            while let Some(end) = line_buf.iter().position(|&byte| byte == b'\n') {
+                                let line: Vec<u8> = line_buf.drain(..=end).collect();
+                                if !line.starts_with(sentinel.as_bytes()) {
+                                    on_chunk(&String::from_utf8_lossy(&line));
+                                }
+                            }
+                        }
                         dropped_bytes += n - keep;
                         if keep < n {
                             dropped_tail.extend_from_slice(&chunk[keep..n]);
@@ -443,7 +523,21 @@ impl ShellSession {
                 }
             }
         };
-        let timed_out = tokio::time::timeout(timeout, read).await.is_err();
+        let (timed_out, interrupted) = match tokio::time::timeout(
+            timeout,
+            async {
+                tokio::select! {
+                    biased;
+                    _ = read => false,
+                    _ = stopped(cancel) => true,
+                }
+            },
+        )
+        .await
+        {
+            Ok(interrupted) => (false, interrupted),
+            Err(_) => (true, false),
+        };
         let mut text = String::from_utf8_lossy(&captured).into_owned();
         if dropped_bytes > 0 {
             // The sentinel line is in the dropped part: keep only whole lines, and say so.
@@ -472,7 +566,7 @@ impl ShellSession {
                 lines.push(line);
             }
         }
-        if timed_out {
+        if timed_out || interrupted {
             drop(killer);
         } else {
             killer.disarm();
@@ -483,6 +577,7 @@ impl ShellSession {
             exit_code,
             timed_out,
             shell_restarted: false,
+            interrupted,
         }
     }
 }
@@ -538,7 +633,7 @@ struct TerminalArgs {
     notify: bool,
 }
 
-pub async fn terminal(tools: &SessionTools, args: Value) -> ToolOutput {
+pub async fn terminal(tools: &SessionTools, args: Value, live: Option<(&str, &Emitter)>) -> ToolOutput {
     let args: TerminalArgs = match parse_args("terminal", args) {
         Ok(args) => args,
         Err(error) => return error,
@@ -580,9 +675,53 @@ pub async fn terminal(tools: &SessionTools, args: Value) -> ToolOutput {
             .clamp(1, MAX_TIMEOUT_SECS),
     );
     let started = Instant::now();
+    // Live output: each captured chunk is masked (the same redaction the full result gets)
+    // and relayed as a `tool.progress` event, the accumulated tail so the clicked-open row
+    // shows the output growing. Throttled to one per 500 ms (Hermes's `tool.progress`
+    // `_MIN_INTERVAL_S`); the finished result's masking still runs on the whole output, so
+    // a secret split across chunk boundaries can only flash in the relay, never in the result.
+    let relay = live.map(|(tool_call_id, emit)| {
+        let state = std::sync::Mutex::new(Relay {
+            last: None,
+            text: String::new(),
+            bytes: 0,
+        });
+        let command = args.command.clone();
+        (tool_call_id, emit, state, command)
+    });
+    let on_chunk = |chunk: &str| {
+        let Some((tool_call_id, emit, state, command)) = &relay else {
+            return;
+        };
+        let masked = crate::redact::redact_terminal_output(chunk, command);
+        let mut relay = state.lock().unwrap_or_else(|e| e.into_inner());
+        relay.text.push_str(&masked);
+        let chars = relay.text.chars().count();
+        if chars > RELAY_TAIL_CHARS {
+            relay.text = relay.text.chars().skip(chars - RELAY_TAIL_CHARS).collect();
+        }
+        relay.bytes += chunk.len() as u64;
+        let now = Instant::now();
+        if relay.last.is_some_and(|last| now.duration_since(last) < RELAY_INTERVAL) {
+            return;
+        }
+        relay.last = Some(now);
+        emit.emit(hermes_agent::events::AgentEvent::ToolProgress {
+            tool_call_id: tool_call_id.to_string(),
+            name: "terminal".to_string(),
+            progress: relay.bytes as f64,
+            message: relay.text.clone(),
+        });
+    };
     let result = tools
         .shell
-        .run(&args.command, workdir.as_deref(), timeout)
+        .run(
+            &args.command,
+            workdir.as_deref(),
+            timeout,
+            live.map(|(_, emit)| emit.cancel_token()),
+            &on_chunk,
+        )
         .await;
     // Secrets are masked before the output is trimmed or saved (Hermes redacts the spill too).
     let output = crate::redact::redact_terminal_output(&result.output, &args.command);
@@ -616,6 +755,14 @@ pub async fn terminal(tools: &SessionTools, args: Value) -> ToolOutput {
             "The shell exited during this command and will restart in the same directory; exported variables were lost."
         );
     }
+    // The turn was stopped while the command ran; the output is what it had printed. The tool
+    // response is kept (the state machine saves it), so the row shows the partial output too.
+    if result.interrupted {
+        value["interrupted"] = json!(true);
+        value["note"] = json!(
+            "The command was stopped before it finished; the output above is what it had printed."
+        );
+    }
     ToolOutput::ok(value)
 }
 
@@ -638,10 +785,11 @@ mod tests {
         let out = terminal(
             &tools,
             json!({"command": "export GREETING=hello && cd sub"}),
+            None,
         )
         .await;
         assert_eq!(out.value["exit_code"], 0, "{:?}", out.value);
-        let out = terminal(&tools, json!({"command": "echo $GREETING; pwd -W"})).await;
+        let out = terminal(&tools, json!({"command": "echo $GREETING; pwd -W"}), None).await;
         let text = out.value["output"].as_str().unwrap();
         assert!(text.starts_with("hello\n"), "{text}");
         assert!(text.trim_end().ends_with("/sub"), "{text}");
@@ -655,7 +803,7 @@ mod tests {
         if !bash_available(&tools) {
             return;
         }
-        let out = terminal(&tools, json!({"command": "echo out; echo err >&2; false"})).await;
+        let out = terminal(&tools, json!({"command": "echo out; echo err >&2; false"}), None).await;
         assert_eq!(out.value["exit_code"], 1);
         let text = out.value["output"].as_str().unwrap();
         assert!(text.contains("out") && text.contains("err"), "{text}");
@@ -670,7 +818,7 @@ mod tests {
         }
         std::fs::create_dir(dir.path().join("other")).unwrap();
         let before = tools.cwd();
-        let out = terminal(&tools, json!({"command": "pwd -W", "workdir": "other"})).await;
+        let out = terminal(&tools, json!({"command": "pwd -W", "workdir": "other"}), None).await;
         assert!(out.value["output"].as_str().unwrap().ends_with("/other"));
         assert_eq!(tools.cwd(), before);
         tools.shutdown().await;
@@ -682,10 +830,10 @@ mod tests {
         if !bash_available(&tools) {
             return;
         }
-        let out = terminal(&tools, json!({"command": "sleep 30", "timeout": 1})).await;
+        let out = terminal(&tools, json!({"command": "sleep 30", "timeout": 1}), None).await;
         assert!(out.is_error);
         assert_eq!(out.value["timed_out"], true);
-        let out = terminal(&tools, json!({"command": "echo alive"})).await;
+        let out = terminal(&tools, json!({"command": "echo alive"}), None).await;
         assert_eq!(out.value["output"], "alive");
         tools.shutdown().await;
     }
@@ -696,9 +844,9 @@ mod tests {
         if !bash_available(&tools) {
             return;
         }
-        let out = terminal(&tools, json!({"command": "exit 3"})).await;
+        let out = terminal(&tools, json!({"command": "exit 3"}), None).await;
         assert!(out.value["note"].as_str().is_some(), "{:?}", out.value);
-        let out = terminal(&tools, json!({"command": "echo back"})).await;
+        let out = terminal(&tools, json!({"command": "echo back"}), None).await;
         assert_eq!(out.value["output"], "back");
         tools.shutdown().await;
     }
@@ -711,5 +859,37 @@ mod tests {
         assert!(limited.starts_with("START") && limited.ends_with("END"));
         assert!(limited.len() < 30_000);
         assert_eq!(std::fs::read_to_string(saved.unwrap()).unwrap(), output);
+    }
+
+    /// The PowerShell path (no Git Bash on the machine) relays its live output too: whole
+    /// lines only, never the run's own sentinel line (the bash path filters it; the nonce
+    /// would flash in the relay).
+    #[tokio::test]
+    async fn the_powershell_relay_takes_whole_lines_without_the_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = ShellSession::new(
+            ShellKind::PowerShell,
+            dir.path().to_path_buf(),
+            dir.path().join("scratch"),
+        );
+        let relayed = std::sync::Mutex::new(Vec::new());
+        let result = shell
+            .run(
+                "Write-Output one; Start-Sleep -Milliseconds 700; Write-Output two",
+                None,
+                Duration::from_secs(30),
+                None,
+                &|line| relayed.lock().unwrap().push(line.to_string()),
+            )
+            .await;
+        assert_eq!(result.exit_code, Some(0), "{:?}", result.output);
+        let relayed = relayed.into_inner().unwrap();
+        assert!(!relayed.is_empty(), "no live output was relayed");
+        assert!(relayed.iter().any(|line| line.contains("one")), "{relayed:?}");
+        assert!(relayed.iter().any(|line| line.contains("two")), "{relayed:?}");
+        assert!(
+            relayed.iter().all(|line| !line.contains("__HERMES_DONE_")),
+            "{relayed:?}"
+        );
     }
 }

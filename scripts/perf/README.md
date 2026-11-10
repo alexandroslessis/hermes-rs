@@ -79,12 +79,30 @@ its own provider on :47900.
 with its own provider on :47900.
 `toolsets-check.mjs` checks Capabilities ▸ Tools (list, switch off and on, the next turn's tools, a refused
 call) with its own provider on :47900.
+`tool-stream-check.mjs` checks the terminal's live output against the page (what the terminal sends
+as `tool.progress` frames reaches it; a command that prints in two bursts must produce relay frames
+before the `tool.complete` answer carries the result, patches/0017) and that a stop mid-command
+keeps the output (the interrupted turn's `tool.complete` carries the result it had printed).
 `memory-check.mjs` checks the Star map's routes (graph, node detail, edit, delete, a stale id) and that
 Settings ▸ Memory reaches the store; it restores the perf instance's memory files after.
 `artifacts-check.mjs` checks the Artifacts view through the page (a written file named in a reply
 and a link are listed).
 `archive-check.mjs` checks archived sessions (archive from PATCH and the shortcut, the `archived=`
 lists, the project tree, unarchive, deleting an archived one, the auto-archive defaults).
+`workspace-check.mjs` checks moving a session between projects (the canonical `workspace` mutation: the
+receipt's cwd/branch/repo-root, session.info and the list carrying the identity, a non-repo folder
+replacing it with nulls, the bare-home move filing the session into Home, the unknown-folder refusal,
+the busy refusal while a turn runs) with its
+own provider on :47900.
+`profiles-check.mjs` checks the profiles window's SOUL.md editor (read, save, read back, a never-written
+one as missing, another profile name refused like Hermes); it restores the SOUL.md it found.
+`provider-error-check.mjs` checks the provider-error card's contract (its own provider on :47900 answers a
+429 daily limit): the turn's `message.complete` carries status "error", the provider's text and the
+descriptor — layer/code, a quota limit not retryable.
+`file-tree-open-check.mjs` checks the file trees' "Open in default app" route (patches/0015) and the
+"Reveal in File Explorer" route (patches/0016): a missing file, a relative path, an empty path and the
+`file:` form answer 400 with a readable detail — the open itself is exercised by `artifacts-check.mjs`
+and the `open_file.rs` unit tests.
 `import-check.mjs` checks the Hermes importer (list, preview, import, `/import-hermes`, continuing an
 imported chat) against a home built by `make-hermes-db.py` with Hermes's own SessionDB; start the
 instance with `HERMES_HOME` set to it.
@@ -92,6 +110,12 @@ instance with `HERMES_HOME` set to it.
 `aux-models-check.mjs` checks Settings ▸ Model ▸ Auxiliary (the four jobs, refused assignments,
 a title and a compression model with its own and an inherited effort reaching their requests,
 reset).
+
+`keyboard-nav-check.mjs` checks arrow-key navigation through the page (DevTools, patches/0018 and
+0019): the file tree's ↑/↓ move the visible selection and ←/→ fold the selected folder, and the
+Settings rail's rows walk with ↑/↓ (wrap-around; arrows only move focus, the hash never changes).
+It reloads the page first — arborist's focus cursor drifts under synthetic keydowns with no real
+DOM focus, which real usage never produces.
 
 `cdp.mjs '<expression>'` evaluates JavaScript in the instance's page (DevTools port 9223) and
 prints the result; `hover.mjs '<selector|label|text>' [click]` moves the mouse onto an element and

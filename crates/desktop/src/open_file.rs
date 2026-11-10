@@ -41,6 +41,17 @@ pub fn plan(link: &str) -> Result<Open, String> {
     Ok(if runs { Open::Reveal(path) } else { Open::Launch(path) })
 }
 
+/// What to do for a "reveal in Explorer" ask (`patches/0016`): show it selected in
+/// its containing folder, a folder included; an error for anything else or a file
+/// that isn't there.
+pub fn reveal_plan(link: &str) -> Result<Open, String> {
+    let path = file_path(link).ok_or_else(|| format!("Not a local file: {link}"))?;
+    if !path.exists() {
+        return Err(format!("{} doesn't exist", path.display()));
+    }
+    Ok(Open::Reveal(path))
+}
+
 /// `file:///C:/a%20b/c.md`, `file://C:/x`, `file:///c:\x` or `C:\x` → `C:\a b\c.md`. Only
 /// absolute paths on this machine (no `file://server/share` hosts other than `localhost`).
 fn file_path(link: &str) -> Option<PathBuf> {
@@ -59,14 +70,21 @@ fn file_path(link: &str) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
+/// explorer.exe reads `/` as its own switch delimiter: a forward-slash path with a
+/// space (the page's tree paths are `C:/…`, `/api/fs/list`'s shape) makes it fall
+/// back to the Documents folder instead. Hand it backslashes only.
+fn native(path: &Path) -> String {
+    path.display().to_string().replace('/', "\\")
+}
+
 /// Does it (Explorer runs the default app for a file, opens a folder, or selects with
 /// `/select,`). Explorer's exit code doesn't say whether it worked, so only a failure to start
 /// it is an error.
 pub fn run(open: &Open) -> Result<(), String> {
     let mut command = std::process::Command::new("explorer.exe");
     match open {
-        Open::Launch(path) => command.arg(path),
-        Open::Reveal(path) => command.arg(format!("/select,{}", path.display())),
+        Open::Launch(path) => command.arg(native(path)),
+        Open::Reveal(path) => command.arg(format!("/select,{}", native(path))),
     };
     command.spawn().map(drop).map_err(|e| format!("Couldn't start Explorer: {e}"))
 }
@@ -74,6 +92,7 @@ pub fn run(open: &Open) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn link_to(path: &Path) -> String {
         format!("file:///{}", path.display().to_string().replace('\\', "/").replace(' ', "%20"))
@@ -106,5 +125,24 @@ mod tests {
         assert_eq!(file_path("FILE://C:/x"), Some(PathBuf::from(r"C:\x")));
         assert_eq!(file_path("file://localhost/C:/x"), Some(PathBuf::from(r"C:\x")));
         assert_eq!(file_path(r"C:\x\y.txt"), Some(PathBuf::from(r"C:\x\y.txt")));
+    }
+
+    #[test]
+    fn explorer_gets_backslashes() {
+        assert_eq!(native(Path::new(r"C:\a b\c.md")), r"C:\a b\c.md");
+        // The page's tree paths (`/api/fs/list`'s shape): forward slashes survive the
+        // plan, and explorer falls back to Documents for one with a space.
+        assert_eq!(native(Path::new("C:/a b/c.md")), r"C:\a b\c.md");
+        assert_eq!(native(Path::new("C:/Users/x/report.md")), r"C:\Users\x\report.md");
+    }
+
+    #[test]
+    fn reveal_shows_what_is_there_and_refuses_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("my report.md");
+        std::fs::write(&doc, "# hi").unwrap();
+        assert_eq!(reveal_plan(&link_to(&doc)), Ok(Open::Reveal(doc)));
+        assert!(reveal_plan("relative/a.md").is_err());
+        assert!(reveal_plan("file:///C:/definitely/not/here.md").is_err());
     }
 }

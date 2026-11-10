@@ -445,6 +445,7 @@ mod tests {
         let started = crate::shell::terminal(
             &tools,
             json!({"command": "echo one; sleep 1; echo two", "background": true}),
+            None,
         )
         .await;
         let id = started.value["session_id"].as_str().unwrap().to_string();
@@ -471,6 +472,7 @@ mod tests {
         let started = crate::shell::terminal(
             &tools,
             json!({"command": "read line; echo got:$line; sleep 60", "background": true}),
+            None,
         )
         .await;
         let id = started.value["session_id"].as_str().unwrap().to_string();
@@ -496,6 +498,7 @@ mod tests {
         crate::shell::terminal(
             &tools,
             json!({"command": "echo done; exit 4", "background": true, "notify": true}),
+            None,
         )
         .await;
         for _ in 0..100 {

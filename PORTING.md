@@ -47,7 +47,7 @@ Not from Hermes, so not in the map:
 | `server.rs` | `hermes_cli/web_server_dashboard.py` (page globals, token), `tui_gateway/ws.py` |
 | `gateway.rs` | `tui_gateway/server.py`, `methods_prompt.py`, `methods_session.py`, `ws.py`; `agent/context_breakdown.py`; the page's side: `apps/desktop/src/api/canonical-protocol.ts`, `apps/shared/src/gateway-contract.openrpc.json` |
 | `hub.rs` | event fan-out: `apps/desktop/src/api/canonical-protocol.ts` |
-| `transcript.rs` | `tui_gateway/methods_session.py`, `tui_gateway/prompt_turn.py` |
+| `transcript.rs` | `tui_gateway/methods_session.py`, `tui_gateway/prompt_turn.py`, `agent/conversation_loop.py` (`_close_durable_failed_turn`), `agent/turn_failure_copy.py` (`failed_turn_notice`) |
 | `rest.rs` | `hermes_cli/config.py` (config schema), `hermes_cli/web_routers/*.py`, `apps/desktop/src/types/hermes.ts` |
 | `commands.rs` | `tui_gateway/command_discovery.py`, `tui_gateway/methods_complete.py` |
 | `paths.rs` | `tui_gateway/methods_complete.py` (`@` paths), `/api/fs/list` |
@@ -62,6 +62,8 @@ Not from Hermes, so not in the map:
 | `open_file.rs` | `apps/desktop/electron/` opener rule (`openExternal` for `file:`), `apps/shared/src/external-url.ts`; with patch 0013, since Hermes's browser build drops `file:` links |
 | `archive.rs` | `hermes_cli/web_routers/sessions.py` (`archived=` filter, PATCH `archived`), `hermes_state_maintenance.py` (`maybe_auto_archive`, `archive_stale_sessions`), `hermes_cli/config_defaults.py` (`sessions.auto_archive*`); the set lives in `archived-sessions.json` (the shared schema has no archived column) |
 | `branch.rs` | `tui_gateway/methods_session_branch.py`; copies stored messages (tools included) where Hermes copies visible text; parent links in `branches.json` (the shared schema has no parent column) |
+| `workspace.rs` | `gateway/session_mutation_policy.py` (`prepare_workspace` — the folder probe), `hermes_state_mutation_prepared.py` (`workspace_in_transaction` — the store move), `tui_gateway/git_probe.py` (`branch`, `common_repo_root`); the git identity lives in `session-workspaces.json` (the shared schema has no git columns), and a live session's cached state is dropped (`Runtime::evict`) where Hermes evicts its cached agent |
+| `profiles.rs` | `hermes_cli/web_routers/profiles.py` (`get_profile_soul`, `update_profile_soul`), `hermes_cli/web_server_profiles.py` (`_resolve_profile_dir`); one profile ("default", home = the data folder) — the multi-profile routes (create, rename, delete, export, import) aren't ported: no second profile and no relaunch to switch to one |
 | `aux_models.rs` | `hermes_cli/web_routers/models.py` (`get_auxiliary_models`), `hermes_cli/web_server_config.py` (`_apply_aux_assignment_sync`, `_AUX_TASK_SLOTS`); four slots, kept in `config.json` `aux_models` with the GPUI app's names |
 | `toolsets.rs` | `hermes_cli/web_routers/tools.py` (`/api/tools/toolsets*`, `/api/tools/terminal/backends`), `hermes_cli/tools_config.py` (`CONFIGURABLE_TOOLSETS`); keeps the disabled toolsets (`disabled_toolsets`) where Hermes keeps the enabled ones per platform |
 | `learning.rs` | `agent/learning_graph.py`, `agent/learning_mutations.py` (`/api/learning/*`, served by `hermes_cli/web_routers/status.py`); memory edits through `MemoryStore::edit_entry` (the store's lock and drift guard), skill deletes through `archive_by_user` |
@@ -78,7 +80,7 @@ Not from Hermes, so not in the map:
 | `Runtime::side_question`, `Runtime::background` | `agent/side_question.py` (one-shot path only; the cache-parity fork isn't ported), `tui_gateway/methods_prompt.py` (`prompt.btw`, `prompt.background`; `/bg` runs as a subagent rather than a full agent) |
 | `subagents.rs`, `delegate.rs` (events) | `tools/delegate_tool_registry.py`, `tui_gateway` `subagent.*` and `delegation.status/pause`; `spawn_tree.*` not ported |
 | **Tools** (`crates/tools`) | |
-| `shell.rs` | `tools/terminal_tool.py` |
+| `shell.rs` | `tools/terminal_tool.py`; the live-output relay is `agent/tool_progress_relay.py` (Hermes relays MCP tools only; ours covers the terminal, throttled the same), and stopping a mid-run command keeps its output, the spirit of `tool_executor.py`'s sequential interrupt grace (ours ends the command instead of waiting 3 s) |
 | `process.rs` | `tools/process_registry.py` |
 | `search.rs` | `tools/file_tools.py`, `tools/file_operations_search.py` |
 | `lint.rs` | `tools/file_operations_lint.py` |

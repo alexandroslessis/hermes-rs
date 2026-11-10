@@ -5,6 +5,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { execSync } from 'node:child_process'
 
 const port = process.argv[2] ?? '47810'
 const folder = process.argv[3] ?? fs.mkdtempSync(path.join(os.tmpdir(), 'files-check-'))
@@ -13,6 +14,10 @@ fs.mkdirSync(path.join(folder, 'src'), { recursive: true })
 fs.writeFileSync(path.join(folder, 'src', 'main.rs'), 'fn main() {}\n')
 fs.writeFileSync(path.join(folder, '.env'), 'SECRET=1\n')
 fs.writeFileSync(path.join(folder, 'clip.mp3'), Buffer.alloc(4096, 7))
+// The git-root check expects a repository around the folder; bare tempdirs
+// answered null and failed it since the check was written. Identity set
+// explicitly (the machine's global git config is nobody's business here).
+execSync(`git -C "${folder}" init -q && git -C "${folder}" config user.name check && git -C "${folder}" config user.email check@local`, { stdio: 'ignore' })
 
 let failed = 0
 const check = (label, ok, detail) => {

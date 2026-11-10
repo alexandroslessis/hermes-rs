@@ -1,0 +1,96 @@
+--- a/apps/desktop/src/store/projects.ts
++++ b/apps/desktop/src/store/projects.ts
+@@ -798,7 +798,13 @@
+   projectId: string,
+   profile?: null | string
+ ): Promise<void> {
+-  const cwd = projectRootCwd($projectTree.get().find(node => node.id === projectId))
++  // The Home bucket has no folder of its own: its workspace is the bare home
++  // directory (the backend's default cwd), which is what the backend's tree
++  // files into Home. Every other project moves to its root folder.
++  const node = $projectTree.get().find(node => node.id === projectId)
++  const cwd =
++    projectRootCwd(node) ||
++    (node?.isNoProject ? (await hermesApi<{ cwd?: string }>({ path: '/api/fs/default-cwd' })).cwd || '' : '')
+ 
+   if (!cwd) {
+     throw new Error(translateNow('sidebar.projects.moveNoFolder'))
+--- a/apps/desktop/src/app/chat/session-drag.ts
++++ b/apps/desktop/src/app/chat/session-drag.ts
+@@ -55,13 +55,12 @@
+ import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
+ import { notifyError } from '@/store/notifications'
+ import { requestFreshSession } from '@/store/profile'
+-import { moveSessionToProject, projectIdForCwd } from '@/store/projects'
++import { $projectOwnerBySessionId, moveSessionToProject, projectIdForCwd } from '@/store/projects'
+ import { $selectedStoredSessionId, $sessions, sessionMatchesStoredId, sessionPinId } from '@/store/session'
+ import { $sessionTiles, nextSessionTileForWorkspace, openSessionTile, type TileDock } from '@/store/session-states'
+ 
+ import { requestComposerInsertRefs } from './composer/focus'
+ import { type SessionDragPayload, sessionInlineRef, sessionLabel } from './composer/inline-refs'
+-import { NO_PROJECT_ID } from './sidebar/projects/workspace-groups'
+ import { tileZoneHost } from './tile-zone-host'
+ 
+ const PROJECT_ROW_DROP_ATTR = 'data-session-drop-hover'
+@@ -80,10 +79,11 @@
+   return (
+     queryAllVisible<HTMLElement>('[data-sessions-project]')
+       .map(el => ({ el, id: el.dataset.sessionsProject || '', rect: snapRect(el) }))
+-      // Home (no folder to move into) and the session's own current project
+-      // (nothing to move) aren't drop targets — same exclusion the row's
+-      // "Move to project" menu applies to its own list.
+-      .filter(row => row.id !== NO_PROJECT_ID && row.id !== excludeId)
++      // The session's own current project isn't a drop target (nothing to
++      // move) — same exclusion the row's "Move to project" menu applies to its
++      // own list. The Home bucket IS one: its workspace is the backend's
++      // bare-home default cwd, where a moved session lands.
++      .filter(row => row.id !== excludeId)
+   )
+ }
+ 
+@@ -200,7 +200,11 @@
+       // survive the row's own reorder/rename churn while a drag is armed.
+       const draggedSession = $sessions.get().find(s => sessionMatchesStoredId(s, payload.id))
+       const cwd = draggedSession?.cwd?.trim() || ''
+-      projectRows = snapshotProjectRows(cwd ? projectIdForCwd(cwd) : null)
++      // The session's own bucket isn't a target (nothing to move): the tree
++      // snapshot's owner map names it, a cwd-only placement falls back to the
++      // project roots (a Home session's owner is the Home bucket).
++      const currentBucket = $projectOwnerBySessionId.get().get(payload.id) ?? (cwd ? projectIdForCwd(cwd) : null)
++      projectRows = snapshotProjectRows(currentBucket)
+       // A row dragged out of Pinned has nothing to pin (it reorders there) —
+       // instead the session lists become unpin targets. Any other row gets
+       // Pinned as its pin target.
+--- a/apps/desktop/src/app/chat/sidebar/session-actions-menu.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-actions-menu.tsx
+@@ -34,6 +34,7 @@
+ import { activeGateway } from '@/store/gateway'
+ import { notify, notifyError } from '@/store/notifications'
+ import {
++  $projectOwnerBySessionId,
+   $projectTree,
+   applyRenamedSessionTitle,
+   moveSessionToProject,
+@@ -214,16 +215,18 @@
+ // component so only an OPEN submenu subscribes to the stores (same reasoning as
+ // SessionColorSwatches). Re-homes the session's workspace at the target
+ // project's root — the fix for a chat created in the wrong folder. The current
+-// owner and folderless projects (the Home bucket) are excluded: there is
+-// nothing to move into.
++// owner is excluded: there is nothing to move into. The Home bucket is a
++// target: its workspace is the backend's bare-home default cwd, where a moved
++// session lands.
+ function MoveToProjectItems({ kit, sessionId, profile }: { kit: MenuKit; sessionId: string; profile?: string }) {
+   const { t } = useI18n()
+   const p = t.sidebar.projects
+   const tree = useStore($projectTree)
++  const owners = useStore($projectOwnerBySessionId)
+   const session = useStore($sessions).find(s => sessionMatchesStoredId(s, sessionId))
+   const cwd = session?.cwd?.trim() || ''
+-  const currentProjectId = cwd ? projectIdForCwd(cwd) : null
+-  const targets = tree.filter(node => node.id !== currentProjectId && !node.isNoProject && projectRootCwd(node))
++  const currentProjectId = owners.get(sessionId) ?? (cwd ? projectIdForCwd(cwd) : null)
++  const targets = tree.filter(node => node.id !== currentProjectId && (node.isNoProject || projectRootCwd(node)))
+ 
+   // The flat (non-grouped) sidebar view only warms $projectTree on a
+   // background timer (PROJECT_TREE_WARM_MS in sidebar/index.tsx), so opening
