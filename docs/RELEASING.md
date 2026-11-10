@@ -3,9 +3,17 @@
 (For people: the step-by-step version is [INSTALLER-TUTORIAL.md](INSTALLER-TUTORIAL.md). Keep the
 two in step when the build changes.)
 
-The app ships as an NSIS installer built by Tauri's CLI and published on the `installer` branch
-(no `gh` on this machine, so no GitHub Releases from here). Build and publish only when the user
-asks for it.
+The app ships as an NSIS installer built by Tauri's CLI and published as a **GitHub Release**
+(`v<version>`, with `Hermes_<version>_x64-setup.exe` and its `.sha256` attached). The old
+`installer` branch is gone; installers are no longer stored in git history. Build and publish only
+when the user asks for it.
+
+**Publishing needs the GitHub CLI (`gh`), which is not installed on the machine agents usually work
+on** (no `gh` here, no GitHub credentials for it). The user publishes from a computer where `gh` is
+signed in, with `scripts/release.ps1`; the step-by-step is
+[INSTALLER-TUTORIAL.md](INSTALLER-TUTORIAL.md). An agent's part is to leave `main` pushed, the
+version bumped (`scripts/bump-version.ps1`) and the docs true, and to build an installer for a smoke
+test when asked.
 
 ## Build
 
@@ -58,33 +66,30 @@ You can't run the installer against the user's data. Check what you can:
 3. Give the user a checklist for installing on the other computer (install, start from the Start
    menu, set up the endpoint, import Hermes sessions, send a prompt).
 
-## Publish (the `installer` branch)
+## Publish (a GitHub Release)
 
-The branch holds only the installer and a README, never code. It was created as an orphan commit
-with git plumbing so nothing in the working tree changes:
-
-```bash
-cd /c/Users/alexandros/repos/hermes-rs
-exe=target/claude/release/bundle/nsis/Hermes_0.1.0_x64-setup.exe
-# a README in the scratchpad: what it is, built from which commit, how to install, first run
-blob_exe=$(git hash-object -w "$exe")
-blob_readme=$(git hash-object -w /path/to/installer-README.md)
-tree=$(printf '100644 blob %s\t%s\n100644 blob %s\tREADME.md\n' \
-  "$blob_exe" "$(basename "$exe")" "$blob_readme" | git mktree)
-git fetch origin installer
-# -p keeps the branch's history (a fast-forward push, no force needed)
-commit=$(git commit-tree "$tree" -p origin/installer \
-  -m "Hermes <version> installer (built from main at $(git rev-parse --short HEAD))" \
-  -m "Co-Authored-By: <the trailer the session gives you>")
-git push origin "$commit:refs/heads/installer"
+```powershell
+powershell -File scripts\bump-version.ps1 -Version 0.3.0 -Commit    # the three version numbers
+git push
+powershell -File scripts\release.ps1 [-Notes notes.md] [-Draft]      # checks, builds, publishes
 ```
 
+`scripts/release.ps1` refuses to start unless: `gh` is installed and signed in, the working tree is
+clean, you are on `main` and it equals `origin/main`, `tauri.conf.json`, `crates/desktop/Cargo.toml`
+and `Cargo.lock` carry the same version, and the tag `v<version>` is free. Then it builds the
+frontend and the installer into `target\release-build` (`-TargetDir` changes it), writes the
+SHA-256 file and runs `gh release create v<version> <installer> <sha256> --target <HEAD>` with
+either `-Notes <file>` or GitHub's generated notes. `-DryRun` runs the checks and prints the `gh`
+command; `-SkipBuild` publishes an installer that is already built (a rerun after a failed upload).
+
 Notes:
-- Each published installer adds ~22 MB to the repository's history. If that grows too much, ask
-  the user whether to replace the branch (orphan commit + force push) instead; never force-push
-  without asking.
-- The README says which `main` commit it was built from; build from a committed, pushed `main`.
-- The user downloads it from GitHub (the file's page ▸ "Download raw file").
+- A release is made from a pushed `main`, so "built from" is always a commit anyone can check out.
+- Versions are used once: a mistaken release is edited or deleted on GitHub (delete its tag too:
+  `git push origin --delete v<version>`), then the next one gets a new number.
+- Binaries live in the release's assets, not in git: the repository stops growing by ~22 MB per
+  installer.
+- Not done yet: building the release in GitHub Actions on a tag push (would need the Hermes clone at
+  `HERMES_COMMIT`, Node, Rust 1.98.1 and the same two build commands), and Tauri's in-app updater.
 
 ## Updating Hermes before a release
 
