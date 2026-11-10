@@ -2,6 +2,11 @@
 
 Things that cost hours once. Read this before debugging; check here first when something is odd.
 
+ACP mode (`--acp`, planned in [docs/acp/](acp/README.md)) has its own known traps, listed there
+before they bite: stdout is the protocol, so `main.rs`'s `init_logging` (which writes to stdout)
+must not run in that mode; an event for a session the gateway's `Hub` doesn't route to us is
+dropped, and an approval nobody sees is denied. Add what you learn while building it here.
+
 ## Shell and tooling (Windows)
 
 - **Two shells.** The Bash tool is Git Bash; PowerShell is separate. Git Bash's `tar` can't handle

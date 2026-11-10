@@ -159,7 +159,7 @@ Edit the `Decision` column (or just tell me the IDs to change). Blank means "go 
 | ID | Feature | Rec | Decision |
 |---|---|---|---|
 | H1 | Messaging gateway (Telegram, Discord, Slack, WhatsApp, Signal, ~20 platforms), Bot Mode, `/handoff` | D | |
-| H2 | ACP server (use Hermes inside Zed/VS Code) | D | |
+| H2 | ACP server (use Hermes inside Zed/VS Code) | D | **Changed to L, 2026-11-10:** the user wants it for Zed and t3code. Plan: [docs/acp/](docs/acp/README.md) |
 | H3 | OpenAI-compatible API server | D | |
 | H4 | Web dashboard / remote backend / multi-connection desktop | D | |
 | H5 | Plugin system (Python plugins: tools, hooks, context engines) | D | |

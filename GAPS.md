@@ -87,6 +87,7 @@ backend code · **L** = a port of a Hermes subsystem.
 | Local model management (download/run GGUFs) | Ollama already covers this | L |
 | LSP integration | diagnostics for the agent | L |
 | Multiple windows / pop-out session | | M |
+| ACP server: the agent in Zed (and later t3code), `hermes-desktop.exe --acp` | Asked for 2026-11-10. Plan, protocol, tests and Zed setup in [docs/acp/](docs/acp/README.md); phases 0–6 in [docs/acp/PHASES.md](docs/acp/PHASES.md). Port of Hermes's `acp_adapter/gateway_server.py` (ACP as a client of our gateway) | L |
 
 ## 6. Not needed for a local harness
 
