@@ -20,7 +20,10 @@ pub fn kind(name: &str) -> &'static str {
         "read_file" | "skill_view" | "skills_list" | "vision_analyze" | "video_analyze" => "read",
         "write_file" | "patch" | "skill_manage" => "edit",
         "search_files" | "session_search" => "search",
-        "terminal" | "process_manage" | "delegate_task" => "execute",
+        "terminal" | "process_manage" => "execute",
+        // Not "execute": Zed draws an execute card as a command and can't expand one that has
+        // text instead of a terminal, so a delegation's log and result were out of reach.
+        "delegate_task" => "other",
         "web_search" | "web_extract" => "fetch",
         _ => "other",
     }
@@ -86,9 +89,50 @@ pub fn title(name: &str, args: &Value) -> String {
                 .unwrap_or_else(|| text_arg(args, &["url"]));
             format!("Fetch {}", clip(url, 80))
         }
-        "delegate_task" => format!("Delegate: {}", clip(text_arg(args, &["goal"]), 60)),
+        "delegate_task" => delegate_title(args),
         other => other.replace('_', " "),
     }
+}
+
+/// `Delegate: <goal>`; the goal is the first task's (the call's shape is `tasks: [{goal, context}]`,
+/// the old `goal` alone also works), with how many more there are.
+fn delegate_title(args: &Value) -> String {
+    let tasks = args.get("tasks").and_then(Value::as_array);
+    let goal = tasks.and_then(|tasks| tasks.first()).map_or_else(
+        || text_arg(args, &["goal"]),
+        |task| text_arg(task, &["goal"]),
+    );
+    let more = tasks.map_or(0, |tasks| tasks.len().saturating_sub(1));
+    let goal = clip(goal, 60);
+    match (goal.is_empty(), more) {
+        (true, _) => "Delegate".to_string(),
+        (false, 0) => format!("Delegate: {goal}"),
+        (false, n) => format!("Delegate: {goal} (+{n} more)"),
+    }
+}
+
+/// What a finished delegation shows: one line per task with its status and summary, instead of
+/// the call's raw JSON.
+fn delegate_summary(result: &Value) -> Option<String> {
+    let results = result.get("results")?.as_array()?;
+    let lines: Vec<String> = results
+        .iter()
+        .map(|task| {
+            let number = task["task_index"].as_u64().unwrap_or(0) + 1;
+            let status = task["status"].as_str().unwrap_or("done");
+            let seconds = task["duration_seconds"].as_f64().unwrap_or(0.0);
+            let body = task["summary"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| task["error"].as_str())
+                .unwrap_or_default();
+            format!(
+                "**Task {number}: {status}** ({seconds:.0}s)\n\n{}",
+                body.trim()
+            )
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n\n"))
 }
 
 /// An absolute Windows path for `path` (relative ones against the session's folder): what the
@@ -273,6 +317,10 @@ pub fn complete_content(
                 .map_or(0, Vec::len);
             vec![text_content(&format!("{todos} task(s) on the list"))]
         }
+        "delegate_task" => match delegate_summary(result) {
+            Some(summary) => vec![text_content(&summary)],
+            None => vec![text_content(&result_text(result, raw))],
+        },
         "terminal" => {
             let text = result_text(result, raw);
             if text.trim().is_empty() {
@@ -329,6 +377,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_finished_delegation_reads_as_one_line_per_task() {
+        let result = json!({"results": [
+            {"task_index": 0, "status": "completed", "summary": "Found it.", "duration_seconds": 10.6},
+            {"task_index": 1, "status": "failed", "summary": "", "error": "no goal", "duration_seconds": 0.2},
+        ]});
+        let content = complete_content("delegate_task", &json!({}), &result, "", "C:/w", None);
+        let text = content[0]["content"]["text"].as_str().unwrap();
+        assert!(
+            text.contains("**Task 1: completed** (11s)") && text.contains("Found it."),
+            "{text}"
+        );
+        assert!(
+            text.contains("**Task 2: failed**") && text.contains("no goal"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn every_tool_has_the_kind_its_icon_expects() {
         for (name, expected) in [
             ("read_file", "read"),
@@ -338,7 +404,7 @@ mod tests {
             ("search_files", "search"),
             ("terminal", "execute"),
             ("process_manage", "execute"),
-            ("delegate_task", "execute"),
+            ("delegate_task", "other"),
             ("web_search", "fetch"),
             ("web_extract", "fetch"),
             ("todo_list", "other"),
@@ -390,6 +456,14 @@ mod tests {
             title("delegate_task", &json!({"goal": "review it"})),
             "Delegate: review it"
         );
+        assert_eq!(
+            title(
+                "delegate_task",
+                &json!({"tasks": [{"goal": "find zed"}, {"goal": "b"}]})
+            ),
+            "Delegate: find zed (+1 more)"
+        );
+        assert_eq!(title("delegate_task", &json!({"tasks": []})), "Delegate");
         assert_eq!(title("memory", &json!({})), "memory");
         assert_eq!(title("skill_manage", &json!({})), "skill manage");
     }

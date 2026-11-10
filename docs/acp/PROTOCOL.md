@@ -236,10 +236,10 @@ Kinds (port of Hermes `tools.py` `TOOL_KIND_MAP`, with **our** tool names — li
 | `read` | `read_file`, `skill_view`, `skills_list`, `vision_analyze`, `video_analyze` |
 | `edit` | `write_file`, `patch`, `skill_manage` |
 | `search` | `search_files`, `session_search` |
-| `execute` | `terminal`, `process_manage`, `delegate_task` |
+| `execute` | `terminal`, `process_manage` (Zed draws an execute card as a command; one with text instead of a terminal can't be expanded) |
 | `fetch` | `web_search`, `web_extract` |
 | `think` | — |
-| `other` | `todo_list`, `memory`, `clarify`, everything else (MCP tools) |
+| `other` | `delegate_task` (its log and result must be expandable), `todo_list`, `memory`, `clarify`, everything else (MCP tools) |
 
 Titles (Hermes `build_tool_title`; keep them short, the editor shows them as the card header):
 - `terminal`: the command (first line, max 80 chars), e.g. `cargo test -p foo`
@@ -247,7 +247,7 @@ Titles (Hermes `build_tool_title`; keep them short, the editor shows them as the
 - `write_file`: `Write <path>`; `patch`: `Edit <path>`
 - `search_files`: `Search "<pattern>"` (+ ` in <path>`)
 - `web_search`: `Web search "<query>"`; `web_extract`: `Fetch <url>`
-- `delegate_task`: `Delegate: <goal, max 60 chars>`
+- `delegate_task`: `Delegate: <first task's goal, max 60 chars>` (+ ` (+N more)`); the call is `tasks: [{goal, context}]`
 - anything else: the tool name with `_` → space.
 
 Locations (Hermes `extract_locations`): from args keys `path` / `file_path` / `file` (resolved
