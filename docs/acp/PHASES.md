@@ -322,25 +322,30 @@ effort selector works; modes (Auto, Manual, Accept edits, Plan, YOLO: the sessio
 
 ## Phase 5 — Hardening and living alongside the desktop app
 
-Open. Done so far: EOF on stdin interrupts every turn and stops the session's processes; a request handler that fails answers an error (each request is its own task).
+✅ **Done 2026-11-11** (the editor's MCP servers were dropped by the user: `mcpServers` in
+`session/new` stays ignored). As built:
 
-1. **Both apps at once** (README D5): run the desktop instance (`perf.ps1`, data `target/perf/home`)
-   and an ACP process on the same `HERMES_RS_HOME`; create a session in each; check both see both
-   (the desktop sidebar after a refresh, `session/list`). Write down in PITFALLS what's shared and
-   what isn't (side files last-writer-wins: `generation-stats.json`, `branches.json`).
-2. **The same session in both:** a turn running in the desktop app and a prompt from Zed on the
-   same session would interleave messages. Add a guard: a lock file
-   `<data>/running/<session id>.lock` held (by pid) while a turn runs, checked by both
-   `prompt.submit` paths; the second one refuses with a readable error. Only if the user wants it
-   (ask; it touches the desktop path).
-3. **Subagents:** `subagent.*` events → text content on the parent `delegate_task` tool card
-   (`tool_call_update` with appended content) so a long delegation isn't a silent spinner.
-4. **Editor MCP servers** (`mcpServers` in `session/new`): decide with the user. The runtime's
-   `McpManager` is global; per-session servers would need a runtime change.
-5. **Crash safety:** a panic in a handler must answer -32603, not kill the process
-   (`tokio::spawn` + `JoinHandle` error → respond). Kill the process tree on exit.
-6. **Installer:** the installed exe path for Zed's config (docs/RELEASING.md, ZED.md). No
-   installer change needed (same exe).
+1. **Both apps at once.** Two processes (the desktop app, `hermes-acp.exe`) share the data folder
+   (`sessions.db`, memories, skills, `config.json`). A thread made in one is in the other's list
+   (`two_agent_processes_share_threads_and_continue_each_others`). What is and isn't shared is in
+   PITFALLS ("Two windows on one data folder").
+2. **The same thread in both.** `hermes_runtime::turnlock`: while a turn (or `/compress`) runs, its
+   process holds `<data>/running/<session id>.lock` open with no sharing; a second process's
+   `start_turn` fails with "This thread is running a turn in another Hermes window…", in the
+   editor as the prompt's error, in the page as an error card. The OS drops the lock if the
+   process dies. And the stale-cache bug under it: rows are keyed by position, so a window whose
+   cached conversation was behind would overwrite the other's messages; `Runtime::reload_if_stale`
+   (count + last message id against the store) reloads at turn start, `/compress`, `messages()`
+   and `rewind()`.
+3. **Subagents.** `subagent.start|tool|complete` page events become lines on the open
+   `delegate_task` card (the whole log each time: an editor replaces a card's content), kept above
+   the result when the call ends (`translate.rs` `subagent`).
+4. ~~Editor MCP servers~~ dropped.
+5. **Crash safety.** A request handler runs in its own task: a panic answers -32603 ("Hermes hit
+   an internal error…") and the agent and the other threads carry on (`_test/panic` in debug
+   builds proves it); panics are logged to `acp.log`. Child processes die with the agent: every
+   shell's job object has KILL_ON_JOB_CLOSE (`crates/tools/src/job.rs`), even on a hard kill.
+6. **Installer.** `hermes-acp.exe` ships next to the app (done with the console-exe fix).
 
 ---
 

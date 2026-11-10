@@ -12,6 +12,7 @@ mod ops;
 mod review;
 mod session;
 pub mod subagents;
+mod turnlock;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -690,9 +691,50 @@ impl Runtime {
             .clone())
     }
 
+    /// `open`, with the conversation brought up to date when it is idle: the desktop app and an
+    /// editor's agent are separate processes on one store, and either may have written to the
+    /// thread since this one loaded it.
+    fn open_fresh(&self, session_id: &str) -> Result<Arc<OpenSession>> {
+        let open = self.open(session_id)?;
+        if open.running.lock().is_none() {
+            self.reload_if_stale(&open, session_id);
+        }
+        Ok(open)
+    }
+
+    /// Reloads the conversation from the store when it no longer matches it (another process
+    /// wrote): same count and same last message means nothing changed.
+    fn reload_if_stale(&self, open: &OpenSession, session_id: &str) {
+        let (len, last) = {
+            let conversation = open.conversation.lock();
+            let messages = conversation.messages();
+            (messages.len(), messages.last().and_then(|m| m.id.clone()))
+        };
+        let (Ok(count), Ok(stored_last)) = (
+            self.store.message_count(session_id),
+            self.store.last_message_id(session_id),
+        ) else {
+            return;
+        };
+        if count == len && stored_last == last {
+            return;
+        }
+        let Ok(messages) = self.store.load_messages(session_id) else {
+            return;
+        };
+        tracing::info!(
+            "session {session_id}: the stored conversation changed elsewhere ({len} -> {} messages); reloaded",
+            messages.len()
+        );
+        let conversation = Conversation::new_unvalidated(messages);
+        open.tools.reset_todos(restore_todos(&conversation));
+        *open.conversation.lock() = conversation;
+        *open.context.lock() = None;
+    }
+
     pub fn messages(&self, session_id: &str) -> Result<Vec<Message>> {
         Ok(self
-            .open(session_id)?
+            .open_fresh(session_id)?
             .conversation
             .lock()
             .messages()
@@ -703,7 +745,7 @@ impl Runtime {
     /// turn continues from the conversation as it was before that message. The todo list goes
     /// back to what it was then. Refused while a turn runs.
     pub fn rewind(&self, session_id: &str, keep: usize) -> Result<Vec<Message>> {
-        let open = self.open(session_id)?;
+        let open = self.open_fresh(session_id)?;
         if open.running.lock().is_some() {
             anyhow::bail!("a turn is running in this session");
         }
@@ -871,8 +913,11 @@ impl Runtime {
                 running.is_none(),
                 "a turn is already running in this session"
             );
-            *running = Some(cancel.clone());
+            let lock = turnlock::TurnLock::acquire(&self.config.data_dir, session_id)?;
+            *running = Some(session::RunGuard::new(cancel.clone(), Some(lock)));
         }
+        // Another process may have added to the conversation since it was loaded.
+        self.reload_if_stale(&open, session_id);
         let model = open.record.lock().model.clone();
         let models = provider.provider().and_then(|llm| {
             let summarizer = summarizer_for(&aux, &llm, &model, context_length)?;
@@ -1224,8 +1269,10 @@ impl Runtime {
                 running.is_none(),
                 "a turn is running in this session; compress it when it ends"
             );
-            *running = Some(cancel.clone());
+            let lock = turnlock::TurnLock::acquire(&self.config.data_dir, session_id)?;
+            *running = Some(session::RunGuard::new(cancel.clone(), Some(lock)));
         }
+        self.reload_if_stale(&open, session_id);
         let llm = match provider.provider() {
             Ok(llm) => llm,
             Err(error) => {

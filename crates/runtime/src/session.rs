@@ -100,11 +100,32 @@ impl MachineSession for TurnSession {
     }
 }
 
+/// A running turn: its cancellation token, and the cross-process lock that keeps another window
+/// from starting a turn on the same thread (released when the turn is dropped from `running`).
+pub struct RunGuard {
+    token: CancellationToken,
+    _lock: Option<crate::turnlock::TurnLock>,
+}
+
+impl RunGuard {
+    pub fn new(token: CancellationToken, lock: Option<crate::turnlock::TurnLock>) -> Self {
+        Self { token, _lock: lock }
+    }
+}
+
+impl std::ops::Deref for RunGuard {
+    type Target = CancellationToken;
+
+    fn deref(&self) -> &CancellationToken {
+        &self.token
+    }
+}
+
 pub struct OpenSession {
     pub record: Mutex<SessionRecord>,
     pub conversation: Mutex<Conversation>,
     pub tools: Arc<SessionTools>,
-    pub running: Mutex<Option<CancellationToken>>,
+    pub running: Mutex<Option<RunGuard>>,
     /// The running turn's loop state (where `/steer` text waits for delivery).
     pub turn_state: Mutex<Option<Arc<Mutex<TurnState>>>>,
     /// The background review running after the last turn; a new turn cancels it.

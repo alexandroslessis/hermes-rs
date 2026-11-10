@@ -228,6 +228,19 @@ impl Store {
         Ok(count as usize)
     }
 
+    /// The id of the session's last stored message (with the count, tells whether another process
+    /// has written to the conversation since it was loaded).
+    pub fn last_message_id(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let mut statement = conn
+            .prepare("SELECT id FROM messages WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1")?;
+        let mut rows = statement.query([session_id])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        })
+    }
+
     /// How many messages each session has stored (sessions without any are absent).
     pub fn message_counts(&self) -> Result<std::collections::HashMap<String, usize>> {
         let conn = self.conn.lock();

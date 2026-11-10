@@ -136,7 +136,9 @@ become `session/update`s. Plan and reference: [acp/README.md](acp/README.md),
 | `tools.rs`, `history.rs`, `prompt.rs`, `permissions.rs`, `controls.rs` | Pure mappings: tool cards and diffs; stored rows → replay; ACP content blocks → text and images; approvals and questions; model/effort/mode options |
 
 It shares `%APPDATA%\hermes-rs` with the app, which may run at the same time (SQLite is in WAL
-mode): a thread started in Zed is in the app's sidebar. Tests: `crates/desktop/tests/acp.rs`
+mode): a thread started in Zed is in the app's sidebar. Approval modes (`hermes_tools::ApprovalMode`, per session) decide what asks the user; the runtime's
+`turnlock` and `reload_if_stale` keep two windows on one data folder from running or overwriting
+one thread (PITFALLS: "Two windows"). Tests: `crates/desktop/tests/acp.rs`
 (the real exe on pipes against a scripted model), probe: `scripts/acp/acp-probe.mjs`.
 
 ## Feature map: screen → code → check

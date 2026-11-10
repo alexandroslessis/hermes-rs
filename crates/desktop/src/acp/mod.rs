@@ -67,6 +67,9 @@ pub fn run() -> Result<()> {
     let mut config = RuntimeConfig::for_current_user()?;
     init_logging(&config.data_dir);
     tracing::info!("hermes-rs ACP agent {} starting", env!("CARGO_PKG_VERSION"));
+    // A panic goes to the log file too (the default hook prints to stderr only, which an editor
+    // may not keep).
+    std::panic::set_hook(Box::new(|info| tracing::error!("panic: {info}")));
     let data_dir = config.data_dir.clone();
     // The terminal tool's shell, as the desktop app chooses it.
     if !crate::wants_git_bash(&data_dir) {

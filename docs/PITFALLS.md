@@ -2,6 +2,25 @@
 
 Things that cost hours once. Read this before debugging; check here first when something is odd.
 
+Two windows on one data folder (the desktop app and an editor's `hermes-acp.exe` are separate
+processes):
+- **Shared, live:** `sessions.db` (sessions, messages), memories, skills, `config.json` (read when
+  used). A thread made in one is in the other's list.
+- **One process each:** a session's cached conversation (reloaded from the store when stale, see
+  below), its effort pick, its mode (`ApprovalMode`), its todo list, the approvals' "always
+  allowed" list (`command_allowlist.json` is read at start), running processes.
+- **Last writer wins** (small JSON side files, rewritten whole): `archived-sessions.json`,
+  `branches.json`, `generation-stats.json`, `session-workspaces.json`, `ui-preferences.json`,
+  `hermes-imports.json`.
+- **One turn per thread across windows:** `hermes_runtime::turnlock` holds
+  `<data>/running/<session id>.lock` open without sharing while a turn runs; the other window's
+  turn is refused with a readable error. Don't "fix" it with a pid file: the OS closing the handle
+  when a process dies is what keeps a crash from leaving the thread locked.
+- **Message rows are keyed by position** (`upsert_message(session, seq, …)`): a process writing
+  from a conversation that is behind the store overwrites the other's rows. `reload_if_stale`
+  compares count and last message id at turn start, `/compress`, `messages()` and `rewind()`;
+  any new write path on a cached conversation must do the same.
+
 ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **Zed shows only what the agent lists.** Modes must also be a config option (`category: "mode"`,
   `controls::mode_option`), or Zed shows no mode selector; a slash command must be in

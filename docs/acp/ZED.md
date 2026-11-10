@@ -96,6 +96,18 @@ relevant part of `dev: open acp logs`.
    `vision_analyze`.
 6. The context-usage indicator shows a value after each turn.
 
+### Phase 5 (two windows, subagents, crashes)
+1. Keep the Hermes desktop app open. In Zed start a new thread, send a message; in the app's
+   sidebar (after a refresh) the thread is there. Open it in the app, send a message there, then
+   go back to Zed and send another → the agent knows both messages.
+2. Start a long turn in the app (`Write a 500-word story`), and while it runs send a message to the
+   **same** thread from Zed → Zed shows "This thread is running a turn in another Hermes window…";
+   after the app's turn ends, sending again works. (And the other way round.)
+3. Ask for something that delegates (`Use a subagent to find where X is defined`) → the delegate
+   card shows lines like `▸ Subagent: …` and `· read_file …` while it works, the result at the end.
+4. Ask for a long command (`Run ping -n 60 127.0.0.1`) and quit Zed while it runs → no leftover
+   `ping.exe` or `hermes-acp.exe` in Task Manager a few seconds later.
+
 ### Undo / retry (instead of editing an old prompt, which Zed 1.27 only offers its own agent)
 1. Send two prompts, then `/undo` → the agent says it undid 1 turn and shows the removed prompt;
    Zed still shows the old messages. Send a third prompt → the agent answers as if the second

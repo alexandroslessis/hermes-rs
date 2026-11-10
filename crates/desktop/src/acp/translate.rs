@@ -58,6 +58,10 @@ pub struct Turn {
     /// The editor draws terminal cards from `_meta` (Zed's `terminal_output` extension): a
     /// `terminal` call is then a terminal card with the output in it, not a text card.
     terminal_cards: bool,
+    /// What the subagents of an open `delegate_task` call did so far: tool call id → the log shown
+    /// on its card (the editor replaces a card's content on every update, so the whole log is
+    /// sent each time).
+    subagent_logs: HashMap<String, String>,
 }
 
 fn chunk(kind: &str, id: &str, text: &str) -> Action {
@@ -94,6 +98,7 @@ impl Turn {
             before: HashMap::new(),
             streamed: false,
             terminal_cards: false,
+            subagent_logs: HashMap::new(),
         }
     }
 
@@ -155,6 +160,9 @@ impl Turn {
                     &format!("{text}\n"),
                 )]
             }
+            "subagent.start" | "subagent.tool" | "subagent.complete" => {
+                self.subagent(kind, payload)
+            }
             "tool.start" => self.tool_start(payload),
             "tool.complete" => self.tool_complete(payload),
             "approval.request" => vec![Action::Approval {
@@ -181,6 +189,63 @@ impl Turn {
             "message.complete" => self.complete(payload),
             _ => Vec::new(),
         }
+    }
+
+    /// A subagent's activity as lines on the card of the `delegate_task` call that started it, so a
+    /// long delegation isn't a silent spinner (the page shows the same as live subagent rows).
+    fn subagent(&mut self, kind: &str, payload: &Value) -> Vec<Action> {
+        let Some(card) = self
+            .open
+            .iter()
+            .find(|(_, name, _)| name == "delegate_task")
+            .map(|(id, ..)| id.clone())
+        else {
+            return Vec::new();
+        };
+        let number = payload["task_index"].as_u64().map_or(1, |i| i + 1);
+        let of = payload["task_count"].as_u64().unwrap_or(1);
+        let who = if of > 1 {
+            format!("Subagent {number}/{of}")
+        } else {
+            "Subagent".to_string()
+        };
+        let one_line = |text: &str, limit: usize| -> String {
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if text.chars().count() > limit {
+                let cut: String = text.chars().take(limit).collect();
+                format!("{cut}\u{2026}")
+            } else {
+                text
+            }
+        };
+        let line = match kind {
+            "subagent.start" => format!(
+                "\u{25b8} {who}: {}",
+                one_line(payload["goal"].as_str().unwrap_or_default(), 140)
+            ),
+            "subagent.tool" => format!(
+                "  \u{b7} {} {}",
+                payload["tool_name"].as_str().unwrap_or_default(),
+                one_line(payload["tool_preview"].as_str().unwrap_or_default(), 100)
+            )
+            .trim_end()
+            .to_string(),
+            _ => {
+                let status = payload["status"].as_str().unwrap_or("done");
+                let tools = payload["tool_count"].as_u64().unwrap_or(0);
+                let seconds = payload["duration_seconds"].as_f64().unwrap_or(0.0);
+                format!("\u{2713} {who} {status} ({tools} tool calls, {seconds:.0}s)")
+            }
+        };
+        let log = self.subagent_logs.entry(card.clone()).or_default();
+        log.push_str(&line);
+        log.push('\n');
+        vec![Action::Update(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": card,
+            "status": "in_progress",
+            "content": [tools::text_content_of(log)],
+        }))]
     }
 
     fn tool_start(&mut self, payload: &Value) -> Vec<Action> {
@@ -235,8 +300,11 @@ impl Turn {
         let raw = payload["result_text"].as_str().unwrap_or_default();
         let failed = tools::failed(&result);
         let before = self.before.remove(&id).flatten();
-        let content =
+        let mut content =
             tools::complete_content(&name, &args, &result, raw, &self.cwd, before.as_deref());
+        if let Some(log) = self.subagent_logs.remove(&id).filter(|log| !log.is_empty()) {
+            content.insert(0, tools::text_content_of(&log));
+        }
         let raw_output = match &result {
             Value::Object(_) => result.clone(),
             other => json!({"output": other.as_str().unwrap_or(raw)}),
@@ -564,6 +632,60 @@ mod tests {
         let update = updates(&actions)[0];
         assert_eq!(update["sessionUpdate"], "agent_thought_chunk");
         assert_eq!(update["content"]["text"], "Compacting\n");
+    }
+
+    #[test]
+    fn a_subagents_work_shows_on_the_delegate_card() {
+        let mut turn = Turn::new("C:/w");
+        turn.event(
+            "tool.start",
+            &json!({"tool_id": "d1", "name": "delegate_task", "args": {"goal": "find it"}}),
+        );
+        let start = turn.event(
+            "subagent.start",
+            &json!({"goal": "find the bug", "task_index": 0, "task_count": 2}),
+        );
+        let first = updates(&start)[0];
+        assert_eq!(first["toolCallId"], "d1");
+        assert_eq!(first["status"], "in_progress");
+        assert!(
+            first["content"][0]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Subagent 1/2: find the bug")
+        );
+        let tool = turn.event(
+            "subagent.tool",
+            &json!({"tool_name": "read_file", "tool_preview": "src/main.rs", "task_index": 0}),
+        );
+        let text = updates(&tool)[0]["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // The whole log each time: the editor replaces the card's content.
+        assert!(
+            text.contains("find the bug") && text.contains("read_file src/main.rs"),
+            "{text}"
+        );
+        let done = turn.event(
+            "tool.complete",
+            &json!({"tool_id": "d1", "name": "delegate_task", "result": {"output": "found it"}}),
+        );
+        let last = updates(&done)[0];
+        assert_eq!(last["status"], "completed");
+        let content = last["content"].as_array().unwrap();
+        assert!(
+            content[0]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("find the bug")
+        );
+        assert!(
+            content[1]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("found it")
+        );
     }
 
     #[test]

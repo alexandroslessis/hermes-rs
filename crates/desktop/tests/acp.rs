@@ -176,7 +176,7 @@ struct Agent {
     answered: HashSet<String>,
     next_id: u64,
     model: Model,
-    _home: tempfile::TempDir,
+    home: tempfile::TempDir,
     work: tempfile::TempDir,
 }
 
@@ -209,9 +209,31 @@ impl Agent {
     }
 
     fn spawn(model: Model, home: tempfile::TempDir, work: tempfile::TempDir) -> Self {
+        let data = home.path().to_path_buf();
+        Self::spawn_at(model, home, work, &data)
+    }
+
+    /// A second agent process on the data folder of another one (the desktop app and an editor).
+    async fn sharing(first: &Agent) -> Self {
+        let model = Model::start(Vec::new(), Duration::ZERO).await;
+        let data = first.home.path().to_path_buf();
+        Self::spawn_at(
+            model,
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            &data,
+        )
+    }
+
+    fn spawn_at(
+        model: Model,
+        home: tempfile::TempDir,
+        work: tempfile::TempDir,
+        data: &Path,
+    ) -> Self {
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_hermes-acp"))
             .arg("--acp")
-            .env("HERMES_RS_HOME", home.path())
+            .env("HERMES_RS_HOME", data)
             .env("RUST_LOG", "info,hermes_desktop::acp=debug")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -247,7 +269,7 @@ impl Agent {
             answered: HashSet::new(),
             next_id: 0,
             model,
-            _home: home,
+            home,
             work,
         }
     }
@@ -1710,4 +1732,105 @@ async fn undo_with_nothing_to_undo_or_a_bad_count_says_so() {
     assert!(agent.reply_text(&session).contains("Only 1 turn"));
     agent.prompt(&session, "/undo x").await;
     assert!(agent.reply_text(&session).contains("Usage: /undo [N]"));
+}
+
+// ---- Two windows on one thread ----
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_thread_running_in_the_desktop_app_refuses_the_editors_prompt() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let (mut agent, session) = Agent::with_session(vec![text_reply("never")]).await;
+    // What the desktop app holds while a turn runs on this thread.
+    let dir = agent.home.path().join("running");
+    std::fs::create_dir_all(&dir).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .share_mode(0)
+        .open(dir.join(format!("{session}.lock")))
+        .unwrap();
+    let answer = agent.prompt(&session, "hello").await;
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("another Hermes window")),
+        "{answer}"
+    );
+    assert!(agent.model.requests().is_empty());
+    drop(held);
+    let answer = agent.prompt(&session, "hello again").await;
+    assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
+}
+
+#[tokio::test]
+async fn a_delegation_shows_the_subagents_work_on_its_card() {
+    let (mut agent, session) = Agent::with_session(vec![
+        tool_reply(&[("d1", "delegate_task", json!({"goal": "say hi to the user"}))]),
+        text_reply("child says hi"),
+        text_reply("All done."),
+    ])
+    .await;
+    let answer = agent.prompt(&session, "delegate it").await;
+    assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
+    let updates = agent.updates_of(&session, "tool_call_update");
+    let card: Vec<&Value> = updates.iter().filter(|u| u["toolCallId"] == "d1").collect();
+    let logged = card
+        .iter()
+        .any(|u| u.to_string().contains("say hi to the user"));
+    assert!(logged, "no subagent line on the card: {card:?}");
+    let last = card.last().unwrap();
+    assert_eq!(last["status"], "completed", "{last}");
+}
+
+// ---- Crash safety ----
+
+#[tokio::test]
+async fn a_handler_that_panics_answers_an_error_and_the_agent_carries_on() {
+    let (mut agent, session) = Agent::with_session(vec![text_reply("still here")]).await;
+    let answer = agent.request("_test/panic", json!({})).await;
+    assert_eq!(answer["error"]["code"], -32603, "{answer}");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("internal error")),
+        "{answer}"
+    );
+    // The agent and the thread are fine.
+    let next = agent.prompt(&session, "hello").await;
+    assert_eq!(next["result"]["stopReason"], "end_turn", "{next}");
+    assert_eq!(agent.reply_text(&session), "still here");
+}
+
+#[tokio::test]
+async fn two_agent_processes_share_threads_and_continue_each_others() {
+    // The desktop app and an editor are two processes on one data folder.
+    let (mut first, session) =
+        Agent::with_session(vec![text_reply("A1"), text_reply("B2"), text_reply("A3")]).await;
+    first.prompt(&session, "from window one").await;
+    let cwd = first.work.path().display().to_string();
+    let mut second = Agent::sharing(&first).await;
+    second.initialize(json!({})).await;
+    let listed = second.request("session/list", json!({"cwd": cwd})).await;
+    let ids: Vec<&str> = listed["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["sessionId"].as_str())
+        .collect();
+    assert!(ids.contains(&session.as_str()), "{listed}");
+    let loaded = second
+        .request(
+            "session/load",
+            json!({"sessionId": session, "cwd": cwd, "mcpServers": []}),
+        )
+        .await;
+    assert!(loaded["result"].is_object(), "{loaded}");
+    second.prompt(&session, "from window two").await;
+    // The first window's next turn starts from what the second stored.
+    first.prompt(&session, "back in window one").await;
+    let last = first.model.requests().last().unwrap().to_string();
+    for wanted in ["from window one", "from window two", "back in window one"] {
+        assert!(last.contains(wanted), "{wanted} missing from {last}");
+    }
 }

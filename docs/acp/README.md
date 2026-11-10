@@ -1,7 +1,7 @@
 # ACP: using hermes-rs from Zed (and later t3code)
 
-Status: **phases 0-4 built** (2026-11-10), checked by the test suite, not yet by the user in Zed
-(the checklists in [ZED.md](ZED.md)); phases 5 (hardening) and 6 (t3code) are open. This folder
+Status: **phases 0-5 built** (2026-11-10/11), checked by the test suite and, for the basics, by
+the user in Zed (the checklists in [ZED.md](ZED.md)); phase 6 (t3code) is open. This folder
 is the plan and the reference: read it before changing the code, and keep it true.
 
 | File | What it is |

@@ -125,6 +125,11 @@ touch them.
 
 ## Part 3: install it on another computer
 
+The installer puts two programs in `%LOCALAPPDATA%\Hermes`: `hermes-desktop.exe` (the app) and
+`hermes-acp.exe` (what an editor such as Zed starts to use Hermes; see
+[acp/ZED.md](acp/ZED.md) for the Zed settings: `command` is the full path of `hermes-acp.exe`,
+no arguments).
+
 Open the repository's **Releases** page on GitHub (the right-hand column of the repository's front
 page, or `https://github.com/alexandroslessis/hermes-rs/releases`), pick the newest release, and
 download `Hermes_<version>_x64-setup.exe` under "Assets". Run it. If the computer lacks WebView2

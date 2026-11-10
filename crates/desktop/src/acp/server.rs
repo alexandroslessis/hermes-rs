@@ -124,11 +124,34 @@ impl AcpServer {
             }
             Ok(Incoming::Response { id, result }) => self.sender.resolve(&id, result),
             Ok(Incoming::Notification { method, params }) => {
-                tokio::spawn(async move { self.notification(&method, &params).await });
+                // A panic in a handler is that handler's failure, never the agent's.
+                let guarded =
+                    tokio::spawn(async move { self.notification(&method, &params).await });
+                tokio::spawn(async move {
+                    if let Err(error) = guarded.await {
+                        tracing::error!("a notification handler failed: {error}");
+                    }
+                });
             }
             Ok(Incoming::Request { id, method, params }) => {
                 tokio::spawn(async move {
-                    let result = self.request(&method, &params).await;
+                    // The handler runs in a task of its own: if it panics, the editor still gets an
+                    // answer (it would wait for one forever) and the other threads carry on.
+                    let worker = tokio::spawn({
+                        let server = self.clone();
+                        let (method, params) = (method.clone(), params.clone());
+                        async move { server.request(&method, &params).await }
+                    });
+                    let result = match worker.await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            tracing::error!("{method} crashed: {error}");
+                            Err(RpcError::internal(format!(
+                                "Hermes hit an internal error on {method} (a bug; it is in logs\\acp.log). \
+                                 Other threads are not affected."
+                            )))
+                        }
+                    };
                     if let Err(error) = &result {
                         tracing::warn!("{method} failed: {}", error.message);
                     }
@@ -164,6 +187,9 @@ impl AcpServer {
         tracing::info!("request {method}");
         match method {
             "initialize" => Ok(self.initialize(params)),
+            // A test can make a handler panic (debug builds only).
+            #[cfg(debug_assertions)]
+            "_test/panic" => panic!("a handler that panics, on purpose"),
             "session/new" => self.new_session(params).await,
             "session/load" => self.load_session(params).await,
             "session/list" => self.list_sessions(params).await,

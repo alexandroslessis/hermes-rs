@@ -3077,3 +3077,66 @@ async fn terminal_output_is_relayed_live_while_the_command_runs() {
         "{relayed:?}"
     );
 }
+
+// ---- Two windows (the desktop app, an editor's agent) on one data folder ----
+
+#[tokio::test]
+async fn a_turn_continues_from_what_another_window_stored() {
+    let h = harness(vec![text_reply("A1"), text_reply("B2"), text_reply("A3")]).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "first").await;
+    // The other window: its own runtime on the same data folder, one more turn on the thread.
+    let other = runtime_in(h.data.path());
+    collect(
+        other
+            .start_turn(&session, &h.provider, TurnOptions::default(), "second")
+            .unwrap(),
+    )
+    .await;
+    // This window's cached conversation is behind; its next turn must start from the store.
+    run_turn(&h, &session, "third").await;
+    let last = h.requests.lock().last().unwrap().to_string();
+    assert!(
+        last.contains("first") && last.contains("second") && last.contains("third"),
+        "{last}"
+    );
+    let stored: Vec<String> = h
+        .runtime
+        .store()
+        .load_messages(&session)
+        .unwrap()
+        .iter()
+        .filter(|m| m.role == rmcp::model::Role::User)
+        .map(|m| m.as_concat_text())
+        .collect();
+    assert_eq!(stored, ["first", "second", "third"]);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_thread_running_in_another_window_refuses_a_second_turn() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let h = harness(vec![text_reply("never")]).await;
+    let session = session_in(&h);
+    // What the other window holds while its turn runs.
+    let dir = h.data.path().join("running");
+    std::fs::create_dir_all(&dir).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .share_mode(0)
+        .open(dir.join(format!("{session}.lock")))
+        .unwrap();
+    let refused = h
+        .runtime
+        .start_turn(&session, &h.provider, TurnOptions::default(), "hello")
+        .err()
+        .expect("the turn must be refused");
+    assert!(
+        refused.to_string().contains("another Hermes window"),
+        "{refused}"
+    );
+    assert!(h.requests.lock().is_empty());
+    drop(held);
+    run_turn(&h, &session, "now it runs").await;
+}

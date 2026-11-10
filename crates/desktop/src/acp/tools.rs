@@ -181,6 +181,11 @@ pub fn terminal_text(result: &Value, raw: &str) -> String {
     }
 }
 
+/// A text item for a tool card's content.
+pub fn text_content_of(text: &str) -> Value {
+    text_content(text)
+}
+
 fn text_content(text: &str) -> Value {
     json!({"type": "content", "content": {"type": "text", "text": text}})
 }

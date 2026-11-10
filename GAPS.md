@@ -114,7 +114,7 @@ backend code · **L** = a port of a Hermes subsystem.
 | Local model management (download/run GGUFs) | Ollama already covers this | L |
 | LSP integration | diagnostics for the agent | L |
 | Multiple windows / pop-out session | | M |
-| ACP server: the agent in Zed (and later t3code), `hermes-desktop.exe --acp` | ✅ **Done 2026-11-10** for Zed (phases 0–4 of [docs/acp/PHASES.md](docs/acp/PHASES.md): new/load/list/prompt/cancel, streamed text and thoughts, tool cards with diffs, approvals and questions, todo list as the plan, history, titles, context meter, slash commands, images, linked files, model and effort pickers, YOLO mode). Not yet: checked in Zed by the user ([docs/acp/ZED.md](docs/acp/ZED.md) checklists), t3code (phase 6), the editor's MCP servers, `session/fork`. [docs/acp/](docs/acp/README.md) | L |
+| ACP server: the agent in Zed (and later t3code), `hermes-acp.exe` | ✅ **Done 2026-11-10/11** for Zed (phases 0–4 of [docs/acp/PHASES.md](docs/acp/PHASES.md): new/load/list/prompt/cancel, streamed text and thoughts, tool cards with diffs, approvals and questions, todo list as the plan, history, titles, context meter, slash commands, images, linked files, model and effort pickers, Auto / Manual / Accept edits / Plan / YOLO modes, `/undo` and `/retry`, subagent progress on the delegate card, a lock against two windows running one thread, handler-crash safety; `hermes-acp.exe` is the console exe editors start, shipped by the installer). Zed 1.27 cannot edit an older prompt of an external agent (no truncate for ACP). Not yet: t3code (phase 6), the editor's MCP servers (dropped), `session/fork`. [docs/acp/](docs/acp/README.md) | L |
 
 ## 6. Not needed for a local harness
 
