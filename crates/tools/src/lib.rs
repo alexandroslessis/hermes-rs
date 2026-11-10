@@ -73,6 +73,25 @@ pub trait UserBridge: Send + Sync {
     }
 }
 
+/// How a session handles permission decisions: what asks the user, and what doesn't. The modes an
+/// editor offers (Zed's mode menu); Hermes's `/yolo` is [`ApprovalMode::Yolo`]. A session with no
+/// mode of its own follows Settings' `approvals.mode` (see [`SessionTools::mode`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalMode {
+    /// Every file edit and every command asks first.
+    Manual,
+    /// Flagged commands are judged by a reviewer model (Hermes's smart approvals); only an
+    /// uncertain verdict asks. File edits go through.
+    Auto,
+    /// File edits go through; flagged commands ask (the app's usual behaviour).
+    AcceptEdits,
+    /// Nothing changes: edits are refused (a plan may be saved under `.hermes/plans/`) and every
+    /// command asks. The model is told to present a plan instead.
+    Plan,
+    /// Nothing asks (the hardline commands still never run).
+    Yolo,
+}
+
 pub struct SessionToolsConfig {
     pub session_id: String,
     pub cwd: PathBuf,
@@ -120,8 +139,8 @@ pub struct SessionTools {
     web: Option<Arc<web::Web>>,
     /// Projects already checkpointed this turn (one snapshot per project per turn).
     turn_checkpoints: parking_lot::Mutex<std::collections::HashSet<String>>,
-    /// Hermes's `/yolo`: flagged commands run without asking (hardline ones never do).
-    yolo: std::sync::atomic::AtomicBool,
+    /// The mode picked for this session (`/yolo`, an editor's mode menu); `None` follows Settings.
+    mode: parking_lot::Mutex<Option<ApprovalMode>>,
     /// The smart-approval reviewer for this turn's model.
     guard: parking_lot::Mutex<Option<Arc<dyn approval::ApprovalGuard>>>,
     /// Whether the session's model accepts images (set per turn; `vision_analyze` needs it).
@@ -149,7 +168,7 @@ impl SessionTools {
             web: config.web,
             turn_checkpoints: Default::default(),
             vision: Default::default(),
-            yolo: Default::default(),
+            mode: Default::default(),
             guard: Default::default(),
             session_approved: Default::default(),
         }
@@ -189,13 +208,32 @@ impl SessionTools {
         }
     }
 
-    /// `/yolo` for this session.
+    /// `/yolo` for this session (off: the session follows Settings again).
     pub fn set_yolo(&self, on: bool) {
-        self.yolo.store(on, std::sync::atomic::Ordering::Relaxed);
+        *self.mode.lock() = on.then_some(ApprovalMode::Yolo);
     }
 
+    /// Whether this session was put in YOLO mode (not Settings' own "off").
     pub fn yolo(&self) -> bool {
-        self.yolo.load(std::sync::atomic::Ordering::Relaxed)
+        *self.mode.lock() == Some(ApprovalMode::Yolo)
+    }
+
+    /// Picks the session's mode.
+    pub fn set_mode(&self, mode: ApprovalMode) {
+        *self.mode.lock() = Some(mode);
+    }
+
+    /// The mode in force: the session's own, else what Settings' `approvals.mode` says (smart →
+    /// Auto, off → Yolo, manual → Accept edits: the app asks about flagged commands only).
+    pub fn mode(&self) -> ApprovalMode {
+        if let Some(mode) = *self.mode.lock() {
+            return mode;
+        }
+        match &self.approvals {
+            Some(store) if store.smart() => ApprovalMode::Auto,
+            Some(store) if !store.asks() => ApprovalMode::Yolo,
+            _ => ApprovalMode::AcceptEdits,
+        }
     }
 
     /// The reviewer smart approvals use (set per turn, for its model).
@@ -376,6 +414,11 @@ impl SessionTools {
         args: Value,
         live: Option<(&str, &Emitter)>,
     ) -> ToolOutput {
+        if matches!(name, "write_file" | "patch") {
+            if let Err(refused) = self.check_edit(name, &args).await {
+                return refused;
+            }
+        }
         match name {
             "read_file" => files::read_file(self, args).await,
             "write_file" => files::write_file(self, args).await,
@@ -464,6 +507,9 @@ impl SessionTools {
         let Some(store) = &self.approvals else {
             return Ok(None);
         };
+        let mode = self.mode();
+        // Manual and Plan ask about every command, not only the flagged ones.
+        let always_ask = matches!(mode, ApprovalMode::Manual | ApprovalMode::Plan);
         let gate = approval::gate(command, store, &self.session_approved.lock());
         let blocked = |message: String| {
             ToolOutput::error_with(
@@ -472,17 +518,24 @@ impl SessionTools {
             )
         };
         let request = match gate {
-            approval::Gate::Run { approved } => return Ok(approved),
+            approval::Gate::Run { approved } if !always_ask => return Ok(approved),
+            approval::Gate::Run { .. } => approval::CommandApproval {
+                command: command.to_string(),
+                description: approval::dangerous(command)
+                    .unwrap_or("run a command")
+                    .to_string(),
+            },
             approval::Gate::Blocked(message) => return Err(blocked(message)),
             approval::Gate::Ask(request) => request,
         };
         let key = request.description.clone();
-        if self.yolo() {
+        if mode == ApprovalMode::Yolo {
             return Ok(None);
         }
         // Smart approvals: the reviewer decides first; only an uncertain verdict reaches the user.
         let guard = self.guard.lock().clone();
-        if let Some(guard) = guard.filter(|_| store.smart()) {
+        let smart = !always_ask && (store.smart() || mode == ApprovalMode::Auto);
+        if let Some(guard) = guard.filter(|_| smart) {
             match guard.assess(&request.command, &request.description).await {
                 approval::Verdict::Approve => return Ok(Some(key)),
                 approval::Verdict::Deny => {
@@ -500,6 +553,12 @@ impl SessionTools {
         .await;
         match answer {
             Ok(approval::ApprovalChoice::Once) => Ok(Some(key)),
+            // A mode that always asks doesn't remember an answer.
+            Ok(approval::ApprovalChoice::Session | approval::ApprovalChoice::Always)
+                if always_ask =>
+            {
+                Ok(Some(key))
+            }
             Ok(approval::ApprovalChoice::Session) => {
                 self.session_approved.lock().insert(key.clone());
                 Ok(Some(key))
@@ -510,6 +569,44 @@ impl SessionTools {
             }
             Ok(approval::ApprovalChoice::Deny) => Err(blocked(approval::denied_message())),
             Err(_) => Err(blocked(approval::timeout_message())),
+        }
+    }
+
+    /// The mode's say over a file edit (`write_file`, `patch`): Plan refuses it (except a plan
+    /// saved under `.hermes/plans/`), Manual asks, the others let it through. `Err` is the result
+    /// the model gets instead.
+    async fn check_edit(&self, name: &str, args: &Value) -> Result<(), ToolOutput> {
+        let mode = self.mode();
+        if !matches!(mode, ApprovalMode::Plan | ApprovalMode::Manual) {
+            return Ok(());
+        }
+        let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+        let normal = path.replace('\\', "/");
+        if mode == ApprovalMode::Plan {
+            if normal.contains("/.hermes/plans/") || normal.starts_with(".hermes/plans/") {
+                return Ok(());
+            }
+            return Err(ToolOutput::error(
+                "Plan mode is on: no files are changed. Present the plan as a message (or save it \
+                 as markdown under .hermes/plans/) and wait for the user to leave Plan mode before \
+                 making the changes.",
+            ));
+        }
+        let request = approval::CommandApproval {
+            command: format!("{name} {path}"),
+            description: "file edit".to_string(),
+        };
+        match tokio::time::timeout(
+            APPROVAL_TIMEOUT,
+            self.bridge.approve_command(&self.session_id, request),
+        )
+        .await
+        {
+            Ok(approval::ApprovalChoice::Deny) => {
+                Err(ToolOutput::error(approval::denied_message()))
+            }
+            Ok(_) => Ok(()),
+            Err(_) => Err(ToolOutput::error(approval::timeout_message())),
         }
     }
 

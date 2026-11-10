@@ -86,7 +86,7 @@ We answer:
 → gateway `session.create {"cwd": <cwd>}` (provider and model: the desktop's default). Answer:
 ```json
 {"result":{"sessionId":"<our session id>",
-  "modes":{"currentModeId":"default","availableModes":[…]},      // Phase 4, omit before
+  "modes":{"currentModeId":"accept_edits","availableModes":[…]},      // Phase 4, omit before
   "configOptions":[…]}}                                          // Phase 4, omit before
 ```
 - ACP `sessionId` **is** our store's session id (no mapping table).
@@ -364,9 +364,9 @@ a free-text question without choices can only be skipped this way (say so in the
 
 Modes (our own, not Hermes's edit-approval modes — we have no edit approvals):
 ```json
-"modes":{"currentModeId":"default","availableModes":[
-  {"id":"default","name":"Default","description":"Ask before dangerous commands."},
-  {"id":"yolo","name":"YOLO","description":"Run flagged commands without asking (hardline ones still never run)."}]}
+"modes":{"currentModeId":"accept_edits","availableModes":[
+  {"id":"auto"},{"id":"manual"},{"id":"accept_edits"},{"id":"plan"},{"id":"yolo"}]}
+// also as configOptions {"id":"mode","category":"mode"}: Zed ignores `modes` when it gets those
 ```
 `session/set_mode {sessionId, modeId}` → `runtime.toggle_yolo` when it differs from
 `runtime.yolo(id)` (check the gateway's `/yolo` path and reuse it); answer `{}`; unknown mode → -32602.

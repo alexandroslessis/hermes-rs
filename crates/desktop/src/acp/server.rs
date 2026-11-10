@@ -380,33 +380,28 @@ impl AcpServer {
             config.push(controls::model_option(&options));
         }
         config.push(controls::effort_option(&self.gateway.effort(session)));
-        config.push(controls::mode_option(self.gateway.runtime.yolo(session)));
+        config.push(controls::mode_option(
+            self.gateway.runtime.approval_mode(session),
+        ));
         json!({
-            "modes": controls::modes(self.gateway.runtime.yolo(session)),
+            "modes": controls::modes(self.gateway.runtime.approval_mode(session)),
             "configOptions": config,
         })
     }
 
-    /// `session/set_mode`: Default asks before dangerous commands, YOLO doesn't (`/yolo`).
+    /// `session/set_mode`: the session's approval mode (Auto, Manual, Accept edits, Plan, YOLO).
     async fn set_mode(self: &Arc<Self>, params: &Value) -> Result<Value, RpcError> {
         let id = param(params, "sessionId")?;
-        let want = match param(params, "modeId")? {
-            controls::YOLO_MODE => true,
-            controls::DEFAULT_MODE => false,
-            other => return Err(RpcError::invalid_params(format!("Unknown mode {other}"))),
-        };
+        let mode_id = param(params, "modeId")?;
+        let mode = controls::parse_mode(mode_id)
+            .ok_or_else(|| RpcError::invalid_params(format!("Unknown mode {mode_id}")))?;
         self.session_handle(id).await?;
         let gateway = self.gateway.clone();
         let session = id.to_string();
-        tokio::task::spawn_blocking(move || {
-            if gateway.runtime.yolo(&session) != want {
-                gateway.runtime.toggle_yolo(&session)?;
-            }
-            anyhow::Ok(())
-        })
-        .await
-        .map_err(|e| RpcError::internal(e.to_string()))?
-        .map_err(|e| RpcError::internal(format!("{e:#}")))?;
+        tokio::task::spawn_blocking(move || gateway.runtime.set_approval_mode(&session, mode))
+            .await
+            .map_err(|e| RpcError::internal(e.to_string()))?
+            .map_err(|e| RpcError::internal(format!("{e:#}")))?;
         Ok(json!({}))
     }
 

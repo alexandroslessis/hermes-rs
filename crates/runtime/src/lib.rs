@@ -1329,6 +1329,25 @@ impl Runtime {
         Ok(on)
     }
 
+    /// The session's approval mode (its own, else Settings'); see [`hermes_tools::ApprovalMode`].
+    pub fn approval_mode(&self, session_id: &str) -> hermes_tools::ApprovalMode {
+        self.sessions
+            .lock()
+            .get(session_id)
+            .map_or(hermes_tools::ApprovalMode::AcceptEdits, |open| {
+                open.tools.mode()
+            })
+    }
+
+    pub fn set_approval_mode(
+        &self,
+        session_id: &str,
+        mode: hermes_tools::ApprovalMode,
+    ) -> Result<()> {
+        self.open(session_id)?.tools.set_mode(mode);
+        Ok(())
+    }
+
     pub fn yolo(&self, session_id: &str) -> bool {
         self.sessions
             .lock()

@@ -4,21 +4,66 @@
 //! JSON the editor shows from what the gateway answers, and reads what it picks.
 //!
 //! Hermes: `acp_adapter/model_catalog.py` (`build_model_state`, `encode_model_choice`),
-//! `acp_adapter/modes.py` and `gateway_server.py` (`set_config_option`, `set_session_mode`). Unlike
-//! Hermes's modes (edit-approval policies), ours are "ask before dangerous commands" and "don't
-//! ask" (`/yolo`), since hermes-rs has no per-edit approvals.
+//! `acp_adapter/modes.py` and `gateway_server.py` (`set_config_option`, `set_session_mode`). Our
+//! modes are the session's [`ApprovalMode`]: Auto, Manual, Accept edits, Plan and YOLO (the
+//! first four as Claude Code names them, the last Hermes's `/yolo`).
 
+use hermes_tools::ApprovalMode;
 use serde_json::{Value, json};
 
-pub const DEFAULT_MODE: &str = "default";
-pub const YOLO_MODE: &str = "yolo";
+/// The modes, in the order the editor lists them: id, name, description.
+const MODES: [(ApprovalMode, &str, &str, &str); 5] = [
+    (
+        ApprovalMode::Auto,
+        "auto",
+        "Auto",
+        "Hermes handles permission decisions: a reviewer model judges risky commands",
+    ),
+    (
+        ApprovalMode::Manual,
+        "manual",
+        "Manual",
+        "Always ask before making changes",
+    ),
+    (
+        ApprovalMode::AcceptEdits,
+        "accept_edits",
+        "Accept edits",
+        "Automatically accept file edits; ask before risky commands",
+    ),
+    (
+        ApprovalMode::Plan,
+        "plan",
+        "Plan",
+        "Create a plan before making changes",
+    ),
+    (
+        ApprovalMode::Yolo,
+        "yolo",
+        "YOLO",
+        "Never ask (the commands that must never run still don't)",
+    ),
+];
+
+pub fn mode_id(mode: ApprovalMode) -> &'static str {
+    MODES
+        .iter()
+        .find(|(m, ..)| *m == mode)
+        .map_or("accept_edits", |(_, id, ..)| id)
+}
+
+/// The mode an editor picked; `None` for one we never offered.
+pub fn parse_mode(id: &str) -> Option<ApprovalMode> {
+    MODES
+        .iter()
+        .find(|(_, mode_id, ..)| *mode_id == id)
+        .map(|(mode, ..)| *mode)
+}
 
 /// The efforts the editor offers: Hermes's own list (`REASONING_EFFORTS` in its frontend, with
-/// "Thinking" off as `off`), the same for every model as there, plus "Default" (nothing picked:
-/// Settings' effort, else the provider's own). A level a model doesn't know is the provider's
-/// to clamp or refuse.
-const EFFORTS: [(&str, &str); 9] = [
-    ("default", "Default"),
+/// "Thinking" off as `off`), the same for every model as there. A level a model doesn't know is
+/// the provider's to clamp or refuse.
+const EFFORTS: [(&str, &str); 8] = [
     ("off", "Off"),
     ("minimal", "Minimal"),
     ("low", "Low"),
@@ -28,6 +73,9 @@ const EFFORTS: [(&str, &str); 9] = [
     ("max", "Max"),
     ("ultra", "Ultra"),
 ];
+
+/// What the effort picker shows when nothing was picked and Settings has none: Hermes's default.
+const DEFAULT_EFFORT: &str = "medium";
 
 /// The commands the gateway runs for `slash.exec` that its `commands.catalog` doesn't list (the
 /// page types them itself): offered to the editor, which refuses a command that isn't listed.
@@ -48,15 +96,13 @@ pub const GATEWAY_COMMANDS: [(&str, &str); 8] = [
     ),
 ];
 
-pub fn modes(yolo: bool) -> Value {
+pub fn modes(current: ApprovalMode) -> Value {
     json!({
-        "currentModeId": if yolo { YOLO_MODE } else { DEFAULT_MODE },
-        "availableModes": [
-            {"id": DEFAULT_MODE, "name": "Default",
-             "description": "Ask before running dangerous commands."},
-            {"id": YOLO_MODE, "name": "YOLO",
-             "description": "Run flagged commands without asking (the ones that must never run still don't)."},
-        ],
+        "currentModeId": mode_id(current),
+        "availableModes": MODES
+            .iter()
+            .map(|(_, id, name, description)| json!({"id": id, "name": name, "description": description}))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -109,8 +155,8 @@ pub fn model_option(options: &Value) -> Value {
 
 /// The mode as a config option too: an editor that gets config options (Zed) shows those and
 /// ignores `modes`.
-pub fn mode_option(yolo: bool) -> Value {
-    let modes = modes(yolo);
+pub fn mode_option(current: ApprovalMode) -> Value {
+    let modes = modes(current);
     json!({
         "id": "mode",
         "name": "Mode",
@@ -123,11 +169,11 @@ pub fn mode_option(yolo: bool) -> Value {
     })
 }
 
-/// The effort picker; `current` is the gateway's effort for the session (`""`: nothing picked,
-/// `none`: thinking off).
+/// The effort picker; `current` is the gateway's effort for the session (`""`: nothing picked
+/// and none in Settings, shown as Hermes's default; `none`: thinking off).
 pub fn effort_option(current: &str) -> Value {
     let current = match current {
-        "" => "default",
+        "" => DEFAULT_EFFORT,
         "none" => "off",
         other => other,
     };
@@ -150,7 +196,6 @@ pub fn gateway_effort(picked: &str) -> Option<&'static str> {
         .iter()
         .find(|(value, _)| *value == picked)
         .map(|(value, _)| match *value {
-            "default" => "",
             "off" => "none",
             other => other,
         })
@@ -214,7 +259,7 @@ mod tests {
 
     #[test]
     fn an_unset_effort_reads_as_default() {
-        assert_eq!(effort_option("")["currentValue"], "default");
+        assert_eq!(effort_option("")["currentValue"], "medium");
         assert_eq!(effort_option("none")["currentValue"], "off");
         assert_eq!(effort_option("high")["currentValue"], "high");
         assert_eq!(effort_option("low")["category"], "thought_level");
@@ -222,7 +267,7 @@ mod tests {
 
     #[test]
     fn the_editors_efforts_map_to_the_gateways() {
-        assert_eq!(gateway_effort("default"), Some(""));
+        assert_eq!(gateway_effort("default"), None);
         assert_eq!(gateway_effort("off"), Some("none"));
         assert_eq!(gateway_effort("xhigh"), Some("xhigh"));
         assert_eq!(gateway_effort("medium"), Some("medium"));
@@ -231,16 +276,26 @@ mod tests {
 
     #[test]
     fn the_mode_is_also_a_config_option() {
-        let option = mode_option(true);
+        let option = mode_option(ApprovalMode::Yolo);
         assert_eq!(option["category"], "mode");
         assert_eq!(option["currentValue"], "yolo");
-        assert_eq!(option["options"][0]["value"], "default");
+        assert_eq!(option["options"][0]["value"], "auto");
     }
 
     #[test]
-    fn the_mode_follows_yolo() {
-        assert_eq!(modes(false)["currentModeId"], "default");
-        assert_eq!(modes(true)["currentModeId"], "yolo");
-        assert_eq!(modes(false)["availableModes"].as_array().unwrap().len(), 2);
+    fn the_modes_are_claude_codes_four_and_yolo() {
+        let all = modes(ApprovalMode::Plan);
+        assert_eq!(all["currentModeId"], "plan");
+        let ids: Vec<&str> = all["availableModes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["auto", "manual", "accept_edits", "plan", "yolo"]);
+        for id in ids {
+            assert_eq!(mode_id(parse_mode(id).unwrap()), id);
+        }
+        assert_eq!(parse_mode("default"), None);
     }
 }

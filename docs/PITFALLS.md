@@ -7,6 +7,12 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   `controls::mode_option`), or Zed shows no mode selector; a slash command must be in
   `available_commands_update` (`controls::GATEWAY_COMMANDS` for the ones `slash.exec` runs that the
   catalog doesn't list), or Zed refuses it before it reaches us.
+- **PowerShell tables were padded to 4096 columns** (`Out-String -Width 4096`, there so long lines
+  aren't cut): each line is `TrimEnd`ed in `run_powershell`. A command that doesn't parse (`&&` in
+  Windows PowerShell 5.1) prints nothing on stdout; its CLIXML stderr is turned into the result.
+- **Modes are `hermes_tools::ApprovalMode`, per session** (`SessionTools::mode`; none picked →
+  follows Settings' `approvals.mode`). `check_command` asks for every command in Manual/Plan;
+  `check_edit` (write_file/patch) asks in Manual and refuses in Plan.
 - **Terminal output needs Zed's terminal card.** When the client announces
   `clientCapabilities._meta.terminal_output`, a `terminal` call is a terminal card
   (`_meta.terminal_info` on the call, `terminal_output` + `terminal_exit` on the result), else a

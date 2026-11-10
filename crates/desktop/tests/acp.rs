@@ -1270,8 +1270,8 @@ async fn a_new_session_lists_the_models_the_modes_and_the_efforts() {
     );
     let effort = option(&result["configOptions"], "effort");
     assert_eq!(effort["category"], "thought_level");
-    assert_eq!(effort["currentValue"], "default");
-    assert_eq!(result["modes"]["currentModeId"], "default");
+    assert_eq!(effort["currentValue"], "medium");
+    assert_eq!(result["modes"]["currentModeId"], "accept_edits");
 }
 
 #[tokio::test]
@@ -1305,12 +1305,12 @@ async fn picking_an_effort_is_kept() {
     let back = agent
         .request(
             "session/set_config_option",
-            json!({"sessionId": session, "configId": "effort", "value": "default"}),
+            json!({"sessionId": session, "configId": "effort", "value": "off"}),
         )
         .await;
     assert_eq!(
         option(&back["result"]["configOptions"], "effort")["currentValue"],
-        "default"
+        "off"
     );
 }
 
@@ -1385,7 +1385,14 @@ async fn the_mode_is_a_config_option_that_switches_yolo() {
     let answer = agent.new_session_answer().await;
     let mode = option(&answer["result"]["configOptions"], "mode");
     assert_eq!(mode["category"], "mode");
-    assert_eq!(mode["currentValue"], "default");
+    assert_eq!(mode["currentValue"], "accept_edits");
+    let ids: Vec<&str> = mode["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["auto", "manual", "accept_edits", "plan", "yolo"]);
     let set = agent
         .request(
             "session/set_config_option",
@@ -1417,11 +1424,10 @@ async fn the_efforts_are_hermes_levels_and_off_is_sent_as_none() {
         .iter()
         .map(|o| o["value"].as_str().unwrap())
         .collect();
-    for wanted in [
-        "default", "off", "minimal", "low", "medium", "high", "xhigh", "max",
-    ] {
+    for wanted in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
         assert!(values.contains(&wanted), "{wanted} in {values:?}");
     }
+    assert!(!values.contains(&"default"), "{values:?}");
     let set = agent
         .request(
             "session/set_config_option",
@@ -1500,4 +1506,123 @@ async fn an_editor_with_terminal_cards_gets_the_command_output_in_one() {
         "{last}"
     );
     assert_eq!(last["_meta"]["terminal_exit"]["exit_code"], 0);
+}
+
+// ---- Modes: Auto, Manual, Accept edits, Plan, YOLO ----
+
+fn write_reply(path: &Path, text: &str) -> String {
+    tool_reply(&[(
+        "w1",
+        "write_file",
+        json!({"path": path.display().to_string(), "content": text}),
+    )])
+}
+
+#[tokio::test]
+async fn plan_mode_refuses_edits_and_tells_the_model_to_plan() {
+    let (mut agent, session) = Agent::with_session(Vec::new()).await;
+    let target = work_file(&agent, "planned.txt");
+    agent.model.set_replies(vec![
+        write_reply(&target, "x"),
+        text_reply("Here is a plan."),
+    ]);
+    let set = agent
+        .request(
+            "session/set_mode",
+            json!({"sessionId": session, "modeId": "plan"}),
+        )
+        .await;
+    assert!(set["result"].is_object(), "{set}");
+    let answer = agent.prompt(&session, "make the file").await;
+    assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
+    assert!(!target.exists(), "Plan mode must not write");
+    let failed = agent.updates_of(&session, "tool_call_update");
+    let last = failed.last().unwrap();
+    assert_eq!(last["status"], "failed", "{last}");
+    assert!(last.to_string().contains("Plan mode"), "{last}");
+}
+
+#[tokio::test]
+async fn manual_mode_asks_before_an_edit_and_obeys_the_answer() {
+    let (mut agent, session) = Agent::with_session(Vec::new()).await;
+    let target = work_file(&agent, "asked.txt");
+    agent
+        .model
+        .set_replies(vec![write_reply(&target, "hello"), text_reply("Written.")]);
+    agent
+        .request(
+            "session/set_mode",
+            json!({"sessionId": session, "modeId": "manual"}),
+        )
+        .await;
+    let prompt = agent
+        .send(
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "write it"}]}),
+        )
+        .await;
+    let (id, params) = agent.agent_request("session/request_permission").await;
+    assert_eq!(params["toolCall"]["kind"], "edit", "{params}");
+    assert!(!target.exists(), "nothing is written before the answer");
+    agent
+        .reply(
+            id,
+            json!({"outcome": {"outcome": "selected", "optionId": "allow_once"}}),
+        )
+        .await;
+    agent.response(prompt).await;
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
+}
+
+#[tokio::test]
+async fn manual_mode_denying_an_edit_leaves_the_file_alone() {
+    let (mut agent, session) = Agent::with_session(Vec::new()).await;
+    let target = work_file(&agent, "denied.txt");
+    agent
+        .model
+        .set_replies(vec![write_reply(&target, "no"), text_reply("Understood.")]);
+    agent
+        .request(
+            "session/set_mode",
+            json!({"sessionId": session, "modeId": "manual"}),
+        )
+        .await;
+    let prompt = agent
+        .send(
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "write it"}]}),
+        )
+        .await;
+    let (id, _) = agent.agent_request("session/request_permission").await;
+    agent
+        .reply(
+            id,
+            json!({"outcome": {"outcome": "selected", "optionId": "deny"}}),
+        )
+        .await;
+    agent.response(prompt).await;
+    assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn accept_edits_writes_without_asking() {
+    let (mut agent, session) = Agent::with_session(Vec::new()).await;
+    let target = work_file(&agent, "free.txt");
+    agent
+        .model
+        .set_replies(vec![write_reply(&target, "free"), text_reply("Done.")]);
+    agent
+        .request(
+            "session/set_mode",
+            json!({"sessionId": session, "modeId": "accept_edits"}),
+        )
+        .await;
+    agent.prompt(&session, "write it").await;
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "free");
+    assert!(
+        !agent
+            .seen
+            .iter()
+            .any(|m| m["method"] == "session/request_permission")
+    );
 }

@@ -445,7 +445,7 @@ impl ShellSession {
         let script = format!(
             "[Console]::OutputEncoding = [Text.Encoding]::UTF8\n\
              Set-Location -LiteralPath {}\n\
-             try {{ . {{\n{command}\n}} 2>&1 | Out-String -Stream -Width 4096 }} catch {{ $_ | Out-String }}\n\
+             try {{ . {{\n{command}\n}} 2>&1 | Out-String -Stream -Width 4096 | ForEach-Object {{ $_.TrimEnd() }} }} catch {{ $_ | Out-String }}\n\
              $hermesExit = if ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} elseif ($?) {{ 0 }} else {{ 1 }}\n\
              \"{sentinel}$hermesExit $((Get-Location).Path)\"\n",
             powershell_quote(&cwd.display().to_string())
@@ -480,6 +480,22 @@ impl ShellSession {
             tree: Some(ProcessTree::contain(child.id())),
         };
         let mut stdout = child.stdout.take().expect("piped stdout");
+        // PowerShell's own errors (a script that doesn't parse never prints the sentinel) come on
+        // stderr, as CLIXML: kept, a little of it, to tell the model why nothing ran.
+        let stderr_task = child.stderr.take().map(|mut stderr| {
+            tokio::spawn(async move {
+                let mut kept = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while let Ok(n) = stderr.read(&mut chunk).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let room = (16 * 1024usize).saturating_sub(kept.len());
+                    kept.extend_from_slice(&chunk[..n.min(room)]);
+                }
+                kept
+            })
+        });
         // Kept up to MAX_CAPTURE_BYTES, as the bash path: the rest is read (so the command can
         // finish) and dropped. Unbounded, a command printing millions of lines held hundreds of
         // MB and made masking secrets in it take minutes.
@@ -566,14 +582,59 @@ impl ShellSession {
             killer.disarm();
             let _ = child.wait().await;
         }
+        let mut output = lines.join("\n").trim_end().to_string();
+        let mut exit_code = exit_code;
+        // No sentinel: PowerShell stopped before running the command (a syntax error such as `&&`,
+        // which Windows PowerShell 5.1 doesn't have). Say why instead of returning nothing.
+        if exit_code.is_none() && !timed_out && !interrupted {
+            if let Some(task) = stderr_task {
+                if let Ok(Ok(bytes)) = tokio::time::timeout(Duration::from_secs(2), task).await {
+                    let errors = powershell_errors(&bytes);
+                    if !errors.is_empty() {
+                        output =
+                            format!("{output}\nPowerShell could not run the command:\n{errors}")
+                                .trim()
+                                .to_string();
+                        exit_code = Some(1);
+                    }
+                }
+            }
+        }
         RunResult {
-            output: lines.join("\n").trim_end().to_string(),
+            output,
             exit_code,
             timed_out,
             shell_restarted: false,
             interrupted,
         }
     }
+}
+
+/// The error text in what PowerShell wrote on stderr: plain text, or CLIXML (`#< CLIXML` then
+/// `<S S="Error">…</S>` pieces with `_x000D__x000A_` for line ends) when stderr is redirected.
+fn powershell_errors(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if !text.contains("#< CLIXML") {
+        return text.trim().to_string();
+    }
+    let mut out = String::new();
+    let mut rest = text.as_ref();
+    while let Some(start) = rest.find("<S S=\"Error\">") {
+        rest = &rest[start + "<S S=\"Error\">".len()..];
+        let Some(end) = rest.find("</S>") else { break };
+        out.push_str(&rest[..end]);
+        rest = &rest[end..];
+    }
+    out.replace("_x000D__x000A_", "\n")
+        .replace("_x000D_", "")
+        .replace("_x000A_", "\n")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+        .trim()
+        .to_string()
 }
 
 pub(crate) fn command_for_powershell(cwd: &Path, scratch_dir: &Path) -> Command {
@@ -772,6 +833,17 @@ mod tests {
     use super::*;
     use crate::tests::tools_in;
 
+    #[test]
+    fn powershells_clixml_errors_read_as_text() {
+        let clixml = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">At line:1 char:5_x000D__x000A_</S><S S=\"Error\">The token &apos;&amp;&amp;&apos; is not a valid statement separator.</S></Objs>";
+        assert_eq!(
+            powershell_errors(clixml.as_bytes()),
+            "At line:1 char:5\nThe token '&&' is not a valid statement separator."
+        );
+        assert_eq!(powershell_errors(b"plain failure\r\n"), "plain failure");
+        assert_eq!(powershell_errors(b""), "");
+    }
+
     fn bash_available(tools: &SessionTools) -> bool {
         matches!(tools.shell.kind(), ShellKind::GitBash(_))
     }
@@ -870,6 +942,58 @@ mod tests {
         assert!(limited.starts_with("START") && limited.ends_with("END"));
         assert!(limited.len() < 30_000);
         assert_eq!(std::fs::read_to_string(saved.unwrap()).unwrap(), output);
+    }
+
+    /// A table is not padded out to the 4096-column width it is formatted at (a `ls` listing was
+    /// thousands of spaces wide per row).
+    #[tokio::test]
+    async fn a_powershell_table_has_no_trailing_padding() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = ShellSession::new(
+            ShellKind::PowerShell,
+            dir.path().to_path_buf(),
+            dir.path().join("scratch"),
+        );
+        let result = shell
+            .run(
+                "[pscustomobject]@{Name='one'; Size=1}, [pscustomobject]@{Name='two'; Size=2} | Format-Table",
+                None,
+                Duration::from_secs(30),
+                None,
+                &|_| {},
+            )
+            .await;
+        assert_eq!(result.exit_code, Some(0), "{:?}", result.output);
+        assert!(result.output.contains("one"), "{:?}", result.output);
+        for line in result.output.lines() {
+            assert_eq!(line, line.trim_end(), "padded: {line:?}");
+        }
+    }
+
+    /// A command Windows PowerShell can't parse (`&&`) says why, instead of returning nothing.
+    #[tokio::test]
+    async fn a_powershell_syntax_error_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = ShellSession::new(
+            ShellKind::PowerShell,
+            dir.path().to_path_buf(),
+            dir.path().join("scratch"),
+        );
+        let result = shell
+            .run(
+                "Write-Output a && Write-Output b",
+                None,
+                Duration::from_secs(30),
+                None,
+                &|_| {},
+            )
+            .await;
+        assert_eq!(result.exit_code, Some(1), "{:?}", result.output);
+        assert!(
+            result.output.contains("could not run the command"),
+            "{:?}",
+            result.output
+        );
     }
 
     /// The PowerShell path (no Git Bash on the machine) relays its live output too: whole

@@ -24,7 +24,7 @@ machine (`%LOCALAPPDATA%\Programs\Zed`) and Zed's source (`../zed`,
          // "HERMES_RS_HOME": "C:\\Users\\alexandros\\repos\\hermes-rs\\target\\acp-home",
          "RUST_LOG": "info"
        }
-       // Phase 4: "default_mode": "default",
+       // Phase 4: "default_mode": "accept_edits",   (auto | manual | accept_edits | plan | yolo)
        //          "default_config_options": { "effort": "medium" }
      }
    }
@@ -102,4 +102,10 @@ relevant part of `dev: open acp logs`.
 2. The effort selector lists Default, Off, Minimal, Low, Medium, High, Extra High, Max, Ultra (Hermes's
    own list, the same for every model); a pick is sent as `reasoning_effort` (Off as `none`).
 3. The **Mode** selector (a config option, category `mode`: Zed shows config options and ignores the
-   legacy `modes`) → YOLO → a flagged command runs without asking; back to Default → it asks again.
+   legacy `modes`) → the modes are Auto, Manual, Accept edits (the start), Plan and YOLO:
+   - Manual: a file edit and a command each ask first (Deny → nothing is written).
+   - Accept edits: an edit goes through; a flagged command (`rm -rf`) asks.
+   - Plan: an edit is refused with a note to present a plan (a file under `.hermes/plans/` is allowed);
+     every command asks.
+   - Auto: a reviewer model judges flagged commands; only an unsure verdict asks.
+   - YOLO: nothing asks (the commands that must never run still don't).

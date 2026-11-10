@@ -47,7 +47,11 @@ pub fn approval_request(
     } else {
         format!("{description}: {command}")
     };
-    let body = if description.is_empty() {
+    // A file edit the mode asks about (`description` is the gateway's "file edit").
+    let edit = description == "file edit";
+    let body = if edit {
+        command.to_string()
+    } else if description.is_empty() {
         format!("$ {command}")
     } else {
         format!("{description}\n$ {command}")
@@ -66,7 +70,7 @@ pub fn approval_request(
         "toolCall": {
             "toolCallId": card_id(prompt_id),
             "title": title,
-            "kind": "execute",
+            "kind": if edit { "edit" } else { "execute" },
             "status": "pending",
             "content": [text_content(&body)],
             "rawInput": {"command": command, "description": description},

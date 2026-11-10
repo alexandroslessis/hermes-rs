@@ -303,7 +303,7 @@ drive letters, a resource without a name); `tests/acp.rs`: `load_replays_history
 ✅ **Done 2026-11-10.** As built: the model list comes from `model.options` (bounded to 4 s, so an unreachable provider doesn't hold up opening a thread); the mode is the runtime's per-session YOLO flag, which lasts as long as the process (a reloaded thread starts in Default).
 
 **Goal:** Zed's model picker lists the desktop's models and switches the thread's model; the
-effort selector works; a "YOLO" mode switches off approvals for the thread.
+effort selector works; modes (Auto, Manual, Accept edits, Plan, YOLO: the session's `ApprovalMode` in `hermes_tools`) change what asks the user.
 
 1. `configOptions` in `session/new`/`session/load` answers (PROTOCOL §5), from `model.options`.
 2. `session/set_config_option` for `model` and `effort`, reusing the page's calls; answer the full
