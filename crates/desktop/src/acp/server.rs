@@ -55,6 +55,14 @@ struct Inner {
     sessions: HashMap<String, Session>,
 }
 
+/// What `/undo` and `/retry` came to.
+enum Rewound {
+    /// The answer to show; the prompt ends there.
+    Reply(String),
+    /// `/retry`: the dropped prompt, sent again as this turn's.
+    Resend(String),
+}
+
 pub struct AcpServer {
     gateway: Arc<Gateway>,
     sender: Sender,
@@ -447,6 +455,74 @@ impl AcpServer {
         Ok(json!({"configOptions": controls["configOptions"]}))
     }
 
+    /// `/undo [N]` and `/retry`: the conversation cut back to before the Nth last typed prompt
+    /// (Hermes's `/undo` and `/retry`, over the gateway's `session.rewind`). `None` for any other
+    /// text.
+    async fn rewind_command(self: &Arc<Self>, id: &str, text: &str) -> Option<Rewound> {
+        let (name, arg) = text
+            .strip_prefix('/')?
+            .split_once(char::is_whitespace)
+            .map_or((text.trim_start_matches('/'), ""), |(n, a)| (n, a.trim()));
+        let retry = match name {
+            "undo" => false,
+            "retry" => true,
+            _ => return None,
+        };
+        let turns = if retry {
+            1
+        } else if arg.is_empty() {
+            1
+        } else {
+            match arg.parse::<usize>() {
+                Ok(n) if n > 0 => n,
+                _ => return Some(Rewound::Reply("Usage: /undo [N]".into())),
+            }
+        };
+        let messages = match self.gateway.runtime.messages(id) {
+            Ok(messages) => messages,
+            Err(error) => return Some(Rewound::Reply(format!("{error:#}"))),
+        };
+        let prompts = crate::transcript::typed_prompts(&messages);
+        if prompts.is_empty() {
+            let what = if retry { "retry" } else { "undo" };
+            return Some(Rewound::Reply(format!("Nothing to {what}.")));
+        }
+        if turns > prompts.len() {
+            return Some(Rewound::Reply(format!(
+                "Only {} turn{} to undo.",
+                prompts.len(),
+                if prompts.len() == 1 { "" } else { "s" }
+            )));
+        }
+        let (row, prompt, image) = &prompts[prompts.len() - turns];
+        if retry && *image {
+            return Some(Rewound::Reply(
+                "/retry: that prompt had an image; send it again yourself.".into(),
+            ));
+        }
+        let answer = match self
+            .call(
+                "session.rewind",
+                json!({"session_id": id, "target_message_id": row}),
+            )
+            .await
+        {
+            Ok(answer) => answer,
+            Err(error) => return Some(Rewound::Reply(error.message)),
+        };
+        if retry {
+            return Some(Rewound::Resend(prompt.clone()));
+        }
+        let count = answer["rewound_count"].as_u64().unwrap_or(0);
+        Some(Rewound::Reply(format!(
+            "Undid {turns} turn{} ({count} message{}).\nRemoved prompt: {prompt}\n\n\
+             The messages above stay on screen in Zed; reopen the thread from the history to see \
+             the shortened conversation.",
+            if turns == 1 { "" } else { "s" },
+            if count == 1 { "" } else { "s" },
+        )))
+    }
+
     /// After `session/new` or `session/load` is answered: the commands the editor can offer.
     async fn after_open(&self, session: &str) {
         let catalog = self.call("commands.catalog", json!({})).await;
@@ -561,6 +637,25 @@ impl AcpServer {
             )
             .await
             .map_err(|error| RpcError::invalid_params(error.message))?;
+        }
+        // `/undo [N]` and `/retry` rewind the conversation (an editor can't edit an older prompt:
+        // Zed offers that to its own agent only).
+        if prompt.images.is_empty() {
+            match self.rewind_command(id, text.trim()).await {
+                Some(Rewound::Reply(answer)) => {
+                    self.update(
+                        id,
+                        json!({
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": answer},
+                            "messageId": uuid::Uuid::new_v4().to_string(),
+                        }),
+                    );
+                    return Ok(json!({"stopReason": "end_turn"}));
+                }
+                Some(Rewound::Resend(again)) => text = again,
+                None => {}
+            }
         }
         // A command (`/usage`, a skill, `/plan …`): answered here, or turned into the message the
         // turn sends. Anything the gateway doesn't know as a command goes to the model as typed.

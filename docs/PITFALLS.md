@@ -17,9 +17,15 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   `clientCapabilities._meta.terminal_output`, a `terminal` call is a terminal card
   (`_meta.terminal_info` on the call, `terminal_output` + `terminal_exit` on the result), else a
   text card. Unverified in Zed 1.26 until the user checks (checklist Phase 2, item 1).
-- **"Editing previous messages is not available"** (Zed, on a hermes thread): ACP v1 has no
-  rewind/edit request (the `session/rewind` proposal was closed, superseded by the v2 prompt
-  lifecycle), so there is nothing to implement. Hermes's `session.rewind` exists for the desktop page.
+- **"Editing previous messages is not available"** (Zed, on a hermes thread): checked in Zed 1.27
+  (2026-11-11): its `AgentConnection::truncate` defaults to "not supported" and neither the v1
+  nor the beta v2 ACP connection implements it; ACP v1 has no rewind request (the `session/rewind`
+  proposal was closed, superseded by the v2 prompt lifecycle). So the edit button can't work for
+  us yet. `/undo [N]` and `/retry` (`AcpServer::rewind_command`, over `session.rewind`) are the
+  stand-in; ACP can't delete messages from the editor's view, so after `/undo` Zed still shows
+  them until the thread is reopened. If Zed gains truncate for external agents: map its message
+  ids to our rows (side file), call `session.rewind` on truncate, then the edited prompt is a
+  normal `session/prompt`.
 - **Editors need `hermes-acp.exe`, not the release `hermes-desktop.exe`.** The release app is a
   Windows GUI-subsystem program; launched by Zed with pipes it exits (code 0) right after
   `initialize`, while the debug build (a console program) works. `hermes-acp.exe`

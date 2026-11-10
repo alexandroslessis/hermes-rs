@@ -79,12 +79,17 @@ const DEFAULT_EFFORT: &str = "medium";
 
 /// The commands the gateway runs for `slash.exec` that its `commands.catalog` doesn't list (the
 /// page types them itself): offered to the editor, which refuses a command that isn't listed.
-pub const GATEWAY_COMMANDS: [(&str, &str); 8] = [
+pub const GATEWAY_COMMANDS: [(&str, &str); 10] = [
     (
         "status",
         "Show the session, its model and folder, tokens so far and the context in use",
     ),
     ("usage", "Show the token usage of this session"),
+    (
+        "undo",
+        "Drop the last turn (or the last N: /undo 2) from the conversation",
+    ),
+    ("retry", "Drop the last turn and send its prompt again"),
     ("context", "Show what fills the context window"),
     ("insights", "Show usage insights over the last days"),
     ("diff", "Show what changed in the working folder"),

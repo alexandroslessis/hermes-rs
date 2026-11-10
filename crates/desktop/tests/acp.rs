@@ -1626,3 +1626,88 @@ async fn accept_edits_writes_without_asking() {
             .any(|m| m["method"] == "session/request_permission")
     );
 }
+
+// ---- /undo and /retry ----
+
+fn user_texts(request: &Value) -> Vec<String> {
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .map(|m| m["content"].to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn undo_drops_the_last_turn_and_the_next_prompt_continues_from_there() {
+    let (mut agent, session) =
+        Agent::with_session(vec![text_reply("A1"), text_reply("A2"), text_reply("A3")]).await;
+    agent.prompt(&session, "first question").await;
+    agent.prompt(&session, "second question").await;
+    let answer = agent.prompt(&session, "/undo").await;
+    assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
+    let said = agent.reply_text(&session);
+    assert!(said.contains("Undid 1 turn"), "{said}");
+    assert!(said.contains("second question"), "{said}");
+    assert_eq!(
+        agent.model.requests().len(),
+        2,
+        "/undo must not call the model"
+    );
+    agent.prompt(&session, "third question").await;
+    let requests = agent.model.requests();
+    let last = user_texts(requests.last().unwrap()).join(" ");
+    assert!(last.contains("first question"), "{last}");
+    assert!(last.contains("third question"), "{last}");
+    assert!(!last.contains("second question"), "{last}");
+}
+
+#[tokio::test]
+async fn undo_n_drops_n_turns() {
+    let (mut agent, session) = Agent::with_session(vec![
+        text_reply("A1"),
+        text_reply("A2"),
+        text_reply("A3"),
+        text_reply("A4"),
+    ])
+    .await;
+    for prompt in ["one", "two", "three"] {
+        agent.prompt(&session, prompt).await;
+    }
+    agent.prompt(&session, "/undo 2").await;
+    assert!(agent.reply_text(&session).contains("Undid 2 turns"));
+    agent.prompt(&session, "four").await;
+    let requests = agent.model.requests();
+    let last = user_texts(requests.last().unwrap()).join(" ");
+    assert!(last.contains("one") && last.contains("four"), "{last}");
+    assert!(!last.contains("two") && !last.contains("three"), "{last}");
+}
+
+#[tokio::test]
+async fn retry_sends_the_last_prompt_again_without_the_old_answer() {
+    let (mut agent, session) =
+        Agent::with_session(vec![text_reply("old answer"), text_reply("new answer")]).await;
+    agent.prompt(&session, "alpha").await;
+    let answer = agent.prompt(&session, "/retry").await;
+    assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
+    let requests = agent.model.requests();
+    assert_eq!(requests.len(), 2);
+    let again = &requests[1];
+    assert_eq!(user_texts(again).len(), 1, "{again}");
+    assert!(user_texts(again)[0].contains("alpha"));
+    assert!(!again.to_string().contains("old answer"), "{again}");
+    assert!(agent.reply_text(&session).contains("new answer"));
+}
+
+#[tokio::test]
+async fn undo_with_nothing_to_undo_or_a_bad_count_says_so() {
+    let (mut agent, session) = Agent::with_session(vec![text_reply("A1")]).await;
+    agent.prompt(&session, "/undo").await;
+    assert!(agent.reply_text(&session).contains("Nothing to undo"));
+    agent.prompt(&session, "only one").await;
+    agent.prompt(&session, "/undo 5").await;
+    assert!(agent.reply_text(&session).contains("Only 1 turn"));
+    agent.prompt(&session, "/undo x").await;
+    assert!(agent.reply_text(&session).contains("Usage: /undo [N]"));
+}

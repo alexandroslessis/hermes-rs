@@ -96,6 +96,14 @@ relevant part of `dev: open acp logs`.
    `vision_analyze`.
 6. The context-usage indicator shows a value after each turn.
 
+### Undo / retry (instead of editing an old prompt, which Zed 1.27 only offers its own agent)
+1. Send two prompts, then `/undo` → the agent says it undid 1 turn and shows the removed prompt;
+   Zed still shows the old messages. Send a third prompt → the agent answers as if the second
+   never happened. Reopen the thread from the history → the second turn is gone.
+2. `/undo 2` drops two turns; `/undo 9` says how many there are; `/undo x` shows the usage.
+3. `/retry` → the last prompt is sent again and answered anew; the old answer is not in the
+   conversation (reopen the thread to see only the new one).
+
 ### Phase 4
 1. The model picker in the thread lists the models the desktop app offers; pick another → the
    next reply comes from it (ask "which model are you?" if the model knows).

@@ -352,6 +352,23 @@ fn is_typed(message: &Message) -> bool {
             .any(|c| matches!(c, MessageContent::Text(t) if !t.text.trim().is_empty()))
 }
 
+/// The user's typed prompts, oldest first, as `(row id, text, has an image)`: the turns an editor's
+/// `/undo` and `/retry` count (tool results ride in user messages and don't).
+pub fn typed_prompts(messages: &[Message]) -> Vec<(usize, String, bool)> {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| is_typed(message))
+        .map(|(index, message)| {
+            let image = message
+                .content
+                .iter()
+                .any(|c| matches!(c, MessageContent::Image(_)));
+            (row_id(index), message.as_concat_text(), image)
+        })
+        .collect()
+}
+
 /// Hermes's `persisted_turn` receipt for a finished turn: the stored rows it wrote (from index
 /// `start` on), its typed rows (the prompt and steers) and its final reply, so the page can
 /// address them (restore, edit) without reloading the transcript.
