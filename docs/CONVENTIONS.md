@@ -78,12 +78,12 @@ Every module starts with a `//!` doc comment that says, in plain sentences:
 
 ## Formatting
 
-- The tree is **not** rustfmt-clean (≈175 diffs in `hermes-desktop` alone). Do **not** run
-  `cargo fmt` over the workspace or a whole existing file inside a feature commit: it buries the
-  change in noise.
-- New files: write them rustfmt-style (`cargo fmt -- --check path/to/new.rs` should be quiet,
-  max width 100). Edits to existing files: match the surrounding lines.
-- A formatting pass, if ever wanted, is its own commit touching nothing else.
+- Our crates (`crates/*`) are **rustfmt-clean** (formatted 2026-11-10, default settings, max width
+  100). Run `cargo fmt -p <crate>` for each crate you changed before committing; the vendored Zed
+  crates (`vendor/`) are never formatted. Check the whole set with
+  `cargo fmt -p hermes-desktop -p hermes_runtime -p hermes_tools -p hermes_memory -p hermes_store -p hermes_prompts -p hermes_llm -p hermes_agent -p hermes_highlight -p hermes_themes -p markdown -p hermes-rs -- --check`.
+- Don't run a bare `cargo fmt` / `cargo fmt --all`: the workspace includes `vendor/zed/*`.
+- A formatting-only change is its own commit; never mix it into a feature commit.
 - Clippy: `cargo clippy -p <crate>` on what you changed; fix new warnings in your code. Known
   pre-existing errors in `hermes_tools` (`recall.rs`, `skill_manage.rs` redundant clones) are not
   yours to fix inside a feature commit.
