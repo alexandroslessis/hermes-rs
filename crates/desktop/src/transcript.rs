@@ -33,7 +33,7 @@ fn error_surface_parts(kind: MessageErrorKind, text: &str) -> (&'static str, &'s
         K::RateLimit => (
             "provider",
             "rate_limit",
-            !hermes_llm::retry::is_usage_limit_error(text),
+            !hermes_llm::retry::is_usage_limit(text),
         ),
         K::ServerError => ("provider", "server_error", true),
         K::Network => ("endpoint", "timeout", true),
@@ -112,8 +112,10 @@ pub fn turn_error_text(kind: MessageErrorKind, detail: &str, provider: &str) -> 
         format!(" ({provider})")
     };
     let mut detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
-    if detail.len() > 400 {
-        detail.truncate(399);
+    // By characters: a byte cut can land inside a multi-byte one (a provider error in Chinese,
+    // say) and `String::truncate` panics there.
+    if detail.chars().count() > 400 {
+        detail = detail.chars().take(399).collect();
         detail.push('\u{2026}');
     }
     [format!("{title}{identity}. Your message was not answered.")]
@@ -183,7 +185,7 @@ pub fn messages(messages: &[Message], provider: &str, model: &str) -> Vec<Value>
                 // (the page won't drop a content-less failed_turn row before it paints the card
                 // from `display_metadata`); the account itself lives on the live frame.
                 MessageContent::Error(error) if message.role == Role::Assistant => {
-                    let notice = if messages[..=index].iter().any(has_tool) {
+                    let notice = if turn_called_a_tool(&messages[..=index]) {
                         "This turn did not complete. Some actions may have already run; verify their effects before resending."
                     } else {
                         "Your request was not processed. Send it again if you still want me to carry it out."
@@ -197,7 +199,6 @@ pub fn messages(messages: &[Message], provider: &str, model: &str) -> Vec<Value>
                 _ => {}
             }
         }
-        let failed_turn = failed_turn;
         if text.trim().is_empty() && reasoning.is_empty() && failed_turn.is_none() {
             continue;
         }
@@ -229,13 +230,20 @@ pub fn messages(messages: &[Message], provider: &str, model: &str) -> Vec<Value>
     out
 }
 
-/// Whether a turn that failed called a tool (your failed-turn notice says so, as Hermes's
-/// `failed_turn_notice` — a tool may have run before the provider error ended the turn).
-fn has_tool(message: &Message) -> bool {
-    message
-        .content
+/// Whether the turn that ends `messages` called a tool: a tool may have run before the provider
+/// error ended it, which the failed-turn notice says (Hermes's `failed_turn_notice`). Only the
+/// turn counts: the messages after the last typed one, not the whole conversation.
+fn turn_called_a_tool(messages: &[Message]) -> bool {
+    messages
         .iter()
-        .any(|c| matches!(c, MessageContent::ToolRequest(_)))
+        .rev()
+        .take_while(|message| !is_typed(message))
+        .any(|message| {
+            message
+                .content
+                .iter()
+                .any(|c| matches!(c, MessageContent::ToolRequest(_)))
+        })
 }
 
 fn tool_result_text(content: &MessageContent) -> String {
@@ -483,6 +491,54 @@ mod tests {
             !account.contains('('),
             "no identity without a provider: {account}"
         );
+    }
+
+    #[test]
+    fn a_long_non_ascii_detail_is_cut_on_a_character_boundary() {
+        // 450 three-byte characters: a byte cut at 399 would split one and panic.
+        let detail = "\u{9519}".repeat(450);
+        let account = turn_error_text(MessageErrorKind::Other, &detail, "p");
+        let shown = account
+            .lines()
+            .find_map(|line| line.strip_prefix("Details: "))
+            .expect("the detail is shown");
+        assert_eq!(shown.chars().count(), 400);
+        assert!(shown.ends_with('\u{2026}'));
+    }
+
+    fn tool_call_message() -> Message {
+        Message::assistant().with_tool_request(
+            "call_1",
+            Ok(rmcp::model::CallToolRequestParams::new("terminal")),
+        )
+    }
+
+    #[test]
+    fn the_failed_turn_notice_counts_only_this_turns_tool_calls() {
+        let failed = Message::from_provider_error(&ProviderError::ServerError("boom".into()));
+        // An earlier turn ran a tool; the failed turn did not.
+        let stored = vec![
+            Message::user().with_text("list files"),
+            tool_call_message(),
+            Message::user().with_text("now say hi"),
+            failed,
+        ];
+        let rows = messages(&stored, "", "");
+        let notice = rows.last().unwrap()["text"].as_str().unwrap();
+        assert!(notice.starts_with("Your request was not processed"), "{notice}");
+    }
+
+    #[test]
+    fn the_failed_turn_notice_warns_when_this_turn_ran_a_tool() {
+        let failed = Message::from_provider_error(&ProviderError::ServerError("boom".into()));
+        let stored = vec![
+            Message::user().with_text("list files"),
+            tool_call_message(),
+            failed,
+        ];
+        let rows = messages(&stored, "", "");
+        let notice = rows.last().unwrap()["text"].as_str().unwrap();
+        assert!(notice.starts_with("This turn did not complete"), "{notice}");
     }
 
     #[test]

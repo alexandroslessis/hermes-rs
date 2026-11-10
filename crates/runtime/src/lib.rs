@@ -1784,14 +1784,18 @@ impl Runtime {
     /// `drop_session_terminal` on a committed workspace move). The transcript is the store's
     /// (every append is persisted), so nothing is lost. Idle sessions only.
     pub async fn evict(&self, session_id: &str) -> Result<()> {
-        let open = self.sessions.lock().get(session_id).cloned();
-        let Some(open) = open else {
-            return Ok(());
+        // The idle check and the removal under one hold of the map: a turn can't start between them.
+        let open = {
+            let mut sessions = self.sessions.lock();
+            let Some(open) = sessions.get(session_id).cloned() else {
+                return Ok(());
+            };
+            if open.running.lock().is_some() {
+                anyhow::bail!("a turn is running in this session");
+            }
+            sessions.remove(session_id);
+            open
         };
-        if open.running.lock().is_some() {
-            anyhow::bail!("a turn is running in this session");
-        }
-        self.sessions.lock().remove(session_id);
         open.tools.shutdown().await;
         Ok(())
     }

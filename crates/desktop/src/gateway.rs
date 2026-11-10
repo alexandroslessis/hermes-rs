@@ -2878,16 +2878,14 @@ impl Gateway {
                             status = "error";
                             error = Some(text.clone());
                         }
-                        let surface = failure.clone().map(|(kind, text)| {
-                            let (provider, model) = this
-                                .runtime
-                                .store()
-                                .session(&id)
-                                .ok()
-                                .flatten()
-                                .map(|record| (record.provider, record.model))
-                                .unwrap_or_default();
-                            crate::transcript::error_surface(kind, &text, &provider, &model)
+                        // Which provider and model failed: the card names them.
+                        let (provider, model) = failure
+                            .as_ref()
+                            .and_then(|_| this.runtime.store().session(&id).ok().flatten())
+                            .map(|record| (record.provider, record.model))
+                            .unwrap_or_default();
+                        let surface = failure.as_ref().map(|(kind, text)| {
+                            crate::transcript::error_surface(*kind, text, &provider, &model)
                         });
                         // A turn that also streamed output keeps it: the text is the user's, not
                         // the error string (Hermes's partial failure settle). One that streamed
@@ -2896,20 +2894,10 @@ impl Gateway {
                         // an empty frame would end the turn in silence (no card, no bubble), and
                         // its partial=false strips the account from the bubble: the card is the
                         // only thing shown.
-                        let provider_for_account = this
-                            .runtime
-                            .store()
-                            .session(&id)
-                            .ok()
-                            .flatten()
-                            .map(|record| record.provider)
-                            .unwrap_or_default();
                         let text = match (&failure, stream.text().trim().is_empty()) {
-                            (Some((kind, detail)), true) => crate::transcript::turn_error_text(
-                                *kind,
-                                detail,
-                                &provider_for_account,
-                            ),
+                            (Some((kind, detail)), true) => {
+                                crate::transcript::turn_error_text(*kind, detail, &provider)
+                            }
                             _ => stream.text().to_string(),
                         };
                         let partial = status == "error" && !stream.text().trim().is_empty();

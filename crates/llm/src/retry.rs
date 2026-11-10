@@ -113,16 +113,17 @@ const USAGE_LIMIT_MARKERS: &[&str] = &[
     "request limit reached",
 ];
 
-fn is_usage_limit(message: &str) -> bool {
+/// True when a rate-limit error says a request/usage limit is reached (a daily or monthly
+/// quota): retrying unchanged reproduces it. `should_retry` and the error card's Retry action
+/// (hidden for these) share this classification.
+pub fn is_usage_limit(message: &str) -> bool {
     let lower = message.to_lowercase();
     USAGE_LIMIT_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
-/// True when a rate-limit error says a request/usage limit is reached (a daily or monthly
-/// quota): retrying unchanged reproduces it, so the error card's Retry action hides. Same
-/// classification `should_retry` uses.
-pub fn is_usage_limit_error(message: &str) -> bool {
-    is_usage_limit(message)
+/// How long a rate limit's own Retry-After is slept: as given, up to [`MAX_RETRY_WAIT_SECS`].
+fn capped_retry_wait(hint: Duration) -> Duration {
+    hint.min(Duration::from_secs(MAX_RETRY_WAIT_SECS))
 }
 
 fn is_permanent_request_failure(message: &str) -> bool {
@@ -182,7 +183,7 @@ where
                         ProviderError::RateLimitExceeded {
                             retry_delay: Some(d),
                             ..
-                        } => (*d).min(Duration::from_secs(MAX_RETRY_WAIT_SECS)),
+                        } => capped_retry_wait(*d),
                         _ => config.delay_for_attempt(attempts),
                     };
 
@@ -437,19 +438,12 @@ mod tests {
 
     #[test]
     fn a_retry_sleeps_at_most_the_retry_wait_cap() {
-        // A daily-limit hint past the cap degrades to the cap, not to an hour-long sleep.
-        let config = RetryConfig::default();
-        let error = ProviderError::RateLimitExceeded {
-            details: "too many requests".into(),
-            retry_delay: Some(Duration::from_secs(19919)),
-        };
-        assert!(should_retry(&error, &config));
-        let delay = match error {
-            ProviderError::RateLimitExceeded { retry_delay, .. } => retry_delay
-                .map(|d| d.min(Duration::from_secs(MAX_RETRY_WAIT_SECS)))
-                .expect("hint kept"),
-            _ => unreachable!(),
-        };
-        assert_eq!(delay, Duration::from_secs(MAX_RETRY_WAIT_SECS));
+        // A daily-limit hint past the cap degrades to the cap, not to a five-hour sleep.
+        assert_eq!(
+            capped_retry_wait(Duration::from_secs(19919)),
+            Duration::from_secs(MAX_RETRY_WAIT_SECS)
+        );
+        // A short hint is honored as given.
+        assert_eq!(capped_retry_wait(Duration::from_secs(2)), Duration::from_secs(2));
     }
 }
