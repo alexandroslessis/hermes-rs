@@ -946,8 +946,17 @@ phase under `requests`.
 
 | Scenario | Baseline | After 3 | After 5 | After 7 | After 10 |
 |---|---|---|---|---|---|
-| S1 read 3, edit 1 | | | | | |
-| S2 empty reply | | | | | |
-| S3 truncated call | | | | | |
-| S4 ten turns (incl. review) | | | | | |
-| S5 delegate two | | | | | |
+| S1 read 3, edit 1 | 5 | | | | |
+| S2 empty reply after tools | 3 | | | | |
+| S2b empty first reply | 2 | | | | |
+| S3 truncated call | 3 | | | | |
+| S4 ten turns (incl. review) | 11 | | | | |
+| S5 delegate two | 4 | | | | |
+
+Phase 0 baselines (2026-11-11, `balanced` = today's behaviour; all counted as `main` until Phase 2
+labels requests): S1 = 4 tool rounds + answer; S2 = tool round + empty reply + answer after
+`EmptyResponseRecovery`'s nudge; S2b = empty first reply + the inference step's own retry (it never
+reaches `EmptyResponseRecovery`); S3 =
+cut-off tool call + retry + answer; S4 = 10 turns + 1 background review (memory and skill counters
+both due on the tenth turn, one combined review request); S5 = parent call + 2 children + parent
+answer. The mock counts every request, so retries and background jobs show up in the totals.

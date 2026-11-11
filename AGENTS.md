@@ -37,6 +37,7 @@ A Windows desktop app that runs **Hermes** (NousResearch's agent, `../hermes-age
 | Changing Hermes's frontend | [crates/desktop/patches/README.md](crates/desktop/patches/README.md) |
 | Building the installer / shipping | [docs/RELEASING.md](docs/RELEASING.md); the user's step-by-step: [docs/INSTALLER-TUTORIAL.md](docs/INSTALLER-TUTORIAL.md) |
 | Performance work | [scripts/perf/README.md](scripts/perf/README.md) |
+| Backend v2 (request-frugal agent, self-improvement, security, Rust cleanup) | [docs/backend/PHASES.md](docs/backend/PHASES.md) — planned 2026-11-11; phase by phase, with checkpoints |
 | ACP (using the agent from Zed / t3code: `hermes-acp.exe`) | [docs/acp/README.md](docs/acp/README.md), then [docs/acp/PHASES.md](docs/acp/PHASES.md) — built 2026-11-10 (Zed; t3code later) |
 | opencode plugin (Hermes memory, skills, self-improvement inside opencode: `hermes-opencode.exe` + TS shim) | [docs/opencode/README.md](docs/opencode/README.md), then [docs/opencode/PHASES.md](docs/opencode/PHASES.md) — planned 2026-11-11, not built |
 
@@ -45,10 +46,15 @@ scope still holds; `PLAN.md`'s milestones are history. `GAPS.md` is the live to-
 
 ## Ground rules (every change)
 
-1. **Port Hermes, don't invent.** Every feature already exists in Hermes. Find how Hermes does it
-   (its frontend's calls, the contract, its Python), port that behavior, and keep the shapes the
-   page expects. Deviate only for a reason, and write the reason down (module doc + PORTING.md
-   row). See [docs/WORKFLOW.md](docs/WORKFLOW.md).
+1. **Protocol: port Hermes. Backend: ours.**
+   - *Protocol:* the page's protocol (JSON-RPC methods, REST routes, event shapes) stays exactly
+     what Hermes's frontend expects. Find how Hermes does it (its frontend's calls, the contract,
+     its Python) and port the shapes. A wrong shape is worse than none (rule 5).
+   - *Backend:* the agent's behaviour (loop, tools, review, curator, memory, prompts) is ours and
+     may deviate from Hermes where that helps (see [docs/backend/PHASES.md](docs/backend/PHASES.md)).
+     When we deviate, the module doc says so and why, and the `PORTING.md` row is marked
+     `diverged`, so a Hermes update knows not to re-port it. See
+     [docs/WORKFLOW.md](docs/WORKFLOW.md).
 2. **Cite the source.** A module ported from Hermes says where from in its header
    (`//! Hermes: \`tools/process_registry.py\` (...)`). These lines are the port map that makes
    Hermes updates tractable. Add a row to `PORTING.md` for a new module.

@@ -41,6 +41,10 @@ Not from Hermes, so not in the map:
 
 ## Map
 
+A row marked `diverged` is backend behaviour we deliberately changed (AGENTS.md rule 1, plan in
+`docs/backend/PHASES.md`): its module doc says how and why, and a Hermes update must not re-port it
+(read the Hermes diff for ideas only). Protocol shapes are never `diverged`.
+
 | hermes-rs | Hermes |
 |---|---|
 | **Desktop backend** (`crates/desktop`) | |

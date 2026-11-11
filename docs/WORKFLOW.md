@@ -3,6 +3,12 @@
 This is the procedure every feature in this repo was built with. Follow it in order; skipping the
 investigation is how wrong shapes and invented behaviour get in.
 
+**Two rules decide how closely to follow Hermes** (AGENTS.md rule 1): the *protocol* the page
+speaks (methods, routes, event shapes) is always ported exactly; the *backend behaviour* (loop,
+tools, review, curator, memory, prompts) is ours and may deviate. A deviation is written in the
+module doc (what and why) and the `PORTING.md` row is marked `diverged`. The plan for the
+deviations in progress is [backend/PHASES.md](backend/PHASES.md).
+
 ## 0. Orient (5 minutes)
 
 - `git log --oneline -15` and `git status`: what changed lately, is the tree clean.

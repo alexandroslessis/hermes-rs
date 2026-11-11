@@ -1,6 +1,6 @@
 //! Full agent turns against a scripted OpenAI-compatible mock server.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,10 +31,72 @@ impl UserBridge for Bridge {
 struct Script {
     replies: Mutex<VecDeque<String>>,
     requests: Arc<Mutex<Vec<Value>>>,
+    /// Requests per `x-hermes-rs-purpose` header value (absent header = `main`).
+    counts: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+/// Why a request was sent; the backend labels each one with the `x-hermes-rs-purpose` header
+/// (Phase 2 of docs/backend/PHASES.md). Until then every request arrives unlabelled and counts
+/// as `Main`, so the per-purpose assertions of later phases start from these numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // the other purposes are used from Phase 2 on
+enum Purpose {
+    Main,
+    Review,
+    Curator,
+    Title,
+    Approval,
+    Compress,
+    Delegate,
+    Btw,
+}
+
+impl Purpose {
+    fn header_value(self) -> &'static str {
+        match self {
+            Purpose::Main => "main",
+            Purpose::Review => "review",
+            Purpose::Curator => "curator",
+            Purpose::Title => "title",
+            Purpose::Approval => "approval",
+            Purpose::Compress => "compress",
+            Purpose::Delegate => "delegate",
+            Purpose::Btw => "btw",
+        }
+    }
+}
+
+/// How many requests of `purpose` the mock has seen so far.
+fn request_count(h: &Harness, purpose: Purpose) -> usize {
+    h.counts
+        .lock()
+        .get(purpose.header_value())
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Asserts the number of requests of `purpose` falls in `range`, e.g. `..=4` or `3..=3`.
+fn assert_requests(h: &Harness, purpose: Purpose, range: impl std::ops::RangeBounds<usize>) {
+    let n = request_count(h, purpose);
+    assert!(
+        range.contains(&n),
+        "{purpose:?} requests: got {n}, expected within {:?}..{:?}",
+        range.start_bound(),
+        range.end_bound()
+    );
 }
 
 impl Respond for Script {
     fn respond(&self, request: &Request) -> ResponseTemplate {
+        // One lock per request, so parallel requests (delegate children, background jobs) can't
+        // lose a count.
+        let purpose = request
+            .headers
+            .get("x-hermes-rs-purpose")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("main")
+            .to_string();
+        *self.counts.lock().entry(purpose).or_insert(0) += 1;
         self.requests.lock().push(request.body_json().unwrap());
         match self.replies.lock().pop_front() {
             Some(body) => ResponseTemplate::new(200)
@@ -106,6 +168,7 @@ struct Harness {
     runtime: Runtime,
     provider: ProviderConfig,
     requests: Arc<Mutex<Vec<Value>>>,
+    counts: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 async fn harness(replies: Vec<String>) -> Harness {
@@ -115,11 +178,13 @@ async fn harness(replies: Vec<String>) -> Harness {
 async fn harness_with(replies: Vec<String>, bridge: Arc<dyn UserBridge>) -> Harness {
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let counts = Arc::new(Mutex::new(HashMap::new()));
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(Script {
             replies: Mutex::new(replies.into()),
             requests: requests.clone(),
+            counts: counts.clone(),
         })
         .mount(&server)
         .await;
@@ -138,6 +203,7 @@ async fn harness_with(replies: Vec<String>, bridge: Arc<dyn UserBridge>) -> Harn
         runtime,
         provider,
         requests,
+        counts,
     }
 }
 
@@ -452,6 +518,7 @@ async fn a_daily_limit_429_ends_the_turn_instead_of_retrying_for_hours() {
             runtime,
             provider,
             requests: requests.clone(),
+            counts: Default::default(),
         },
         &session.id,
         "hello",
@@ -3166,4 +3233,165 @@ async fn a_rewind_waits_for_no_other_windows_turn() {
     );
     drop(held);
     assert!(h.runtime.rewind(&session, 0).unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Request baselines (docs/backend/PHASES.md, Phase 0). Each scenario asserts how many model
+// requests today's backend makes, so later phases show their savings as a change to these
+// numbers. The numbers are what the code does now, not what we'd like it to do; when a phase
+// lowers one, it edits the assertion and the *Baselines* table in the plan.
+// ---------------------------------------------------------------------------------------------
+
+/// S1: read three files, edit one. Four tool rounds, then the answer.
+#[tokio::test]
+async fn baseline_s1_read_three_files_edit_one() {
+    let h = harness(vec![
+        tool_reply(&[("r1", "read_file", json!({"path": "a.txt"}))]),
+        tool_reply(&[("r2", "read_file", json!({"path": "b.txt"}))]),
+        tool_reply(&[("r3", "read_file", json!({"path": "c.txt"}))]),
+        tool_reply(&[(
+            "w1",
+            "write_file",
+            json!({"path": "b.txt", "content": "edited"}),
+        )]),
+        text_reply("Edited b.txt."),
+    ])
+    .await;
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(h.work.path().join(name), format!("contents of {name}")).unwrap();
+    }
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "read a, b and c, then change b").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_requests(&h, Purpose::Main, 5..=5);
+    assert_eq!(h.requests.lock().len(), 5);
+    assert_eq!(
+        std::fs::read_to_string(h.work.path().join("b.txt")).unwrap(),
+        "edited"
+    );
+}
+
+/// S2: after a tool round the model answers with nothing; `EmptyResponseRecovery` nudges it once,
+/// then it answers. (An empty reply with no tool call before it never reaches that op: the
+/// inference step retries it itself, see `baseline_s2b_empty_first_reply_is_retried`.)
+#[tokio::test]
+async fn baseline_s2_empty_reply_then_answer() {
+    let h = harness(vec![
+        tool_reply(&[(
+            "call_1",
+            "write_file",
+            json!({"path": "n.txt", "content": "1"}),
+        )]),
+        finished_text_reply("", "stop"),
+        text_reply("Here is the answer."),
+    ])
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "question").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_requests(&h, Purpose::Main, 3..=3);
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 3);
+    // The third request carries the recovery's nudge, so the op (not a plain retry) ran.
+    let sent = sent_messages(&requests[2]);
+    assert!(
+        sent[sent.len() - 1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("returned an empty response")
+    );
+    assert_eq!(last_text(&h, &session), "Here is the answer.");
+}
+
+/// S2b: the first reply is empty; the inference step's own empty-response retry resends the same
+/// request, then the model answers.
+#[tokio::test]
+async fn baseline_s2b_empty_first_reply_is_retried() {
+    let h = harness(vec![
+        finished_text_reply("", "stop"),
+        text_reply("Here is the answer."),
+    ])
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "question").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_requests(&h, Purpose::Main, 2..=2);
+    assert_eq!(h.requests.lock().len(), 2);
+    assert_eq!(last_text(&h, &session), "Here is the answer.");
+}
+
+/// S3: a tool call cut off by the output limit, retried, then the answer.
+#[tokio::test]
+async fn baseline_s3_truncated_tool_call() {
+    let h = harness(vec![
+        raw_tool_reply(
+            "write_file",
+            r#"{"path": "big.txt", "content": "abc"#,
+            "length",
+        ),
+        tool_reply(&[(
+            "call_2",
+            "write_file",
+            json!({"path": "big.txt", "content": "abc"}),
+        )]),
+        text_reply("written"),
+    ])
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "write a big file").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_requests(&h, Purpose::Main, 3..=3);
+    assert_eq!(h.requests.lock().len(), 3);
+}
+
+/// S4: ten one-reply turns; the tenth makes the memory (and skill) counters due, so a background
+/// review runs on top of the ten main requests.
+#[tokio::test]
+async fn baseline_s4_ten_turn_session_with_review() {
+    let mut replies: Vec<String> = (0..10).map(|i| text_reply(&format!("answer {i}"))).collect();
+    replies.push(text_reply("Nothing to save."));
+    let h = harness(replies).await;
+    let session = session_in(&h);
+    for i in 0..10 {
+        let events = run_turn(&h, &session, &format!("question {i}")).await;
+        assert_eq!(finished_status(&events), TurnStatus::Completed);
+    }
+    // The review runs in the background and reports through the bridge only when it saved
+    // something, so wait on the mock's counter, then give a stray extra request time to show up.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while h.requests.lock().len() < 11 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Until Phase 2 labels the review's requests, they count as `main` too: 10 turns + 1 review.
+    assert_requests(&h, Purpose::Main, 11..=11);
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 11);
+    // The eleventh is one combined memory + skill review, not two reviews or a stray turn.
+    let review = sent_messages(&requests[10]);
+    let prompt = review[review.len() - 1]["content"].to_string();
+    assert!(prompt.contains("update two things"), "{prompt}");
+    assert!(prompt.contains("memory and skill management tools"));
+}
+
+/// S5: the parent delegates two children, then answers.
+#[tokio::test]
+async fn baseline_s5_delegate_two_children() {
+    let h = harness(vec![
+        tool_reply(&[(
+            "d1",
+            "delegate_task",
+            json!({"tasks": [{"goal": "count the txt files"}, {"goal": "count the md files"}]}),
+        )]),
+        text_reply("- 3 files"),
+        text_reply("- 1 file"),
+        text_reply("Both children reported."),
+    ])
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "delegate two counts").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    // The parent's two requests and one per child.
+    assert_requests(&h, Purpose::Main, 4..=4);
+    assert_eq!(h.requests.lock().len(), 4);
 }
