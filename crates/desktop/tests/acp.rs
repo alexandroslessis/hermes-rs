@@ -2081,3 +2081,52 @@ async fn an_empty_thread_this_agent_made_is_deleted_when_closed() {
         .await;
     assert!(kept["result"].is_object(), "{kept}");
 }
+
+#[tokio::test]
+async fn t3code_threads_ask_about_everything_so_its_policy_decides() {
+    let mut agent = Agent::start(Vec::new()).await;
+    agent
+        .request(
+            "initialize",
+            json!({"protocolVersion": 2, "clientCapabilities": {},
+                   "clientInfo": {"name": "t3-code", "version": "0.0.0"}}),
+        )
+        .await;
+    let target = work_file(&agent, "t3.txt");
+    agent.model.set_replies(vec![
+        tool_reply(&[(
+            "w1",
+            "write_file",
+            json!({"path": "t3.txt", "content": "x"}),
+        )]),
+        text_reply("ok"),
+    ]);
+    let answer = agent.new_session_answer().await;
+    assert_eq!(
+        answer["result"]["modes"]["currentModeId"], "manual",
+        "{answer}"
+    );
+    let session = answer["result"]["sessionId"].as_str().unwrap().to_string();
+    let prompt = agent
+        .send(
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "write"}]}),
+        )
+        .await;
+    // Even a plain file edit asks: t3code's policy answers it by kind and location.
+    let (id, params) = agent.agent_request("session/request_permission").await;
+    assert_eq!(params["toolCall"]["kind"], "edit");
+    let location = params["toolCall"]["locations"][0]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(location.ends_with("t3.txt"), "{location}");
+    agent
+        .reply(
+            id,
+            json!({"outcome": {"outcome": "selected", "optionId": "allow_once"}}),
+        )
+        .await;
+    agent.response(prompt).await;
+    assert!(target.exists());
+}

@@ -55,6 +55,10 @@ struct Inner {
     forms: bool,
     /// The editor draws terminal cards from `_meta` (Zed's extension).
     terminal_cards: bool,
+    /// The editor applies its own permission policy (t3code: approval required / auto-accept
+    /// edits / full access, answering our permission requests by tool kind): its threads start in
+    /// Manual, so every edit and command reaches that policy.
+    client_decides: bool,
     /// The provider's model list (`model.options` asks the provider over the network, seconds on a
     /// slow one) and when it was fetched: a thread opens with what is cached and gets the full
     /// picker in a `config_option_update` when the list arrives.
@@ -247,6 +251,8 @@ impl AcpServer {
         self.lock().forms = forms;
         self.lock().terminal_cards =
             params["clientCapabilities"]["_meta"]["terminal_output"] == true;
+        let name = client["name"].as_str().unwrap_or_default();
+        self.lock().client_decides = name.starts_with("t3-code") || name.starts_with("t3_code");
         json!({
             "protocolVersion": 1,
             "agentCapabilities": {
@@ -311,6 +317,7 @@ impl AcpServer {
         );
         tracing::info!("new session {id} in {cwd}");
         self.settle_effort(&id).await;
+        self.leave_policy_to_client(&id).await;
         let mut answer = self.controls(&id).await;
         answer["sessionId"] = json!(id);
         Ok(answer)
@@ -372,7 +379,27 @@ impl AcpServer {
             tracing::info!("resumed session {id}: {} rows", rows.len());
         }
         self.settle_effort(id).await;
+        self.leave_policy_to_client(id).await;
         Ok(self.controls(id).await)
+    }
+
+    /// For an editor with its own permission policy (`client_decides`): the thread asks about
+    /// everything (Manual) and the editor's policy answers, allowing, denying or asking the user.
+    async fn leave_policy_to_client(&self, id: &str) {
+        if !self.lock().client_decides {
+            return;
+        }
+        let gateway = self.gateway.clone();
+        let session = id.to_string();
+        let set = tokio::task::spawn_blocking(move || {
+            gateway
+                .runtime
+                .set_approval_mode(&session, hermes_tools::ApprovalMode::Manual)
+        })
+        .await;
+        if !matches!(set, Ok(Ok(()))) {
+            tracing::warn!("{id}: could not leave the permission policy to the editor");
+        }
     }
 
     /// `session/close`: the editor is done with the thread (it closed it): its turn stops and its
@@ -1094,8 +1121,22 @@ impl AcpServer {
         description: &str,
         choices: &[String],
     ) {
-        let request =
+        let mut request =
             permissions::approval_request(session, prompt_id, command, description, choices);
+        // A file edit names its file: an editor's policy (t3code's workspace-write rule) decides
+        // by where the change lands.
+        if description == "file edit" {
+            if let Some((_, path)) = command.split_once(' ') {
+                let cwd = self
+                    .lock()
+                    .sessions
+                    .get(session)
+                    .map(|s| s.cwd.clone())
+                    .unwrap_or_default();
+                request["toolCall"]["locations"] =
+                    json!([{"path": super::tools::absolute(path, &cwd)}]);
+            }
+        }
         let answer = self
             .sender
             .request("session/request_permission", request.clone())
