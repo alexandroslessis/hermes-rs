@@ -601,12 +601,14 @@ impl Runtime {
         let skills = self.skills.clone();
         let approvals = self.approvals.clone();
         let checkpoints = self.checkpoints.clone();
+        let data_dir = self.config.data_dir.clone();
         let web = self.web.clone();
         Arc::new(move |session_id, cwd, scratch_dir| {
             SessionTools::new(SessionToolsConfig {
                 session_id: session_id.to_string(),
                 cwd: cwd.to_path_buf(),
                 home: dirs::home_dir().unwrap_or_default(),
+                data_dir: data_dir.clone(),
                 scratch_dir: scratch_dir.to_path_buf(),
                 shell: shell.clone(),
                 bridge: Arc::new(delegate::ChildBridge),
@@ -652,6 +654,7 @@ impl Runtime {
             session_id: session_id.to_string(),
             cwd: PathBuf::from(&record.cwd),
             home: dirs::home_dir().context("no home directory")?,
+            data_dir: self.config.data_dir.clone(),
             scratch_dir: self.scratch_dir(session_id),
             shell: self.config.shell.clone(),
             bridge: self.bridge.clone(),

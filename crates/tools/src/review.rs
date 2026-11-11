@@ -293,6 +293,7 @@ mod tests {
             session_id: "ses_test".into(),
             cwd: dir.path().to_path_buf(),
             home: dir.path().to_path_buf(),
+            data_dir: dir.path().join(".data"),
             scratch_dir: dir.path().join(".scratch"),
             shell: crate::detect_shell(),
             bridge: Arc::new(crate::tests::TestBridge::default()),

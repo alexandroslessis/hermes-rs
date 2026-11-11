@@ -176,6 +176,17 @@ async fn harness(replies: Vec<String>) -> Harness {
 }
 
 async fn harness_with(replies: Vec<String>, bridge: Arc<dyn UserBridge>) -> Harness {
+    harness_for_data(|_| replies, bridge).await
+}
+
+/// Like `harness_with`, for replies that name a path inside the data folder (made first).
+async fn harness_for_data(
+    replies: impl FnOnce(&Path) -> Vec<String>,
+    bridge: Arc<dyn UserBridge>,
+) -> Harness {
+    let data = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let replies = replies(data.path());
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
     let counts = Arc::new(Mutex::new(HashMap::new()));
@@ -188,8 +199,6 @@ async fn harness_with(replies: Vec<String>, bridge: Arc<dyn UserBridge>) -> Harn
         })
         .mount(&server)
         .await;
-    let data = tempfile::tempdir().unwrap();
-    let work = tempfile::tempdir().unwrap();
     let runtime = runtime_with(data.path(), bridge);
     let provider = ProviderConfig {
         id: "mock".into(),
@@ -3348,7 +3357,9 @@ async fn baseline_s3_truncated_tool_call() {
 /// review runs on top of the ten main requests.
 #[tokio::test]
 async fn baseline_s4_ten_turn_session_with_review() {
-    let mut replies: Vec<String> = (0..10).map(|i| text_reply(&format!("answer {i}"))).collect();
+    let mut replies: Vec<String> = (0..10)
+        .map(|i| text_reply(&format!("answer {i}")))
+        .collect();
     replies.push(text_reply("Nothing to save."));
     let h = harness(replies).await;
     let session = session_in(&h);
@@ -3394,4 +3405,70 @@ async fn baseline_s5_delegate_two_children() {
     // The parent's two requests and one per child.
     assert_requests(&h, Purpose::Main, 4..=4);
     assert_eq!(h.requests.lock().len(), 4);
+}
+
+#[tokio::test]
+async fn writing_into_the_app_data_folder_is_refused_and_the_file_is_unchanged() {
+    let h = harness_for_data(
+        |data| {
+            let config = data.join("desktop-config.json");
+            std::fs::write(&config, "{\"keep\": true}").unwrap();
+            vec![
+                tool_reply(&[(
+                    "w1",
+                    "write_file",
+                    json!({"path": config.display().to_string(), "content": "{}"}),
+                )]),
+                text_reply("I couldn't change it."),
+            ]
+        },
+        Arc::new(Bridge),
+    )
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "overwrite the app config").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    // The model's second request carries the denial as the tool result.
+    let second = h.requests.lock()[1].to_string();
+    assert!(second.contains("data folder"), "{second}");
+    assert_eq!(
+        std::fs::read_to_string(h.data.path().join("desktop-config.json")).unwrap(),
+        "{\"keep\": true}"
+    );
+}
+
+#[tokio::test]
+async fn a_declined_git_hook_write_asks_even_in_yolo_and_takes_no_checkpoint() {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let h = harness_with(
+        vec![
+            tool_reply(&[(
+                "w1",
+                "write_file",
+                json!({"path": ".git/hooks/pre-commit", "content": "evil"}),
+            )]),
+            text_reply("Not written."),
+        ],
+        Arc::new(ApproveBridge {
+            choice: hermes_tools::approval::ApprovalChoice::Deny,
+            asked: asked.clone(),
+        }),
+    )
+    .await;
+    std::fs::write(h.work.path().join("Cargo.toml"), "[package]").unwrap();
+    h.runtime.checkpoints().set_enabled(true);
+    let session = session_in(&h);
+    h.runtime
+        .set_approval_mode(&session, hermes_tools::ApprovalMode::Yolo)
+        .unwrap();
+    let events = run_turn(&h, &session, "add a pre-commit hook").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert!(
+        asked.lock()[0].contains("runs code later"),
+        "{:?}",
+        asked.lock()
+    );
+    assert!(!h.work.path().join(".git/hooks/pre-commit").exists());
+    // The policy runs before the checkpoint: a declined edit snapshots nothing.
+    assert!(h.runtime.checkpoints().list(h.work.path()).is_empty());
 }

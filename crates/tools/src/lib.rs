@@ -13,6 +13,7 @@ mod files;
 mod hints;
 mod job;
 pub mod lint;
+mod path_policy;
 mod paths;
 mod process;
 mod recall;
@@ -96,6 +97,8 @@ pub struct SessionToolsConfig {
     pub session_id: String,
     pub cwd: PathBuf,
     pub home: PathBuf,
+    /// The app's data folder (`HERMES_RS_HOME`): the path policy keeps file tools out of it.
+    pub data_dir: PathBuf,
     /// Per-session scratch space; also where truncated terminal output is saved in full.
     pub scratch_dir: PathBuf,
     pub shell: ShellKind,
@@ -119,6 +122,7 @@ pub struct SessionToolsConfig {
 pub struct SessionTools {
     session_id: String,
     home: PathBuf,
+    data_dir: PathBuf,
     scratch_dir: PathBuf,
     bridge: Arc<dyn UserBridge>,
     shell: shell::ShellSession,
@@ -157,6 +161,7 @@ impl SessionTools {
             todos: todo::TodoList::new(config.todos),
             session_id: config.session_id,
             home: config.home,
+            data_dir: config.data_dir,
             scratch_dir: config.scratch_dir,
             bridge: config.bridge,
             memory: config.memory,
@@ -361,6 +366,21 @@ impl SessionTools {
         args: Value,
         live: Option<(&str, &Emitter)>,
     ) -> ToolOutput {
+        if matches!(name, "write_file" | "patch") {
+            if let Err(refused) = self.check_edit(name, &args).await {
+                return refused;
+            }
+        }
+        self.dispatch_checked(name, args, live).await
+    }
+
+    /// [`Self::dispatch`] for a call whose edit check (`check_edit`) has already passed.
+    async fn dispatch_checked(
+        &self,
+        name: &str,
+        args: Value,
+        live: Option<(&str, &Emitter)>,
+    ) -> ToolOutput {
         let read_path = (name == "read_file")
             .then(|| {
                 args.get("path")
@@ -414,11 +434,6 @@ impl SessionTools {
         args: Value,
         live: Option<(&str, &Emitter)>,
     ) -> ToolOutput {
-        if matches!(name, "write_file" | "patch") {
-            if let Err(refused) = self.check_edit(name, &args).await {
-                return refused;
-            }
-        }
         match name {
             "read_file" => files::read_file(self, args).await,
             "write_file" => files::write_file(self, args).await,
@@ -574,19 +589,52 @@ impl SessionTools {
         }
     }
 
-    /// The mode's say over a file edit (`write_file`, `patch`): Plan refuses it (except a plan
-    /// saved under `.hermes/plans/`), Manual asks, the others let it through. `Err` is the result
-    /// the model gets instead.
+    /// What may happen to a file edit (`write_file`, `patch`), by where the path points
+    /// ([`path_policy`]) and the mode. `Err` is the result the model gets instead.
+    ///
+    /// - the app's data folder and the skills/memory folders are refused in every mode (the model
+    ///   is pointed at the tool that may write there);
+    /// - Plan refuses everything except a plan saved under `.hermes/plans/`;
+    /// - persistence places (startup folders, shell profiles, git hooks, `~/.ssh`...) always ask,
+    ///   even in Yolo;
+    /// - Manual asks for every edit; AcceptEdits and Auto ask for edits outside the workspace;
+    ///   Yolo lets those through.
     async fn check_edit(&self, name: &str, args: &Value) -> Result<(), ToolOutput> {
+        use path_policy::PathClass;
         let mode = self.mode();
-        if !matches!(mode, ApprovalMode::Plan | ApprovalMode::Manual) {
-            return Ok(());
-        }
         let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+        let resolved = self.resolve(path);
+        let ctx = path_policy::PolicyContext::new(
+            self.cwd(),
+            self.scratch_dir.clone(),
+            self.data_dir.clone(),
+            self.home.clone(),
+        );
+        // `classify` canonicalizes several folders (file-system calls): off the async workers.
+        let target = resolved.clone();
+        let class = tokio::task::spawn_blocking(move || path_policy::classify(&target, &ctx))
+            .await
+            .unwrap_or(PathClass::Persistence);
+        match class {
+            PathClass::AppData => {
+                return Err(ToolOutput::error(format!(
+                    "Refused: {path} is inside the app's own data folder (settings, history, \
+                     approvals), which file tools never change. Ask the user to change the \
+                     setting in the app instead."
+                )));
+            }
+            PathClass::SelfImprove => {
+                return Err(ToolOutput::error(format!(
+                    "Refused: {path} is inside the skills or memory folder. Change skills with \
+                     skill_manage and memory with the memory tool, which check what is saved."
+                )));
+            }
+            _ => {}
+        }
         if mode == ApprovalMode::Plan {
             // Resolved and `..`-free before the check: `.hermes/plans/../../src/x` is not a plan.
             let plans = lexical(&self.cwd().join(".hermes").join("plans"));
-            if is_within(&lexical(&self.resolve(path)), &plans) {
+            if is_within(&lexical(&resolved), &plans) {
                 return Ok(());
             }
             return Err(ToolOutput::error(
@@ -595,9 +643,24 @@ impl SessionTools {
                  making the changes.",
             ));
         }
+        let description = match class {
+            PathClass::Persistence => Some(
+                "edit a file that runs code later (startup folder, shell profile, git hook, ssh)",
+            ),
+            _ if mode == ApprovalMode::Manual => Some("file edit"),
+            PathClass::Outside
+                if matches!(mode, ApprovalMode::AcceptEdits | ApprovalMode::Auto) =>
+            {
+                Some("edit a file outside the working folder")
+            }
+            _ => None,
+        };
+        let Some(description) = description else {
+            return Ok(());
+        };
         let request = approval::CommandApproval {
             command: format!("{name} {path}"),
-            description: "file edit".to_string(),
+            description: description.to_string(),
             once_only: true,
         };
         match tokio::time::timeout(
@@ -730,6 +793,7 @@ pub(crate) mod tests {
             session_id: "ses_test".into(),
             cwd: dir.path().to_path_buf(),
             home: dir.path().to_path_buf(),
+            data_dir: dir.path().join(".data"),
             scratch_dir: dir.path().join(".scratch"),
             shell: detect_shell(),
             bridge,
@@ -746,6 +810,177 @@ pub(crate) mod tests {
 
     pub fn tools_in() -> (tempfile::TempDir, SessionTools) {
         tools_with_bridge(Arc::new(TestBridge::default()))
+    }
+
+    /// Answers every approval with `answer` and remembers what was asked.
+    struct AskBridge {
+        answer: approval::ApprovalChoice,
+        asked: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl AskBridge {
+        fn new(answer: approval::ApprovalChoice) -> Arc<Self> {
+            Arc::new(Self {
+                answer,
+                asked: Default::default(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl UserBridge for AskBridge {
+        async fn clarify(&self, _session_id: &str, _request: ClarifyRequest) -> ClarifyOutcome {
+            ClarifyOutcome::Undelivered
+        }
+        fn process_finished(&self, _session_id: &str, _notice: ProcessNotice) {}
+        async fn approve_command(
+            &self,
+            _session_id: &str,
+            request: approval::CommandApproval,
+        ) -> approval::ApprovalChoice {
+            self.asked.lock().push(request.description);
+            self.answer
+        }
+    }
+
+    const ALL_MODES: [ApprovalMode; 4] = [
+        ApprovalMode::Manual,
+        ApprovalMode::AcceptEdits,
+        ApprovalMode::Auto,
+        ApprovalMode::Yolo,
+    ];
+
+    async fn write(tools: &SessionTools, path: &str) -> ToolOutput {
+        tools
+            .dispatch("write_file", json!({"path": path, "content": "x"}), None)
+            .await
+    }
+
+    #[tokio::test]
+    async fn the_data_folder_and_skills_and_memories_are_refused_in_every_mode() {
+        for mode in ALL_MODES {
+            let bridge = AskBridge::new(approval::ApprovalChoice::Once);
+            let (dir, tools) = tools_with_bridge(bridge.clone());
+            tools.set_mode(mode);
+            let data = dir.path().join(".data");
+            let refused = write(&tools, ".data/desktop-config.json").await;
+            assert!(refused.is_error, "{mode:?}");
+            assert!(
+                refused.value["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("data folder")
+            );
+            let refused = write(&tools, ".data/skills/x/SKILL.md").await;
+            assert!(
+                refused.value["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("skill_manage")
+            );
+            let refused = write(&tools, ".data/memories/MEMORY.md").await;
+            assert!(
+                refused.value["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("memory tool")
+            );
+            assert!(!data.exists(), "{mode:?}: nothing may be written");
+            // Refused outright: the user is not even asked.
+            assert!(bridge.asked.lock().is_empty(), "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn persistence_places_ask_even_in_yolo_and_stay_unwritten_when_denied() {
+        for mode in ALL_MODES {
+            let denied = AskBridge::new(approval::ApprovalChoice::Deny);
+            let (dir, tools) = tools_with_bridge(denied.clone());
+            tools.set_mode(mode);
+            let result = write(&tools, ".git/hooks/pre-commit").await;
+            assert!(result.is_error, "{mode:?}");
+            assert!(!dir.path().join(".git/hooks/pre-commit").exists());
+            assert!(
+                denied.asked.lock()[0].contains("runs code later"),
+                "{mode:?}"
+            );
+
+            let allowed = AskBridge::new(approval::ApprovalChoice::Once);
+            let (dir, tools) = tools_with_bridge(allowed.clone());
+            tools.set_mode(mode);
+            let result = write(&tools, ".git/hooks/pre-commit").await;
+            assert!(!result.is_error, "{mode:?}: {:?}", result.value);
+            assert!(dir.path().join(".git/hooks/pre-commit").exists());
+            assert_eq!(allowed.asked.lock().len(), 1, "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn edits_outside_the_workspace_ask_except_in_yolo() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        for (mode, asks) in [
+            (ApprovalMode::AcceptEdits, true),
+            (ApprovalMode::Auto, true),
+            (ApprovalMode::Manual, true),
+            (ApprovalMode::Yolo, false),
+        ] {
+            let bridge = AskBridge::new(approval::ApprovalChoice::Once);
+            let (_dir, tools) = tools_with_bridge(bridge.clone());
+            tools.set_mode(mode);
+            let target = elsewhere
+                .path()
+                .join(format!("{mode:?}.txt"))
+                .display()
+                .to_string();
+            let result = write(&tools, &target).await;
+            assert!(!result.is_error, "{mode:?}: {:?}", result.value);
+            assert_eq!(bridge.asked.lock().len(), usize::from(asks), "{mode:?}");
+        }
+        // Declined, the file is not written.
+        let bridge = AskBridge::new(approval::ApprovalChoice::Deny);
+        let (_dir, tools) = tools_with_bridge(bridge);
+        tools.set_mode(ApprovalMode::AcceptEdits);
+        let other = elsewhere.path().join("declined.txt");
+        assert!(write(&tools, &other.display().to_string()).await.is_error);
+        assert!(!other.exists());
+    }
+
+    #[tokio::test]
+    async fn workspace_and_scratch_edits_do_not_ask_outside_manual_mode() {
+        for mode in [
+            ApprovalMode::AcceptEdits,
+            ApprovalMode::Auto,
+            ApprovalMode::Yolo,
+        ] {
+            let bridge = AskBridge::new(approval::ApprovalChoice::Deny);
+            let (dir, tools) = tools_with_bridge(bridge.clone());
+            tools.set_mode(mode);
+            let result = write(&tools, "src/lib.rs").await;
+            assert!(!result.is_error, "{mode:?}: {:?}", result.value);
+            assert!(dir.path().join("src/lib.rs").exists());
+            let scratch = tools.scratch_dir().join("note.txt").display().to_string();
+            assert!(!write(&tools, &scratch).await.is_error);
+            assert!(bridge.asked.lock().is_empty(), "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_is_checked_like_write_file() {
+        let (dir, tools) = tools_in();
+        std::fs::create_dir_all(dir.path().join(".data")).unwrap();
+        std::fs::write(dir.path().join(".data/desktop-config.json"), "a").unwrap();
+        let result = tools
+            .dispatch(
+                "patch",
+                json!({"path": ".data/desktop-config.json", "old_string": "a", "new_string": "b"}),
+                None,
+            )
+            .await;
+        assert!(result.is_error);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".data/desktop-config.json")).unwrap(),
+            "a"
+        );
     }
 
     #[tokio::test]
@@ -806,9 +1041,16 @@ impl<S: Send + Sync + 'static> ToolProvider<S> for SessionTools {
         if call.name == "vision_analyze" {
             return Ok(self.vision_analyze(&args).await);
         }
+        // The path policy first: a refused or declined edit must not snapshot the folder it aimed
+        // at (that would copy the data folder or `~/.ssh` into the checkpoint store).
+        if matches!(call.name.as_ref(), "write_file" | "patch")
+            && let Err(refused) = self.check_edit(&call.name, &args).await
+        {
+            return Ok(refused.into_result());
+        }
         let written = self.checkpoint_before(&call.name, &args);
         let mut result = self
-            .dispatch(&call.name, args.clone(), Some((request_id, emit)))
+            .dispatch_checked(&call.name, args.clone(), Some((request_id, emit)))
             .await
             .into_result();
         if let (Some(path), Some(checkpoints)) = (written, &self.checkpoints)

@@ -133,6 +133,7 @@ impl Runtime {
             session_id: "curator".into(),
             cwd: skills_root.clone(),
             home: dirs::home_dir().context("no home directory")?,
+            data_dir: self.config.data_dir.clone(),
             scratch_dir: scratch.clone(),
             shell: self.config.shell.clone(),
             bridge: self.bridge.clone(),
