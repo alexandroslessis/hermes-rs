@@ -349,6 +349,16 @@ effort selector works; modes (Auto, Manual, Accept edits, Plan, YOLO: the sessio
 
 ---
 
+## After the review (2026-11-11)
+
+✅ Fixed: rewinds take the thread's lock; subagents inherit the mode; the Plan exception compares
+resolved paths; Manual/Plan cards are once-or-deny; the effort shown is the effort sent; store
+reads in the ACP server go through `spawn_blocking`; the subagent log keeps its last 100 lines; the
+model list is refetched on every open; the flaky budget test (a background review's request) is
+fixed. Added: `session/close`, `session/resume`, live terminal output into the terminal card.
+
+---
+
 ## Phase 6 — t3code (later; t3code isn't installed yet)
 
 t3code (pingdotgg/t3code) is a GUI for coding agents. As of 2026-11 its ACP support was a draft

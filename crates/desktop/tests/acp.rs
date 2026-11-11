@@ -1540,14 +1540,18 @@ async fn an_editor_with_terminal_cards_gets_the_command_output_in_one() {
     assert_eq!(started["content"][0]["type"], "terminal");
     assert_eq!(started["content"][0]["terminalId"], "t1");
     let finished = agent.updates_of(&session, "tool_call_update");
-    let last = finished.last().unwrap();
-    assert!(
-        last["_meta"]["terminal_output"]["data"]
-            .as_str()
-            .unwrap()
-            .contains("card-output"),
-        "{last}"
-    );
+    let card: Vec<&Value> = finished
+        .iter()
+        .filter(|u| u["toolCallId"] == "t1")
+        .collect();
+    // The output, live while it runs and whatever is left at the end: all of it, once.
+    let streamed: String = card
+        .iter()
+        .filter_map(|u| u["_meta"]["terminal_output"]["data"].as_str())
+        .collect();
+    assert_eq!(streamed.matches("card-output").count(), 1, "{card:?}");
+    let last = card.last().unwrap();
+    assert_eq!(last["status"], "completed", "{last}");
     assert_eq!(last["_meta"]["terminal_exit"]["exit_code"], 0);
 }
 
@@ -1854,4 +1858,166 @@ async fn two_agent_processes_share_threads_and_continue_each_others() {
     for wanted in ["from window one", "from window two", "back in window one"] {
         assert!(last.contains(wanted), "{wanted} missing from {last}");
     }
+}
+
+// ---- Review fixes: modes, effort, close, resume ----
+
+#[tokio::test]
+async fn plan_mode_allows_a_plan_file_but_not_an_escape_from_the_plans_folder() {
+    let (mut agent, session) = Agent::with_session(Vec::new()).await;
+    let escape = work_file(&agent, "escaped.txt");
+    let plan = agent.work.path().join(".hermes").join("plans").join("p.md");
+    agent.model.set_replies(vec![
+        tool_reply(&[(
+            "w1",
+            "write_file",
+            json!({"path": ".hermes/plans/../../escaped.txt", "content": "x"}),
+        )]),
+        tool_reply(&[(
+            "w2",
+            "write_file",
+            json!({"path": ".hermes/plans/p.md", "content": "# plan"}),
+        )]),
+        text_reply("Planned."),
+    ]);
+    agent
+        .request(
+            "session/set_mode",
+            json!({"sessionId": session, "modeId": "plan"}),
+        )
+        .await;
+    agent.prompt(&session, "plan it").await;
+    assert!(!escape.exists(), "the escape was written");
+    assert_eq!(std::fs::read_to_string(&plan).unwrap(), "# plan");
+}
+
+#[tokio::test]
+async fn a_subagent_keeps_the_threads_plan_mode() {
+    let (mut agent, session) = Agent::with_session(Vec::new()).await;
+    let target = work_file(&agent, "by-the-child.txt");
+    agent.model.set_replies(vec![
+        tool_reply(&[(
+            "d1",
+            "delegate_task",
+            json!({"tasks": [{"goal": "write the file"}]}),
+        )]),
+        tool_reply(&[(
+            "c1",
+            "write_file",
+            json!({"path": target.display().to_string(), "content": "x"}),
+        )]),
+        text_reply("I could not write it."),
+        text_reply("Done."),
+    ]);
+    agent
+        .request(
+            "session/set_mode",
+            json!({"sessionId": session, "modeId": "plan"}),
+        )
+        .await;
+    agent.prompt(&session, "delegate the write").await;
+    assert!(!target.exists(), "a subagent wrote in Plan mode");
+}
+
+#[tokio::test]
+async fn manual_mode_cards_offer_once_or_deny_only() {
+    let (mut agent, session) = Agent::with_session(Vec::new()).await;
+    let target = work_file(&agent, "once.txt");
+    agent.model.set_replies(vec![
+        tool_reply(&[(
+            "w1",
+            "write_file",
+            json!({"path": target.display().to_string(), "content": "x"}),
+        )]),
+        text_reply("ok"),
+    ]);
+    agent
+        .request(
+            "session/set_mode",
+            json!({"sessionId": session, "modeId": "manual"}),
+        )
+        .await;
+    let prompt = agent
+        .send(
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "write"}]}),
+        )
+        .await;
+    let (id, params) = agent.agent_request("session/request_permission").await;
+    let ids: Vec<&str> = params["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["optionId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["allow_once", "deny"], "{params}");
+    agent
+        .reply(
+            id,
+            json!({"outcome": {"outcome": "selected", "optionId": "deny"}}),
+        )
+        .await;
+    agent.response(prompt).await;
+}
+
+#[tokio::test]
+async fn the_effort_shown_is_the_effort_sent() {
+    let (mut agent, session) = Agent::with_session(vec![text_reply("ok")]).await;
+    agent.prompt(&session, "hi").await;
+    // The picker said Medium (nothing picked, nothing in Settings): the request says it too.
+    assert_eq!(agent.model.requests()[0]["reasoning_effort"], "medium");
+}
+
+#[tokio::test]
+async fn closing_a_session_ends_its_turn_and_it_can_be_loaded_again() {
+    let (mut agent, session) =
+        Agent::with_session(vec![text_reply("first"), text_reply("again")]).await;
+    let caps = agent
+        .request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let session_caps = &caps["result"]["agentCapabilities"]["sessionCapabilities"];
+    assert!(
+        session_caps["close"].is_object() && session_caps["resume"].is_object(),
+        "{caps}"
+    );
+    agent.prompt(&session, "hello").await;
+    let closed = agent
+        .request("session/close", json!({"sessionId": session}))
+        .await;
+    assert!(closed["result"].is_object(), "{closed}");
+    let cwd = agent.work.path().display().to_string();
+    let loaded = agent
+        .request(
+            "session/load",
+            json!({"sessionId": session, "cwd": cwd, "mcpServers": []}),
+        )
+        .await;
+    assert!(loaded["result"].is_object(), "{loaded}");
+    let answer = agent.prompt(&session, "still there?").await;
+    assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
+    let last = agent.model.requests().last().unwrap().to_string();
+    assert!(last.contains("hello"), "{last}");
+}
+
+#[tokio::test]
+async fn resume_reopens_a_thread_without_replaying_it() {
+    let (mut first, session) = Agent::with_session(vec![text_reply("A1"), text_reply("B2")]).await;
+    first.prompt(&session, "remember the word kiwi").await;
+    let cwd = first.work.path().display().to_string();
+    let mut second = Agent::sharing(&first).await;
+    second.initialize(json!({})).await;
+    let resumed = second
+        .request(
+            "session/resume",
+            json!({"sessionId": session, "cwd": cwd, "mcpServers": []}),
+        )
+        .await;
+    assert!(resumed["result"]["configOptions"].is_array(), "{resumed}");
+    assert!(
+        second.updates_of(&session, "user_message_chunk").is_empty(),
+        "resume must not replay the history"
+    );
+    second.prompt(&session, "which word?").await;
+    let last = first.model.requests().last().unwrap().to_string();
+    assert!(last.contains("kiwi"), "{last}");
 }

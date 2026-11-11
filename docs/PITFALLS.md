@@ -16,16 +16,28 @@ processes):
   `<data>/running/<session id>.lock` open without sharing while a turn runs; the other window's
   turn is refused with a readable error. Don't "fix" it with a pid file: the OS closing the handle
   when a process dies is what keeps a crash from leaving the thread locked.
+- **Rewinds take the thread's lock too** (`Runtime::rewind`): `/undo`, `/retry`, the page's edit
+  and resend all rewrite rows, so they are refused while another window runs a turn on the thread.
 - **Message rows are keyed by position** (`upsert_message(session, seq, …)`): a process writing
   from a conversation that is behind the store overwrites the other's rows. `reload_if_stale`
   compares count and last message id at turn start, `/compress`, `messages()` and `rewind()`;
   any new write path on a cached conversation must do the same.
 
 ACP mode (`--acp`, [docs/acp/](acp/README.md)):
+- **The effort picker shows what is sent** (`settle_effort`): a thread with nothing picked gets
+  Settings' effort, else medium, picked for it when it opens. (The page still sends nothing for an
+  unpicked effort.) A model that rejects `reasoning_effort` needs a provider that drops it.
+- **Live terminal output** (`translate.rs` `tool_progress`): `tool.progress` carries the output's
+  *tail* (a sliding window), Zed's `terminal_output` *appends*, so only the new part is sent
+  (`new_part` lines the old tail up in the new one; overlapping matches count, the last one wins),
+  and the end sends what the last progress hadn't. Line ends go out as `\r\n` for the terminal.
+- **`session/close`** stops the thread's turn, shell and processes (`Runtime::close`); the thread
+  stays loadable. **`session/resume`** is `session/load` without the replay (Zed still shows it).
 - **`session/new` and `session/load` must not wait on the network.** The editor blocks on their
   answer, and `model.options` asks the provider for its model list (seconds: it made a thread take
   ~3 s to open in Zed). `AcpServer::controls` is instant (cached list, else the thread's own model);
-  `refresh_model_options` fetches in the background and sends a `config_option_update`. Time it with
+  `refresh_model_options` fetches in the background on every open and sends a
+  `config_option_update` when the list changed (so a provider added in Settings appears). Time it with
   `scripts/acp/acp-probe.mjs` (the ms column) on a copy of the real `config.json`.
 - **Zed shows only what the agent lists.** Modes must also be a config option (`category: "mode"`,
   `controls::mode_option`), or Zed shows no mode selector; a slash command must be in
@@ -34,6 +46,13 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **PowerShell tables were padded to 4096 columns** (`Out-String -Width 4096`, there so long lines
   aren't cut): each line is `TrimEnd`ed in `run_powershell`. A command that doesn't parse (`&&` in
   Windows PowerShell 5.1) prints nothing on stdout; its CLIXML stderr is turned into the result.
+- **A subagent inherits its thread's mode** (`delegate.rs` `run_child` → `set_mode`); it can't
+  ask (`ChildBridge` denies), so in Manual or Plan what would ask is refused. Without this, Plan
+  mode was escaped by delegating.
+- **Plan mode's `.hermes/plans/` exception compares resolved, `..`-free paths** (`lexical`,
+  `is_within` in `tools/src/lib.rs`): a substring check let `.hermes/plans/../../src/x` through.
+- **Cards in Manual / Plan offer "Allow once" and "Deny" only** (`CommandApproval::once_only`,
+  the hub's `choices`): those modes ask every time, so "for session" / "always" meant nothing.
 - **Modes are `hermes_tools::ApprovalMode`, per session** (`SessionTools::mode`; none picked →
   follows Settings' `approvals.mode`). `check_command` asks for every command in Manual/Plan;
   `check_edit` (write_file/patch) asks in Manual and refuses in Plan.

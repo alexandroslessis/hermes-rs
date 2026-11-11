@@ -749,6 +749,10 @@ impl Runtime {
         if open.running.lock().is_some() {
             anyhow::bail!("a turn is running in this session");
         }
+        // Not under another window's running turn either: rows are keyed by position, so cutting
+        // them while it appends would leave a mix of both.
+        let _lock = turnlock::TurnLock::acquire(&self.config.data_dir, session_id)?;
+        self.reload_if_stale(&open, session_id);
         let conversation = {
             let mut conversation = open.conversation.lock();
             conversation.messages_mut().truncate(keep);

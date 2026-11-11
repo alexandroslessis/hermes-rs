@@ -2206,6 +2206,14 @@ impl Gateway {
         *revision
     }
 
+    /// The effort picked for this session, if any (not Settings' default).
+    pub(crate) fn picked_effort(&self, id: &str) -> Option<String> {
+        self.efforts
+            .lock()
+            .ok()
+            .and_then(|efforts| efforts.get(id).cloned())
+    }
+
     /// The session's reasoning effort: picked in the composer, else Settings' default.
     pub(crate) fn effort(&self, id: &str) -> String {
         self.efforts

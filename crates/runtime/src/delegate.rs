@@ -475,6 +475,9 @@ impl Delegator {
         ));
         tools.begin_turn();
         tools.set_vision(self.supports_vision);
+        // The thread's mode holds for its subagents: Plan and Manual must not be escaped by
+        // delegating (a child can't ask, so what would ask is refused), YOLO carries over.
+        tools.set_mode(self.parent.tools.mode());
         let mut record = self.parent.record.lock().clone();
         record.system_prompt = format!(
             "{base_prompt}\n\n{}",

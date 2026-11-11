@@ -517,17 +517,19 @@ impl SessionTools {
                 json!({"output": "", "exit_code": -1, "status": "blocked"}),
             )
         };
-        let request = match gate {
+        let mut request = match gate {
             approval::Gate::Run { approved } if !always_ask => return Ok(approved),
             approval::Gate::Run { .. } => approval::CommandApproval {
                 command: command.to_string(),
                 description: approval::dangerous(command)
                     .unwrap_or("run a command")
                     .to_string(),
+                once_only: true,
             },
             approval::Gate::Blocked(message) => return Err(blocked(message)),
             approval::Gate::Ask(request) => request,
         };
+        request.once_only = always_ask;
         let key = request.description.clone();
         if mode == ApprovalMode::Yolo {
             return Ok(None);
@@ -581,9 +583,10 @@ impl SessionTools {
             return Ok(());
         }
         let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
-        let normal = path.replace('\\', "/");
         if mode == ApprovalMode::Plan {
-            if normal.contains("/.hermes/plans/") || normal.starts_with(".hermes/plans/") {
+            // Resolved and `..`-free before the check: `.hermes/plans/../../src/x` is not a plan.
+            let plans = lexical(&self.cwd().join(".hermes").join("plans"));
+            if is_within(&lexical(&self.resolve(path)), &plans) {
                 return Ok(());
             }
             return Err(ToolOutput::error(
@@ -595,6 +598,7 @@ impl SessionTools {
         let request = approval::CommandApproval {
             command: format!("{name} {path}"),
             description: "file edit".to_string(),
+            once_only: true,
         };
         match tokio::time::timeout(
             APPROVAL_TIMEOUT,
@@ -623,6 +627,28 @@ impl SessionTools {
             is_error: failed,
         }
     }
+}
+
+/// `path` with `.` and `..` folded away, without touching the disk (the file may not exist yet).
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether `path` is `dir` or inside it, ignoring case and slash style (Windows paths).
+fn is_within(path: &Path, dir: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").to_lowercase();
+    let (path, dir) = (norm(path), norm(dir));
+    path == dir || path.starts_with(&format!("{}/", dir.trim_end_matches('/')))
 }
 
 /// A tool result: JSON shown to the model, flagged as an error when the call failed.

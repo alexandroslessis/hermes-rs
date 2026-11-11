@@ -226,10 +226,15 @@ impl UserBridge for DesktopBridge {
     }
 
     async fn approve_command(&self, session_id: &str, request: CommandApproval) -> ApprovalChoice {
+        let choices: &[&str] = if request.once_only {
+            &["once", "deny"]
+        } else {
+            &APPROVAL_CHOICES
+        };
         let payload = json!({
             "command": request.command,
             "description": request.description,
-            "choices": APPROVAL_CHOICES,
+            "choices": choices,
         });
         // No page to ask (or the card was dropped): deny, as Hermes does when nobody answers.
         match self
@@ -277,6 +282,7 @@ mod tests {
                     CommandApproval {
                         command: "rm -rf build".into(),
                         description: "recursive delete".into(),
+                        once_only: false,
                     },
                 )
                 .await
@@ -310,6 +316,7 @@ mod tests {
         let request = CommandApproval {
             command: "x".into(),
             description: "y".into(),
+            once_only: false,
         };
         assert!(matches!(
             bridge.approve_command("none", request).await,

@@ -65,7 +65,7 @@ We answer:
     "loadSession":true,
     "promptCapabilities":{"image":true,"audio":false,"embeddedContext":true},
     "mcpCapabilities":{"http":false,"sse":false},
-    "sessionCapabilities":{"list":{}}
+    "sessionCapabilities":{"list":{},"close":{},"resume":{}}
   },
   "agentInfo":{"name":"hermes-rs","title":"Hermes (rs)","version":"<CARGO_PKG_VERSION>"},
   "authMethods":[]}}

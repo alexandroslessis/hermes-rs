@@ -108,6 +108,21 @@ relevant part of `dev: open acp logs`.
 4. Ask for a long command (`Run ping -n 60 127.0.0.1`) and quit Zed while it runs → no leftover
    `ping.exe` or `hermes-acp.exe` in Task Manager a few seconds later.
 
+### Review fixes (2026-11-11)
+1. Ask for a long command (`Run ping -n 8 127.0.0.1`) → the terminal card fills line by line while
+   it runs, nothing repeated at the end.
+2. Plan mode: ask it to write `.hermes/plans/../../escape.txt` → refused; `.hermes/plans/p.md` →
+   written. Plan mode + `Use a subagent to create test.txt` → the file is not created.
+3. Manual mode: a file edit's card offers only Allow once and Deny.
+4. A new thread's effort shows Medium (or your Settings effort) and that is what is sent: switch a
+   reasoning model between Off and High and see the thinking appear or not.
+5. Close a thread tab in Zed while it runs `ping -n 60 127.0.0.1` → no `ping.exe` left behind; the
+   thread opens again from the history.
+6. Restart Zed with a Hermes thread open → it comes back and continues (Zed may resume it
+   without replaying); opening an old thread from the history still shows its messages.
+7. While the desktop app runs a turn on a thread, `/undo` in Zed on that thread → refused
+   ("another Hermes window").
+
 ### Undo / retry (instead of editing an old prompt, which Zed 1.27 only offers its own agent)
 1. Send two prompts, then `/undo` → the agent says it undid 1 turn and shows the removed prompt;
    Zed still shows the old messages. Send a third prompt → the agent answers as if the second

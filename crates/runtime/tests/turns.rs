@@ -967,7 +967,10 @@ async fn an_exhausted_budget_ends_with_a_toolless_summary() {
     let events = run_turn(&h, &session, "write many files").await;
     assert_eq!(finished_status(&events), TurnStatus::Completed);
     let requests = h.requests.lock().clone();
-    assert_eq!(requests.len(), 21);
+    // 21 model calls pass the skill-review threshold, so a background review may start right after
+    // the turn and add its own request (it used to make this test flaky): the turn's are the first
+    // 21.
+    assert!(requests.len() >= 21, "{}", requests.len());
     assert!(
         requests[19]["tools"]
             .as_array()
@@ -3139,4 +3142,28 @@ async fn a_thread_running_in_another_window_refuses_a_second_turn() {
     assert!(h.requests.lock().is_empty());
     drop(held);
     run_turn(&h, &session, "now it runs").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_rewind_waits_for_no_other_windows_turn() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let h = harness(vec![text_reply("one")]).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "first").await;
+    let dir = h.data.path().join("running");
+    std::fs::create_dir_all(&dir).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .share_mode(0)
+        .open(dir.join(format!("{session}.lock")))
+        .unwrap();
+    let refused = h.runtime.rewind(&session, 0).err().expect("refused");
+    assert!(
+        refused.to_string().contains("another Hermes window"),
+        "{refused}"
+    );
+    drop(held);
+    assert!(h.runtime.rewind(&session, 0).unwrap().is_empty());
 }

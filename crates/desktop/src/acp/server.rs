@@ -55,12 +55,9 @@ struct Inner {
     /// The provider's model list (`model.options` asks the provider over the network, seconds on a
     /// slow one) and when it was fetched: a thread opens with what is cached and gets the full
     /// picker in a `config_option_update` when the list arrives.
-    model_options: Option<(std::time::Instant, Value)>,
+    model_options: Option<Value>,
     sessions: HashMap<String, Session>,
 }
-
-/// How long a fetched model list is used without asking the provider again.
-const MODEL_LIST_FRESH: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// What `/undo` and `/retry` came to.
 enum Rewound {
@@ -164,7 +161,7 @@ impl AcpServer {
                     }
                     let opened = match (&result, method.as_str()) {
                         (Ok(answer), "session/new") => answer["sessionId"].as_str(),
-                        (Ok(_), "session/load") => params["sessionId"].as_str(),
+                        (Ok(_), "session/load" | "session/resume") => params["sessionId"].as_str(),
                         _ => None,
                     }
                     .map(str::to_string);
@@ -198,7 +195,9 @@ impl AcpServer {
             #[cfg(debug_assertions)]
             "_test/panic" => panic!("a handler that panics, on purpose"),
             "session/new" => self.new_session(params).await,
-            "session/load" => self.load_session(params).await,
+            "session/load" => self.load_session(params, true).await,
+            "session/resume" => self.load_session(params, false).await,
+            "session/close" => self.close_session(params).await,
             "session/list" => self.list_sessions(params).await,
             "session/set_mode" => self.set_mode(params).await,
             "session/set_config_option" => self.set_config_option(params).await,
@@ -237,7 +236,7 @@ impl AcpServer {
                 "loadSession": true,
                 "promptCapabilities": {"image": true, "audio": false, "embeddedContext": true},
                 "mcpCapabilities": {"http": false, "sse": false},
-                "sessionCapabilities": {"list": {}},
+                "sessionCapabilities": {"list": {}, "close": {}, "resume": {}},
             },
             "agentInfo": {
                 "name": "hermes-rs",
@@ -293,14 +292,20 @@ impl AcpServer {
             },
         );
         tracing::info!("new session {id} in {cwd}");
+        self.settle_effort(&id).await;
         let mut answer = self.controls(&id).await;
         answer["sessionId"] = json!(id);
         Ok(answer)
     }
 
     /// `session/load`: the thread's history is replayed as updates *before* the answer (the editor
-    /// takes them while it waits for it), then the session is ready for prompts.
-    async fn load_session(self: &Arc<Self>, params: &Value) -> Result<Value, RpcError> {
+    /// takes them while it waits for it), then the session is ready for prompts. `session/resume`
+    /// (`replay` false) is the same without the replay: the editor still shows the thread.
+    async fn load_session(
+        self: &Arc<Self>,
+        params: &Value,
+        replay: bool,
+    ) -> Result<Value, RpcError> {
         let id = param(params, "sessionId")?;
         let asked_cwd = params["cwd"].as_str().unwrap_or_default();
         let resumed = self
@@ -339,11 +344,60 @@ impl AcpServer {
             session.title = title;
         }
         let rows = resumed["messages"].as_array().cloned().unwrap_or_default();
-        for update in history::replay(&rows, &cwd) {
-            self.update(id, update);
+        if replay {
+            for update in history::replay(&rows, &cwd) {
+                self.update(id, update);
+            }
+            tracing::info!("loaded session {id}: {} rows", rows.len());
+        } else {
+            tracing::info!("resumed session {id}: {} rows", rows.len());
         }
-        tracing::info!("loaded session {id}: {} rows", rows.len());
+        self.settle_effort(id).await;
         Ok(self.controls(id).await)
+    }
+
+    /// `session/close`: the editor is done with the thread (it closed it): its turn stops and its
+    /// shell and background processes end. The thread itself stays, to be loaded again.
+    async fn close_session(self: &Arc<Self>, params: &Value) -> Result<Value, RpcError> {
+        let id = param(params, "sessionId")?.to_string();
+        let known = self.lock().sessions.remove(&id);
+        if let Some(mut session) = known {
+            if let Some(mut turn) = session.turn.take() {
+                for (_, task) in turn.asking.drain() {
+                    task.abort();
+                }
+                if let Some(done) = turn.done.take() {
+                    let _ = done.send(Ok(json!({"stopReason": "cancelled"})));
+                }
+            }
+        }
+        self.gateway.runtime.cancel(&id);
+        self.gateway.runtime.close(&id).await;
+        tracing::info!("closed session {id}");
+        Ok(json!({}))
+    }
+
+    /// What the effort picker shows must be what a turn sends: a thread with nothing picked gets
+    /// Settings' effort, else Hermes's default (medium), picked for it.
+    async fn settle_effort(&self, id: &str) {
+        if self.gateway.picked_effort(id).is_some() {
+            return;
+        }
+        let effective = self.gateway.effort(id);
+        let effort = if effective.is_empty() {
+            controls::DEFAULT_EFFORT.to_string()
+        } else {
+            effective
+        };
+        if let Err(error) = self
+            .call(
+                "config.set",
+                json!({"session_id": id, "key": "reasoning", "value": effort}),
+            )
+            .await
+        {
+            tracing::warn!("{id}: setting the effort: {}", error.message);
+        }
     }
 
     /// `session/list`: this folder's threads (all of them without a `cwd`), newest first, a page
@@ -415,8 +469,16 @@ impl AcpServer {
             .lock()
             .model_options
             .as_ref()
-            .map_or_else(|| json!({"providers": []}), |(_, options)| options.clone());
-        if let Some(record) = self.gateway.runtime.store().session(session).ok().flatten() {
+            .map_or_else(|| json!({"providers": []}), Value::clone);
+        let gateway = self.gateway.clone();
+        let wanted = session.to_string();
+        let record = tokio::task::spawn_blocking(move || {
+            gateway.runtime.store().session(&wanted).ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(record) = record {
             options["provider"] = json!(record.provider);
             options["model"] = json!(record.model);
         }
@@ -515,10 +577,14 @@ impl AcpServer {
                 _ => return Some(Rewound::Reply("Usage: /undo [N]".into())),
             }
         };
-        let messages = match self.gateway.runtime.messages(id) {
-            Ok(messages) => messages,
-            Err(error) => return Some(Rewound::Reply(format!("{error:#}"))),
-        };
+        let gateway = self.gateway.clone();
+        let session = id.to_string();
+        let messages =
+            match tokio::task::spawn_blocking(move || gateway.runtime.messages(&session)).await {
+                Ok(Ok(messages)) => messages,
+                Ok(Err(error)) => return Some(Rewound::Reply(format!("{error:#}"))),
+                Err(error) => return Some(Rewound::Reply(error.to_string())),
+            };
         let prompts = crate::transcript::typed_prompts(&messages);
         if prompts.is_empty() {
             let what = if retry { "retry" } else { "undo" };
@@ -560,17 +626,10 @@ impl AcpServer {
         )))
     }
 
-    /// Fetches the provider's model list when none is cached (or it is old) and sends the editor the
-    /// full picker. Runs after the thread is open, off the request's path.
+    /// Fetches the provider's model list and, when it differs from what the thread opened with,
+    /// sends the editor the full picker. Runs after the thread is open, off the request's path, on
+    /// every open: a provider added in Settings shows up in the next thread.
     fn refresh_model_options(self: &Arc<Self>, session: &str) {
-        let fresh = self
-            .lock()
-            .model_options
-            .as_ref()
-            .is_some_and(|(at, _)| at.elapsed() < MODEL_LIST_FRESH);
-        if fresh {
-            return;
-        }
         let server = self.clone();
         let session = session.to_string();
         tokio::spawn(async move {
@@ -583,7 +642,14 @@ impl AcpServer {
             let Ok(Ok(options)) = fetched else {
                 return;
             };
-            server.lock().model_options = Some((std::time::Instant::now(), options));
+            let unchanged = server
+                .lock()
+                .model_options
+                .replace(options.clone())
+                .is_some_and(|before| before == options);
+            if unchanged {
+                return;
+            }
             let controls = server.controls(&session).await;
             server.update(
                 &session,

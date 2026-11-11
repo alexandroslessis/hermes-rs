@@ -75,7 +75,7 @@ const EFFORTS: [(&str, &str); 8] = [
 ];
 
 /// What the effort picker shows when nothing was picked and Settings has none: Hermes's default.
-const DEFAULT_EFFORT: &str = "medium";
+pub const DEFAULT_EFFORT: &str = "medium";
 
 /// The commands the gateway runs for `slash.exec` that its `commands.catalog` doesn't list (the
 /// page types them itself): offered to the editor, which refuses a command that isn't listed.

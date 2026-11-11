@@ -1072,6 +1072,9 @@ pub struct CommandApproval {
     pub command: String,
     /// Why it was flagged; also the key the approval is remembered by.
     pub description: String,
+    /// Only "once" or "deny" make sense (a mode that asks every time, Manual or Plan): the card
+    /// offers no "for this session" / "always".
+    pub once_only: bool,
 }
 
 /// The approval policy every session shares: whether to ask at all (Hermes's `approvals.mode`
@@ -1191,6 +1194,7 @@ pub fn gate(
         Some(key) => Gate::Ask(CommandApproval {
             command: command.to_string(),
             description: key.to_string(),
+            once_only: false,
         }),
     }
 }

@@ -62,6 +62,9 @@ pub struct Turn {
     /// on its card (the editor replaces a card's content on every update, so the whole log is
     /// sent each time).
     subagent_logs: HashMap<String, String>,
+    /// What a running `terminal` call's card has been sent so far (the output's tail as the last
+    /// `tool.progress` had it): the next progress, and the end, send only what is new.
+    terminal_sent: HashMap<String, String>,
 }
 
 fn chunk(kind: &str, id: &str, text: &str) -> Action {
@@ -70,6 +73,47 @@ fn chunk(kind: &str, id: &str, text: &str) -> Action {
         "content": {"type": "text", "text": text},
         "messageId": id,
     }))
+}
+
+/// What `new` adds to `sent`, two views of one growing output: `new` may be `sent` plus more, a
+/// tail that slid on (its start dropped), or the whole output `sent` was the tail of. A part
+/// that can't be lined up comes whole, after a gap mark.
+fn new_part(sent: &str, new: &str) -> String {
+    if sent.is_empty() {
+        return new.to_string();
+    }
+    if let Some(rest) = new.strip_prefix(sent) {
+        return rest.to_string();
+    }
+    // Line up `sent`'s last characters in `new`; a match counts when everything before it in
+    // `new` agrees with `sent` (one is a suffix of the other).
+    let anchor_start = sent.char_indices().rev().nth(63).map_or(0, |(at, _)| at);
+    let anchor = &sent[anchor_start..];
+    // The last match that lines up: repeated output (a progress bar, a table) lines up in several
+    // places, and the furthest is the one that sends nothing twice.
+    // (Overlapping matches count: `match_indices` would skip them.)
+    let mut lined_up = None;
+    let mut from = 0;
+    while let Some(found) = new[from..].find(anchor) {
+        let at = from + found;
+        let end = at + anchor.len();
+        if new[..end].ends_with(sent) || sent.ends_with(&new[..end]) {
+            lined_up = Some(end);
+        }
+        from = at + new[at..].chars().next().map_or(1, char::len_utf8);
+    }
+    if let Some(end) = lined_up {
+        return new[end..].to_string();
+    }
+    if sent.ends_with(new) || sent.contains(new) {
+        return String::new();
+    }
+    format!("\n\u{2026}\n{new}")
+}
+
+/// Text for a terminal: a line feed alone doesn't return to the line's start there.
+fn terminal_data(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
 fn new_id() -> String {
@@ -99,6 +143,7 @@ impl Turn {
             streamed: false,
             terminal_cards: false,
             subagent_logs: HashMap::new(),
+            terminal_sent: HashMap::new(),
         }
     }
 
@@ -163,6 +208,7 @@ impl Turn {
             "subagent.start" | "subagent.tool" | "subagent.complete" => {
                 self.subagent(kind, payload)
             }
+            "tool.progress" => self.tool_progress(payload),
             "tool.start" => self.tool_start(payload),
             "tool.complete" => self.tool_complete(payload),
             "approval.request" => vec![Action::Approval {
@@ -240,11 +286,43 @@ impl Turn {
         let log = self.subagent_logs.entry(card.clone()).or_default();
         log.push_str(&line);
         log.push('\n');
+        // The whole log goes out on every line: keep the last ones only.
+        const KEEP: usize = 100;
+        let lines = log.lines().count();
+        if lines > KEEP {
+            let kept: Vec<&str> = log.lines().skip(lines - KEEP).collect();
+            *log = format!("\u{2026} (earlier lines dropped)\n{}\n", kept.join("\n"));
+        }
         vec![Action::Update(json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": card,
             "status": "in_progress",
             "content": [tools::text_content_of(log)],
+        }))]
+    }
+
+    /// A running `terminal` call's output, live, into its terminal card (Zed's `terminal_output`,
+    /// appended): only what is new since the last progress.
+    fn tool_progress(&mut self, payload: &Value) -> Vec<Action> {
+        let id = payload["tool_id"].as_str().unwrap_or_default();
+        let open_terminal = self
+            .open
+            .iter()
+            .any(|(open, name, _)| open == id && name == "terminal");
+        if !self.terminal_cards || !open_terminal {
+            return Vec::new();
+        }
+        let tail = payload["message"].as_str().unwrap_or_default();
+        let sent = self.terminal_sent.entry(id.to_string()).or_default();
+        let new = new_part(sent, tail);
+        *sent = tail.to_string();
+        if new.is_empty() {
+            return Vec::new();
+        }
+        vec![Action::Update(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": id,
+            "_meta": {"terminal_output": {"terminal_id": id, "data": terminal_data(&new)}},
         }))]
     }
 
@@ -317,8 +395,14 @@ impl Turn {
         });
         if self.terminal_cards && name == "terminal" && position.is_some() {
             // The output goes into the terminal card that `tool_start` opened.
+            // What the live progress already put in the card isn't sent again.
+            let output = tools::terminal_text(&result, raw);
+            let rest = match self.terminal_sent.remove(&id) {
+                Some(sent) => new_part(&sent, &output),
+                None => output,
+            };
             update["_meta"] = json!({
-                "terminal_output": {"terminal_id": id, "data": tools::terminal_text(&result, raw)},
+                "terminal_output": {"terminal_id": id, "data": terminal_data(&rest)},
                 "terminal_exit": {
                     "terminal_id": id,
                     "exit_code": result.get("exit_code").and_then(Value::as_i64).unwrap_or(i64::from(failed)),
@@ -685,6 +769,65 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("found it")
+        );
+    }
+
+    #[test]
+    fn live_terminal_output_sends_only_what_is_new() {
+        assert_eq!(new_part("", "abc"), "abc");
+        assert_eq!(new_part("abc", "abcdef"), "def");
+        // A tail that slid: its start was dropped.
+        let old = "x".repeat(10) + &"0123456789".repeat(10);
+        let slid = format!("{}NEW", &old[20..]);
+        assert_eq!(new_part(&old, &slid), "NEW");
+        // The whole output at the end, the last tail inside it.
+        let whole = format!("head {old}tail");
+        assert_eq!(new_part(&old, &whole), "tail");
+        assert_eq!(new_part("same", "same"), "");
+        assert_eq!(terminal_data("a\nb\r\nc"), "a\r\nb\r\nc");
+    }
+
+    #[test]
+    fn a_terminal_card_streams_and_ends_without_repeating() {
+        let mut turn = Turn::new("C:/w").with_terminal_cards(true);
+        turn.event(
+            "tool.start",
+            &json!({"tool_id": "t1", "name": "terminal", "args": {"command": "build"}}),
+        );
+        let first = turn.event(
+            "tool.progress",
+            &json!({"tool_id": "t1", "message": "line 1\n"}),
+        );
+        assert_eq!(
+            updates(&first)[0]["_meta"]["terminal_output"]["data"],
+            "line 1\r\n"
+        );
+        let second = turn.event(
+            "tool.progress",
+            &json!({"tool_id": "t1", "message": "line 1\nline 2\n"}),
+        );
+        assert_eq!(
+            updates(&second)[0]["_meta"]["terminal_output"]["data"],
+            "line 2\r\n"
+        );
+        let done = turn.event(
+            "tool.complete",
+            &json!({"tool_id": "t1", "name": "terminal",
+                    "result": {"output": "line 1\nline 2\nline 3", "exit_code": 0}}),
+        );
+        let last = updates(&done)[0];
+        assert_eq!(last["_meta"]["terminal_output"]["data"], "line 3");
+        assert_eq!(last["_meta"]["terminal_exit"]["exit_code"], 0);
+        // Without terminal cards, progress sends nothing.
+        let mut plain = Turn::new("C:/w");
+        plain.event(
+            "tool.start",
+            &json!({"tool_id": "t2", "name": "terminal", "args": {"command": "x"}}),
+        );
+        assert!(
+            plain
+                .event("tool.progress", &json!({"tool_id": "t2", "message": "x"}))
+                .is_empty()
         );
     }
 
