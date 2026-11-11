@@ -359,18 +359,18 @@ fixed. Added: `session/close`, `session/resume`, live terminal output into the t
 
 ---
 
-## Phase 6 — t3code (later; t3code isn't installed yet)
+## Phase 6 — t3code
 
-t3code (pingdotgg/t3code) is a GUI for coding agents. As of 2026-11 its ACP support was a draft
-PR that installs agents from the ACP registry; a custom stdio command may or may not be offered.
-When the user installs it:
-1. Find how it adds a custom ACP agent (settings file, UI) and write it in a new `docs/acp/T3CODE.md`.
-2. Capture its `initialize` (probe through a logging wrapper: a tiny script that tees stdin/stdout
-   of the real exe to a file) and compare its capabilities with Zed's; fix anything we assumed
-   only Zed does (e.g. it may not support `elicitation`, `session/list`, or `configOptions`).
-3. Re-run the ZED.md checklist items that make sense there.
-If t3code only installs from the ACP registry, publishing to the registry is a separate decision
-for the user (it needs a public download).
+✅ **Built 2026-11-11** (the user's checklist in [T3CODE.md](T3CODE.md) is open). t3code adds a
+local ACP agent as an "ACP Registry" provider with source Local and a command path. Read from its
+bundled server (`resources/server.asar`, `runtimeLayer-*.mjs`): it sends `protocolVersion: 2` and
+speaks v1 to v1 agents; it reads models only from the `session/new` answer's `configOptions`; it
+starts a fresh agent per thread and probes the agent with a test session every ~15 min. As built:
+the model list persists in `<data>/acp-model-options.json` (loaded at start, rewritten when the
+background refresh finds it changed); threads this connection made are deleted when closed or when
+the editor leaves while still empty (`forget_if_empty`). Tests:
+`a_fresh_agent_answers_with_the_model_list_an_earlier_one_fetched`,
+`an_empty_thread_this_agent_made_is_deleted_when_closed`.
 
 ---
 

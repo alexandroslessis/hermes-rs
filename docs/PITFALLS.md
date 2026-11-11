@@ -33,6 +33,10 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   and the end sends what the last progress hadn't. Line ends go out as `\r\n` for the terminal.
 - **`session/close`** stops the thread's turn, shell and processes (`Runtime::close`); the thread
   stays loadable. **`session/resume`** is `session/load` without the replay (Zed still shows it).
+- **Editors that start a fresh agent per thread** (t3code) see the model picker only in the
+  `session/new` answer: the list is cached on disk (`acp-model-options.json`), not just in memory.
+  They also probe with test sessions: threads a connection made are deleted when closed or left
+  empty (`forget_if_empty`), or they pile up in the desktop app.
 - **`session/new` and `session/load` must not wait on the network.** The editor blocks on their
   answer, and `model.options` asks the provider for its model list (seconds: it made a thread take
   ~3 s to open in Zed). `AcpServer::controls` is instant (cached list, else the thread's own model);

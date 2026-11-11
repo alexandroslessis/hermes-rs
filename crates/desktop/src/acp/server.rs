@@ -44,6 +44,9 @@ struct Session {
     turn: Option<Turn>,
     /// The title the editor was last told.
     title: Option<String>,
+    /// Made by this connection's `session/new`: deleted again if it is closed (or the editor
+    /// leaves) with nothing in it. t3code makes a test thread every time it checks the agent.
+    created_here: bool,
 }
 
 #[derive(Default)]
@@ -58,6 +61,10 @@ struct Inner {
     model_options: Option<Value>,
     sessions: HashMap<String, Session>,
 }
+
+/// The provider model list, kept between runs in the data folder: an editor that starts a fresh
+/// agent per thread (t3code) gets the full picker in the `session/new` answer, not only later.
+const MODEL_LIST_FILE: &str = "acp-model-options.json";
 
 /// What `/undo` and `/retry` came to.
 enum Rewound {
@@ -100,11 +107,21 @@ impl AcpServer {
     {
         let (sender, writer) = Sender::writing_to(output);
         let (outbox, events) = mpsc::unbounded_channel::<String>();
+        let saved = gateway.data_dir().join(MODEL_LIST_FILE);
+        let model_options = tokio::task::spawn_blocking(move || {
+            serde_json::from_slice::<Value>(&std::fs::read(saved).ok()?).ok()
+        })
+        .await
+        .ok()
+        .flatten();
         let server = Arc::new(Self {
             gateway,
             sender: sender.clone(),
             outbox,
-            inner: Mutex::new(Inner::default()),
+            inner: Mutex::new(Inner {
+                model_options,
+                ..Inner::default()
+            }),
         });
         let pump = tokio::spawn(server.clone().pump(events));
         let reader = server.clone();
@@ -289,6 +306,7 @@ impl AcpServer {
                 gate: Arc::default(),
                 turn: None,
                 title: None,
+                created_here: true,
             },
         );
         tracing::info!("new session {id} in {cwd}");
@@ -340,6 +358,7 @@ impl AcpServer {
                     gate: Arc::default(),
                     turn: None,
                     title: None,
+                    created_here: false,
                 });
             session.title = title;
         }
@@ -361,6 +380,7 @@ impl AcpServer {
     async fn close_session(self: &Arc<Self>, params: &Value) -> Result<Value, RpcError> {
         let id = param(params, "sessionId")?.to_string();
         let known = self.lock().sessions.remove(&id);
+        let created_here = known.as_ref().is_some_and(|s| s.created_here);
         if let Some(mut session) = known {
             if let Some(mut turn) = session.turn.take() {
                 for (_, task) in turn.asking.drain() {
@@ -373,6 +393,9 @@ impl AcpServer {
         }
         self.gateway.runtime.cancel(&id);
         self.gateway.runtime.close(&id).await;
+        if created_here {
+            self.forget_if_empty(&id).await;
+        }
         tracing::info!("closed session {id}");
         Ok(json!({}))
     }
@@ -650,6 +673,9 @@ impl AcpServer {
             if unchanged {
                 return;
             }
+            let file = server.gateway.data_dir().join(MODEL_LIST_FILE);
+            let bytes = serde_json::to_vec(&options).unwrap_or_default();
+            let _ = tokio::task::spawn_blocking(move || std::fs::write(file, bytes)).await;
             let controls = server.controls(&session).await;
             server.update(
                 &session,
@@ -729,6 +755,7 @@ impl AcpServer {
                 gate: Arc::default(),
                 turn: None,
                 title: None,
+                created_here: false,
             });
         Ok((session.gate.clone(), session.cwd.clone()))
     }
@@ -746,12 +773,47 @@ impl AcpServer {
         }
     }
 
-    /// The editor went away: stop every turn, and every command the agent started for it.
+    /// The editor went away: stop every turn, and every command the agent started for it; the
+    /// empty threads it made are deleted.
     async fn shutdown(&self) {
-        let sessions: Vec<String> = self.lock().sessions.keys().cloned().collect();
-        for session in sessions {
+        let sessions: Vec<(String, bool)> = self
+            .lock()
+            .sessions
+            .iter()
+            .map(|(id, s)| (id.clone(), s.created_here))
+            .collect();
+        for (session, created_here) in sessions {
             self.gateway.runtime.cancel(&session);
             self.gateway.runtime.stop_processes(&session).await;
+            if created_here {
+                self.forget_if_empty(&session).await;
+            }
+        }
+    }
+
+    /// Deletes a thread this connection made if nobody wrote in it (a probe's test session, a
+    /// thread opened and left): they would pile up in the desktop app's store.
+    async fn forget_if_empty(&self, session: &str) {
+        let gateway = self.gateway.clone();
+        let id = session.to_string();
+        let empty = tokio::task::spawn_blocking(move || {
+            gateway
+                .runtime
+                .store()
+                .message_count(&id)
+                .is_ok_and(|n| n == 0)
+        })
+        .await
+        .unwrap_or(false);
+        if !empty {
+            return;
+        }
+        match self
+            .call("session.delete", json!({"session_id": session}))
+            .await
+        {
+            Ok(_) => tracing::info!("deleted the empty thread {session}"),
+            Err(error) => tracing::warn!("deleting the empty thread {session}: {}", error.message),
         }
     }
 

@@ -2021,3 +2021,63 @@ async fn resume_reopens_a_thread_without_replaying_it() {
     let last = first.model.requests().last().unwrap().to_string();
     assert!(last.contains("kiwi"), "{last}");
 }
+
+// ---- t3code: a fresh agent per thread, a test session per check ----
+
+#[tokio::test]
+async fn a_fresh_agent_answers_with_the_model_list_an_earlier_one_fetched() {
+    let mut first = Agent::start(Vec::new()).await;
+    first.initialize(json!({})).await;
+    let session = first.new_session_answer().await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sid = session.clone();
+    first
+        .wait_for(move |seen, _| {
+            seen.iter()
+                .find(|m| {
+                    m["params"]["sessionId"] == sid.as_str()
+                        && m["params"]["update"]["sessionUpdate"] == "config_option_update"
+                })
+                .map(|_| ())
+        })
+        .await;
+    // Another process on the same data folder, its first thread: the full picker at once.
+    let mut second = Agent::sharing(&first).await;
+    second.initialize(json!({})).await;
+    let answer = second.new_session_answer().await;
+    let values = model_values(&answer["result"]["configOptions"]);
+    assert!(values.contains(&"mock/other".to_string()), "{values:?}");
+}
+
+#[tokio::test]
+async fn an_empty_thread_this_agent_made_is_deleted_when_closed() {
+    let (mut agent, empty) = Agent::with_session(vec![text_reply("kept")]).await;
+    let used = agent.new_session().await;
+    agent.prompt(&used, "keep me").await;
+    for id in [&empty, &used] {
+        let closed = agent
+            .request("session/close", json!({"sessionId": id}))
+            .await;
+        assert!(closed["result"].is_object(), "{closed}");
+    }
+    let cwd = agent.work.path().display().to_string();
+    let gone = agent
+        .request(
+            "session/load",
+            json!({"sessionId": empty, "cwd": cwd, "mcpServers": []}),
+        )
+        .await;
+    assert!(
+        gone["error"].is_object(),
+        "the empty thread is still there: {gone}"
+    );
+    let kept = agent
+        .request(
+            "session/load",
+            json!({"sessionId": used, "cwd": cwd, "mcpServers": []}),
+        )
+        .await;
+    assert!(kept["result"].is_object(), "{kept}");
+}
