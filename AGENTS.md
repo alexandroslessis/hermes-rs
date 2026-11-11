@@ -38,6 +38,7 @@ A Windows desktop app that runs **Hermes** (NousResearch's agent, `../hermes-age
 | Building the installer / shipping | [docs/RELEASING.md](docs/RELEASING.md); the user's step-by-step: [docs/INSTALLER-TUTORIAL.md](docs/INSTALLER-TUTORIAL.md) |
 | Performance work | [scripts/perf/README.md](scripts/perf/README.md) |
 | ACP (using the agent from Zed / t3code: `hermes-acp.exe`) | [docs/acp/README.md](docs/acp/README.md), then [docs/acp/PHASES.md](docs/acp/PHASES.md) — built 2026-11-10 (Zed; t3code later) |
+| opencode plugin (Hermes memory, skills, self-improvement inside opencode: `hermes-opencode.exe` + TS shim) | [docs/opencode/README.md](docs/opencode/README.md), then [docs/opencode/PHASES.md](docs/opencode/PHASES.md) — planned 2026-11-11, not built |
 
 `PLAN.md` and `FEATURES.md` are from the GPUI era (2026-10/11). `FEATURES.md`'s keep/later/drop
 scope still holds; `PLAN.md`'s milestones are history. `GAPS.md` is the live to-do list.
