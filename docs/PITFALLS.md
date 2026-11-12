@@ -395,7 +395,7 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   command_source`, a name check) taints; other terminal output does not (build logs, `git`), nor
   does `python -c "urllib..."` or a `git clone` whose files are then read *inside* the working
   folder. `vision_analyze` on a local image outside the working folder taints like `read_file`.
-  Skill and memory content (staged in CP6.2), `session_search`, MCP *tool descriptions* (in every
+  Skill and memory content (their *writes* are staged, see below), `session_search`, MCP *tool descriptions* (in every
   request from the start; tainting on them would make every session with a server careful) and
   the user's own attachments do not taint.
 - **Parallel tool calls** in one assistant message run concurrently (`ToolOperation`,
@@ -438,3 +438,59 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   new event or a patch. The line lives in the page's session state only (it is not stored, so it
   is gone after a reload) and is also logged (`warn`). Zed (ACP) shows it as a thought. If the
   page ever treats `fallback` as more than a line, move this to a patch (`crates/desktop/patches/`).
+
+## The staging area (Phase 6 CP6.2 of `docs/backend/PHASES.md`)
+
+- **A tainted session does not write memory or skills.** `SessionTools::dispatch` stages every
+  `memory` and `skill_manage` call while `taint().is_tainted()`, in every approval mode including
+  Yolo (it asks nothing and costs no request), and the model's tool result starts "Saved for review
+  by the user". A call that would have failed (a threat-scan hit, a patch whose text isn't there, a
+  bad name, a full memory) is refused at staging with the tool's own message and is not kept. A
+  background review of a tainted session stages its writes the same way (`ReviewTools`: it reads the
+  whole conversation, untrusted text included); the curator has its own tools and a clean taint.
+  Clean sessions are untouched: same code path, same request counts.
+- **Where.** `staging/<id>.json` in the data folder: `{v, id, kind: memory|skill, op, diff, reason,
+  session_id, sources, created, status: pending|stale, error}`. `v` is the format (1); a file from a
+  newer format, a damaged file or one whose `id` isn't its name is skipped and *left on disk*. Ids are
+  12 lowercase hex characters (`valid_id` accepts 8 to 32 hex, so no id can be a path or a Windows
+  device name). Files are written whole to a temporary file and renamed; at most 200 files (damaged
+  ones count), at most 50 from one session (so one session looping on hostile content can't crowd
+  out the rest), and 1 MiB each (a larger file is not read). The very same change staged again is
+  kept once (the model is told it already waits). The diff is **never cut** (approving a cut diff
+  could approve a hidden tail): a change too big to hold with its whole diff is refused. What the
+  user reviews (diff, summary, reason, sources, error) shows control, zero-width and bidi
+  characters as `<U+XXXX>` (`staging::display_text`), and a memory diff marks every line of a
+  multi-line entry, so a staged write can't make its diff read differently from what it writes.
+  The diff is display only: Apply runs the payload, so a payload edited on disk (the terminal can
+  reach the data folder; the file tools can't) is still validated, but its diff may not match.
+  The terminal is the bigger gap anyway: a command naming the data, skills or memory folder is
+  flagged (so it asks while tainted, Yolo only warns), but that is a name check a determined
+  command gets past; Phase 15's sandbox is the boundary for a shell writing `MEMORY.md` directly.
+- **`op` is the kind's payload**, so Phases 7 and 8 reuse the store: `memory` is `{target,
+  operations}` (each patch/remove pinned to the entry it was reviewed against), `skill` is
+  `{operations, origin, bases}`. A new kind needs a payload and an arm in `StagingStore::apply`.
+- **Apply re-checks everything, and goes through the stores.** Memory: `MemoryStore::apply` (limits,
+  threat scan, the pinned entry still there: otherwise the item is `stale`). Skills: a new
+  `SkillStore::apply_staged` takes the skills write lock, compares each file the batch was reviewed
+  against (`FileBase`: FNV-1a fingerprint of the file at staging, or "must not exist") and then runs
+  the ordinary `apply_ops` (validators, threat scan of the whole skill, git commit, index hook). A
+  changed file, a deleted or newly created skill make the item stale; any other failure leaves it
+  pending; both keep the item with its `error` and write nothing (the batch is all-or-nothing). A
+  patch is stale when *any* change hit its file, even one elsewhere in it: strict on purpose.
+  Staging a skill batch simulates it first (`SkillStore::plan`: later ops see earlier ones), so most
+  mistakes reach the model at once; Apply is still the real check.
+- **The user's Apply is not tainted.** It calls the stores directly (`Runtime::apply_staged`), not a
+  tool, so taint can't stage it again. Staged items outlive their session (deleting a session keeps
+  its pending items) and a restart; `session_id` only says who asked.
+- **Two queues exist.** Hermes's `memory.write_approval` / `skills.write_approval` settings (and the
+  unattended review's staged memory patches/removals) still use their own per-store queues
+  (`pending/memory/`, `skills/.pending/`), shown by the GPUI app and `/memory`. The taint staging
+  area is separate (`staging/`); CP6.3 shows it in the page, and a later phase may fold the old
+  queues into it.
+- **`staging.*` is ours** (not Hermes's contract): `staging.list` -> `{items, count}`,
+  `staging.apply {id}` -> `{id, kind, applied: true, message}` or an error saying why,
+  `staging.reject {id}` -> `{id, kind, rejected: true}`; REST mirror `GET /api/staging`,
+  `POST /api/staging/<id>/apply|reject` (404 unknown, 409 could not apply). The page ignores
+  methods it doesn't know and nothing calls these before CP6.3.
+- **Sessions built without a data folder can't stage** (`StagingStore::usable`): a tainted write is
+  then refused, never written (fail closed). Only tests build such sessions.

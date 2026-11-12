@@ -143,93 +143,9 @@ impl MemoryStore {
     }
 
     fn tool_as(&self, args: &Value, failures: &mut TurnFailures, unattended: bool) -> Value {
-        let text = |key: &str| {
-            args.get(key)
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        };
-        let Some(target_name) = args.get("target").filter(|t| !t.is_null()) else {
-            return error(
-                "Missing required target. Retry with target='memory' or target='user' at the top level. For a batch, remove target from every operation; use separate calls for different stores. Nothing was written or staged.",
-            );
-        };
-        let Some(target) = target_name.as_str().and_then(Target::parse) else {
-            return error(format!(
-                "Invalid memory target '{}'. Use 'memory' or 'user'.",
-                target_name.as_str().unwrap_or(&target_name.to_string())
-            ));
-        };
-        let operations = args.get("operations").filter(|ops| !ops.is_null());
-        if let Some(Value::Array(ops)) = operations {
-            for (index, op) in ops.iter().enumerate() {
-                if let Some(nested) = op.get("target").and_then(Value::as_str) {
-                    if nested != target.name() {
-                        return error(format!(
-                            "Operation {} names a different target than the one at the top level. One call writes one store: retry with separate calls for different stores. Nothing was written or staged.",
-                            index + 1
-                        ));
-                    }
-                }
-            }
-        }
-        if !self.enabled(target) {
-            return json!({"success": false, "error": format!("Built-in {} writes are disabled in memory config.", target.file_name()), "target": target.name()});
-        }
-
-        let ops: Vec<Operation> = match operations {
-            Some(Value::Array(items)) if !items.is_empty() => {
-                let mut ops = Vec::new();
-                for item in items {
-                    let Ok(mut op) = serde_json::from_value::<Operation>(item.clone()) else {
-                        return error(
-                            "operations must be a list of {action, content?, old_text?} objects.",
-                        );
-                    };
-                    if op.content.as_deref().is_none_or(str::is_empty) {
-                        op.content = item
-                            .get("new_text")
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
-                    }
-                    op.matched_entry = None;
-                    ops.push(op);
-                }
-                if ops.iter().any(|op| op.action == "replace") {
-                    return error(REPLACE_REMOVED);
-                }
-                ops
-            }
-            Some(other) if !other.as_array().is_some_and(Vec::is_empty) => {
-                return error(
-                    "operations must be a list of {action, content?, old_text?} objects.",
-                );
-            }
-            _ => {
-                let Some(action) = text("action") else {
-                    return error(
-                        "Missing required parameter: 'operations', a list of {action: add/patch/remove, content?, old_text?} changes; a single change is a one-item list.",
-                    );
-                };
-                if action == "replace" {
-                    return error(REPLACE_REMOVED);
-                }
-                if !matches!(action.as_str(), "add" | "patch" | "remove") {
-                    return error(format!(
-                        "Unknown action '{action}'. Use: add, patch, remove"
-                    ));
-                }
-                let op = Operation {
-                    action,
-                    content: text("content").or_else(|| text("new_text")),
-                    old_text: text("old_text"),
-                    matched_entry: None,
-                };
-                if let Some(invalid) = self.validate_single(target, &op) {
-                    return invalid;
-                }
-                vec![op]
-            }
+        let (target, ops) = match self.parse_call(args) {
+            Ok(parsed) => parsed,
+            Err(refusal) => return refusal,
         };
         if unattended && ops.iter().any(|op| op.action != "add") {
             let mut staged = self.stage(target, ops);
@@ -245,6 +161,104 @@ impl MemoryStore {
             return self.stage(target, ops);
         }
         self.apply(target, &ops, failures)
+    }
+
+    /// Reads a `memory` call into its store and operations, with every check the tool makes
+    /// before it writes (shape, target, the store being enabled). `Err` is the tool's own refusal.
+    /// The taint-driven staging area (`hermes_tools::staging`) reads a call through this too, so a
+    /// staged write is the same write the tool would have made.
+    pub fn parse_call(&self, args: &Value) -> Result<(Target, Vec<Operation>), Value> {
+        let text = |key: &str| {
+            args.get(key)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let Some(target_name) = args.get("target").filter(|t| !t.is_null()) else {
+            return Err(error(
+                "Missing required target. Retry with target='memory' or target='user' at the top level. For a batch, remove target from every operation; use separate calls for different stores. Nothing was written or staged.",
+            ));
+        };
+        let Some(target) = target_name.as_str().and_then(Target::parse) else {
+            return Err(error(format!(
+                "Invalid memory target '{}'. Use 'memory' or 'user'.",
+                target_name.as_str().unwrap_or(&target_name.to_string())
+            )));
+        };
+        let operations = args.get("operations").filter(|ops| !ops.is_null());
+        if let Some(Value::Array(ops)) = operations {
+            for (index, op) in ops.iter().enumerate() {
+                if let Some(nested) = op.get("target").and_then(Value::as_str) {
+                    if nested != target.name() {
+                        return Err(error(format!(
+                            "Operation {} names a different target than the one at the top level. One call writes one store: retry with separate calls for different stores. Nothing was written or staged.",
+                            index + 1
+                        )));
+                    }
+                }
+            }
+        }
+        if !self.enabled(target) {
+            return Err(
+                json!({"success": false, "error": format!("Built-in {} writes are disabled in memory config.", target.file_name()), "target": target.name()}),
+            );
+        }
+
+        let ops: Vec<Operation> = match operations {
+            Some(Value::Array(items)) if !items.is_empty() => {
+                let mut ops = Vec::new();
+                for item in items {
+                    let Ok(mut op) = serde_json::from_value::<Operation>(item.clone()) else {
+                        return Err(error(
+                            "operations must be a list of {action, content?, old_text?} objects.",
+                        ));
+                    };
+                    if op.content.as_deref().is_none_or(str::is_empty) {
+                        op.content = item
+                            .get("new_text")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                    }
+                    op.matched_entry = None;
+                    ops.push(op);
+                }
+                if ops.iter().any(|op| op.action == "replace") {
+                    return Err(error(REPLACE_REMOVED));
+                }
+                ops
+            }
+            Some(other) if !other.as_array().is_some_and(Vec::is_empty) => {
+                return Err(error(
+                    "operations must be a list of {action, content?, old_text?} objects.",
+                ));
+            }
+            _ => {
+                let Some(action) = text("action") else {
+                    return Err(error(
+                        "Missing required parameter: 'operations', a list of {action: add/patch/remove, content?, old_text?} changes; a single change is a one-item list.",
+                    ));
+                };
+                if action == "replace" {
+                    return Err(error(REPLACE_REMOVED));
+                }
+                if !matches!(action.as_str(), "add" | "patch" | "remove") {
+                    return Err(error(format!(
+                        "Unknown action '{action}'. Use: add, patch, remove"
+                    )));
+                }
+                let op = Operation {
+                    action,
+                    content: text("content").or_else(|| text("new_text")),
+                    old_text: text("old_text"),
+                    matched_entry: None,
+                };
+                if let Some(invalid) = self.validate_single(target, &op) {
+                    return Err(invalid);
+                }
+                vec![op]
+            }
+        };
+        Ok((target, ops))
     }
 }
 

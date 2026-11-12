@@ -26,6 +26,7 @@ pub mod providers;
 pub mod rest;
 pub mod server;
 pub mod skills;
+pub mod staging;
 pub mod terminal;
 pub mod toolsets;
 pub mod transcript;

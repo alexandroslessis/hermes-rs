@@ -25,6 +25,7 @@ mod search;
 mod shell;
 mod skill_manage;
 pub mod skills;
+pub mod staging;
 pub mod taint;
 mod todo;
 pub mod vision;
@@ -52,7 +53,9 @@ pub use clarify::{
 pub use process::ProcessNotice;
 pub use review::ReviewTools;
 pub use shell::{ShellKind, detect_shell, set_env_passthrough};
-pub use skill_manage::{PendingSkillWrite, SkillOp, WriteOrigin};
+pub use skill_manage::{
+    FileBase, PendingSkillWrite, SkillOp, SkillPlan, StagedSkillError, WriteOrigin,
+};
 pub use skills::{IndexStyle, SkillCommit, SkillEntry, SkillStore, SkillsConfig};
 pub use todo::{TodoItem, TodoStatus};
 
@@ -500,6 +503,11 @@ impl SessionTools {
             "terminal" => shell::terminal(self, args, live).await,
             "process_manage" => process::process_manage(self, args).await,
             "todo_list" => todo::todo_list(self, args),
+            // A tainted session's memory and skill writes wait for the user (`staging.rs`).
+            "memory" if self.taint().is_tainted() => self.stage_memory(&args).await,
+            "skill_manage" if self.taint().is_tainted() => {
+                self.stage_skills(&args, WriteOrigin::Foreground).await
+            }
             "memory" => self.memory_tool(&args),
             "session_search" => self.session_search(&args),
             "skills_list" | "skill_view" | "skill_manage" => self.skills_tool(name, &args),
@@ -913,6 +921,57 @@ impl SessionTools {
             }
             Ok(_) => Ok(()),
             Err(_) => Err(ToolOutput::error(approval::timeout_message())),
+        }
+    }
+
+    /// Who is staging, and why the write waits.
+    fn staging_meta(&self) -> staging::Meta {
+        let taint = self.taint();
+        staging::Meta {
+            session_id: self.session_id.clone(),
+            reason: taint.reason().unwrap_or_default(),
+            sources: taint.sources,
+        }
+    }
+
+    /// A `memory` call from a tainted session: checked now, kept for the user ("Saved for review
+    /// by the user"), not written. Every approval mode, Yolo included.
+    pub(crate) async fn stage_memory(&self, args: &Value) -> ToolOutput {
+        let Some(memory) = self.memory.clone() else {
+            return ToolOutput::error(
+                "Memory is not available. It may be disabled in config or this environment.",
+            );
+        };
+        let store = staging::StagingStore::new(&self.data_dir);
+        let (args, meta) = (args.clone(), self.staging_meta());
+        let result =
+            tokio::task::spawn_blocking(move || store.stage_memory_call(&memory, &args, &meta))
+                .await
+                .unwrap_or_else(|e| json!({"success": false, "error": e.to_string()}));
+        Self::staged_output(result)
+    }
+
+    /// A `skill_manage` call from a tainted session (or a review of one): the same as
+    /// [`Self::stage_memory`] for skills.
+    pub(crate) async fn stage_skills(&self, args: &Value, origin: WriteOrigin) -> ToolOutput {
+        let Some(skills) = self.skills.clone() else {
+            return ToolOutput::error("Skills are not available in this session.");
+        };
+        let store = staging::StagingStore::new(&self.data_dir);
+        let (args, meta) = (args.clone(), self.staging_meta());
+        let result = tokio::task::spawn_blocking(move || {
+            store.stage_skill_call(&skills, &args, origin, &meta)
+        })
+        .await
+        .unwrap_or_else(|e| json!({"success": false, "error": e.to_string()}));
+        Self::staged_output(result)
+    }
+
+    fn staged_output(result: Value) -> ToolOutput {
+        let failed = result.get("success") == Some(&Value::Bool(false));
+        ToolOutput {
+            value: result,
+            is_error: failed,
         }
     }
 

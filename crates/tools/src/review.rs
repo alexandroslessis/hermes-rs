@@ -158,6 +158,11 @@ impl ReviewTools {
                 let Some(skills) = &self.tools.skills else {
                     return self.tools.dispatch(name, args, None).await;
                 };
+                // The review reads the whole conversation, so a tainted session's review writes
+                // nothing either: its changes wait for the user (Phase 7 reworks the review).
+                if self.tools.taint().is_tainted() {
+                    return self.tools.stage_skills(&args, self.origin()).await;
+                }
                 let result = skills.manage_with(&args, self.origin());
                 let failed = result.get("success") == Some(&Value::Bool(false));
                 ToolOutput {
@@ -193,6 +198,9 @@ impl ReviewTools {
                 let Some(memory) = &self.tools.memory else {
                     return self.tools.dispatch(name, args, None).await;
                 };
+                if self.tools.taint().is_tainted() {
+                    return self.tools.stage_memory(&args).await;
+                }
                 let result = memory.unattended_tool(&args, &mut self.tools.memory_failures.lock());
                 let failed = result.get("success") == Some(&Value::Bool(false));
                 ToolOutput {

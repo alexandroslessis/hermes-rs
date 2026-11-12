@@ -259,6 +259,8 @@ fn patch_entry(entry: &str, old_text: &str, new_text: &str) -> Result<String, St
     Ok(patched)
 }
 
+/// The refusal when a pinned entry is gone; the result also carries `"stale": true`, which is
+/// what callers test (`MemoryStore::apply`), never this text.
 fn stale_entry_message(entry: &str) -> String {
     format!(
         "Entry changed since it was staged, so this write was not applied: '{entry}' is no longer in memory as reviewed. Recreate the change against the current entry or reject it; the pending record has been preserved."
@@ -683,7 +685,15 @@ impl MemoryStore {
                     Some(entry) => match working.iter().position(|e| e == entry) {
                         Some(index) => index,
                         None => {
-                            return batch_failure(failures, format!("{pos}: {}", stale_entry_message(entry)), None, false);
+                            // Typed, not matched on the text: `"stale": true` says the pinned
+                            // entry is gone (a limit or a threat is a different failure).
+                            let mut reply = batch_failure(failures, format!("{pos}: {}", stale_entry_message(entry)), None, false);
+                            if let Mutation::Reply(value) = &mut reply {
+                                if value.get("done").is_none() {
+                                    value["stale"] = json!(true);
+                                }
+                            }
+                            return reply;
                         }
                     },
                     None => match find_unique_match(&working, &old_text) {

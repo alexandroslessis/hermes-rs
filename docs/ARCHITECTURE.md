@@ -43,7 +43,7 @@ it calls into. Everything runs in one process.
 | `crates/runtime` | `hermes_runtime` | Sessions and turns over the agent: `Runtime` | `lib.rs` (API), `session.rs`, `ops.rs` (per-turn tool guards), `delegate.rs` + `subagents.rs`, `compress.rs`, `review.rs` (background review), `curator.rs`, `mcp.rs`, `commands.rs` (`/diff`, `/usage`…), `guards.rs`, `changes.rs` |
 | `crates/agent` | `hermes_agent` | The agent state machine (from Goose): stream a reply, run tool calls, repeat | `events.rs` has `AgentEvent` |
 | `crates/llm` | `hermes_llm` | Messages, the OpenAI-compatible provider, retries (from Goose) | `conversation::message::{Message, MessageContent}`; `observer.rs` is where every model POST is reported (purpose, session, provider) to the request ledger |
-| `crates/tools` | `hermes_tools` | Every agent tool + `SessionTools` (the per-session tool set) | One module per tool family; `paths.rs` resolves paths; `path_policy.rs` classifies where file edits and terminal commands may go (workspace, app data, skills/memory, persistence places, outside); `approval.rs` the dangerous-command check; `taint.rs` what the session has read that the user didn't write (see Taint in PITFALLS.md); `index.rs` the local FTS5 index (`index.db`) over skills and memory, kept fresh by write hooks on `SkillStore` / `MemoryStore` |
+| `crates/tools` | `hermes_tools` | Every agent tool + `SessionTools` (the per-session tool set) | One module per tool family; `paths.rs` resolves paths; `path_policy.rs` classifies where file edits and terminal commands may go (workspace, app data, skills/memory, persistence places, outside); `approval.rs` the dangerous-command check; `taint.rs` what the session has read that the user didn't write (see Taint in PITFALLS.md); `staging.rs` the writes a tainted session's `memory` / `skill_manage` calls leave for the user (`staging/<id>.json`, applied through the stores' own write paths); `index.rs` the local FTS5 index (`index.db`) over skills and memory, kept fresh by write hooks on `SkillStore` / `MemoryStore` |
 | `crates/memory` | `hermes_memory` | The memory store and tool (`§`-separated entries, char limits, drift guard) | |
 | `crates/store` | `hermes_store` | SQLite: sessions, messages, usage, projects | **Schema frozen** (shared with GPUI) |
 | `crates/prompts` | `hermes_prompts` | Builds the system prompt; tool schemas; coding-command and side-question prompts | Text comes from `prompts/` |
@@ -114,7 +114,7 @@ is the contract (257 methods), `apps/desktop/src/api/` is how the page calls the
 - A prefix block delegates to its module: `/api/providers/custom-endpoints*` → `endpoints.rs`,
   `/api/fs/*` and `/api/files/*` → `files.rs`, `/api/git/*` → `git_review::route`,
   `/api/tools/*` → `toolsets.rs`, `/api/learning/*` → `learning.rs`, `/api/skills*` → `skills.rs`,
-  `/api/sessions/{id}` → `session_route`, `/api/sessions/{id}/messages` → `stored_messages`.
+  `/api/staging*` → `staging.rs` (ours), `/api/sessions/{id}` → `session_route`, `/api/sessions/{id}/messages` → `stored_messages`.
 
 ## ACP mode (`--acp`, `crates/desktop/src/acp/`)
 
@@ -171,6 +171,7 @@ Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`
 | Settings (all other pages) | `rest.rs` (`config_defaults`, `config_schema`), gw `apply_settings` | `/api/config*` | — |
 | Settings ▸ Memory, the Star map | `learning.rs`, `hermes_memory` | `/api/learning/*`, `/api/memory*` | `memory-check.mjs` |
 | Capabilities ▸ Skills | `skills.rs` | `/api/skills*` | — |
+| Writes waiting for review (tainted sessions; no screen until CP6.3) | `staging.rs`, `hermes_tools::staging` | `staging.list/apply/reject` (ours), `/api/staging*` | — |
 | Capabilities ▸ Tools | `toolsets.rs`, runtime `set_disabled_tools` | `/api/tools/*` | `toolsets-check.mjs` |
 | Command Center ▸ Maintenance, logs, insights | `maintenance.rs`, gw | `/api/curator*`, `/api/logs`, `insights.get` | — |
 | Import Hermes sessions | `hermes_import.rs` | `session.foreign.*`, `/import-hermes` | `import-check.mjs` |

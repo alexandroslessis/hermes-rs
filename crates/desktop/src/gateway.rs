@@ -542,6 +542,19 @@ impl Gateway {
                     None => Err((INVALID_PARAMS, "No provider is configured".to_string())),
                 }
             }
+            // The writes a tainted session left for the user to review (`staging.rs`). Ours.
+            "staging.list" => Ok(crate::staging::list(&self.runtime).await),
+            "staging.apply" | "staging.reject" => {
+                let Some(id) = params["id"].as_str() else {
+                    return Err((INVALID_PARAMS, "id is required".to_string()));
+                };
+                let answer = if method == "staging.apply" {
+                    crate::staging::apply(&self.runtime, id).await
+                } else {
+                    crate::staging::reject(&self.runtime, id).await
+                };
+                answer.map_err(|failure| (SERVER_ERROR, failure.message().to_string()))
+            }
             "config.get" => Ok(json!({
                 "value": params["key"]
                     .as_str()
@@ -3545,6 +3558,9 @@ impl Gateway {
                 .unwrap_or(200);
             return Some((200, self.actions.status(&name, limit)));
         }
+        if path == "/api/staging" || path.starts_with("/api/staging/") {
+            return crate::staging::route(&self.runtime, method, path).await;
+        }
         if path == "/api/skills" || path.starts_with("/api/skills/") {
             let store = self.runtime.skills();
             return crate::skills::route(&store, &self.rest, method, path, query, body);
@@ -4154,5 +4170,174 @@ mod budget_tests {
         // Saved to the config record, so the next start reads it back.
         let saved = std::fs::read_to_string(dir.path().join("desktop-config.json")).unwrap();
         assert!(saved.contains("\"tokens\""), "{saved}");
+    }
+
+    /// Stages a memory write the way a tainted session's `memory` call does.
+    fn stage_memory(gateway: &Gateway, text: &str) -> String {
+        let meta = hermes_tools::staging::Meta {
+            session_id: "s1".into(),
+            sources: vec!["a web page".into()],
+            reason: "this turn read a web page".into(),
+        };
+        let args = json!({"target": "memory", "operations": [{"action": "add", "content": text}]});
+        let staged =
+            gateway
+                .runtime
+                .staging()
+                .stage_memory_call(&gateway.runtime.memory(), &args, &meta);
+        assert_eq!(staged["success"], true, "{staged}");
+        gateway.runtime.staging().list().last().unwrap().id.clone()
+    }
+
+    #[tokio::test]
+    async fn staging_list_has_a_stable_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let gateway = gateway(dir.path());
+        let empty = call(&gateway, "staging.list", json!({})).await.unwrap();
+        assert_eq!(empty, json!({"items": [], "count": 0}));
+        let id = stage_memory(&gateway, "likes tea");
+        let listed = call(&gateway, "staging.list", json!({})).await.unwrap();
+        assert_eq!(listed["count"], 1);
+        let item = &listed["items"][0];
+        assert_eq!(item["id"], id);
+        assert_eq!(item["kind"], "memory");
+        assert_eq!(item["summary"], "add memory");
+        assert_eq!(item["status"], "pending");
+        assert_eq!(item["session_id"], "s1");
+        assert_eq!(item["sources"], json!(["a web page"]));
+        assert_eq!(item["reason"], "this turn read a web page");
+        assert!(item["diff"].as_str().unwrap().contains("+ likes tea"));
+        assert!(item["created"].as_i64().unwrap() > 0);
+        assert!(item["error"].is_null());
+        // The payload is not part of the answer.
+        assert!(item.get("op").is_none());
+    }
+
+    #[tokio::test]
+    async fn staging_apply_saves_the_write_and_reject_drops_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let gateway = gateway(dir.path());
+        let keep = stage_memory(&gateway, "likes tea");
+        let drop = stage_memory(&gateway, "likes coffee");
+        let applied = call(&gateway, "staging.apply", json!({"id": keep}))
+            .await
+            .unwrap();
+        assert_eq!(applied["id"], keep);
+        assert_eq!(applied["kind"], "memory");
+        assert_eq!(applied["applied"], true);
+        assert!(applied["message"].is_string());
+        assert_eq!(
+            gateway
+                .runtime
+                .memory()
+                .entries(hermes_memory::Target::Memory),
+            ["likes tea"]
+        );
+        let rejected = call(&gateway, "staging.reject", json!({"id": drop}))
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected,
+            json!({"id": drop, "kind": "memory", "rejected": true})
+        );
+        let listed = call(&gateway, "staging.list", json!({})).await.unwrap();
+        assert_eq!(listed["count"], 0);
+        assert_eq!(
+            gateway
+                .runtime
+                .memory()
+                .entries(hermes_memory::Target::Memory),
+            ["likes tea"]
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_errors_say_what_went_wrong() {
+        let dir = tempfile::tempdir().unwrap();
+        let gateway = gateway(dir.path());
+        for method in ["staging.apply", "staging.reject"] {
+            let missing = call(&gateway, method, json!({})).await.unwrap_err();
+            assert_eq!(missing.0, INVALID_PARAMS, "{method}");
+            for id in ["abcdef012345", "../sessions", "", r"..\..\x"] {
+                let unknown = call(&gateway, method, json!({"id": id})).await.unwrap_err();
+                assert_eq!(unknown.0, SERVER_ERROR, "{method} {id}");
+                assert!(unknown.1.starts_with("No staged item"), "{}", unknown.1);
+            }
+        }
+        // A write that can no longer be applied: an error that says why, and the item stays.
+        let id = stage_memory(&gateway, "a fairly long entry that no longer fits");
+        gateway
+            .runtime
+            .memory()
+            .set_config(hermes_memory::MemoryConfig {
+                memory_char_limit: 10,
+                ..Default::default()
+            });
+        let failed = call(&gateway, "staging.apply", json!({"id": id}))
+            .await
+            .unwrap_err();
+        assert_eq!(failed.0, SERVER_ERROR);
+        assert!(
+            failed.1.starts_with("Could not apply this change:"),
+            "{}",
+            failed.1
+        );
+        assert!(
+            gateway
+                .runtime
+                .memory()
+                .entries(hermes_memory::Target::Memory)
+                .is_empty()
+        );
+        let listed = call(&gateway, "staging.list", json!({})).await.unwrap();
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["items"][0]["status"], "pending");
+        assert!(listed["items"][0]["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn staging_over_rest_mirrors_the_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let gateway = gateway(dir.path());
+        let id = stage_memory(&gateway, "likes tea");
+        let (status, body) = gateway
+            .rest("GET", "/api/staging", None, b"")
+            .await
+            .unwrap();
+        assert_eq!((status, body["count"].clone()), (200, json!(1)));
+        let (status, body) = gateway
+            .rest("POST", "/api/staging/abcdef012345/apply", None, b"")
+            .await
+            .unwrap();
+        assert_eq!(status, 404);
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("No staged item")
+        );
+        let (status, body) = gateway
+            .rest("POST", &format!("/api/staging/{id}/apply"), None, b"")
+            .await
+            .unwrap();
+        assert_eq!((status, body["applied"].clone()), (200, json!(true)));
+        let (status, _) = gateway
+            .rest("POST", &format!("/api/staging/{id}/reject"), None, b"")
+            .await
+            .unwrap();
+        assert_eq!(status, 404, "already applied");
+        // Not a route: Hermes's 404.
+        assert!(
+            gateway
+                .rest("DELETE", "/api/staging", None, b"")
+                .await
+                .is_none()
+        );
+        assert!(
+            gateway
+                .rest("POST", "/api/staging/x/nope", None, b"")
+                .await
+                .is_none()
+        );
     }
 }

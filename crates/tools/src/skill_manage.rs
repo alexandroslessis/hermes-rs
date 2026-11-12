@@ -370,6 +370,20 @@ impl SkillStore {
 
     /// `skill_manage` for a writer other than the session's agent.
     pub fn manage_with(&self, args: &Value, origin: WriteOrigin) -> Value {
+        let ops = match self.parse_call(args) {
+            Ok(ops) => ops,
+            Err(refusal) => return refusal,
+        };
+        if self.config().write_approval {
+            return self.stage(ops, origin);
+        }
+        self.apply_ops(&ops, origin)
+    }
+
+    /// Reads a `skill_manage` call (the `operations` batch, or Hermes's flat single-op shape)
+    /// into its operations, with the checks the tool makes before it writes anything. `Err` is the
+    /// tool's own refusal. The taint-driven staging area reads a call through this too.
+    pub(crate) fn parse_call(&self, args: &Value) -> Result<Vec<SkillOp>, Value> {
         let ops: Vec<SkillOp> = match args.get("operations").filter(|o| !o.is_null()) {
             Some(Value::Array(items)) => {
                 let default_name = args.get("name").and_then(Value::as_str).unwrap_or_default();
@@ -383,32 +397,31 @@ impl SkillStore {
                             ops.push(op);
                         }
                         Err(e) => {
-                            return err(format!("operations[{i}] is not a valid operation: {e}"));
+                            return Err(err(format!(
+                                "operations[{i}] is not a valid operation: {e}"
+                            )));
                         }
                     }
                 }
                 ops
             }
-            Some(_) => return err("operations must be a list of operation objects."),
+            Some(_) => return Err(err("operations must be a list of operation objects.")),
             None => match serde_json::from_value::<SkillOp>(args.clone()) {
                 Ok(op) if !op.action.is_empty() => vec![op],
                 _ => {
-                    return err(
+                    return Err(err(
                         "Missing required parameter: 'operations', a list of {action, name, ...} changes; a single change is a one-item list.",
-                    );
+                    ));
                 }
             },
         };
         if ops.is_empty() {
-            return err("operations list is empty.");
+            return Err(err("operations list is empty."));
         }
         if let Some(error) = self.validate_ops(&ops) {
-            return err(error);
+            return Err(err(error));
         }
-        if self.config().write_approval {
-            return self.stage(ops, origin);
-        }
-        self.apply_ops(&ops, origin)
+        Ok(ops)
     }
 
     /// A write the user makes in the app (create or edit from Capabilities ▸ Skills): applied
@@ -477,6 +490,11 @@ impl SkillStore {
     /// Applies every op or none: touched skill folders are snapshotted and restored on failure.
     fn apply_ops(&self, ops: &[SkillOp], origin: WriteOrigin) -> Value {
         let _guard = self.write_lock.lock();
+        self.apply_ops_locked(ops, origin)
+    }
+
+    /// [`Self::apply_ops`] with the write lock already held by the caller.
+    fn apply_ops_locked(&self, ops: &[SkillOp], origin: WriteOrigin) -> Value {
         let Ok(backup) = tempfile::Builder::new()
             .prefix("hermes-skill-batch")
             .tempdir()
@@ -795,6 +813,353 @@ impl SkillStore {
             format!(" Content absorbed into '{absorbed}'.")
         };
         json!({"success": true, "message": format!("Skill '{}' deleted.{note}", op.name)})
+    }
+}
+
+// ---- staged writes (the taint-driven staging area, `staging.rs`) --------------------------------
+
+/// A file a staged batch reads or overwrites, with what it was when the batch was staged. When the
+/// batch is applied later the file must still be that, or the write is stale: it was reviewed
+/// against text that has since changed, and applying it could undo newer work.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FileBase {
+    /// The skill's name.
+    pub skill: String,
+    /// The file inside it (`SKILL.md`, `references/x.md`).
+    pub file: String,
+    /// [`fingerprint`] of the file then; `None`: it did not exist (for `SKILL.md`: the skill didn't).
+    pub fingerprint: Option<String>,
+}
+
+/// What staging a skill write needs: the diff the user reviews and the bases it was made against.
+#[derive(Debug)]
+pub struct SkillPlan {
+    pub diff: String,
+    pub bases: Vec<FileBase>,
+}
+
+/// Why a staged skill write could not be applied.
+#[derive(Debug)]
+pub enum StagedSkillError {
+    /// What the batch was made against has changed (message names what).
+    Stale(String),
+}
+
+/// A stable 64-bit FNV-1a hash of `bytes`, as hex. Change detection, not security: the text
+/// compared is the user's own skill folder.
+pub fn fingerprint(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn file_diff(skill: &str, file: &str, old: Option<&str>, new: Option<&str>) -> String {
+    let from = if old.is_some() {
+        format!("a/{skill}/{file}")
+    } else {
+        "/dev/null".to_string()
+    };
+    let to = if new.is_some() {
+        format!("b/{skill}/{file}")
+    } else {
+        "/dev/null".to_string()
+    };
+    similar::TextDiff::from_lines(old.unwrap_or_default(), new.unwrap_or_default())
+        .unified_diff()
+        .context_radius(3)
+        .header(&from, &to)
+        .to_string()
+}
+
+fn scan_text(text: &str, label: &str) -> Option<String> {
+    let scope = hermes_memory::threats::Scope::All;
+    hermes_memory::threats::first_threat_message(text, scope)
+        .map(|threat| format!("Security scan blocked this skill ({label}): {threat}"))
+}
+
+/// Walks a batch against the files as they are now, keeping the result of each op in memory so a
+/// later op sees an earlier one's effect (a `create` then a `write_file`).
+struct Planner<'a> {
+    store: &'a SkillStore,
+    /// `(skill, file)` -> the text it will have; `None`: absent.
+    files: std::collections::HashMap<(String, String), Option<String>>,
+    /// Skills this batch creates (they have no files on disk yet).
+    created: std::collections::HashSet<String>,
+    bases: Vec<FileBase>,
+    diff: String,
+}
+
+impl Planner<'_> {
+    /// The current text of a file (`None`: absent); the first read of a file on disk is a base.
+    fn current(&mut self, skill: &str, file: &str) -> Result<Option<String>, String> {
+        let key = (skill.to_string(), file.to_string());
+        if let Some(text) = self.files.get(&key) {
+            return Ok(text.clone());
+        }
+        // A skill this batch creates has no other files yet. (Only those: a skill whose SKILL.md
+        // an earlier op read still has its other files on disk, and they must be read and pinned.)
+        if self.created.contains(skill) {
+            self.files.insert(key, None);
+            return Ok(None);
+        }
+        let Some(entry) = self.store.find_any(skill) else {
+            return Err(format!(
+                "Skill '{skill}' not found. Use skills_list to see the available skills."
+            ));
+        };
+        // Pinned on the bytes, as `check_bases` reads them (a file that isn't UTF-8 is still a
+        // file: it must not look absent and be shown as new).
+        let bytes = std::fs::read(entry.dir.join(file)).ok();
+        let text = bytes
+            .as_ref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        self.bases.push(FileBase {
+            skill: skill.to_string(),
+            file: file.to_string(),
+            fingerprint: bytes.as_deref().map(fingerprint),
+        });
+        self.files.insert(key, text.clone());
+        Ok(text)
+    }
+
+    fn set(&mut self, skill: &str, file: &str, old: Option<&str>, new: Option<String>) {
+        self.diff
+            .push_str(&file_diff(skill, file, old, new.as_deref()));
+        self.files
+            .insert((skill.to_string(), file.to_string()), new);
+    }
+
+    /// Replaces a whole file (a full rewrite of SKILL.md, or `write_file`): what the real write
+    /// refuses, refused now.
+    fn overwrite(&mut self, op: &SkillOp, file: &str, content: &str) -> Result<(), String> {
+        let old = self.current(&op.name, file)?;
+        if file == "SKILL.md" {
+            if let Some(e) = validate_frontmatter(content)
+                .or_else(|| validate_content_size(content, "SKILL.md"))
+                .or_else(|| description_budget_error(content, old.as_deref()))
+            {
+                return Err(e);
+            }
+        }
+        if let Some(threat) = scan_text(content, file) {
+            return Err(threat);
+        }
+        self.set(&op.name, file, old.as_deref(), Some(content.to_string()));
+        Ok(())
+    }
+
+    fn step(&mut self, op: &SkillOp) -> Result<(), String> {
+        let content = op.content.as_deref().unwrap_or_default();
+        match op.action.as_str() {
+            "create" => {
+                if let Some(e) = validate_name(&op.name)
+                    .or_else(|| validate_category(op.category.as_deref()))
+                    .or_else(|| validate_frontmatter(content))
+                    .or_else(|| validate_content_size(content, "SKILL.md"))
+                {
+                    return Err(e);
+                }
+                if self.store.find_any(&op.name).is_some() {
+                    return Err(format!("A skill named '{}' already exists.", op.name));
+                }
+                if let Some(e) = description_budget_error(content, None) {
+                    return Err(e);
+                }
+                if let Some(threat) = scan_text(content, "SKILL.md") {
+                    return Err(threat);
+                }
+                self.bases.push(FileBase {
+                    skill: op.name.clone(),
+                    file: "SKILL.md".into(),
+                    fingerprint: None,
+                });
+                let place = match op
+                    .category
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                {
+                    Some(category) => format!("{category}/{}", op.name),
+                    None => op.name.clone(),
+                };
+                self.diff.push_str(&format!("# new skill {place}\n"));
+                self.created.insert(op.name.clone());
+                self.set(&op.name, "SKILL.md", None, Some(content.to_string()));
+                Ok(())
+            }
+            "edit" => self.overwrite(op, "SKILL.md", content),
+            "patch" if !content.is_empty() => self.overwrite(op, "SKILL.md", content),
+            "patch" => {
+                let file = op.file_path.clone().unwrap_or_else(|| "SKILL.md".into());
+                if op.file_path.is_some() {
+                    if let Some(e) = validate_file_path(&file) {
+                        return Err(e);
+                    }
+                }
+                let Some(text) = self.current(&op.name, &file)? else {
+                    return Err(format!("File not found: {file}"));
+                };
+                let old = op.old_string.as_deref().unwrap_or_default();
+                let new = op.new_string.as_deref().unwrap_or_default();
+                let (updated, _) = replace_in(&text, old, new, op.replace_all)?;
+                if let Some(e) = validate_content_size(&updated, &file) {
+                    return Err(e);
+                }
+                if file == "SKILL.md" {
+                    if let Some(e) = validate_frontmatter(&updated) {
+                        return Err(format!("Patch would break SKILL.md structure: {e}"));
+                    }
+                    if let Some(e) = description_budget_error(&updated, Some(&text)) {
+                        return Err(e);
+                    }
+                }
+                if let Some(threat) = scan_text(&updated, &file) {
+                    return Err(threat);
+                }
+                self.set(&op.name, &file, Some(&text), Some(updated));
+                Ok(())
+            }
+            "write_file" => {
+                let file = op.file_path.as_deref().unwrap_or_default();
+                let body = op.file_content.as_deref().unwrap_or_default();
+                if let Some(e) = validate_file_path(file) {
+                    return Err(e);
+                }
+                if body.len() > MAX_SKILL_FILE_BYTES {
+                    return Err(format!(
+                        "File content is {} bytes (limit: {MAX_SKILL_FILE_BYTES} bytes / 1 MiB).",
+                        body.len()
+                    ));
+                }
+                if let Some(e) = validate_content_size(body, file) {
+                    return Err(e);
+                }
+                if file == "SKILL.md" {
+                    return self.overwrite(op, file, body);
+                }
+                let old = self.current(&op.name, file)?;
+                if let Some(threat) = scan_text(body, file) {
+                    return Err(threat);
+                }
+                self.set(&op.name, file, old.as_deref(), Some(body.to_string()));
+                Ok(())
+            }
+            "remove_file" => {
+                let file = op.file_path.as_deref().unwrap_or_default();
+                if let Some(e) = validate_file_path(file) {
+                    return Err(e);
+                }
+                let Some(old) = self.current(&op.name, file)? else {
+                    return Err(format!("File '{file}' not found in skill '{}'.", op.name));
+                };
+                self.set(&op.name, file, Some(&old), None);
+                Ok(())
+            }
+            "delete" => {
+                let Some(old) = self.current(&op.name, "SKILL.md")? else {
+                    return Err(format!("Skill '{}' not found.", op.name));
+                };
+                let absorbed = op.absorbed_into.as_deref().map(str::trim).unwrap_or("");
+                if !absorbed.is_empty()
+                    && (absorbed == op.name || self.store.find_any(absorbed).is_none())
+                {
+                    return Err(format!(
+                        "absorbed_into='{absorbed}' must be another skill that exists."
+                    ));
+                }
+                self.set(&op.name, "SKILL.md", Some(&old), None);
+                self.diff.push_str(&format!(
+                    "# the whole skill '{}' and its files are deleted\n",
+                    op.name
+                ));
+                Ok(())
+            }
+            other => Err(format!("Unknown action '{other}'.")),
+        }
+    }
+}
+
+impl SkillStore {
+    /// Checks a batch against the skills as they are now, without writing, for staging: the first
+    /// problem as the message the model would have got, or the diff and bases. The write itself
+    /// checks everything again when it is applied ([`Self::apply_staged`]).
+    pub fn plan(&self, ops: &[SkillOp]) -> Result<SkillPlan, String> {
+        if let Some(error) = self.validate_ops(ops) {
+            return Err(error);
+        }
+        let mut planner = Planner {
+            store: self,
+            files: Default::default(),
+            created: Default::default(),
+            bases: Vec::new(),
+            diff: String::new(),
+        };
+        for (i, op) in ops.iter().enumerate() {
+            planner.step(op).map_err(|e| {
+                format!(
+                    "operations[{i}] ({} on '{}'): {e} Nothing was saved.",
+                    op.action, op.name
+                )
+            })?;
+        }
+        Ok(SkillPlan {
+            diff: planner.diff,
+            bases: planner.bases,
+        })
+    }
+
+    /// Whether the files a staged batch was made against are still as they were.
+    fn check_bases(&self, bases: &[FileBase]) -> Result<(), StagedSkillError> {
+        let stale = |message: String| Err(StagedSkillError::Stale(message));
+        for base in bases {
+            let entry = self.find_any(&base.skill);
+            if base.file == "SKILL.md" && base.fingerprint.is_none() {
+                if entry.is_some() {
+                    return stale(format!(
+                        "A skill named '{}' exists now; this one was staged as new.",
+                        base.skill
+                    ));
+                }
+                continue;
+            }
+            let Some(entry) = entry else {
+                return stale(format!("Skill '{}' no longer exists.", base.skill));
+            };
+            if base.file != "SKILL.md" && validate_file_path(&base.file).is_some() {
+                return stale(format!("'{}' is not a file a skill may hold.", base.file));
+            }
+            let now = std::fs::read(entry.dir.join(&base.file))
+                .ok()
+                .map(|bytes| fingerprint(&bytes));
+            if now != base.fingerprint {
+                return stale(format!(
+                    "'{}/{}' has changed since this was staged.",
+                    base.skill, base.file
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies a staged batch (the user approved it) through the same write path as a direct one
+    /// (validation, threat scan, the git commit, the index hook), but only when the files it was
+    /// reviewed against are unchanged: under the write lock, so nothing slips in between.
+    /// `Ok` holds the write's own result (`success` true or false).
+    pub fn apply_staged(
+        &self,
+        ops: &[SkillOp],
+        origin: WriteOrigin,
+        bases: &[FileBase],
+    ) -> Result<Value, StagedSkillError> {
+        let _guard = self.write_lock.lock();
+        self.check_bases(bases)?;
+        if let Some(error) = self.validate_ops(ops) {
+            return Ok(err(error));
+        }
+        Ok(self.apply_ops_locked(ops, origin))
     }
 }
 

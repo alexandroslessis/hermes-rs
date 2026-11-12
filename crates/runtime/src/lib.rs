@@ -573,6 +573,27 @@ impl Runtime {
         self.memory.clone()
     }
 
+    /// The writes waiting for the user's review (`staging/` in the data folder): what a tainted
+    /// session's `memory` and `skill_manage` calls leave there. Its calls block: use
+    /// `spawn_blocking`, or [`Self::apply_staged`].
+    pub fn staging(&self) -> hermes_tools::staging::StagingStore {
+        hermes_tools::staging::StagingStore::new(&self.config.data_dir)
+    }
+
+    /// Applies a staged item (the user clicked Apply) through the memory and skill stores, so the
+    /// limits, the threat scan and the index hooks run as for a direct write. The user's own
+    /// action: not a tool call, so taint doesn't stage it again.
+    pub async fn apply_staged(&self, id: &str) -> hermes_tools::staging::Applied {
+        let (staging, memory, skills) = (self.staging(), self.memory.clone(), self.skills.clone());
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || staging.apply(&id, &memory, &skills))
+            .await
+            .unwrap_or_else(|e| hermes_tools::staging::Applied::Failed {
+                error: format!("The write did not finish: {e}."),
+                stale: false,
+            })
+    }
+
     fn scratch_dir(&self, session_id: &str) -> PathBuf {
         self.config.data_dir.join("scratch").join(session_id)
     }
