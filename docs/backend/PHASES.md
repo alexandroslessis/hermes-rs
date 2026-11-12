@@ -39,7 +39,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | # | Phase | Size | Depends on | Coding | Lane |
 |---|---|---|---|---|---|
 | 0 | Groundwork: rules, request-counting test harness | S | — | Sonnet | A |
-| 1 | Path policy, env scrub, skill-script flag | S–M | — | Sonnet | B |
+| 1 | Path policy, env scrub, skill-script flag — ✅ 2026-11-12 | S–M | — | Sonnet | B |
 | 2 | Request ledger | M | 0 | Sonnet | A |
 | 3 | Budget profiles and the knobs they set | M | 2 | Sonnet | A |
 | 4 | Side jobs off the main quota | S–M | 3 | Sonnet | A |

@@ -246,6 +246,183 @@ fn within(path: &str, dir: &str) -> bool {
     path == dir || path.starts_with(&format!("{dir}/"))
 }
 
+// --- Terminal commands -------------------------------------------------------------------------
+
+/// Why a terminal command is flagged for naming a protected path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandFlag {
+    /// The reason shown to the user; also the key an approval is remembered by.
+    pub description: &'static str,
+    /// Persistence places always ask, in every mode, and the answer is never remembered.
+    pub persistence: bool,
+}
+
+pub const DESC_PERSISTENCE: &str =
+    "touches a place that runs code later (startup folder, shell profile, git hook, ssh)";
+pub const DESC_APP_DATA: &str = "touches the app's own data folder (settings, history, approvals)";
+pub const DESC_SELF_IMPROVE: &str =
+    "touches the skills or memory folder (use skill_manage / memory instead)";
+pub const DESC_SKILL_SCRIPT: &str = "runs a script the agent wrote into a skill";
+
+/// Looks for protected paths in the text of a terminal command and says why it should be flagged.
+///
+/// Defence in depth only: this is simple token extraction (quoted or bare words, with `~`, `$HOME`,
+/// `$env:APPDATA`, `%USERPROFILE%` and a few other variables expanded), so a determined command
+/// gets past it; the real boundary is the OS sandbox of Phase 15. Reads are flagged like writes.
+///
+/// `is_stock_script` says whether a file under the skills folder is an unmodified copy of a script
+/// bundled with the app (those are exempt from the skill-script flag).
+pub fn command_flag(
+    command: &str,
+    ctx: &PolicyContext,
+    is_stock_script: &dyn Fn(&Path) -> bool,
+) -> Option<CommandFlag> {
+    let skills = ctx.data_dir.join("skills");
+    let mut found: Option<CommandFlag> = None;
+    for path in command_paths(command, ctx) {
+        let (description, persistence) = match classify(&path, ctx) {
+            PathClass::Persistence => (DESC_PERSISTENCE, true),
+            PathClass::AppData => (DESC_APP_DATA, false),
+            PathClass::SelfImprove => {
+                // Only the part below the skills folder counts: a data folder that itself sits
+                // under some `scripts` folder must not make every skills path a "script".
+                let (target, root) = (key(&canonical(&path)), key(&canonical(&skills)));
+                let in_skills = !ctx.data_dir.as_os_str().is_empty() && within(&target, &root);
+                let is_script = in_skills
+                    && target[root.len()..]
+                        .split('/')
+                        .any(|part| part == "scripts");
+                if is_script {
+                    if is_stock_script(&path) {
+                        continue;
+                    }
+                    (DESC_SKILL_SCRIPT, false)
+                } else {
+                    (DESC_SELF_IMPROVE, false)
+                }
+            }
+            PathClass::Workspace | PathClass::Outside => continue,
+        };
+        if persistence {
+            return Some(CommandFlag {
+                description,
+                persistence,
+            });
+        }
+        found.get_or_insert(CommandFlag {
+            description,
+            persistence,
+        });
+    }
+    found
+}
+
+/// The path-like words of a command, resolved against the working folder (`~` and the common
+/// Windows/POSIX variables expanded).
+pub fn command_paths(command: &str, ctx: &PolicyContext) -> Vec<PathBuf> {
+    words(command)
+        .into_iter()
+        .map(|word| expand_variables(&word, ctx))
+        .filter(|word| {
+            word.contains('/')
+                || word.contains('\\')
+                || word.starts_with('~')
+                || word.starts_with('.')
+                || word.chars().nth(1) == Some(':')
+        })
+        .map(|word| crate::paths::resolve(&word, &ctx.cwd, &ctx.home))
+        .collect()
+}
+
+/// The words of a command line: split at whitespace and shell punctuation, except inside quotes,
+/// where a quoted string (spaces and all) is one word. An unquoted path with spaces in it is not
+/// recognised (best effort, see [`command_flag`]).
+fn words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for c in command.chars() {
+        match quote {
+            Some(q) if c == q => {
+                quote = None;
+                words.push(std::mem::take(&mut current));
+            }
+            Some(_) => current.push(c),
+            None if c == '"' || c == '\'' => {
+                words.push(std::mem::take(&mut current));
+                quote = Some(c);
+            }
+            None if c.is_whitespace()
+                || matches!(c, '`' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | ',' | '=') =>
+            {
+                words.push(std::mem::take(&mut current));
+            }
+            None => current.push(c),
+        }
+    }
+    words.push(current);
+    words.retain(|word| !word.is_empty());
+    words
+}
+
+/// `$HOME`, `${HOME}`, `$env:HOME` and `%HOME%` (case-insensitive) for the folders the policy
+/// knows about; other variables are left alone.
+fn expand_variables(word: &str, ctx: &PolicyContext) -> String {
+    let slashed = |path: &Path| {
+        path.to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/")
+    };
+    let home = slashed(&ctx.home);
+    let roaming = format!("{home}/AppData/Roaming");
+    let local = format!("{home}/AppData/Local");
+    let data = slashed(&ctx.data_dir);
+    let program_data = ctx
+        .program_data
+        .as_ref()
+        .map(|p| slashed(p))
+        .unwrap_or_default();
+    let vars: [(&str, &str); 6] = [
+        ("userprofile", &home),
+        ("home", &home),
+        ("appdata", &roaming),
+        ("localappdata", &local),
+        ("programdata", &program_data),
+        ("hermes_rs_home", &data),
+    ];
+    let mut out = word.to_string();
+    for (name, value) in vars {
+        if value.is_empty() {
+            continue;
+        }
+        for pattern in [
+            format!("$env:{name}"),
+            format!("${{{name}}}"),
+            format!("${name}"),
+            format!("%{name}%"),
+        ] {
+            // `$HOME` must not match the start of `$HOMEPATH`; `${..}` and `%..%` are delimited.
+            let open_ended = !pattern.ends_with(['}', '%']);
+            // Search after each replacement: a value containing the pattern can't loop forever.
+            let mut from = 0;
+            while let Some(found) = out[from..].to_ascii_lowercase().find(&pattern) {
+                let at = from + found;
+                let end = at + pattern.len();
+                let continues = out[end..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+                if open_ended && continues {
+                    from = end;
+                    continue;
+                }
+                out.replace_range(at..end, value);
+                from = at + value.len();
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +598,120 @@ mod tests {
         assert_eq!(f.class(home.join(".bashrc:evil")), PathClass::Persistence);
         assert_eq!(f.class(home.join(".bashrc.")), PathClass::Persistence);
         assert_eq!(f.class(home.join(".ssh./id")), PathClass::Persistence);
+    }
+
+    fn flag(f: &Fixture, command: &str) -> Option<CommandFlag> {
+        command_flag(command, &f.ctx, &|_| false)
+    }
+
+    #[test]
+    fn commands_naming_protected_paths_are_flagged() {
+        let f = Fixture::new();
+        let data = f.ctx.data_dir.display().to_string();
+        let persistent = |command: &str| {
+            let flag = flag(&f, command).unwrap_or_else(|| panic!("not flagged: {command}"));
+            assert!(flag.persistence, "{command}: {flag:?}");
+        };
+        persistent("cat ~/.ssh/id_rsa");
+        persistent("echo ssh-rsa AAA >> $HOME/.ssh/authorized_keys");
+        persistent("echo evil >> ~/.bashrc");
+        persistent(r#"copy x.bat "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\x.bat""#);
+        persistent(r"Set-Content $env:USERPROFILE\Documents\WindowsPowerShell\profile.ps1 'iex x'");
+        persistent("echo '#!/bin/sh' > .git/hooks/pre-commit");
+        persistent("cd ~/.ssh && ls");
+        assert_eq!(
+            flag(&f, &format!("rm {data}/sessions.db"))
+                .unwrap()
+                .description,
+            DESC_APP_DATA
+        );
+        assert_eq!(
+            flag(&f, "echo x >> $env:HERMES_RS_HOME/desktop-config.json")
+                .unwrap()
+                .description,
+            DESC_APP_DATA
+        );
+        assert_eq!(
+            flag(&f, &format!("echo x >> {data}/memories/MEMORY.md"))
+                .unwrap()
+                .description,
+            DESC_SELF_IMPROVE
+        );
+        assert_eq!(
+            flag(&f, &format!("python {data}/skills/x/scripts/run.py"))
+                .unwrap()
+                .description,
+            DESC_SKILL_SCRIPT
+        );
+        // A persistence path wins over a lesser one in the same command.
+        assert!(
+            flag(&f, &format!("cp {data}/sessions.db ~/.ssh/x"))
+                .unwrap()
+                .persistence
+        );
+    }
+
+    #[test]
+    fn ordinary_commands_are_not_flagged() {
+        let f = Fixture::new();
+        for command in [
+            "ls -la",
+            "cargo build --release",
+            "git commit -m \"fix hooks\"",
+            "echo hi > out.txt",
+            "cat src/main.rs | grep foo",
+            "python scripts/run.py --flag=value",
+            "type /c/Windows/win.ini",
+        ] {
+            assert_eq!(flag(&f, command), None, "{command}");
+        }
+        // The scratch folder lives in the data folder and is fine.
+        let scratch = f.ctx.scratch.display().to_string();
+        assert_eq!(flag(&f, &format!("echo x > {scratch}/a.txt")), None);
+    }
+
+    #[test]
+    fn variables_expand_whole_names_only_and_never_loop() {
+        let mut f = Fixture::new();
+        let home = f.ctx.home.display().to_string().replace('\\', "/");
+        assert_eq!(
+            expand_variables("$HOME/.ssh", &f.ctx),
+            format!("{home}/.ssh")
+        );
+        assert_eq!(
+            expand_variables("$env:userprofile/x", &f.ctx),
+            format!("{home}/x")
+        );
+        // `$HOMEPATH` is another variable, not `$HOME` + "PATH".
+        assert_eq!(expand_variables("$HOMEPATH/.ssh", &f.ctx), "$HOMEPATH/.ssh");
+        // A value that contains the pattern itself is replaced once.
+        f.ctx.home = PathBuf::from("C:/Users/$home");
+        assert_eq!(expand_variables("$home/x", &f.ctx), "C:/Users/$home/x");
+    }
+
+    #[test]
+    fn a_data_folder_under_a_scripts_folder_does_not_make_every_skill_path_a_script() {
+        let mut f = Fixture::new();
+        let data = f.ctx.data_dir.join("scripts").join("data");
+        f.ctx.data_dir = data.clone();
+        let command = format!("cat {}/skills/x/SKILL.md", data.display());
+        assert_eq!(flag(&f, &command).unwrap().description, DESC_SELF_IMPROVE);
+    }
+
+    #[test]
+    fn stock_skill_scripts_are_exempt_and_other_skill_scripts_are_not() {
+        let f = Fixture::new();
+        let script = format!(
+            "bash {}/skills/p5js/scripts/setup.sh",
+            f.ctx.data_dir.display()
+        );
+        assert_eq!(command_flag(&script, &f.ctx, &|_| true), None);
+        assert_eq!(
+            command_flag(&script, &f.ctx, &|_| false)
+                .unwrap()
+                .description,
+            DESC_SKILL_SCRIPT
+        );
     }
 
     #[test]

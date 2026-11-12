@@ -87,6 +87,52 @@ pub fn detect_shell() -> ShellKind {
         .unwrap_or(ShellKind::PowerShell)
 }
 
+/// Names the user keeps in the shell's environment although they look like secrets
+/// (`terminal.env_passthrough` in Settings), compared case-insensitively.
+static ENV_PASSTHROUGH: parking_lot::RwLock<Vec<String>> = parking_lot::RwLock::new(Vec::new());
+
+/// Sets the passthrough list (the app calls it at startup and after Settings change).
+pub fn set_env_passthrough(names: Vec<String>) {
+    *ENV_PASSTHROUGH.write() = names.into_iter().map(|n| n.to_ascii_uppercase()).collect();
+}
+
+/// Whether an environment variable looks like it holds a secret: its name contains `KEY`,
+/// `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL` or `AUTH` (so `SSH_AUTH_SOCK` goes too;
+/// list it in `terminal.env_passthrough` to keep it). `AUTHOR` is not `AUTH`: git's
+/// `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` stay, or the agent's commits would change author.
+fn looks_secret(name: &str) -> bool {
+    let name = name.to_ascii_uppercase().replace("AUTHOR", "");
+    [
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "AUTH",
+    ]
+    .iter()
+    .any(|word| name.contains(word))
+}
+
+/// The parent's environment minus secret-looking names (except the user's passthrough list):
+/// what the agent's shell starts with, so a command (or a prompt injection) can't read the
+/// provider's API key with `env`.
+pub(crate) fn scrubbed_env(
+    parent: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    passthrough: &[String],
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    parent
+        .filter(|(name, _)| {
+            let name = name.to_string_lossy();
+            !looks_secret(&name)
+                || passthrough
+                    .iter()
+                    .any(|kept| kept.eq_ignore_ascii_case(&name))
+        })
+        .collect()
+}
+
 pub(crate) fn shell_env(scratch_dir: &Path) -> Vec<(&'static str, String)> {
     let scratch = display_path(scratch_dir);
     vec![
@@ -104,11 +150,13 @@ pub(crate) fn shell_env(scratch_dir: &Path) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// A command builder that never opens a console window and inherits our shell environment.
+/// A command builder that never opens a console window and starts from our environment without the secret-looking variables (`scrubbed_env`).
 pub(crate) fn command(program: &Path, cwd: &Path, scratch_dir: &Path) -> Command {
     let mut command = Command::new(program);
     command
         .current_dir(cwd)
+        .env_clear()
+        .envs(scrubbed_env(std::env::vars_os(), &ENV_PASSTHROUGH.read()))
         .envs(shell_env(scratch_dir))
         .creation_flags(CREATE_NO_WINDOW)
         .kill_on_drop(true);
@@ -842,6 +890,74 @@ mod tests {
         );
         assert_eq!(powershell_errors(b"plain failure\r\n"), "plain failure");
         assert_eq!(powershell_errors(b""), "");
+    }
+
+    #[test]
+    fn secret_looking_variables_are_dropped_unless_passed_through() {
+        let parent = || {
+            [
+                "PATH",
+                "SystemRoot",
+                "USERPROFILE",
+                "GIT_AUTHOR_NAME",
+                "OPENAI_API_KEY",
+                "gh_token",
+                "DB_PASSWORD",
+                "AWS_SECRET_ACCESS_KEY",
+                "SSH_AUTH_SOCK",
+                "hermes_rs_or_api_key",
+                "MY_CREDENTIALS",
+                "PASSWD_FILE",
+                "GIT_AUTHOR_TOKEN",
+            ]
+            .into_iter()
+            .map(|name| (name.into(), "v".into()))
+        };
+        let names = |vars: Vec<(std::ffi::OsString, std::ffi::OsString)>| -> Vec<String> {
+            vars.into_iter()
+                .map(|(n, _)| n.to_string_lossy().into_owned())
+                .collect()
+        };
+        let basics = ["PATH", "SystemRoot", "USERPROFILE", "GIT_AUTHOR_NAME"];
+        assert_eq!(names(scrubbed_env(parent(), &[])), basics);
+        // The passthrough list is matched case-insensitively.
+        let kept = names(scrubbed_env(
+            parent(),
+            &["OPENAI_API_KEY".into(), "ssh_auth_sock".into()],
+        ));
+        assert_eq!(
+            kept,
+            [&basics[..], &["OPENAI_API_KEY", "SSH_AUTH_SOCK"]].concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_shell_does_not_see_secret_variables_but_keeps_the_basics() {
+        // Process-global state: names unique to this test.
+        unsafe {
+            std::env::set_var("HERMES_TEST_SCRUB_TOKEN", "scrub-me-12345");
+            std::env::set_var("HERMES_TEST_KEEP_TOKEN", "keep-me-67890");
+        }
+        set_env_passthrough(vec!["hermes_test_keep_token".into()]);
+        let (_dir, tools) = tools_in();
+        let list = if bash_available(&tools) {
+            "echo keep=$HERMES_TEST_KEEP_TOKEN scrub=$HERMES_TEST_SCRUB_TOKEN root=$SYSTEMROOT utf=$PYTHONUTF8 path=${PATH:+set}"
+        } else {
+            "\"keep=$($env:HERMES_TEST_KEEP_TOKEN) scrub=$($env:HERMES_TEST_SCRUB_TOKEN) root=$($env:SystemRoot) utf=$($env:PYTHONUTF8) path=$(if ($env:Path) {'set'})\""
+        };
+        let out = terminal(&tools, json!({"command": list}), None).await;
+        set_env_passthrough(Vec::new());
+        let text = out.value["output"]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase();
+        assert!(text.contains("keep=keep-me-67890"), "{text}");
+        assert!(text.contains("scrub= "), "{text}");
+        // SystemRoot survives the scrub (Windows programs break without it).
+        assert!(text.contains("root=c:"), "{text}");
+        assert!(text.contains("path=set"), "{text}");
+        // The terminal's own settings still apply.
+        assert!(text.contains("utf=1"), "{text}");
     }
 
     fn bash_available(tools: &SessionTools) -> bool {

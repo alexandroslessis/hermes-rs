@@ -3472,3 +3472,30 @@ async fn a_declined_git_hook_write_asks_even_in_yolo_and_takes_no_checkpoint() {
     // The policy runs before the checkpoint: a declined edit snapshots nothing.
     assert!(h.runtime.checkpoints().list(h.work.path()).is_empty());
 }
+
+#[tokio::test]
+async fn a_terminal_command_naming_the_app_data_folder_asks_and_is_blocked_when_declined() {
+    let h = harness_for_data(
+        |data| {
+            let config = data.join("desktop-config.json");
+            std::fs::write(&config, "{\"keep\": true}").unwrap();
+            let command = format!("echo {{}} > \"{}\"", config.display());
+            vec![
+                tool_reply(&[("t1", "terminal", json!({"command": command}))]),
+                text_reply("I couldn't."),
+            ]
+        },
+        // `Bridge` leaves approvals unanswered, which counts as a denial.
+        Arc::new(Bridge),
+    )
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "reset the app config").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let second = h.requests.lock()[1].to_string();
+    assert!(second.contains("BLOCKED"), "{second}");
+    assert_eq!(
+        std::fs::read_to_string(h.data.path().join("desktop-config.json")).unwrap(),
+        "{\"keep\": true}"
+    );
+}

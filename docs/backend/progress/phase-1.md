@@ -86,3 +86,110 @@ Left, with reasons:
 Tests after review: `cargo test -p hermes_tools` 102 passed (1 ignored); `cargo test -p
 hermes_runtime --test turns` 77 passed (7 ignored); `cargo build --workspace --exclude
 hermes-desktop` OK.
+
+## CP1.2 — Terminal paths, env scrub, skill-script flag, docs, live check
+Worktree: C:\Users\alexandros\repos\hermes-rs-p1   Branch: backend/p1-path-policy   Model: Sonnet 5.5
+Done:
+- `path_policy.rs`: `command_flag` / `command_paths` / `words` / `expand_variables`. Quote-aware word
+  splitting; `~`, `$HOME`, `${HOME}`, `$env:X`, `%X%` expanded for HOME, USERPROFILE, APPDATA,
+  LOCALAPPDATA, ProgramData, HERMES_RS_HOME; each path-like word is resolved and classified.
+  Persistence -> flagged (always asks); AppData / skills+memories -> flagged like a dangerous
+  pattern; a file under `skills/**/scripts/` -> "runs a script the agent wrote into a skill".
+- `SessionTools::check_command` (`tools/src/lib.rs`): a flag turns a "Run" into an "Ask". Persistence
+  asks in every mode (even Yolo and approvals "off"), once-only, never smart-approved; the others
+  are remembered by description like patterns and skipped in Yolo/off. Bug found and fixed on the
+  way: the `session_approved` lock was held across the `match` (deadlock); now taken per call.
+- `skills::is_stock_script(root, path)`: compares the file with the embedded `Bundled` copy byte for
+  byte (not a manifest hash), so editing the extracted copy or the manifest can't make it pass.
+- Env scrub (`shell.rs`): `command()` now does `env_clear()` + the parent env minus names containing
+  KEY/TOKEN/SECRET/PASSWORD/PASSWD/CREDENTIAL/AUTH, then `shell_env`. `terminal.env_passthrough`
+  (Settings config record) keeps names; applied in `Gateway::apply_settings` through
+  `hermes_tools::set_env_passthrough` (process-global list). MCP stdio servers untouched.
+- Docs: PITFALLS section, PORTING rows (`path_policy.rs` diverged, `shell.rs`/`approval.rs`
+  notes), perf README line.
+- Live check `scripts/perf/path-policy-check.mjs`: mock model writes into the perf instance's data,
+  skills and memories folders; all refused with the right message, nothing written.
+Files: crates/tools/src/{path_policy,lib,shell,skills}.rs, crates/desktop/src/gateway.rs,
+  crates/runtime/tests/turns.rs, docs/PITFALLS.md, PORTING.md, scripts/perf/{README.md,path-policy-check.mjs}
+Tests: hermes_tools 112 passed (1 ignored); hermes_runtime turns 78 passed (7 ignored); hermes-desktop
+  67 + 26 passed; `cargo build --workspace` OK; live check `path-policy-check.mjs` all ok on a perf
+  instance built from this worktree (port 47810, stopped afterwards).
+Request counts: unchanged.
+Deviations from the plan:
+- The plan's "turns scenario" for the env scrub became a `shell.rs` unit test that runs a real shell
+  (`the_shell_does_not_see_secret_variables_but_keeps_the_basics`); it ran in Git Bash here, the
+  PowerShell branch of the test command was not exercised.
+- No GAPS.md row: GAPS tracks Hermes feature gaps and has no section for backend v2; the phase is
+  documented in PORTING/PITFALLS instead. The reviewer may prefer a different place.
+- To build `hermes-desktop` in this worktree I made a directory junction `target/hermes-src` ->
+  the main checkout's `target/hermes-src` (gitignored, read-only use) and ran node from
+  `../hermes-rs/tools/node`.
+For the reviewer:
+- **Env scrub is the riskiest part**: check nothing the shell needs is dropped (`SSH_AUTH_SOCK`
+  goes by design; `GIT_ASKPASS`, `PATH`, `SystemRoot`, `USERPROFILE`, `ProgramFiles*` stay). The
+  process-global passthrough list is simple but global.
+- `command_flag` flags reads too, and an existing pattern ("overwrite system file via redirection")
+  still wins the description for `>> ~/.bashrc`; the persistence flag only changes the
+  "never remembered / even Yolo" behaviour there. Unquoted paths with spaces aren't recognised.
+- `approvals: None` sessions (curator) skip `check_command` entirely, as before.
+- Not done from the plan text: none. Not verified: PowerShell variant of the env test; Settings UI
+  for `terminal.env_passthrough` (config record only, as the page already has the key).
+- Last checkpoint of Phase 1: docs and phase-map ✅ and the merge into main are the reviewer's.
+
+### Review (Opus 5.5)
+Reviewed 2026-11-12 in this worktree. `main` is still at 846be90 (an ancestor of this branch), so
+no merge needed. `/code-review high` run on the uncommitted diff, plus the CP1.2 focus by reading
+the code.
+
+Review focus:
+- **Env scrub keeps the basics.** Only `shell::command()` (foreground terminal and background
+  processes) is scrubbed; `PATH`, `SystemRoot`, `USERPROFILE`, `ProgramFiles*`, `ComSpec`,
+  `PATHEXT`, `TEMP`, `GIT_ASKPASS` match none of the words. On this machine the only variables
+  dropped are the API key and some Claude Code ones. Git/lint/checkpoint/desktop spawns are not
+  the agent's shell and are untouched.
+- **MCP servers keep their configured env.** `runtime/src/mcp.rs` is unchanged: servers inherit
+  the whole environment plus their config. The plan also asked to scrub servers that have *no*
+  env config; not done, on purpose: many read their key from an inherited variable and would
+  break silently. Recorded in PITFALLS; a candidate for Phase 15 / 6.
+- **Bundled-skill check can't be fooled by editing the copy.** `is_stock_script` compares the
+  file's bytes with the embedded `Bundled` copy (no manifest, no hash on disk); a path that isn't
+  lexically under `skills/` (case, junction, `..` left after normalisation) is "not stock", i.e.
+  asks: the safe direction. Limit, noted: a stock script that runs a sibling file the agent wrote
+  is not caught (token matching only).
+- **`check_command` flow.** Persistence: always_ask → `once_only`, never smart-assessed, the Yolo
+  early return is skipped, Session/Always answers are not remembered; with approvals "off" the
+  gate returns Run and the flag still turns it into Ask. Tests cover every mode plus "off".
+  Non-persistence flags behave like dangerous patterns (remembered by description, skipped in
+  Yolo/off). When a dangerous pattern also matches, its description wins (the flag's is not
+  shown); harmless.
+- **Passthrough list** is process-global but set by `Gateway::build` → `apply_settings` for both
+  the app and `hermes-acp.exe`, and after every config write. Fine for one data folder per
+  process.
+
+Findings fixed:
+- Rule 7: `command_flag` (several `canonicalize` per path word) ran on the async worker; now in
+  `spawn_blocking`, a panic falls back to the persistence flag (asks).
+- `expand_variables` could loop forever when a value contained its own pattern (`C:\Users\$home`);
+  it now searches past each replacement. And `$HOME` matched the start of `$HOMEPATH`
+  (`$env:X` likewise); open-ended patterns now need a non-identifier character after them.
+  Test `variables_expand_whole_names_only_and_never_loop`.
+- `AUTH` matched `GIT_AUTHOR_NAME/EMAIL`: the agent's commits would have changed author when
+  those are set. `AUTHOR` is ignored before matching; unit test extended.
+- The "skill script" check looked for a `scripts` component anywhere in the path, including the
+  data folder's own location; now only below `skills/`. Test added.
+- `scrubbed_env` compares passthrough names case-insensitively itself instead of relying on the
+  setter having uppercased them.
+- `cargo fmt` on the new code. Docs: GAPS.md row (section 5, Backend v2), ARCHITECTURE.md
+  (`path_policy.rs`), PITFALLS (MCP and `GIT_AUTHOR_*`), phase map ✅.
+
+Left, with reasons:
+- Terminal commands naming the data / skills / memories folders *ask* (and can be smart-approved
+  in Auto or remembered with "Always"), while the file tools refuse them. Reading logs or skills
+  from the shell is legitimate; the terminal check is defence in depth until Phase 15.
+- Token matching misses unquoted paths with spaces, paths built in variables, script contents;
+  documented in PITFALLS and the module doc.
+- The PowerShell branch of the shell env test is still unexercised here (Git Bash present).
+- Live check not re-run: the review's changes touch only the terminal guard and the env scrub,
+  which `path-policy-check.mjs` (file tools) does not exercise; the implementer's run stands.
+Tests after review: `cargo test -p hermes_tools` 114 passed (1 ignored); `turns` 78 passed (7
+ignored); `hermes-desktop` 158 + 67 passed; `cargo build --workspace` OK.

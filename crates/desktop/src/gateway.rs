@@ -211,6 +211,20 @@ impl Gateway {
     /// after every change.
     fn apply_settings(&self) {
         self.apply_approvals_mode(&self.rest.config_value("approvals.mode"));
+        // Variables the terminal keeps although their names look like secrets (`terminal.
+        // env_passthrough`; everything with KEY/TOKEN/SECRET/PASSWORD/AUTH... is dropped).
+        hermes_tools::set_env_passthrough(
+            self.rest
+                .config_value("terminal.env_passthrough")
+                .as_array()
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(|name| name.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
         // File checkpoints (`/rollback`), before the turn's first write.
         self.runtime
             .checkpoints()

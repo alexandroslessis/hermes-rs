@@ -85,12 +85,13 @@ A row marked `diverged` is backend behaviour we deliberately changed (AGENTS.md 
 | `Runtime::side_question`, `Runtime::background` | `agent/side_question.py` (one-shot path only; the cache-parity fork isn't ported), `tui_gateway/methods_prompt.py` (`prompt.btw`, `prompt.background`; `/bg` runs as a subagent rather than a full agent) |
 | `subagents.rs`, `delegate.rs` (events) | `tools/delegate_tool_registry.py`, `tui_gateway` `subagent.*` and `delegation.status/pause`; `spawn_tree.*` not ported |
 | **Tools** (`crates/tools`) | |
-| `shell.rs` | `tools/terminal_tool.py`; the live-output relay is `agent/tool_progress_relay.py` (Hermes relays MCP tools only; ours covers the terminal, throttled the same), and stopping a mid-run command keeps its output, the spirit of `tool_executor.py`'s sequential interrupt grace (ours ends the command instead of waiting 3 s) |
+| `path_policy.rs` | **diverged**: not from Hermes (Hermes has no path policy). Classifies where file tools and terminal commands may write: workspace, app data, skills/memory, persistence places (startup folders, shell profiles, git hooks, ssh), outside. `check_edit` and the terminal guard use it |
+| `shell.rs` | `tools/terminal_tool.py` (**diverged** in `command()`: the shell starts from the parent environment minus secret-looking variables, `terminal.env_passthrough` keeps some; Hermes passes the whole environment); the live-output relay is `agent/tool_progress_relay.py` (Hermes relays MCP tools only; ours covers the terminal, throttled the same), and stopping a mid-run command keeps its output, the spirit of `tool_executor.py`'s sequential interrupt grace (ours ends the command instead of waiting 3 s) |
 | `process.rs` | `tools/process_registry.py` |
 | `search.rs` | `tools/file_tools.py`, `tools/file_operations_search.py` |
 | `lint.rs` | `tools/file_operations_lint.py` |
 | `checkpoints.rs` | `tools/checkpoint_manager.py` |
-| `approval.rs` | `tools/approval_detection.py`, `tools/approval_smart.py` |
+| `approval.rs` | `tools/approval_detection.py`, `tools/approval_smart.py` (**diverged**: `check_command` also flags commands naming protected paths and skill scripts the agent wrote; persistence places ask even in Yolo) |
 | `clarify.rs` | `tools/clarify_tool.py` |
 | `todo.rs` | `tools/todo_tool.py` |
 | `recall.rs` | `tools/session_search_tool.py` |

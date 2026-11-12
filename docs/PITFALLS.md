@@ -234,3 +234,34 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   `tui_gateway/server.py` `_status_update`).
 - **The store is shared with the GPUI app**: a schema change breaks the user's other app. Side
   files only.
+
+## Path policy and the shell environment (Phase 1 of `docs/backend/PHASES.md`)
+
+- **File tools refuse some folders in every mode.** `write_file` / `patch` into the app's data
+  folder (`HERMES_RS_HOME`: settings, `sessions.db`, approvals) or its `skills` / `memories`
+  folders fail with a message naming the right tool (`skill_manage`, `memory`). Yolo doesn't lift
+  it. A test that writes there with a file tool must go through the real tool instead.
+- **Persistence places always ask**, in every mode including Yolo, and "always allow" is not
+  remembered: startup folders, `$PROFILE` scripts, `~/.ssh`, `~/.gitconfig`, `~/.bashrc`-style
+  rc files, `.git/hooks`, `.git/config`, scheduled-task folders. Editing a repo's `.git/config`
+  from the agent is a normal-looking request that now asks.
+- **Auto (smart approvals) now asks for edits outside the workspace.** It used to let every file
+  edit through; AcceptEdits and Auto behave the same here, Yolo allows them.
+- **The terminal check is token matching, not a sandbox.** It looks at quoted or bare words in the
+  command (`~`, `$HOME`, `$env:APPDATA`, `%USERPROFILE%` expanded), so an unquoted path with spaces,
+  a path built in a variable or a script file's contents get past it. Reads are flagged as well as
+  writes (`cat ~/.ssh/config` asks). The real boundary is the OS sandbox of Phase 15.
+- **The agent's shell has no secrets in its environment.** Variables whose name contains `KEY`,
+  `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL` or `AUTH` are removed before `bash` /
+  PowerShell starts, so a tool that needs one (`gh`, `cargo publish`, `ssh-agent`:
+  `SSH_AUTH_SOCK`) fails with its own "not logged in" error. Keep a variable by listing its name
+  in `terminal.env_passthrough` (Settings config record, case-insensitive). `GIT_AUTHOR_*` is
+  kept (`AUTHOR` is not `AUTH`). MCP stdio servers are not scrubbed at all: they inherit the
+  app's whole environment plus their configured env (many read their key from an inherited
+  variable; scrubbing them would break them silently).
+- **Scripts in skills are flagged.** A command that runs a file under
+  `skills/*/scripts/` asks ("runs a script the agent wrote into a skill") unless the file is
+  byte-for-byte the copy bundled with the app (compared with the embedded one, so editing the
+  extracted copy or the manifest doesn't pass).
+- **`SessionToolsConfig` has a `data_dir`**; a session built without it (empty path) gets no
+  AppData / skills / memories protection.
