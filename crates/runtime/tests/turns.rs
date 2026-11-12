@@ -4567,3 +4567,49 @@ async fn a_paused_refine_is_not_replaced_by_a_review_that_falls_due() {
     assert_requests(&h, Purpose::Review, 1..=1);
     assert_requests(&h, Purpose::Main, 11..=11);
 }
+
+/// Backend v2 phase 5: the runtime keeps `index.db` (FTS5 over skills and memory) fresh on its own:
+/// the bundled skills at startup, a `skill_manage` write and a memory write afterwards. No request
+/// to the model is involved.
+#[tokio::test]
+async fn the_local_index_follows_skill_and_memory_writes() {
+    use hermes_tools::index::{IndexQuery, Limits};
+    let h = harness(vec![]).await;
+    assert!(h.data.path().join("index.db").is_file());
+    let index = h.runtime.index().expect("index opens in a fresh data folder");
+    let ask = |message: &str| IndexQuery {
+        message: message.into(),
+        ..Default::default()
+    };
+    let limits = Limits {
+        min_skill_score: 0.0,
+        min_memory_score: 0.0,
+        ..Limits::default()
+    };
+    // Startup: the bundled skills (queries wait for the background refresh).
+    let hits = index.query_async(ask("search arxiv for papers"), limits).await.unwrap();
+    assert_eq!(hits.skills[0].name, "arxiv");
+    // A skill the agent writes.
+    let reply = h.runtime.skills().manage_tool(&json!({"operations": [{
+        "action": "create", "name": "tulip-farming", "category": "gardening",
+        "content": "---\nname: tulip-farming\ndescription: Grow tulips in raised beds.\n---\n# Tulips\nPlant bulbs in autumn.\n"
+    }]}));
+    assert_eq!(reply["success"], true, "{reply}");
+    let hits = index.query_async(ask("grow tulips"), limits).await.unwrap();
+    assert_eq!(hits.skills[0].name, "tulip-farming");
+    // A memory the agent writes.
+    let reply = h.runtime.memory().apply(
+        hermes_memory::Target::Memory,
+        &[hermes_memory::Operation {
+            action: "add".into(),
+            content: Some("The tulip beds are watered on Tuesdays.".into()),
+            ..Default::default()
+        }],
+        &mut hermes_memory::TurnFailures::default(),
+    );
+    assert_eq!(reply["success"], true, "{reply}");
+    let hits = index.query_async(ask("when are the tulip beds watered"), limits).await.unwrap();
+    assert!(hits.memory[0].text.contains("Tuesdays"));
+    // No model request was made by any of this.
+    assert!(h.requests.lock().is_empty());
+}

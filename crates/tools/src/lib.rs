@@ -11,6 +11,7 @@ mod clarify;
 pub mod curator;
 mod files;
 mod hints;
+pub mod index;
 mod job;
 pub mod lint;
 mod path_policy;

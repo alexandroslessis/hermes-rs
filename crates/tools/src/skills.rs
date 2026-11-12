@@ -92,6 +92,8 @@ pub struct SkillStore {
     pub(crate) write_lock: Mutex<()>,
     /// Serializes changes to `.usage.json`.
     pub(crate) usage_lock: Mutex<()>,
+    /// Run after every skill write: keeps the local index fresh (see `index.rs`).
+    on_change: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// `(frontmatter, body)` of a SKILL.md; the frontmatter is empty when absent or unparseable.
@@ -225,7 +227,7 @@ pub fn is_stock_script(root: &Path, path: &Path) -> bool {
     std::fs::read(path).is_ok_and(|bytes| bytes == embedded.data.as_ref())
 }
 
-fn hash(bytes: &[u8]) -> String {
+pub(crate) fn hash(bytes: &[u8]) -> String {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
@@ -247,8 +249,63 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// The catalog entry of one `SKILL.md` (`text` is its content), or `None` for a skill that
+/// doesn't run on Windows. Shared by the catalog and the local index.
+pub(crate) fn skill_entry(
+    root: &Path,
+    external: bool,
+    skill_md: &Path,
+    text: &str,
+) -> Option<SkillEntry> {
+    let head: String = text.chars().take(4000).collect();
+    let (frontmatter, body) = parse_frontmatter(&head);
+    if !runs_on_windows(&frontmatter) {
+        return None;
+    }
+    let dir = skill_md.parent().unwrap_or(root).to_path_buf();
+    let name = field(&frontmatter, "name")
+        .unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into())
+        .chars()
+        .take(64)
+        .collect::<String>();
+    let mut description = normalize_description(&frontmatter);
+    if description.is_empty() {
+        description = body
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .unwrap_or_default()
+            .to_string();
+    }
+    if description.chars().count() > MAX_DESCRIPTION_LENGTH {
+        description = description
+            .chars()
+            .take(MAX_DESCRIPTION_LENGTH - 3)
+            .collect::<String>()
+            + "...";
+    }
+    // The category is the folder between the root and the skill's folder.
+    let category = dir.strip_prefix(root).ok().and_then(|rel| {
+        let parts: Vec<_> = rel.components().collect();
+        (parts.len() >= 2).then(|| {
+            parts[..parts.len() - 1]
+                .iter()
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+    });
+    Some(SkillEntry {
+        name,
+        description,
+        category,
+        dir,
+        external,
+    })
+}
+
 /// Every `SKILL.md` under `root`, skipping excluded folders and the support folders of skills.
-fn skill_files(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn skill_files(root: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -285,6 +342,7 @@ impl SkillStore {
             config: Mutex::new(config),
             write_lock: Mutex::new(()),
             usage_lock: Mutex::new(()),
+            on_change: Mutex::new(None),
         }
     }
 
@@ -297,7 +355,16 @@ impl SkillStore {
     }
 
     pub fn set_config(&self, config: SkillsConfig) {
-        *self.config.lock() = config;
+        let roots_changed = {
+            let mut current = self.config.lock();
+            let changed = current.external_dirs != config.external_dirs;
+            *current = config;
+            changed
+        };
+        // Other folders for the local index (disabled skills are filtered at query time).
+        if roots_changed {
+            self.changed();
+        }
     }
 
     /// Every skill the agent may load: [`Self::catalog_all`] minus the disabled ones.
@@ -320,58 +387,38 @@ impl SkillStore {
                 let Ok(text) = std::fs::read_to_string(&skill_md) else {
                     continue;
                 };
-                let head: String = text.chars().take(4000).collect();
-                let (frontmatter, body) = parse_frontmatter(&head);
-                if !runs_on_windows(&frontmatter) {
+                let Some(entry) = skill_entry(&root, external, &skill_md, &text) else {
+                    continue;
+                };
+                if !seen.insert(entry.name.clone()) {
                     continue;
                 }
-                let dir = skill_md.parent().unwrap_or(&root).to_path_buf();
-                let name = field(&frontmatter, "name")
-                    .unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into())
-                    .chars()
-                    .take(64)
-                    .collect::<String>();
-                if !seen.insert(name.clone()) {
-                    continue;
-                }
-                let mut description = normalize_description(&frontmatter);
-                if description.is_empty() {
-                    description = body
-                        .lines()
-                        .map(str::trim)
-                        .find(|l| !l.is_empty() && !l.starts_with('#'))
-                        .unwrap_or_default()
-                        .to_string();
-                }
-                if description.chars().count() > MAX_DESCRIPTION_LENGTH {
-                    description = description
-                        .chars()
-                        .take(MAX_DESCRIPTION_LENGTH - 3)
-                        .collect::<String>()
-                        + "...";
-                }
-                // The category is the folder between the root and the skill's folder.
-                let category = dir.strip_prefix(&root).ok().and_then(|rel| {
-                    let parts: Vec<_> = rel.components().collect();
-                    (parts.len() >= 2).then(|| {
-                        parts[..parts.len() - 1]
-                            .iter()
-                            .map(|c| c.as_os_str().to_string_lossy().to_string())
-                            .collect::<Vec<_>>()
-                            .join("/")
-                    })
-                });
-                skills.push(SkillEntry {
-                    name,
-                    description,
-                    category,
-                    dir,
-                    external,
-                });
+                skills.push(entry);
             }
         }
         skills.sort_by(|a, b| (&a.category, &a.name).cmp(&(&b.category, &b.name)));
         skills
+    }
+
+    /// The folders the catalog reads, in priority order (the app's own first, then the external
+    /// ones): `(root, external)`. The local index walks these.
+    pub(crate) fn catalog_roots(&self) -> Vec<(PathBuf, bool)> {
+        let mut roots = vec![(self.root.clone(), false)];
+        roots.extend(self.config().external_dirs.into_iter().map(|d| (d, true)));
+        roots
+    }
+
+    /// Tells the local index (see `index.rs`) that the skills folder may have changed.
+    fn changed(&self) {
+        let hook = self.on_change.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Registers the callback run after every skill write (it must not block).
+    pub fn set_on_change(&self, hook: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        *self.on_change.lock() = Some(hook);
     }
 
     /// An enabled skill by name, or by its relative path (`category/name`): what the agent may
@@ -707,7 +754,7 @@ impl SkillStore {
     }
 
     /// The copying half of [`Self::seed_bundled`]: whether any file was written.
-    fn seed_files(&self) -> bool {
+    pub(crate) fn seed_files(&self) -> bool {
         let manifest_path = self.root.join(MANIFEST);
         let mut manifest: HashMap<String, String> = std::fs::read(&manifest_path)
             .ok()
@@ -782,6 +829,7 @@ impl SkillStore {
 
     /// Commits whatever changed in the folder since the last commit (no-op when clean).
     pub fn commit_outside_changes(&self) {
+        self.changed();
         if self.root.join(".git").is_dir()
             && git(&self.root, &["status", "--porcelain"]).is_some_and(|s| !s.trim().is_empty())
         {
@@ -810,6 +858,7 @@ impl SkillStore {
 
     /// Commits every change in the skills folder (one commit per batch: the rollback unit).
     pub fn commit(&self, message: &str) {
+        self.changed();
         if !self.ensure_repo() {
             return;
         }

@@ -3335,6 +3335,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rmcp",
+ "rusqlite",
  "rust-embed",
  "serde",
  "serde_json",

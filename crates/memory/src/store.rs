@@ -116,6 +116,8 @@ pub struct MemoryStore {
     config: Mutex<MemoryConfig>,
     /// Serializes read-modify-write of the files (Hermes uses a lock file across processes).
     lock: Mutex<()>,
+    /// Run after every successful write: keeps the local index fresh (`hermes_tools::index`).
+    on_change: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// Per-turn count of failed consolidation attempts (lives with the session, reset each turn).
@@ -287,7 +289,13 @@ impl MemoryStore {
             dir: dir.into(),
             config: Mutex::new(config),
             lock: Mutex::new(()),
+            on_change: Mutex::new(None),
         }
+    }
+
+    /// Registers the callback run after every memory write (it must not block).
+    pub fn set_on_change(&self, hook: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        *self.on_change.lock() = Some(hook);
     }
 
     pub fn dir(&self) -> &Path {
@@ -338,6 +346,13 @@ impl MemoryStore {
     /// The live entries (the Memory screen and the tool's error payloads show these).
     pub fn entries(&self, target: Target) -> Vec<String> {
         parse_entries(&self.read_raw(target).0)
+    }
+
+    /// The live entries, or `None` when the file exists but can't be read right now (where
+    /// [`Self::entries`] would answer "empty"). The local index uses this.
+    pub fn readable_entries(&self, target: Target) -> Option<Vec<String>> {
+        let (raw, ok) = self.read_raw(target);
+        ok.then(|| parse_entries(&raw))
     }
 
     fn chars(entries: &[String]) -> usize {
@@ -506,6 +521,10 @@ impl MemoryStore {
                         "Failed to write memory file {}: {e}",
                         self.path(target).display()
                     ));
+                }
+                let hook = self.on_change.lock().clone();
+                if let Some(hook) = hook {
+                    hook();
                 }
                 let mut response = json!({
                     "success": true,

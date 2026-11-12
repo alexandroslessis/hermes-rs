@@ -108,6 +108,7 @@ A row marked `diverged` is backend behaviour we deliberately changed (AGENTS.md 
 | `skill_manage.rs` | `tools/skill_manager_tool.py`, `tools/skill_manager_batch.py` |
 | `bundles.rs` | `agent/skill_bundles.py` |
 | `curator.rs` | `agent/curator.py`, `tools/skill_usage.py` |
+| `index.rs` | **diverged**: not from Hermes (Hermes lists every skill in the system prompt; no local index). SQLite FTS5 file `index.db` (skill_doc, memory_doc; BM25, `porter unicode61`) over SKILL.md files and MEMORY.md / USER.md, rebuilt incrementally (mtime + hash) and after every skill / memory write; query escaping turns user text into quoted tokens. CP5.1 of Backend v2 Phase 5; the per-turn injection is CP5.2 |
 | **Memory** (`crates/memory`) | |
 | `store.rs` | `tools/memory_tool_store.py` |
 | `tool.rs` | `tools/memory_tool.py`, `tools/write_approval.py` |

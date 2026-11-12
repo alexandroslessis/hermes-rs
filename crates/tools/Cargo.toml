@@ -27,6 +27,7 @@ hermes_prompts.workspace = true
 ignore.workspace = true
 parking_lot.workspace = true
 regex.workspace = true
+rusqlite.workspace = true
 fancy-regex = "0.14"
 unicode-normalization = "0.1"
 rust-embed.workspace = true

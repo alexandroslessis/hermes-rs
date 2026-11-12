@@ -417,6 +417,8 @@ pub struct Runtime {
     store: Arc<Store>,
     memory: Arc<MemoryStore>,
     skills: Arc<SkillStore>,
+    /// The FTS5 index of skills and memory (`index.db`); `None` when the file can't be opened.
+    index: Option<Arc<hermes_tools::index::LocalIndex>>,
     /// The dangerous-command policy every session shares.
     approvals: Arc<hermes_tools::approval::ApprovalStore>,
     /// Filesystem checkpoints every session shares (Hermes: opt-in).
@@ -448,13 +450,32 @@ pub struct Runtime {
 impl Runtime {
     pub fn new(config: RuntimeConfig, bridge: Arc<dyn UserBridge>) -> Result<Self> {
         let store = Store::open(&config.data_dir.join("sessions.db"))?;
-        let memory = MemoryStore::new(config.data_dir.join("memories"), config.memory.clone());
+        let memory = Arc::new(MemoryStore::new(
+            config.data_dir.join("memories"),
+            config.memory.clone(),
+        ));
         let skills = Arc::new(SkillStore::new(
             config.data_dir.join("skills"),
             config.skills.clone(),
         ));
         // The files now; their git history off the startup path.
         skills.seed_bundled_in_background();
+        // The index follows every skill and memory write; the first refresh runs in the background.
+        let index = match hermes_tools::index::LocalIndex::open(
+            &config.data_dir.join("index.db"),
+            skills.clone(),
+            memory.clone(),
+        ) {
+            Ok(index) => {
+                index.attach();
+                index.notify_changed();
+                Some(index)
+            }
+            Err(e) => {
+                tracing::warn!("local index unavailable: {e:#}");
+                None
+            }
+        };
         let approvals = Arc::new(hermes_tools::approval::ApprovalStore::new(&config.data_dir));
         let checkpoints = Arc::new(hermes_tools::checkpoints::Checkpoints::new(
             config.data_dir.join("checkpoints"),
@@ -464,8 +485,9 @@ impl Runtime {
         let initial_budget = config.budget;
         Ok(Self {
             store: Arc::new(store),
-            memory: Arc::new(memory),
+            memory,
             skills,
+            index,
             approvals,
             checkpoints,
             mcp: Arc::default(),
@@ -511,6 +533,12 @@ impl Runtime {
     /// The quota governor over the ledger (see [`governor`]).
     pub fn governor(&self) -> governor::Governor {
         governor::Governor::new(self.ledger.clone())
+    }
+
+    /// The local FTS5 index over skills and memory (kept fresh on every write); `None` when its
+    /// file couldn't be opened. Its calls block: use `spawn_blocking` (or its `*_async` methods).
+    pub fn index(&self) -> Option<Arc<hermes_tools::index::LocalIndex>> {
+        self.index.clone()
     }
 
     /// The skills folder every session shares (the Skills screen edits it too).
