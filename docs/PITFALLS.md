@@ -265,3 +265,39 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   extracted copy or the manifest doesn't pass).
 - **`SessionToolsConfig` has a `data_dir`**; a session built without it (empty path) gets no
   AppData / skills / memories protection.
+
+## Request ledger and governor (Phase 2 of `docs/backend/PHASES.md`)
+
+- **A model request made outside a request context is not counted.** The context is a tokio
+  task-local: `tokio::spawn` does *not* carry it (like a thread not inheriting a Python
+  `contextvar`). Start a task that calls the model with `observer::spawn_with_purpose` /
+  `spawn_in_context`, or wrap its future in `Ledger::scoped(purpose, session, fut)`. A POST from a
+  labelled client with no context logs one `warn`; a client without a provider id (Ollama's
+  `api/show` during discovery) is never counted.
+- **Counts are per HTTP attempt**, so a retried request counts once per try and a connection
+  failure counts too. Only POSTs count; model-list GETs don't.
+- **`requests.json` is written at most every 2 s and when the app exits.** Tauri's `run` never
+  returns, so the flush is on `RunEvent::Exit` (`main.rs`), and `hermes-acp.exe` flushes when the
+  editor closes stdin; a hard kill loses up to 2 s of counts.
+- **The governor reads a snapshot that may lag the last few requests**, so at the boundary one
+  extra request can slip through; the provider's own 429 is the hard stop. The main turn is
+  refused only when the limit is used up; review, curator and titles wait below 20% left, and
+  delegation and the smart-approval judge stop below 5%. `/review` starts with a scripted
+  `delegate_task`, so below 5% it runs without the child.
+- **A daily limit has three sources**: the endpoint's own field (Settings ▸ Providers; needs patch
+  0021 and a webapp rebuild), `requests.limits.<provider id>.daily_limit` in the config record,
+  and the "N of N" a daily-limit 429 states (learned, used only when none is set; the latest wins).
+  When both are set, the config record's limit wins over the endpoint's (`gateway::provider_limits`);
+  a null or 0 there leaves the endpoint's in force. The config record **merges** what is set into what is there, so a limit is removed by setting it
+  to `null` (`config.set` key `requests.limits.<id>`, value `{"daily_limit": null}`), not by
+  sending `{}`.
+- **A day starts at the provider's midnight as a fixed UTC offset** (`reset_offset_minutes`, default
+  UTC), not a named time zone: a provider that follows daylight saving needs the offset changed
+  twice a year.
+- **The `requests.status` / allowance gauge are ours**: the page's gauge is Hermes's "plan usage"
+  item (`plan_gauge` in `session.usage`), shown as "Requests 312/800 39%" with the reset time in
+  its tooltip; patch 0021 points its click at Settings ▸ Providers instead of the (hidden) Billing
+  tab. The gauge is sent only with `session.usage` / `message.complete`, so a changed limit shows
+  from the next turn. The warning near zero goes out as
+  `status.update` `{kind: "quota"}`, a kind the page ignores.
+- **ACP shows no quota**: `usage_update` carries tokens (`used`, `size`) only.

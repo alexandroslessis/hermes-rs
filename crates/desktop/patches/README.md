@@ -179,6 +179,18 @@ files before 0003/0004, 6.6 MB in 109 after.
   fired anywhere in the tree until the user clicked back in. A blur-origin finish (the user
   clicked elsewhere) leaves focus there. Tested live 2026-11-09.
 
+- **0021-daily-request-limit.patch** (`app/settings/custom-endpoints-settings.tsx`,
+  `types/hermes.ts`, `app/shell/hooks/use-statusbar-items.tsx`): a "Daily request limit" field in
+  the custom endpoint form, under the model and context window (English text, not an i18n key:
+  a key would mean editing every locale file). It sends `daily_request_limit` (a number, thousands
+  separators dropped, or null to clear) and reads it back from the endpoint list; `endpoints.rs`
+  stores it in `config.json` and `Gateway::apply_settings` hands it to the request ledger. A page
+  without the patch just doesn't send the key, which the backend leaves alone. The status bar's
+  allowance gauge, when it is our request quota (`id: "requests"`), opens Settings ▸ Providers
+  instead of the Billing tab, which `hide.css` hides. **Written 2026-11-12 and checked with `git apply` against the pinned
+  source, but not built into a webapp or tried in the page** (a webapp build needs npm
+  packages): run `build-hermes-webapp.ps1` and look at Settings ▸ Providers before relying on it.
+
 ## To do
 
 - **Skill hub** (install from Capabilities ▸ Skills ▸ Discover): `tools/skills_hub*.py` and

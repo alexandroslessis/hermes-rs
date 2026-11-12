@@ -77,6 +77,11 @@ on :47900 (stop `mock_llm.py` first).
 its own provider on :47900.
 `side-and-branch-check.mjs` checks `/branch` (all three routes, retries, the parent link), `/btw` and `/bg`
 with its own provider on :47900.
+`requests-check.mjs` checks the request ledger and governor (`requests.status` agrees with the requests the
+mock really served, in total and per purpose; a daily limit set in the config record shows as the
+status bar's allowance gauge; used up, the turn is refused before any request; cleared, turns run
+again; a limit saved on the custom endpoint, as the Settings field of patch 0021 does, reaches the
+ledger and clears) with its own provider on :47900.
 `path-policy-check.mjs` checks the file tools' path policy (a model asking to write into the app's data, skills
  and memories folders is refused, naming the right tool, and nothing is written) with its own provider
  on :47900.

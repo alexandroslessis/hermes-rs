@@ -80,10 +80,14 @@ fn main() -> Result<()> {
     // (Built in sequence, the window started ~130ms later on every launch, ~1.9s on a first run.)
     // The side panel's shells (`terminal.rs`), ended when the window closes.
     let terminals = Arc::new(terminal::Terminals::default());
+    // The request ledger, once the backend is built: written out when the app exits (Tauri's
+    // `run` never returns, so nothing after it would run).
+    let exit_ledger: Arc<std::sync::OnceLock<hermes_runtime::ledger::Ledger>> = Arc::default();
     {
         let window = window.clone();
         let url = url.clone();
         let terminals = terminals.clone();
+        let exit_ledger = exit_ledger.clone();
         tokio.spawn(async move {
             let built = tokio::task::spawn_blocking(move || -> Result<server::ServerState> {
                 // The runtime asks the user (approvals, clarify) through the page following the
@@ -94,6 +98,7 @@ fn main() -> Result<()> {
                     Arc::new(hub::DesktopBridge { hub: hub.clone() }),
                 )?);
                 runtime.warm_up();
+                let _ = exit_ledger.set(runtime.ledger().clone());
                 Ok(server::ServerState {
                     dist: webapp_dist(),
                     gateway: {
@@ -160,8 +165,15 @@ fn main() -> Result<()> {
             let _ = window.set(built);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .context("running the window")?;
+        .build(tauri::generate_context!())
+        .context("building the window")?
+        .run(move |_, event| {
+            if let tauri::RunEvent::Exit = event
+                && let Some(ledger) = exit_ledger.get()
+            {
+                ledger.flush_blocking();
+            }
+        });
     terminals.close_all();
     drop(tokio);
     Ok(())

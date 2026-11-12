@@ -283,3 +283,132 @@ and checked the review focus by reading the code.
 **Tests** (CARGO_TARGET_DIR=target/claude): `cargo test -p hermes_llm -p hermes_runtime -p
 hermes-desktop`: llm lib 467 (7 ignored), stream 1, request_observer 4; runtime lib 47; turns 85
 passed, 7 ignored; desktop 158 + acp 67. `cargo build --workspace` OK, no warnings.
+
+## CP2.3 — Page display, exit flush, settings field, live check, docs
+Worktree: C:\Users\alexandros\repos\hermes-rs-p2   Branch: backend/p2-ledger   Model: Sonnet 5.5
+Built on CP2.2 as reviewed and committed (b23d48a). This is the **last checkpoint of Phase 2**.
+Done:
+- **Page display, no patch needed**: the page's status bar already has an allowance gauge
+  ("plan usage", fed by `plan_gauge: {id, label, used_bp, resets_at_ms}` in the `session.usage`
+  payload; the contract has it). `usage_snapshot` now adds it when the session's provider has a
+  limit: `{id: "requests", label: "Requests 312/800", used_bp, resets_at_ms}`, which the page draws
+  as "Requests 312/800 39%" (red from 80%, amber from 50%) with "used, resets in Xh" in the
+  tooltip. An unknown gauge id shows our label as is. (There is no field for a bare "312/800", this
+  is the existing one that comes closest.)
+- **Exit flush**: `main.rs` builds the Tauri app and runs it with a callback that calls
+  `Ledger::flush_blocking` on `RunEvent::Exit` (the reviewer's CP2.1 finding: `Builder::run` never
+  returns); `hermes-acp.exe` flushes when stdin closes (`acp/mod.rs`).
+- **Daily limit in Settings**: `ProviderSettings.daily_request_limit` (`config.json`), served and
+  saved by the custom-endpoint routes (`endpoints.rs`; only when the page sent the key, so an older
+  page can't wipe it; null/0/nonsense clears), merged with `requests.limits.*` in
+  `Gateway::apply_settings`, which now also runs after an endpoint is saved or deleted. The page
+  field is **patch 0021** (`custom-endpoints-settings.tsx`, `types/hermes.ts`).
+- **Live check** `scripts/perf/requests-check.mjs` (all ok, twice in a row, on a perf instance built
+  from this worktree; stopped afterwards): `requests.status` matches the mock's own counts in total
+  and per purpose (2 main + 1 title for two turns, nothing unlabelled); a limit set through
+  `config.set` shows in the status and as the gauge in `session.usage`; used up, the turn is refused
+  ("used up (5 of 5). It resets at ...") with zero requests reaching the mock; cleared, turns run.
+- Docs: ARCHITECTURE (llm observer, `requests.json`, request accounting paragraph), PITFALLS (a
+  Phase 2 section), perf README, patches README (0021), GAPS (Phase 2 in the backend v2 row),
+  PHASES Baselines (split by purpose).
+Files: crates/desktop/src/{gateway,endpoints,providers,main,acp/mod}.rs,
+  crates/desktop/patches/0021-daily-request-limit.patch, scripts/perf/requests-check.mjs, docs
+Tests (CARGO_TARGET_DIR=target/claude): `cargo test -p hermes_llm -p hermes_runtime -p
+  hermes-desktop` all green (desktop lib 159 with the new endpoint test, acp 67; runtime turns 85);
+  `cargo build --workspace` OK; live check all ok.
+Request counts: unchanged.
+Deviations from the plan:
+- **No per-turn request count in the transcript metadata**: the page's `session.usage.calls` already
+  counts model calls per session from the store, and the ledger has the per-purpose day counts;
+  adding a side file per session would duplicate them.
+- **ACP shows no quota**: `usage_update` is `{used, size}` in tokens (the shape doesn't allow it).
+- **Patch 0021 is not built or tried in the page**: I validated it with `git apply --check` against
+  the pinned source only. A webapp build needs npm packages (not present beside the shared
+  `target/hermes-src`, which is a junction to the main checkout's build, so I didn't rebuild it).
+  Until it is built, the limit is set through the config record (`requests.limits.<id>`) or learned
+  from a 429. The user checklist's "Settings field" needs that rebuild.
+- Config-record limits can only be cleared by setting them to `null` (the record merges).
+For the reviewer:
+- Patch 0021 is the thing to look at: minimal (two files, ~20 lines), English literals instead of
+  i18n keys (adding keys means editing four locale files), and unverified in the page. Decide
+  whether to keep it, or to rebuild the webapp in your own session and look at the form.
+- The gauge's `id: "requests"` is not one of the page's known ids (day/week/month/top_tier), so
+  the page shows our label verbatim; its click target is `?tab=billing`, which we hide.
+- `apply_settings` runs after every endpoint change now; check it is cheap (reads `config.json`).
+- Phase 2 is complete with this checkpoint: docs per rule 10 are written, but the phase-map
+  tick (and the merge into main, which needs the user's go-ahead) is the reviewer's step.
+
+### Review (Opus 5.5)
+`main` had not moved (still 5a9d388, an ancestor of this branch), so nothing was merged. Ran
+`/code-review high` and checked the review focus by reading the code against the pinned page.
+
+**Review focus**
+- *Patch 0021*: correct and close to minimal. Exported Hermes at `HERMES_COMMIT` into a scratch
+  folder and applied 0001–0021 in name order with `git apply` (as `build-hermes-webapp.ps1` does):
+  all apply; only 0012 also touches `custom-endpoints-settings.tsx`, in other hunks. The field's
+  value is typed by `CustomEndpointUpdate` (the patch extends it), `toPayload` always sends the key
+  (null when empty, so clearing works), and `validateCustomEndpoint` gets it too (ignored by
+  `validate`). English literals instead of i18n keys: accepted (four locale files otherwise).
+  **Not built and not seen in the page**: safe to ship unbuilt, because the backend works without
+  it (an unpatched page never sends the key, which `save` leaves alone) and the build script fails
+  loudly if a patch doesn't apply; the risk left is a syntax, type or layout slip in ~20 lines
+  read here against the pinned source, which the user's next `build-hermes-webapp.ps1` (a syntax
+  error stops it; a pure type error may not, if the build doesn't type-check) and the checklist
+  below catch.
+- *`plan_gauge`*: matches `PlanGauge {id, label, used_bp, resets_at_ms?}`. `gaugeTitle` shows the
+  server's `label` for an id it doesn't know ("requests"), the status bar adds the percent;
+  `used_bp` is capped at 10 000 (and the page clamps too); `resets_at_ms` is `resets_at * 1000`
+  (seconds → ms). `usage_snapshot` always sends `calls`, so `mergeUsage` deletes a stale gauge once
+  a provider has no limit. Live: `{"id":"requests","label":"Requests 25/124","used_bp":2016,
+  "resets_at_ms":1794528000000}`.
+- *Exit flush*: `Builder::run(ctx)` in Tauri 2 is `self.build(ctx)?.run(|_, _| {})`, so
+  `.build(ctx)?.run(callback)` keeps everything (plugins, `setup`, the window) and only adds the
+  callback. Tested: set a limit on my instance and closed its window 0 s later (the ledger writes
+  2 s after a change): `requests.json` was written 36 ms after the close, with the new offset. ACP:
+  `flush_blocking` runs after `serve` returns (stdin closed), before the process exits; a blocking
+  wait at the end of `block_on`'s own future can't stall other work. A hard kill still loses up
+  to 2 s (PITFALLS says so).
+- *`apply_settings`*: one more read of `config.json`, the same as the other config reads it already
+  makes (a few small files, synchronous like the endpoint routes around it); runs on settings
+  changes only, not per turn. No `config.json` → no endpoint limits, `requests.limits` alone.
+
+**Fixed**
+1. The limit field parsed "1,000" as 1 (`parseInt` stops at the comma): one request a day, then
+   every turn refused. The patch now drops spaces, commas, dots, apostrophes and underscores first.
+2. The gauge's click went to Settings ▸ Billing, which `hide.css` hides (an empty page). Patch 0021
+   now sends our gauge (`id: "requests"`) to Settings ▸ Providers, where the limit is set (one line
+   in `use-statusbar-items.tsx`; the patch is regenerated and re-checked against 0001–0020).
+3. A hand-edited `daily_request_limit` that isn't a positive u32 ("800", -1, 5e9) failed the whole
+   `config.json` parse, and `Settings::load` then fell back to *no providers at all*. It is now read
+   leniently (anything else = unset). Test.
+4. The merge of endpoint limits and `requests.limits` is now `gateway::provider_limits`, a pure
+   function with tests (precedence, offsets, null in the record, no providers); the comment that
+   said 0 in the record means "no limit" was wrong after the merge (it means "the record sets
+   none") and is corrected; PITFALLS states the precedence.
+5. The live check now also saves a limit through the custom-endpoint route (what the Settings
+   field does) and checks the ledger takes it at once and that saving it empty clears it.
+6. Docs: patches README (third file, separators, the click target), PITFALLS (precedence, click
+   target, gauge refreshes on the next turn), perf README, phase map ✅.
+
+**Left, and why**
+- The gauge is sent with `session.usage` / `message.complete` only, so after a limit change it
+  updates on the next turn. Pushing it to every open session on a settings change needs a list of
+  open sessions per window; not worth it for a number that changes per turn anyway (documented).
+- `requests.limits` wins over the endpoint's field when both are set: the record is the
+  power-user path and the live check relies on it. Documented in PITFALLS.
+- `perf.ps1 -Do start` piped or redirected (`| Select-Object`, `*> file`) waits until the app
+  exits (the app inherits the pipe); run it bare. And from a worktree without `tools/node`, its
+  page-timing step errors harmlessly (the instance still starts).
+
+**Tests** (CARGO_TARGET_DIR=target/claude): `cargo test -p hermes_llm -p hermes_runtime -p
+hermes-desktop`: llm 467 (7 ignored) + 1 + 4; runtime lib 47, turns 85 (7 ignored); desktop 162
+(3 new) + acp 67. `cargo build --workspace` OK, no warnings. `requests-check.mjs`: all ok twice
+in a row on my perf instance (built from this worktree), which was then stopped with its limit
+cleared.
+
+**For the user, after the next `build-hermes-webapp.ps1` and a build**
+1. Settings ▸ Providers ▸ edit your endpoint: a "Daily request limit" field sits under the model
+   and context window. Type `800`, save; reopen: it shows 800.
+2. Send a message: the status bar shows "Requests N/800 x%"; hover it for "resets in …".
+3. Click it: Settings ▸ Providers opens (not an empty page).
+4. Empty the field, save, send a message: the gauge is gone.

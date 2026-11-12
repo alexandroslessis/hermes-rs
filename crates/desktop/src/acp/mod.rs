@@ -98,7 +98,10 @@ pub fn run() -> Result<()> {
                 )))
             })
             .await??;
+        let ledger = gateway.runtime.ledger().clone();
         server::AcpServer::serve(gateway, tokio::io::stdin(), tokio::io::stdout()).await;
+        // The editor closed stdin: write the request counts before the process ends.
+        ledger.flush_blocking();
         Ok::<(), anyhow::Error>(())
     })?;
     // Tasks that never finish (a read of stdin) must not keep the process alive.

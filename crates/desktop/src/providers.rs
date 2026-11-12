@@ -29,10 +29,24 @@ pub struct ProviderSettings {
     /// The context window to assume for the endpoint's models, when it doesn't say.
     #[serde(default)]
     pub context_length: Option<usize>,
+    /// How many requests per day the provider allows (Settings ▸ Providers); the request ledger
+    /// and its governor use it. `None` = not set (a limit the provider's 429 states is learned).
+    /// Read leniently: a hand-edited value that isn't a positive whole number counts as unset,
+    /// rather than failing the whole file (which would lose every provider).
+    #[serde(default, deserialize_with = "positive_u32_or_none")]
+    pub daily_request_limit: Option<u32>,
 }
 
 fn discover_by_default() -> bool {
     true
+}
+
+fn positive_u32_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(value
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0))
 }
 
 /// A model on a particular provider (the GPUI app's `ModelChoice`).

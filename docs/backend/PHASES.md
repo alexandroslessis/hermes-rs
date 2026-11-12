@@ -40,7 +40,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 |---|---|---|---|---|---|
 | 0 | Groundwork: rules, request-counting test harness | S | — | Sonnet | A |
 | 1 | Path policy, env scrub, skill-script flag — ✅ 2026-11-12 | S–M | — | Sonnet | B |
-| 2 | Request ledger | M | 0 | Sonnet | A |
+| 2 | Request ledger — ✅ 2026-11-12 | M | 0 | Sonnet | A |
 | 3 | Budget profiles and the knobs they set | M | 2 | Sonnet | A |
 | 4 | Side jobs off the main quota | S–M | 3 | Sonnet | A |
 | 5 | Local index (FTS5) and per-turn pre-injection | M | 3 | Sonnet | A |
@@ -960,3 +960,7 @@ reaches `EmptyResponseRecovery`); S3 =
 cut-off tool call + retry + answer; S4 = 10 turns + 1 background review (memory and skill counters
 both due on the tenth turn, one combined review request); S5 = parent call + 2 children + parent
 answer. The mock counts every request, so retries and background jobs show up in the totals.
+
+Since Phase 2 the mock also splits them by purpose (the `x-hermes-rs-purpose` header): S1-S3 are
+all `main`; S4 is 10 `main` + 1 `review`; S5 is 2 `main` + 2 `delegate`. The totals above are
+unchanged.

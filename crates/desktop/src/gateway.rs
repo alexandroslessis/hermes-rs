@@ -225,29 +225,12 @@ impl Gateway {
                 })
                 .unwrap_or_default(),
         );
-        // Each provider's daily request limit and where its day starts (`requests.limits.<id>`:
-        // `daily_limit`, `reset_offset_minutes`), for the request ledger and its governor.
-        // Applied as a whole: a provider removed from the key (or the key removed) loses its limit.
-        // 0, a missing value or one out of range means "no limit"; an offset is at most ±24 h.
-        let limits = self.rest.config_value("requests.limits");
-        self.runtime.ledger().configure(
-            limits
-                .as_object()
-                .into_iter()
-                .flatten()
-                .map(|(provider, limit)| hermes_runtime::ledger::ProviderLimit {
-                    provider: provider.clone(),
-                    daily_limit: limit["daily_limit"]
-                        .as_u64()
-                        .and_then(|n| u32::try_from(n).ok())
-                        .filter(|n| *n > 0),
-                    reset_offset_minutes: limit["reset_offset_minutes"]
-                        .as_i64()
-                        .filter(|m| m.abs() <= 24 * 60)
-                        .unwrap_or(0) as i32,
-                })
-                .collect(),
-        );
+        // Each provider's daily request limit and where its day starts, for the request ledger
+        // and its governor (`provider_limits`).
+        self.runtime.ledger().configure(provider_limits(
+            &Settings::load(&self.data_dir),
+            &self.rest.config_value("requests.limits"),
+        ));
         // File checkpoints (`/rollback`), before the turn's first write.
         self.runtime
             .checkpoints()
@@ -1357,6 +1340,20 @@ impl Gateway {
             usage["context_percent"] = json!((used * 100 / context_max).min(100));
             usage["context_source"] = json!("provider_usage");
             usage["context_estimated"] = json!(false);
+        }
+        // The status bar's allowance gauge (`plan_gauge`, which the page draws as "<label> <n>%"
+        // with the reset time in its tooltip) carries the day's request quota when there is one.
+        if let Some(record) = record.as_ref() {
+            let quota = self.runtime.ledger().usage(&record.provider);
+            if let Some(limit) = quota.limit.filter(|limit| *limit > 0) {
+                let used_bp = (quota.used.saturating_mul(10_000) / u64::from(limit)).min(10_000);
+                usage["plan_gauge"] = json!({
+                    "id": "requests",
+                    "label": format!("Requests {}/{limit}", quota.used),
+                    "used_bp": used_bp,
+                    "resets_at_ms": quota.resets_at * 1000,
+                });
+            }
         }
         usage
     }
@@ -3203,6 +3200,8 @@ impl Gateway {
                 if let Ok(mut lengths) = self.context_lengths.lock() {
                     lengths.clear();
                 }
+                // ...or a new daily request limit.
+                self.apply_settings();
             }
             return Some(answer);
         }
@@ -3879,6 +3878,111 @@ fn send(outbox: &Outbox, frame: Value) {
 }
 
 /// `requests.status`: the request ledger's numbers for one provider, as the page reads them.
+/// The daily request limits the ledger enforces, from two places: a provider's own settings
+/// (`config.json`'s `daily_request_limit`, Settings ▸ Providers ▸ Custom endpoints) and the config
+/// record's `requests.limits.<id>` (`daily_limit`, `reset_offset_minutes`). The record's
+/// `daily_limit`, when it is a positive whole number, wins; null, 0 or nonsense there means "the
+/// record sets none", so the provider's own limit (if any) stands. Its offset (at most ±24 h, else
+/// 0 = UTC) says where the provider's day starts. Applied as a whole by `Ledger::configure`: a
+/// provider in neither place has no limit.
+fn provider_limits(settings: &Settings, record: &Value) -> Vec<hermes_runtime::ledger::ProviderLimit> {
+    use hermes_runtime::ledger::ProviderLimit;
+    let mut merged: std::collections::BTreeMap<String, ProviderLimit> = settings
+        .providers
+        .iter()
+        .map(|p| {
+            let limit = ProviderLimit {
+                provider: p.id.clone(),
+                daily_limit: p.daily_request_limit.filter(|n| *n > 0),
+                reset_offset_minutes: 0,
+            };
+            (p.id.clone(), limit)
+        })
+        .collect();
+    for (provider, limit) in record.as_object().into_iter().flatten() {
+        let entry = merged
+            .entry(provider.clone())
+            .or_insert_with(|| ProviderLimit {
+                provider: provider.clone(),
+                daily_limit: None,
+                reset_offset_minutes: 0,
+            });
+        if let Some(n) = limit["daily_limit"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0)
+        {
+            entry.daily_limit = Some(n);
+        }
+        entry.reset_offset_minutes = limit["reset_offset_minutes"]
+            .as_i64()
+            .filter(|m| m.abs() <= 24 * 60)
+            .unwrap_or(0) as i32;
+    }
+    merged.into_values().collect()
+}
+
+#[cfg(test)]
+mod provider_limit_tests {
+    use super::*;
+
+    fn settings(json: Value) -> Settings {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn limit_of(limits: &[hermes_runtime::ledger::ProviderLimit], id: &str) -> Option<(Option<u32>, i32)> {
+        limits
+            .iter()
+            .find(|l| l.provider == id)
+            .map(|l| (l.daily_limit, l.reset_offset_minutes))
+    }
+
+    #[test]
+    fn endpoint_limits_and_the_config_record_merge() {
+        let s = settings(json!({"providers": [
+            {"id": "a", "name": "A", "base_url": "http://a", "daily_request_limit": 800},
+            {"id": "b", "name": "B", "base_url": "http://b"},
+            {"id": "c", "name": "C", "base_url": "http://c", "daily_request_limit": 50},
+        ]}));
+        let record = json!({
+            "a": {"reset_offset_minutes": 120},
+            "b": {"daily_limit": 300},
+            "c": {"daily_limit": null},
+            "d": {"daily_limit": 10, "reset_offset_minutes": 99999},
+        });
+        let limits = provider_limits(&s, &record);
+        // The endpoint's limit with the record's day start.
+        assert_eq!(limit_of(&limits, "a"), Some((Some(800), 120)));
+        // Only the record has one.
+        assert_eq!(limit_of(&limits, "b"), Some((Some(300), 0)));
+        // A null in the record leaves the endpoint's limit.
+        assert_eq!(limit_of(&limits, "c"), Some((Some(50), 0)));
+        // A provider only in the record; an offset beyond a day is UTC.
+        assert_eq!(limit_of(&limits, "d"), Some((Some(10), 0)));
+        // The record's limit wins over the endpoint's.
+        let limits = provider_limits(&s, &json!({"a": {"daily_limit": 5}}));
+        assert_eq!(limit_of(&limits, "a"), Some((Some(5), 0)));
+    }
+
+    #[test]
+    fn no_providers_and_no_record_means_no_limits() {
+        assert!(provider_limits(&Settings::default(), &Value::Null).is_empty());
+        let limits = provider_limits(&Settings::default(), &json!({"x": {"daily_limit": 7}}));
+        assert_eq!(limit_of(&limits, "x"), Some((Some(7), 0)));
+    }
+
+    #[test]
+    fn a_hand_edited_bad_limit_does_not_lose_the_providers() {
+        for bad in [json!("800"), json!(-1), json!(5_000_000_000u64), json!(0), json!(1.5)] {
+            let s = settings(json!({"providers": [
+                {"id": "a", "name": "A", "base_url": "http://a", "daily_request_limit": bad},
+            ]}));
+            assert_eq!(s.providers.len(), 1, "{bad}");
+            assert_eq!(s.providers[0].daily_request_limit, None, "{bad}");
+        }
+    }
+}
+
 fn requests_status(runtime: &hermes_runtime::Runtime, provider: &str) -> Value {
     let usage = runtime.ledger().usage(provider);
     json!({

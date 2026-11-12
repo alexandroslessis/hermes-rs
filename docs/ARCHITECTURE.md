@@ -42,7 +42,7 @@ it calls into. Everything runs in one process.
 | `crates/desktop` | `hermes-desktop` | The app: Tauri window, axum server, the protocol layer | The main app. Most feature work lands here. |
 | `crates/runtime` | `hermes_runtime` | Sessions and turns over the agent: `Runtime` | `lib.rs` (API), `session.rs`, `ops.rs` (per-turn tool guards), `delegate.rs` + `subagents.rs`, `compress.rs`, `review.rs` (background review), `curator.rs`, `mcp.rs`, `commands.rs` (`/diff`, `/usage`…), `guards.rs`, `changes.rs` |
 | `crates/agent` | `hermes_agent` | The agent state machine (from Goose): stream a reply, run tool calls, repeat | `events.rs` has `AgentEvent` |
-| `crates/llm` | `hermes_llm` | Messages, the OpenAI-compatible provider, retries (from Goose) | `conversation::message::{Message, MessageContent}` |
+| `crates/llm` | `hermes_llm` | Messages, the OpenAI-compatible provider, retries (from Goose) | `conversation::message::{Message, MessageContent}`; `observer.rs` is where every model POST is reported (purpose, session, provider) to the request ledger |
 | `crates/tools` | `hermes_tools` | Every agent tool + `SessionTools` (the per-session tool set) | One module per tool family; `paths.rs` resolves paths; `path_policy.rs` classifies where file edits and terminal commands may go (workspace, app data, skills/memory, persistence places, outside); `approval.rs` the dangerous-command check |
 | `crates/memory` | `hermes_memory` | The memory store and tool (`§`-separated entries, char limits, drift guard) | |
 | `crates/store` | `hermes_store` | SQLite: sessions, messages, usage, projects | **Schema frozen** (shared with GPUI) |
@@ -222,6 +222,16 @@ checkpoints, memory limits, disabled toolsets). Call it after any settings write
 runtime; it runs at startup and after `PUT /api/config`. Defaults and descriptions for keys
 Hermes's page shows live in `rest.rs`.
 
+**Request accounting** (Phase 2 of `docs/backend/PHASES.md`): every model request is announced by
+`hermes_llm::observer` to the `Ledger` (`runtime/src/ledger.rs`, one thread owning `requests.json`),
+labelled with a purpose (`main`, `review`, `curator`, `title`, `approval`, `compress`, `delegate`,
+`btw`) taken from a task-local context: set around each turn and background job, re-labelled
+for steps inside a turn. `governor.rs` turns today's count and the provider's daily limit into
+allow / warn / deny per purpose. The limit comes from Settings ▸ Providers ▸ Custom endpoints
+(`daily_request_limit`, patch 0021) or the `requests.limits.<provider id>` config key, else it is
+learned from a provider's "N of N" 429. The page sees it as `requests.status` and as the status
+bar's allowance gauge (`plan_gauge` in `session.usage`).
+
 Data folder (`%APPDATA%\hermes-rs`, or `HERMES_RS_HOME`):
 
 | Path | Owner |
@@ -232,6 +242,7 @@ Data folder (`%APPDATA%\hermes-rs`, or `HERMES_RS_HOME`):
 | `branches.json` | `branch.rs` (child → parent session) |
 | `archived-sessions.json` | `archive.rs` (archived sessions, last auto-archive sweep) |
 | `hermes-imports.json` | `hermes_import.rs` (imported Hermes session ids) |
+| `requests.json` | `hermes_runtime::ledger` (model requests per provider, day and purpose; the provider's learned limit) |
 | `memories/MEMORY.md`, `memories/USER.md` | `hermes_memory` |
 | `skills/` (+ `.usage.json`, `.archive/`) | `hermes_tools::skills`, curator |
 | `checkpoints/` | `hermes_tools::checkpoints` |

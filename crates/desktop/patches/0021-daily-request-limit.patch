@@ -1,0 +1,91 @@
+--- a/apps/desktop/src/app/settings/custom-endpoints-settings.tsx
++++ b/apps/desktop/src/app/settings/custom-endpoints-settings.tsx
+@@ -40,6 +40,7 @@ interface EndpointForm {
+   apiMode: CustomEndpointApiMode
+   baseUrl: string
+   contextLength: string
++  dailyLimit: string
+   discoverModels: boolean
+   id: string
+   makeDefault: boolean
+@@ -60,6 +61,7 @@ const EMPTY_FORM: EndpointForm = {
+   apiMode: '',
+   baseUrl: '',
+   contextLength: '',
++  dailyLimit: '',
+   discoverModels: true,
+   id: '',
+   makeDefault: true,
+@@ -73,6 +75,7 @@ function formFromEndpoint(endpoint: CustomEndpoint): EndpointForm {
+     apiMode: endpoint.api_mode ?? '',
+     baseUrl: endpoint.base_url,
+     contextLength: endpoint.context_length ? String(endpoint.context_length) : '',
++    dailyLimit: endpoint.daily_request_limit ? String(endpoint.daily_request_limit) : '',
+     discoverModels: endpoint.discover_models,
+     id: endpoint.id,
+     makeDefault: Boolean(endpoint.is_current),
+@@ -87,6 +90,8 @@ function toPayload(
+   modelDetails?: CustomEndpointModelDetail[]
+ ): CustomEndpointUpdate {
+   const contextLength = Number.parseInt(form.contextLength, 10)
++  // hermes-rs: "1,000" or "1 000" is a thousand, not 1
++  const dailyLimit = Number.parseInt(form.dailyLimit.replace(/[\s,.'_]/g, ''), 10)
+ 
+   return {
+     id: form.id.trim() || undefined,
+@@ -96,6 +101,8 @@ function toPayload(
+     api_key: form.apiKey.trim() || undefined,
+     api_mode: form.apiMode,
+     context_length: Number.isFinite(contextLength) && contextLength > 0 ? contextLength : undefined,
++    // hermes-rs: the provider's requests per day (null clears it)
++    daily_request_limit: Number.isFinite(dailyLimit) && dailyLimit > 0 ? dailyLimit : null,
+     discover_models: form.discoverModels,
+     make_default: form.makeDefault,
+     models: models?.length ? models : undefined,
+@@ -492,6 +499,16 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
+                 />
+               </label>
+             </div>
++            <label className="grid gap-1.5 text-xs text-muted-foreground">
++              {/* hermes-rs: the request ledger and its governor read this */}
++              Daily request limit
++              <Input
++                inputMode="numeric"
++                onChange={event => setForm(current => ({ ...current, dailyLimit: event.target.value }))}
++                placeholder="e.g. 800 (empty: none; background jobs wait as it runs low)"
++                value={form.dailyLimit}
++              />
++            </label>
+             <label className="grid gap-1.5 text-xs text-muted-foreground">
+               {ce.fields.apiKey}
+               <Input
+--- a/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
++++ b/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
+@@ -748,7 +748,8 @@ export function useStatusbarItems({
+         title: planGauge
+           ? copy.planUsageTitle(formatPercentUsed(planUsed), formatResetsIn(planGauge.resets_at_ms) ?? '')
+           : undefined,
+-        to: `${SETTINGS_ROUTE}?tab=billing`,
++        // hermes-rs: our request quota gauge leads to the provider's limit (Billing is hidden)
++        to: planGauge?.id === 'requests' ? `${SETTINGS_ROUTE}?tab=providers` : `${SETTINGS_ROUTE}?tab=billing`,
+         // Listed in the bar's show/hide menu only for window plans; everyone else never sees the entry.
+         toggleLabel: planGauge ? copy.togglePlanUsage : undefined,
+         variant: 'link'
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -294,6 +294,7 @@ export interface CustomEndpoint {
+   api_mode?: CustomEndpointApiMode
+   base_url: string
+   context_length?: null | number
++  daily_request_limit?: null | number
+   discover_models: boolean
+   has_api_key: boolean
+   id: string
+@@ -320,6 +321,7 @@ export interface CustomEndpointUpdate {
+   api_mode?: CustomEndpointApiMode
+   base_url: string
+   context_length?: number
++  daily_request_limit?: null | number
+   discover_models?: boolean
+   id?: string
+   make_default?: boolean

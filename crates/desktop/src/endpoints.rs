@@ -77,6 +77,7 @@ fn endpoint(provider: &ProviderSettings, settings: &Settings) -> Value {
         "models": provider.models,
         "discover_models": provider.discover_models,
         "context_length": provider.context_length,
+        "daily_request_limit": provider.daily_request_limit,
         "api_mode": "chat_completions",
         "has_api_key": key.is_some(),
         "api_key_preview": key.as_deref().map(hermes_tools::redact::mask),
@@ -193,6 +194,14 @@ pub fn save(data_dir: &Path, body: &Value) -> Answer {
         .as_u64()
         .filter(|n| *n > 0)
         .map_or(Value::Null, |n| json!(n));
+    // Only when the page sent it: an older page that has no such field must not wipe the limit.
+    if let Some(limit) = body.get("daily_request_limit") {
+        entry["daily_request_limit"] = limit
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0)
+            .map_or(Value::Null, |n| json!(n));
+    }
     if let Some(key) = body["api_key"].as_str().filter(|k| !k.trim().is_empty()) {
         if let Err(answer) = store_key(&id, Some(key.trim())) {
             return answer;
@@ -372,6 +381,34 @@ pub async fn validate(data_dir: &Path, body: &Value) -> Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_daily_request_limit_is_saved_listed_cleared_and_not_wiped_by_an_older_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let save_body = |body: Value| {
+            let (status, answer) = save(dir.path(), &body);
+            assert_eq!(status, 200, "{answer}");
+        };
+        let limit = || {
+            let settings = Settings::load(dir.path());
+            settings.provider("srv").unwrap().daily_request_limit
+        };
+        save_body(json!({"id": "srv", "name": "Srv", "base_url": "http://localhost:1/v1", "model": "m",
+                         "daily_request_limit": 800}));
+        assert_eq!(limit(), Some(800));
+        assert_eq!(list(dir.path())["endpoints"][0]["daily_request_limit"], 800);
+        // A page that has no such field (it does not send the key) leaves the limit alone.
+        save_body(json!({"id": "srv", "name": "Srv", "base_url": "http://localhost:1/v1", "model": "m2"}));
+        assert_eq!(limit(), Some(800));
+        // null, 0 and nonsense clear it.
+        for cleared in [json!(null), json!(0), json!("many"), json!(-5)] {
+            save_body(json!({"id": "srv", "name": "Srv", "base_url": "http://localhost:1/v1", "model": "m",
+                             "daily_request_limit": 800}));
+            save_body(json!({"id": "srv", "name": "Srv", "base_url": "http://localhost:1/v1", "model": "m",
+                             "daily_request_limit": cleared}));
+            assert_eq!(limit(), None, "{cleared}");
+        }
+    }
 
     #[tokio::test]
     async fn add_edit_default_and_delete_keep_the_rest_of_the_config() {
