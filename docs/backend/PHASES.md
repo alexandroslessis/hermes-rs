@@ -8,7 +8,8 @@ Phase 0); the page's protocol stays what Hermes's frontend expects.
 
 Each phase ends in something the user can try, with its tests green and its docs true. Phases are
 split into **checkpoints**: Sonnet (or Opus, where marked) implements up to a checkpoint and stops
-without committing; a separate Opus session reviews, fixes and commits. Don't start a phase before
+without committing; a separate, fresh Opus reviewer reviews, fixes and commits. Since 2026-11-12 one
+orchestrator session starts both as subagents (the `checkpoint` skill). Don't start a phase before
 its dependencies are merged into `main`, and don't start a checkpoint before the previous one is
 committed. See *How the work is run* for the sessions, lanes and briefs. Within a checkpoint, do
 the steps in order.
@@ -64,19 +65,38 @@ fillers are explained in the next section.
 
 ## How the work is run: models, checkpoints, sessions
 
+### Orchestrator and subagents (the default since 2026-11-12)
+
+One **orchestrator** session (Sonnet 5.5, in the main checkout) runs the work through the project
+skill [`.claude/skills/checkpoint/SKILL.md`](../../.claude/skills/checkpoint/SKILL.md). It writes no
+product code: it checks the gates (dependencies merged, previous checkpoint reviewed), creates the
+phase's worktree `..\hermes-rs-p<N>` on `backend/p<N>-<slug>`, starts the implementer and then the
+reviewer as **subagents** with the model each role needs, reads their reports, and asks the user
+before merging into `main`. The roles, the checkpoint protocol and the lanes below are unchanged;
+only who starts the sessions changed. The skill holds the exact briefs, so the orchestrator never
+improvises them. Two differences from separate sessions:
+
+- The reviewer can't ask the user anything while it runs, so at a phase's last checkpoint it stops
+  after its commit; the **orchestrator** asks about the merge and does it (local, never pushed).
+- `/code-review high` may not be available inside a subagent; the reviewer brief has the manual
+  review pass that replaces it (and runs the skill too when it is available).
+
+The manual way (a session per role, started by hand with the briefs at the end of this section)
+still works, e.g. to steer an implementer live.
+
 ### Roles
 
-- **Implementer, Sonnet 5.5**: the default for coding. A fresh session per checkpoint (or per
-  phase, continued across its checkpoints), in **its own git worktree** on branch
+- **Implementer, Sonnet 5.5**: the default for coding. A fresh session or subagent per checkpoint
+  (or per phase, continued across its checkpoints), in **its own git worktree** on branch
   `backend/p<N>-<slug>`. It works up to the next checkpoint and then **stops without committing**.
-- **Reviewer, Opus 5.5**: a fresh session **in the implementer's worktree**, started after the
-  implementer has stopped. It reviews the uncommitted diff, fixes what it finds, runs the tests and
-  commits. It adds no scope beyond the checkpoint.
+- **Reviewer, Opus 5.5**: a fresh session or subagent **in the implementer's worktree**, started
+  after the implementer has stopped. It reviews the uncommitted diff, fixes what it finds, runs the
+  tests and commits. It adds no scope beyond the checkpoint.
 - **Implementer, Opus 5.5**: for the work marked **Opus** (design-heavy, concurrency, unsafe
   Win32, data migration): Phases 7, 13b, 13d, 13e, 15 and checkpoint CP9.1. Its checkpoints still
-  go to a *separate*, fresh Opus review session (fresh eyes, not the session that wrote the code).
+  go to a *separate*, fresh Opus reviewer (fresh eyes, not the one that wrote the code).
 
-Why fresh sessions: the prompt cache is per model, so switching a coding session to Opus pays for
+Why fresh reviewers: the prompt cache is per model, so switching a coding session to Opus pays for
 the whole coding history again; a fresh reviewer starts from the plan, the progress note and the
 diff, and hasn't absorbed the implementer's assumptions.
 
@@ -155,11 +175,15 @@ The start of the schedule (then continue the same pattern):
 | 11 | P3 CP3.2 | P6 CP6.3 → merge | P15 CP15.1 |
 | 12 | P13c (filler) | P3 CP3.2 → merge | P15 CP15.2 |
 
-### Session briefs
+### Session briefs (manual way)
 
-Start the implementer as a **worktree session on Sonnet 5.5**, and the reviewer as a session **in
-that worktree's folder on Opus 5.5** (the path is in the progress note). This plan's orchestrating
-session can also start them on request.
+With the orchestrator, ask it in plain words: `run CP3.1` (implement, then review),
+`implement CP3.1`, `review CP3.1`, `continue CP3.2`, `round 11` (the schedule's parallel round),
+`merge phase 3`, `status`. The skill's full briefs are what it sends.
+
+By hand: start the implementer as a **worktree session on Sonnet 5.5**, and the reviewer as a
+session **in that worktree's folder on Opus 5.5** (the path is in the progress note), with these
+short briefs.
 
 Implementer:
 ```
