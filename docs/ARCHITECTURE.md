@@ -166,7 +166,7 @@ Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`
 | Side panel: terminal | `terminal.rs`, `server.rs` | `/api/host-terminal` (PTY socket) | `terminal-check.mjs` |
 | Subagents | runtime `delegate.rs`, `subagents.rs`; gw `subagent.*` | `subagent.*`, `delegation.*` | `subagents-check.mjs` |
 | Model picker, effort | gw `model_options`, `switch_model`, `providers.rs` | `model.options`, `config.set {key: "model"}`, `session.mutate` | `switch.mjs` |
-| Settings ▸ Model ▸ Auxiliary | `aux_models.rs`, gw `turn_options` | `/api/model/auxiliary`, `/api/model/set {scope: auxiliary}` | `aux-models-check.mjs` |
+| Settings ▸ Model ▸ Auxiliary | `aux_models.rs`, gw `turn_options` | `/api/model/auxiliary`, `/api/model/set {scope: auxiliary}`, `/api/model/auxiliary/local` (ours: "Use a local model for background jobs", patch 0023) | `aux-models-check.mjs`, `local-aux-check.mjs` |
 | Settings ▸ Providers ▸ Custom endpoints | `endpoints.rs`, `providers.rs` | `/api/providers/custom-endpoints*` | `endpoints-check.mjs` |
 | Settings (all other pages) | `rest.rs` (`config_defaults`, `config_schema`), gw `apply_settings` | `/api/config*` | — |
 | Settings ▸ Memory, the Star map | `learning.rs`, `hermes_memory` | `/api/learning/*`, `/api/memory*` | `memory-check.mjs` |

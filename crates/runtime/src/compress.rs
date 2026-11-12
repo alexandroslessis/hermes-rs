@@ -754,7 +754,22 @@ pub struct Summarizer {
     pub request_params: Option<std::collections::HashMap<String, Value>>,
     /// Where compression starts (the turn's budget profile).
     pub compress_at: CompressAt,
+    /// Who writes the summary when this one can't (an auxiliary model whose server is down):
+    /// the session's own model. Hermes-rs: `None` for the session model itself, which has no
+    /// one to fall back to (its failure is the compaction's, and the turn goes on uncompressed).
+    pub fallback: Option<Box<Summarizer>>,
+    /// How long this summarizer gets (retries included) before the fallback writes the summary;
+    /// `None` = the HTTP client's own timeouts. Without it a hung local server (it takes the
+    /// connection, never answers) would hold the turn for the client's 600 s read timeout per
+    /// attempt. Hermes bounds a summary with a 120 s idle / 600 s total deadline
+    /// (`agent/conversation_compression_deadline.py`); ours is a single total for the aux try.
+    pub deadline: Option<std::time::Duration>,
 }
+
+/// The time an auxiliary compression model gets before the session's model takes over. Long
+/// enough for a small local model to read a large conversation on a CPU, short of Hermes's
+/// 600 s ceiling.
+pub const AUX_SUMMARY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 
 pub struct Compacted {
     pub conversation: Conversation,
@@ -946,6 +961,25 @@ pub fn undo(conversation: &mut Conversation) -> bool {
 /// One summarizer call: the prompt as the only message, no tools; the reply's text without
 /// reasoning, redacted (the summarizer may echo secrets).
 async fn summarize(summarizer: &Summarizer, prompt: &str) -> Result<String> {
+    let first = match summarizer.deadline {
+        Some(deadline) => tokio::time::timeout(deadline, summarize_with(summarizer, prompt))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("no summary within {deadline:?}"))),
+        None => summarize_with(summarizer, prompt).await,
+    };
+    match first {
+        Err(error) if summarizer.fallback.is_some() => {
+            let fallback = summarizer.fallback.as_deref().expect("checked");
+            tracing::warn!(
+                "the compression model failed ({error:#}); the session's model writes the summary"
+            );
+            summarize_with(fallback, prompt).await
+        }
+        result => result,
+    }
+}
+
+async fn summarize_with(summarizer: &Summarizer, prompt: &str) -> Result<String> {
     let mut config =
         ModelConfig::new(&summarizer.model).with_context_limit(summarizer.context_length);
     if let Some(params) = &summarizer.request_params {
@@ -1057,6 +1091,54 @@ impl Operation<TurnSession, HermesEffect> for AutoCompress {
 mod tests {
     use super::*;
     use rmcp::model::CallToolRequestParams;
+
+    fn summarizer_at(base_url: String, deadline: Option<std::time::Duration>) -> Summarizer {
+        let provider = crate::ProviderConfig {
+            id: "p".into(),
+            base_url,
+            api_key: None,
+        };
+        Summarizer {
+            llm: provider.provider_with(1).unwrap(),
+            model: "m".into(),
+            context_length: None,
+            window: None,
+            request_params: None,
+            compress_at: BudgetKnobs::BALANCED.compress_at,
+            fallback: None,
+            deadline,
+        }
+    }
+
+    /// A hung aux server (it takes the connection and never answers) holds the summary only
+    /// until the deadline; then the session's model writes it.
+    #[tokio::test]
+    async fn a_hung_aux_server_falls_back_at_its_deadline() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let main = MockServer::start().await;
+        let chunk = serde_json::json!({"id": "c", "object": "chat.completion.chunk", "model": "m",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "## Goal\nmain"},
+                         "finish_reason": "stop"}]});
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n")),
+            )
+            .mount(&main)
+            .await;
+        let hung = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let hung_url = format!("http://127.0.0.1:{}/v1", hung.local_addr().unwrap().port());
+        let mut aux = summarizer_at(hung_url, Some(std::time::Duration::from_secs(1)));
+        aux.fallback = Some(Box::new(summarizer_at(format!("{}/v1", main.uri()), None)));
+        let started = std::time::Instant::now();
+        let summary = summarize(&aux, "summarize this").await.unwrap();
+        assert_eq!(summary, "## Goal\nmain");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        drop(hung);
+    }
 
     fn tool_round(id: &str, command: &str, output: &str) -> [Message; 2] {
         let mut args = serde_json::Map::new();

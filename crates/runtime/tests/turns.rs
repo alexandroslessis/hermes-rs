@@ -3034,6 +3034,206 @@ async fn compression_uses_the_auxiliary_model_when_one_is_set() {
     assert!(requests[3].get("reasoning_effort").is_none());
 }
 
+/// A second provider (the user's local model server): answers from `replies`, records requests.
+async fn aux_server(replies: Vec<String>) -> (MockServer, ProviderConfig, Arc<Mutex<Vec<Value>>>) {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(Script {
+            replies: Mutex::new(replies.into()),
+            requests: requests.clone(),
+            counts: Arc::new(Mutex::new(HashMap::new())),
+            by_purpose: Mutex::new(HashMap::new()),
+            delays: HashMap::new(),
+        })
+        .mount(&server)
+        .await;
+    let provider = ProviderConfig {
+        id: "local".into(),
+        base_url: format!("{}/v1", server.uri()),
+        api_key: None,
+    };
+    (server, provider, requests)
+}
+
+/// A provider whose server isn't running: the port was free a moment ago and nothing listens.
+fn dead_provider() -> ProviderConfig {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    ProviderConfig {
+        id: "local".into(),
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        api_key: None,
+    }
+}
+
+fn compression_via(provider: ProviderConfig) -> TurnOptions {
+    TurnOptions {
+        aux: hermes_runtime::AuxModels {
+            compression: Some(hermes_runtime::AuxModel {
+                provider,
+                model: "summary-model".into(),
+                context_length: Some(32_000),
+                effort: None,
+            }),
+            review: None,
+            approval: None,
+        },
+        ..TurnOptions::default()
+    }
+}
+
+#[tokio::test]
+async fn compression_via_the_aux_model_makes_no_summary_request_on_the_main_provider() {
+    let h = harness(vec![
+        text_reply("one"),
+        text_reply(&long_two()),
+        text_reply("three"),
+        text_reply("four"),
+    ])
+    .await;
+    let (_aux, provider, aux_requests) =
+        aux_server(vec![text_reply("## Goal\nlocal summary")]).await;
+    let session = session_in(&h);
+    for text in ["first", "second", "third", "fourth"] {
+        run_turn(&h, &session, text).await;
+    }
+    let events = collect(
+        h.runtime
+            .compress(&session, &h.provider, compression_via(provider), None)
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_requests(&h, Purpose::Compress, 0..=0);
+    assert_requests(&h, Purpose::Main, 4..=4);
+    assert_eq!(aux_requests.lock().len(), 1);
+    assert_eq!(aux_requests.lock()[0]["model"], "summary-model");
+    let messages = h.runtime.messages(&session).unwrap();
+    let handoff = messages.iter().find(|m| is_handoff(m)).unwrap();
+    assert!(handoff.as_concat_text().contains("local summary"));
+}
+
+#[tokio::test]
+async fn compression_falls_back_to_the_main_model_when_the_aux_server_is_down() {
+    let h = harness(vec![
+        text_reply("one"),
+        text_reply(&long_two()),
+        text_reply("three"),
+        text_reply("four"),
+        text_reply("## Goal\nmain summary"),
+    ])
+    .await;
+    let session = session_in(&h);
+    for text in ["first", "second", "third", "fourth"] {
+        run_turn(&h, &session, text).await;
+    }
+    let started = std::time::Instant::now();
+    let events = collect(
+        h.runtime
+            .compress(&session, &h.provider, compression_via(dead_provider()), None)
+            .unwrap(),
+    )
+    .await;
+    // Not an error: the session's model wrote the summary, and the retry backoff stayed short.
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_requests(&h, Purpose::Compress, 1..=1);
+    assert_eq!(h.requests.lock()[4]["model"], "test-model");
+    let messages = h.runtime.messages(&session).unwrap();
+    let handoff = messages.iter().find(|m| is_handoff(m)).unwrap();
+    assert!(handoff.as_concat_text().contains("main summary"));
+}
+
+/// The aux server answers with an error (the model was unloaded, a 500): the same fallback.
+#[tokio::test]
+async fn compression_falls_back_when_the_aux_server_errors() {
+    let h = harness(vec![
+        text_reply("one"),
+        text_reply(&long_two()),
+        text_reply("three"),
+        text_reply("four"),
+        text_reply("## Goal\nmain summary"),
+    ])
+    .await;
+    // No replies scripted: every request answers 500.
+    let (_aux, provider, aux_requests) = aux_server(vec![]).await;
+    let session = session_in(&h);
+    for text in ["first", "second", "third", "fourth"] {
+        run_turn(&h, &session, text).await;
+    }
+    let events = collect(
+        h.runtime
+            .compress(&session, &h.provider, compression_via(provider), None)
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert!(!aux_requests.lock().is_empty());
+    assert_requests(&h, Purpose::Compress, 1..=1);
+}
+
+#[tokio::test]
+async fn auto_compression_uses_the_aux_model_and_falls_back_when_it_is_down() {
+    for dead in [false, true] {
+        let mut replies = vec![
+            text_reply("one"),
+            text_reply(&long_two()),
+            text_reply("three"),
+            // 35k tokens: past 75% of the 40k window.
+            text_reply_with_prompt_tokens("four", 35_000),
+        ];
+        if dead {
+            replies.push(text_reply("## Goal\nmain summary"));
+        }
+        replies.push(text_reply("five"));
+        let h = harness_profile(replies, BudgetProfile::Balanced).await;
+        let (_aux, local, aux_requests) =
+            aux_server(vec![text_reply("## Goal\nlocal summary")]).await;
+        let mut options = compression_via(if dead { dead_provider() } else { local });
+        options.context_length = Some(40_000);
+        let session = session_in(&h);
+        let mut last = Vec::new();
+        for text in ["first", "second", "third", "fourth"] {
+            last = collect(
+                h.runtime
+                    .start_turn(&session, &h.provider, options.clone(), text)
+                    .unwrap(),
+            )
+            .await;
+        }
+        let _ = last;
+        let events = collect(
+            h.runtime
+                .start_turn(&session, &h.provider, options.clone(), "fifth")
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(finished_status(&events), TurnStatus::Completed, "dead: {dead}");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::Agent(AgentEvent::Compacting)))
+        );
+        // Dead: the main model summarized (1 compress request); alive: the aux one did (0).
+        assert_requests(&h, Purpose::Compress, if dead { 1..=1 } else { 0..=0 });
+        assert_eq!(aux_requests.lock().len(), usize::from(!dead), "dead: {dead}");
+        let messages = h.runtime.messages(&session).unwrap();
+        let handoff = messages.iter().find(|m| is_handoff(m)).unwrap();
+        let text = handoff.as_concat_text();
+        assert!(text.contains(if dead { "main summary" } else { "local summary" }));
+        assert_eq!(last_text(&h, &session), "five");
+    }
+}
+
 #[tokio::test]
 async fn undo_usage_and_insights_report_in_the_chat() {
     let h = harness(vec![text_reply("one"), text_reply("two")]).await;

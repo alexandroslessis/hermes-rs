@@ -202,6 +202,19 @@ files before 0003/0004, 6.6 MB in 109 after.
   (a webapp build needs npm packages): run `build-hermes-webapp.ps1` and look at Settings ▸ Model ▸
   Main before relying on it.
 
+- **0023-local-aux-models-button.patch** (`api/models.ts`, `app/settings/model-settings.tsx`): a
+  "Use a local model for background jobs" button in Settings ▸ Model ▸ Auxiliary, beside "Reset all
+  to main". It calls `assignLocalAuxiliaryModels` (`POST /api/model/auxiliary/local`, a route of
+  ours: Hermes has no such call, an older backend answers 404 and the page shows its usual load
+  error), which `aux_models::use_local` answers: it finds a local server (a local provider in
+  Settings, else Ollama on :11434 or LM Studio on :1234, added as a provider), picks a chat model
+  and sets compression, approval, titles and review to it; a 400 with a plain `detail` when no
+  server answers. The page then refreshes its list. English text, not an i18n key (a key would mean
+  editing every locale file). **Written 2026-11-12 and checked with `git apply --check` against the
+  pinned source, but not built into a webapp or tried in the page** (a webapp build needs npm
+  packages): run `build-hermes-webapp.ps1` and look at Settings ▸ Model ▸ Auxiliary before relying
+  on it. The backend route is checked live by `scripts/perf/local-aux-check.mjs`.
+
 ## To do
 
 - **Skill hub** (install from Capabilities ▸ Skills ▸ Discover): `tools/skills_hub*.py` and

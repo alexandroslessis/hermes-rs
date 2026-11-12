@@ -43,7 +43,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 1 | Path policy, env scrub, skill-script flag — ✅ 2026-11-12 | S–M | — | Sonnet | B |
 | 2 | Request ledger — ✅ 2026-11-12 | M | 0 | Sonnet | A |
 | 3 | Budget profiles and the knobs they set — ✅ 2026-11-12 | M | 2 | Sonnet | A |
-| 4 | Side jobs off the main quota | S–M | 3 | Sonnet | A |
+| 4 | Side jobs off the main quota — ✅ 2026-11-12 | S–M | 3 | Sonnet | A |
 | 5 | Local index (FTS5) and per-turn pre-injection | M | 3 | Sonnet | A |
 | 6 | Taint tracking and the staging area | M | 1 | Sonnet | B |
 | 7 | Review rewrite: signals, evidence packet, one shot | M–L | 5, 6 | **Opus** | C |
@@ -456,6 +456,19 @@ main provider's requests unless the user wants them to.
 not cancelled when a turn starts mid-review (scenario with a slow mock).
 **User checklist:** with "local model for background jobs" on, the request counter only moves on
 main turns.
+
+**Done 2026-11-12** ([progress](progress/phase-4.md)). Built as planned, with these notes for later
+phases and for testing:
+- Under `requests` (the default) with no aux title model, titles are heuristic and **no** model
+  title is requested, and a heuristic title is not upgraded later. A live check or test that expects
+  a model-written title must set `budget.profile = balanced` or an aux title model (the ACP tests
+  write `budget.profile`; of `scripts/perf/*-check.mjs`, only `aux-models-check.mjs` asserts a model
+  title, and it picks an aux title model, so none needed changing).
+- Compression via an aux model falls back to the session's model when the aux server is down,
+  errors, returns nothing or doesn't answer within 300 s (`compress::AUX_SUMMARY_DEADLINE`); the aux
+  provider retries once at most. The fallback is logged, not shown in the chat.
+- The one-click route `GET/POST /api/model/auxiliary/local` is ours (not Hermes's contract); the
+  page reaches it through patch 0023, which is not yet built into a webapp.
 
 ---
 
@@ -987,6 +1000,15 @@ reaches `EmptyResponseRecovery`); S3 =
 cut-off tool call + retry + answer; S4 = 10 turns + 1 background review (memory and skill counters
 both due on the tenth turn, one combined review request); S5 = parent call + 2 children + parent
 answer. The mock counts every request, so retries and background jobs show up in the totals.
+
+After 4 (`requests`, 2026-11-12): S1-S5 unchanged (the scenarios make no title, approval or
+summary request). What Phase 4 moved off the main provider, asserted in `turns.rs`
+(`s4_makes_no_title_and_no_approval_requests`, `compression_via_the_aux_model_...`): title
+requests per new session 1 -> 0 (heuristic) under `requests` without an aux title model; approval
+judge requests per flagged command 1 -> 0 under `requests` without an aux approval model;
+compression summaries with an aux model 1 -> 0 on the main provider (1 only when the aux server
+fails); a review running when the next turn starts is no longer cancelled (its requests no longer
+wasted).
 
 Since Phase 2 the mock also splits them by purpose (the `x-hermes-rs-purpose` header): S1-S3 are
 all `main`; S4 is 10 `main` + 1 `review`; S5 is 2 `main` + 2 `delegate`. The totals above are

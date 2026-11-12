@@ -3521,6 +3521,19 @@ impl Gateway {
         if (method, path) == ("GET", "/api/model/auxiliary") {
             return Some((200, crate::aux_models::list(&self.data_dir)));
         }
+        // One click: every side job on a local model (ours; the patched Settings page calls it).
+        if path == "/api/model/auxiliary/local" && matches!(method, "GET" | "POST") {
+            let well_known = &crate::aux_models::WELL_KNOWN_LOCAL;
+            if method == "GET" {
+                return Some(crate::aux_models::local_list(&self.data_dir, well_known).await);
+            }
+            let body: Value = serde_json::from_slice(body).unwrap_or_default();
+            let answer = crate::aux_models::use_local(&self.data_dir, &body, well_known).await;
+            if let Ok(mut lengths) = self.context_lengths.lock() {
+                lengths.clear();
+            }
+            return Some(answer);
+        }
         if (method, path) == ("POST", "/api/model/set") {
             let body: Value = serde_json::from_slice(body).unwrap_or_default();
             match body["scope"].as_str() {

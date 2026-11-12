@@ -336,3 +336,24 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   (heuristic title) and no approval judge without an aux approval model. A test that expects a
   model title or a judge request pins `balanced` (the ACP tests write
   `desktop-config.json` with `budget.profile`).
+
+- **Compression via an aux model that is down** (Phase 4 CP4.2): `summarizer_for` gives the aux
+  `Summarizer` a `fallback` (the session's model) and at most one HTTP retry, so a stopped local
+  server costs one refused connection, not seven seconds of backoff; the summary then costs one
+  `compress` request on the main provider (as with no aux model). Only when that fails too is the
+  compaction marked failed for the rest of the turn. A hung (not refused) aux server would hold the
+  turn for the HTTP client's 600 s read timeout per attempt, so the aux try has its own deadline
+  (`compress::AUX_SUMMARY_DEADLINE`, 300 s) before the fallback. The fallback is logged only (a
+  `warn` line), not shown in the chat; the ledger shows it as a `compress` request on the main
+  provider. Under `requests` with no aux model,
+  compression still uses the main model: it cannot wait for idle, the turn needs the room.
+- **`session.compress` answers `status: "noop"` for a real compaction**: it says "compressed" only
+  when the visible message list got shorter, and a compaction hides messages and adds a notice
+  and handoff instead. The token counts in the answer (`before_tokens`/`after_tokens`) are the
+  truth; checks use those.
+- **"Use a local model" adds providers**: when no configured provider points at the well-known
+  Ollama / LM Studio port but a server answers there, `aux_models::use_local` adds it to
+  `config.json` as `ollama` / `lm-studio` (via `endpoints::save`, not made the default). Servers
+  are probed side by side, 3 s each at most; a configured local provider that is down is not
+  offered even when it lists its models itself (`discover_models` off). A live check on a machine
+  where Ollama or LM Studio runs will also see that server in `GET /api/model/auxiliary/local`.

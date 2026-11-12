@@ -124,6 +124,13 @@ instance with `HERMES_HOME` set to it.
 a title and a compression model with its own and an inherited effort reaching their requests,
 reset).
 
+`local-aux-check.mjs` checks "Use a local model for background jobs" (`GET/POST /api/model/auxiliary/local`, patch
+0023): this script is the main provider and a second, local one on :47901 that it adds as an endpoint; the
+servers found (embedding models left out), refused unknown servers or models, every job set to the local
+model, a `/compress` whose summary comes from the local server (zero `compress` requests on the main
+provider), the same with the local server stopped (the main model writes it), 400 and nothing changed when
+no server answers, reset, endpoint removed.
+
 `keyboard-nav-check.mjs` checks arrow-key navigation through the page (DevTools, patches/0018 and
 0019): the file tree's ↑/↓ move the visible selection and ←/→ fold the selected folder, and the
 Settings rail's rows walk with ↑/↓ (wrap-around; arrows only move focus, the hash never changes).

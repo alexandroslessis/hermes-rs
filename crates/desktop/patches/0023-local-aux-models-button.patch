@@ -1,0 +1,90 @@
+diff --git a/apps/desktop/src/api/models.ts b/apps/desktop/src/api/models.ts
+index 4357a80..9981ca2 100644
+--- a/apps/desktop/src/api/models.ts
++++ b/apps/desktop/src/api/models.ts
+@@ -120,6 +120,17 @@ export function saveMoaModels(
+   })
+ }
+ 
++// hermes-rs: "Use a local model for background jobs" (`POST /api/model/auxiliary/local`) puts
++// every side job on a local Ollama / LM Studio model; the backend picks the server and its model.
++export function assignLocalAuxiliaryModels(profile?: ProfileScope): Promise<ModelAssignmentResponse> {
++  return window.hermesDesktop.api<ModelAssignmentResponse>({
++    ...capabilityScoped(profile),
++    path: '/api/model/auxiliary/local',
++    method: 'POST',
++    body: {}
++  })
++}
++
+ export function setModelAssignment(
+   body: ModelAssignmentRequest,
+   profile?: ProfileScope
+diff --git a/apps/desktop/src/app/settings/model-settings.tsx b/apps/desktop/src/app/settings/model-settings.tsx
+index 98a9d05..cb91cbc 100644
+--- a/apps/desktop/src/app/settings/model-settings.tsx
++++ b/apps/desktop/src/app/settings/model-settings.tsx
+@@ -10,6 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
+ import { Skeleton } from '@/components/ui/skeleton'
+ import { Switch } from '@/components/ui/switch'
+ import {
++  assignLocalAuxiliaryModels,
+   getAuxiliaryModels,
+   getGlobalModelInfo,
+   getGlobalModelOptions,
+@@ -1038,6 +1039,22 @@ export function ModelSettings({ onMainModelChanged, scopeProfile, subpage }: Mod
+     }
+   }, [m.loadFailed, mainModel, refresh, scopeProfile, setCaughtError])
+ 
++  // hermes-rs: one click puts every side job on a local model (Ollama / LM Studio).
++  const applyLocalAuxiliaryModels = useCallback(async () => {
++    setApplying(true)
++    setError('')
++
++    try {
++      await assignLocalAuxiliaryModels(scopeProfile)
++      setSwitchStaleAux([])
++      await refresh()
++    } catch (err) {
++      setCaughtError(err, m.loadFailed)
++    } finally {
++      setApplying(false)
++    }
++  }, [m.loadFailed, refresh, scopeProfile, setCaughtError])
++
+   const recycleStaleBackend = useCallback(async () => {
+     setRestartingBackend(true)
+     setError('')
+@@ -1200,14 +1217,24 @@ export function ModelSettings({ onMainModelChanged, scopeProfile, subpage }: Mod
+         <section>
+           <div className={cn('mb-2.5 flex items-center', subpage === undefined ? 'justify-between' : 'justify-end')}>
+             {subpage === undefined && <SectionHeading icon={Cpu} title={m.auxiliaryTitle} />}
+-            <Button
+-              disabled={!mainModel || applying}
+-              onClick={() => void resetAuxiliaryModels()}
+-              size="sm"
+-              variant="textStrong"
+-            >
+-              {m.resetAllToMain}
+-            </Button>
++            <div className="flex items-center gap-1.5">
++              <Button
++                disabled={applying}
++                onClick={() => void applyLocalAuxiliaryModels()}
++                size="sm"
++                variant="textStrong"
++              >
++                Use a local model for background jobs
++              </Button>
++              <Button
++                disabled={!mainModel || applying}
++                onClick={() => void resetAuxiliaryModels()}
++                size="sm"
++                variant="textStrong"
++              >
++                {m.resetAllToMain}
++              </Button>
++            </div>
+           </div>
+           <p className="mb-2 text-xs text-muted-foreground">{m.auxiliaryDesc}</p>
+           {(switchStaleAux.length === 0 || !showMain) && persistentStaleAux.length > 0 && !staleAuxDismissed && (

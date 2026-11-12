@@ -216,23 +216,32 @@ fn summarizer_for(
     context_length: Option<usize>,
     budget: &budget::BudgetKnobs,
 ) -> Result<compress::Summarizer> {
+    let session = compress::Summarizer {
+        llm: llm.clone(),
+        model: model.to_string(),
+        context_length,
+        window: context_length,
+        request_params: None,
+        compress_at: budget.compress_at,
+        fallback: None,
+        deadline: None,
+    };
     Ok(match &aux.compression {
+        // A local server that is down must not cost the compaction: one retry at most (a
+        // refused connection answers at once, backing off would stall the turn for seconds),
+        // then the session's model writes the summary, as it does with no aux model.
         Some(aux) => compress::Summarizer {
-            llm: aux.provider.provider_with(budget.http_retries)?,
+            llm: aux.provider.provider_with(budget.http_retries.min(1))?,
             model: aux.model.clone(),
             context_length: aux.context_length,
             window: context_length,
             request_params: aux_effort_params(aux),
             compress_at: budget.compress_at,
+            fallback: Some(Box::new(session)),
+            // A hung server (connection taken, no answer) is bounded too.
+            deadline: Some(compress::AUX_SUMMARY_DEADLINE),
         },
-        None => compress::Summarizer {
-            llm: llm.clone(),
-            model: model.to_string(),
-            context_length,
-            window: context_length,
-            request_params: None,
-            compress_at: budget.compress_at,
-        },
+        None => session,
     })
 }
 
