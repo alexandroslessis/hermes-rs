@@ -34,6 +34,10 @@ struct Script {
     requests: Arc<Mutex<Vec<Value>>>,
     /// Requests per `x-hermes-rs-purpose` header value (absent header = `main`).
     counts: Arc<Mutex<HashMap<String, usize>>>,
+    /// Replies for one purpose only (a request with that purpose never takes from `replies`).
+    by_purpose: Mutex<HashMap<String, VecDeque<String>>>,
+    /// How long each purpose's responses are held back (a slow provider).
+    delays: HashMap<String, Duration>,
 }
 
 /// Why a request was sent; the backend labels each one with the `x-hermes-rs-purpose` header
@@ -97,12 +101,23 @@ impl Respond for Script {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("main")
             .to_string();
-        *self.counts.lock().entry(purpose).or_insert(0) += 1;
+        *self.counts.lock().entry(purpose.clone()).or_insert(0) += 1;
         self.requests.lock().push(request.body_json().unwrap());
-        match self.replies.lock().pop_front() {
-            Some(body) => ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(body),
+        let delay = self.delays.get(&purpose).copied();
+        let next = match self.by_purpose.lock().get_mut(&purpose) {
+            Some(queue) => queue.pop_front(),
+            None => self.replies.lock().pop_front(),
+        };
+        match next {
+            Some(body) => {
+                let template = ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body);
+                match delay {
+                    Some(delay) => template.set_delay(delay),
+                    None => template,
+                }
+            }
             None => ResponseTemplate::new(500)
                 .set_body_json(json!({"error": {"message": "script exhausted"}})),
         }
@@ -214,6 +229,17 @@ async fn harness_budget(
     bridge: Arc<dyn UserBridge>,
     budget: BudgetKnobs,
 ) -> Harness {
+    harness_scripted(replies, bridge, budget, HashMap::new(), HashMap::new()).await
+}
+
+/// Like `harness_budget`, with replies kept per purpose and responses held back per purpose.
+async fn harness_scripted(
+    replies: impl FnOnce(&Path) -> Vec<String>,
+    bridge: Arc<dyn UserBridge>,
+    budget: BudgetKnobs,
+    by_purpose: HashMap<&str, Vec<String>>,
+    delays: HashMap<&str, Duration>,
+) -> Harness {
     let data = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
     let replies = replies(data.path());
@@ -226,6 +252,16 @@ async fn harness_budget(
             replies: Mutex::new(replies.into()),
             requests: requests.clone(),
             counts: counts.clone(),
+            by_purpose: Mutex::new(
+                by_purpose
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.into()))
+                    .collect(),
+            ),
+            delays: delays
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
         })
         .mount(&server)
         .await;
@@ -3100,8 +3136,9 @@ async fn smart_approvals_let_the_reviewer_decide_and_yolo_skips_asking() {
     // The agent runs a flagged command twice; the reviewer approves the first and denies the
     // second. Then /yolo runs one without asking anybody.
     let flagged = json!({"command": "git reset --hard HEAD~1"});
-    let h = harness_with(
-        vec![
+    // Under `requests` the judge doesn't borrow the main model (see the Phase 4 tests below).
+    let h = harness_budget(
+        |_| vec![
             tool_reply(&[("t1", "terminal", flagged.clone())]),
             text_reply("APPROVE"),
             text_reply("done"),
@@ -3112,6 +3149,7 @@ async fn smart_approvals_let_the_reviewer_decide_and_yolo_skips_asking() {
             text_reply("ran it"),
         ],
         Arc::new(Bridge),
+        test_budget(Some(BudgetProfile::Balanced)),
     )
     .await;
     let session = session_in(&h);
@@ -4060,4 +4098,272 @@ async fn tool_schemas_state_no_profile_dependent_limit() {
     assert!(!read_file.contains("2000") && !read_file.contains("\"maximum\""), "{read_file}");
     let delegate = schema("delegate_task");
     assert!(!delegate.contains("up to 10"), "{delegate}");
+}
+
+// ---- Phase 4, CP4.1: side jobs off the main quota ----
+
+/// S4 again, as the budget spec of side jobs: ten main turns make no `title` and no `approval`
+/// request on the main provider under any profile (titles are the desktop's, from the first
+/// message under `requests`; nothing here asks the judge).
+#[tokio::test]
+async fn s4_makes_no_title_and_no_approval_requests() {
+    for profile in BudgetProfile::ALL {
+        let mut replies: Vec<String> = (0..10)
+            .map(|i| text_reply(&format!("answer {i}")))
+            .collect();
+        replies.push(text_reply("Nothing to save."));
+        let h = harness_profile(replies, profile).await;
+        let session = session_in(&h);
+        for i in 0..10 {
+            run_turn(&h, &session, &format!("question {i}")).await;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while h.requests.lock().len() < 11 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_requests(&h, Purpose::Title, 0..=0);
+        assert_requests(&h, Purpose::Approval, 0..=0);
+    }
+}
+
+fn flagged_turn_replies() -> Vec<String> {
+    vec![
+        tool_reply(&[(
+            "t1",
+            "terminal",
+            json!({"command": "git reset --hard HEAD~1"}),
+        )]),
+        text_reply("done"),
+    ]
+}
+
+/// Under `requests`, smart approvals without an auxiliary approval model don't fall back to the
+/// main model: the flagged command asks the user.
+#[tokio::test]
+async fn requests_profile_smart_approval_without_an_aux_model_asks_the_user() {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let h = harness_budget(
+        |_| flagged_turn_replies(),
+        Arc::new(ApproveBridge {
+            choice: hermes_tools::approval::ApprovalChoice::Deny,
+            asked: asked.clone(),
+        }),
+        test_budget(Some(BudgetProfile::Requests)),
+    )
+    .await;
+    let session = session_in(&h);
+    h.runtime.approvals().set_smart(true);
+    let events = run_turn(&h, &session, "reset it").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_requests(&h, Purpose::Approval, 0..=0);
+    assert_requests(&h, Purpose::Main, 2..=2);
+    assert_eq!(asked.lock().len(), 1, "the user was asked");
+}
+
+/// With an auxiliary approval model the judge still runs under `requests` (labelled `approval`),
+/// and `balanced` keeps its fallback to the main model.
+#[tokio::test]
+async fn an_aux_approval_model_still_judges_and_balanced_still_falls_back() {
+    let judge_replies = || {
+        vec![
+            tool_reply(&[(
+                "t1",
+                "terminal",
+                json!({"command": "git reset --hard HEAD~1"}),
+            )]),
+            text_reply("DENY"),
+            text_reply("blocked"),
+        ]
+    };
+    let h = harness_budget(
+        |_| judge_replies(),
+        Arc::new(Bridge),
+        test_budget(Some(BudgetProfile::Requests)),
+    )
+    .await;
+    let session = session_in(&h);
+    h.runtime.approvals().set_smart(true);
+    let options = TurnOptions {
+        aux: hermes_runtime::AuxModels {
+            approval: Some(hermes_runtime::AuxModel {
+                provider: h.provider.clone(),
+                model: "judge".into(),
+                context_length: None,
+                effort: None,
+            }),
+            ..Default::default()
+        },
+        ..TurnOptions::default()
+    };
+    let mut turn = h
+        .runtime
+        .start_turn(&session, &h.provider, options, "reset it")
+        .unwrap();
+    while let Some(event) = turn.events.recv().await {
+        if matches!(event, RuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    assert_requests(&h, Purpose::Approval, 1..=1);
+    assert_eq!(h.requests.lock()[1]["model"], "judge");
+
+    // Balanced: no aux model, the main model judges.
+    let h = harness_budget(
+        |_| judge_replies(),
+        Arc::new(Bridge),
+        test_budget(Some(BudgetProfile::Balanced)),
+    )
+    .await;
+    let session = session_in(&h);
+    h.runtime.approvals().set_smart(true);
+    run_turn(&h, &session, "reset it").await;
+    assert_requests(&h, Purpose::Approval, 1..=1);
+}
+
+/// A skill review due after the first turn (ten model calls), with its replies kept apart from the
+/// main provider's so the order of arrival doesn't matter.
+fn review_scenario() -> (Vec<String>, Vec<String>) {
+    let skill = "---\nname: list-files\ndescription: List a folder's files with read tools.\n---\n\n# List\n\nUse search_files.\n";
+    let mut main: Vec<String> = (0..9)
+        .map(|i| tool_reply(&[(&format!("call_{i}"), "todo_list", json!({}))]))
+        .collect();
+    main.push(text_reply("Done."));
+    main.push(text_reply("Second answer."));
+    let review = vec![
+        tool_reply(&[(
+            "call_review",
+            "skill_manage",
+            json!({"operations": [{"action": "create", "name": "list-files", "content": skill}]}),
+        )]),
+        text_reply("Captured the listing workflow."),
+    ];
+    (main, review)
+}
+
+/// A turn that starts while the review's first request is in flight does not cancel it: the review
+/// makes its second request, saves its skill and reports, and the turn is untouched by it.
+#[tokio::test]
+async fn a_turn_starting_mid_review_does_not_cancel_it() {
+    let (main, review) = review_scenario();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let h = harness_scripted(
+        |_| main,
+        Arc::new(ReviewBridge(tx)),
+        test_budget(Some(BudgetProfile::Balanced)),
+        HashMap::from([("review", review)]),
+        HashMap::from([("review", Duration::from_millis(1500))]),
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "Check the task list a few times.").await;
+    // The review's first request is in flight (held back by the slow mock).
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while request_count(&h, Purpose::Review) < 1 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_requests(&h, Purpose::Review, 1..=1);
+    let events = run_turn(&h, &session, "And now something else.").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!(last_text(&h, &session), "Second answer.");
+    // The review finishes anyway: its second request and its report.
+    let (actions, requested) = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!requested);
+    assert_eq!(actions, vec!["Skill 'list-files' created"]);
+    assert_requests(&h, Purpose::Review, 2..=2);
+    assert_requests(&h, Purpose::Main, 11..=11);
+    assert!(h.runtime.skills().find("list-files").is_some());
+    // It worked on a copy taken before the second turn, and none of it joined the session.
+    let review_request = h
+        .requests
+        .lock()
+        .iter()
+        .find(|r| r.to_string().contains("update the skill library"))
+        .cloned()
+        .expect("a review request");
+    assert!(!review_request.to_string().contains("something else"));
+    let stored = h.runtime.messages(&session).unwrap();
+    assert!(
+        !stored
+            .iter()
+            .any(|m| m.as_concat_text().contains("update the skill library"))
+    );
+}
+
+/// A turn that starts before the review has made its first request pauses it: the review's
+/// request comes after the turn's, on the conversation including that turn. (`refine` spawns the
+/// review and the test starts the turn with no yield between; on the single-threaded test runtime
+/// the review task therefore first runs while the turn holds the session.)
+#[tokio::test]
+async fn a_turn_starting_before_the_reviews_first_request_pauses_it() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let h = harness_scripted(
+        |_| vec![text_reply("Hello."), text_reply("Second answer.")],
+        Arc::new(ReviewBridge(tx)),
+        test_budget(Some(BudgetProfile::Balanced)),
+        HashMap::from([("review", vec![text_reply("Nothing to save.")])]),
+        HashMap::new(),
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "Say hello.").await;
+    h.runtime
+        .refine(&session, &h.provider, TurnOptions::default(), None)
+        .unwrap();
+    let events = run_turn(&h, &session, "And now something else.").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!(last_text(&h, &session), "Second answer.");
+    let (actions, requested) = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(requested && actions.is_empty());
+    assert_requests(&h, Purpose::Review, 1..=1);
+    assert_requests(&h, Purpose::Main, 2..=2);
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 3);
+    // Order: the turn's request, then the paused review's, which saw the turn's message.
+    assert!(requests[1].to_string().contains("something else"));
+    assert!(requests[2].to_string().contains("Review the conversation above"));
+    assert!(requests[2].to_string().contains("something else"));
+    assert!(requests[2].to_string().contains("Second answer"));
+}
+
+/// A paused `/refine` is not replaced by a review that falls due while it waits (the user's report
+/// would be lost): the turn that paused it makes a skill review due, and still the one review
+/// that runs is the requested one.
+#[tokio::test]
+async fn a_paused_refine_is_not_replaced_by_a_review_that_falls_due() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut main = vec![text_reply("Hello.")];
+    main.extend((0..9).map(|i| tool_reply(&[(&format!("call_{i}"), "todo_list", json!({}))])));
+    main.push(text_reply("Second answer."));
+    let h = harness_scripted(
+        |_| main,
+        Arc::new(ReviewBridge(tx)),
+        test_budget(Some(BudgetProfile::Balanced)),
+        HashMap::from([("review", vec![text_reply("Nothing to save.")])]),
+        HashMap::new(),
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "Say hello.").await;
+    h.runtime
+        .refine(&session, &h.provider, TurnOptions::default(), None)
+        .unwrap();
+    // Starts before the review task first runs (single-threaded test runtime), so it pauses it.
+    let events = run_turn(&h, &session, "Check the task list a few times.").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let (actions, requested) = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(requested, "the /refine ran and reported");
+    assert!(actions.is_empty());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_requests(&h, Purpose::Review, 1..=1);
+    assert_requests(&h, Purpose::Main, 11..=11);
 }

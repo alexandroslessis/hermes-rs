@@ -179,7 +179,11 @@ impl ReviewTools {
                     .get("path")
                     .and_then(Value::as_str)
                     .map(|p| self.tools.resolve(p));
-                let output = self.tools.dispatch(name, args, None).await;
+                // The review's own read: recorded in `self.read` for its guard, not in the
+                // session's file state the turn's write guard checks.
+                let output = crate::files::SIDE_READ
+                    .scope((), self.tools.dispatch(name, args, None))
+                    .await;
                 if let (false, Some(path)) = (output.is_error, path) {
                     self.mark_read(&path);
                 }
@@ -359,5 +363,45 @@ mod tests {
                 .starts_with("Refusing background review delete")
         );
         assert!(skills.find("deploy").is_some());
+    }
+
+    /// A review's `read_file` is its own: it doesn't satisfy the session's read-before-write
+    /// guard (a review may run beside a turn, Phase 4).
+    #[tokio::test]
+    async fn a_review_read_does_not_count_as_the_sessions() {
+        let (dir, review, _) = review_tools(false);
+        std::fs::write(dir.path().join("notes.md"), "old\n").unwrap();
+        let read = review
+            .dispatch("read_file", json!({"path": "notes.md"}))
+            .await;
+        assert!(!read.is_error, "{}", read.value);
+        let write = review
+            .tools
+            .dispatch(
+                "write_file",
+                json!({"path": "notes.md", "content": "new\n"}),
+                None,
+            )
+            .await;
+        assert!(write.is_error, "{}", write.value);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("notes.md")).unwrap(),
+            "old\n"
+        );
+        // The session's own read still counts.
+        let read = review
+            .tools
+            .dispatch("read_file", json!({"path": "notes.md"}), None)
+            .await;
+        assert!(!read.is_error);
+        let write = review
+            .tools
+            .dispatch(
+                "write_file",
+                json!({"path": "notes.md", "content": "new\n"}),
+                None,
+            )
+            .await;
+        assert!(!write.is_error, "{}", write.value);
     }
 }

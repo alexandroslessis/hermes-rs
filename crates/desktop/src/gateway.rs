@@ -2738,7 +2738,12 @@ impl Gateway {
         // An untitled session takes its first message's first line as its title until the title
         // model's arrives (after this turn); a loaded skill counts as the command that loaded it.
         let shown = commands::typed_command(&text).unwrap_or_else(|| text.clone());
-        let titling = record.title.is_none().then(|| {
+        // Under `requests` with no auxiliary title model the title comes from the message itself
+        // and no title request is made (Phase 4); an auxiliary model, or another profile, keeps
+        // the model's title.
+        let heuristic_titles = self.runtime.budget().titles == hermes_runtime::budget::TitleMode::Heuristic
+            && settings.aux_models.titles.is_none();
+        let titling = (record.title.is_none() && !heuristic_titles).then(|| {
             let chosen = settings.aux_models.titles.as_ref().and_then(|choice| {
                 Some((
                     settings.provider(&choice.provider)?.runtime(),
@@ -2757,7 +2762,16 @@ impl Gateway {
                 .find(|l| !l.trim().is_empty())
                 .unwrap_or("")
                 .trim();
-            let title: String = line.chars().take(60).collect();
+            let heuristic = if heuristic_titles {
+                hermes_runtime::titles::heuristic_title(&shown)
+            } else {
+                String::new()
+            };
+            let title: String = if heuristic.is_empty() {
+                line.chars().take(60).collect()
+            } else {
+                heuristic
+            };
             if !title.is_empty() {
                 let _ = self.runtime.store().set_title(&id, &title);
                 self.emit(

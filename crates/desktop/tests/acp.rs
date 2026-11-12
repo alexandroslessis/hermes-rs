@@ -92,6 +92,8 @@ struct Script {
     replies: Arc<std::sync::Mutex<VecDeque<String>>>,
     requests: Arc<std::sync::Mutex<Vec<Value>>>,
     delay: Duration,
+    /// Requests that offered no tools (session titles).
+    titles: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Respond for Script {
@@ -102,6 +104,8 @@ impl Respond for Script {
             .as_array()
             .is_some_and(|tools| !tools.is_empty());
         if !offers_tools {
+            self.titles
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if body["stream"] == true {
                 return ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
@@ -130,6 +134,7 @@ struct Model {
     server: MockServer,
     requests: Arc<std::sync::Mutex<Vec<Value>>>,
     script: Arc<std::sync::Mutex<VecDeque<String>>>,
+    titles: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Model {
@@ -137,12 +142,14 @@ impl Model {
         let server = MockServer::start().await;
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let script = Arc::new(std::sync::Mutex::new(VecDeque::from(replies)));
+        let titles = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(Script {
                 replies: script.clone(),
                 requests: requests.clone(),
                 delay,
+                titles: titles.clone(),
             })
             .mount(&server)
             .await;
@@ -157,6 +164,7 @@ impl Model {
             server,
             requests,
             script,
+            titles,
         }
     }
 
@@ -186,6 +194,11 @@ impl Agent {
     }
 
     async fn start_with(replies: Vec<String>, delay: Duration) -> Self {
+        // The suite's counts are `balanced`'s (the default profile makes no title request).
+        Self::start_profile(replies, delay, "balanced").await
+    }
+
+    async fn start_profile(replies: Vec<String>, delay: Duration, profile: &str) -> Self {
         let model = Model::start(replies, delay).await;
         let home = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
@@ -195,6 +208,12 @@ impl Agent {
             "background_review": false, "checkpoints": false,
         });
         std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
+        // The budget profile lives in the desktop config (`budget.profile`).
+        std::fs::write(
+            home.path().join("desktop-config.json"),
+            json!({"budget": {"profile": profile}}).to_string(),
+        )
+        .unwrap();
         Self::spawn(model, home, work)
     }
 
@@ -1080,6 +1099,37 @@ async fn a_thread_gets_a_title_update() {
     assert_eq!(
         titles.first().map(String::as_str),
         Some("Please introduce yourself")
+    );
+}
+
+/// Under `requests` with no title model set, the thread is named from its first message and no
+/// title request is made (Phase 4).
+#[tokio::test]
+async fn under_requests_a_thread_gets_a_heuristic_title_and_no_title_request() {
+    let mut agent = Agent::start_profile(vec![text_reply("Hi")], Duration::ZERO, "requests").await;
+    agent.initialize(json!({})).await;
+    let session = agent.new_session().await;
+    agent.prompt(&session, "Please introduce yourself").await;
+    // Give a (wrong) title request time to show up.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let sid = session.clone();
+    let titles: Vec<String> = agent
+        .wait_for(move |seen, _| {
+            let titles: Vec<String> = seen
+                .iter()
+                .filter(|m| m["params"]["sessionId"] == sid.as_str())
+                .filter(|m| m["params"]["update"]["sessionUpdate"] == "session_info_update")
+                .filter_map(|m| m["params"]["update"]["title"].as_str().map(str::to_string))
+                .collect();
+            (!titles.is_empty()).then_some(titles)
+        })
+        .await;
+    assert_eq!(titles, vec!["Introduce Yourself"]);
+    assert_eq!(agent.model.requests().len(), 1, "only the turn's request");
+    assert_eq!(
+        agent.model.titles.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no title request"
     );
 }
 

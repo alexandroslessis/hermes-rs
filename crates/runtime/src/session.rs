@@ -121,6 +121,39 @@ impl std::ops::Deref for RunGuard {
     }
 }
 
+/// A background review in flight. A turn starting while it runs leaves it alone (Phase 4):
+/// before its first request ([`ReviewHandle::started`] is `false`) it waits for the turn to end
+/// (a pause: it takes its snapshot of the conversation only when no turn is running), and after
+/// that it is left to finish on its own copy of the conversation.
+#[derive(Clone)]
+pub struct ReviewHandle {
+    pub cancel: CancellationToken,
+    /// Set, under the session's `running` lock, when the review took its snapshot of the
+    /// conversation, i.e. when it is about to make its first request.
+    pub started: Arc<std::sync::atomic::AtomicBool>,
+    /// What the review covers, and whether the user asked for it (`/refine`): a review that
+    /// replaces a paused one takes these over, so the paused one's job isn't lost.
+    pub memory: bool,
+    pub skills: bool,
+    pub requested: bool,
+}
+
+impl ReviewHandle {
+    pub fn new(memory: bool, skills: bool, requested: bool) -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+            started: Arc::default(),
+            memory,
+            skills,
+            requested,
+        }
+    }
+
+    pub fn has_started(&self) -> bool {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 pub struct OpenSession {
     pub record: Mutex<SessionRecord>,
     pub conversation: Mutex<Conversation>,
@@ -128,8 +161,9 @@ pub struct OpenSession {
     pub running: Mutex<Option<RunGuard>>,
     /// The running turn's loop state (where `/steer` text waits for delivery).
     pub turn_state: Mutex<Option<Arc<Mutex<TurnState>>>>,
-    /// The background review running after the last turn; a new turn cancels it.
-    pub review: Mutex<Option<CancellationToken>>,
+    /// The background review running after the last turn. A new turn no longer cancels it: see
+    /// [`ReviewHandle`].
+    pub review: Mutex<Option<ReviewHandle>>,
     /// Hermes's nudge counters, which decide when a turn is followed by a review.
     pub nudges: Mutex<crate::review::Nudges>,
     /// The last request's tokens and the conversation length then (see [`TurnSession`]).

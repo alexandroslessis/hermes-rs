@@ -15,6 +15,7 @@ mod ops;
 mod review;
 mod session;
 pub mod subagents;
+pub mod titles;
 mod turnlock;
 
 use std::collections::HashMap;
@@ -1052,6 +1053,8 @@ impl Runtime {
                     governor: Some((governor.clone(), aux.provider.id.clone())),
                 }) as Arc<dyn hermes_tools::approval::ApprovalGuard>
             }),
+            // Under `requests` there is no fallback to the main model: a flagged command asks.
+            None if !budget.side_jobs_may_use_main_model() => None,
             None => provider.provider().ok().map(|llm| {
                 Arc::new(SmartGuard {
                     llm,
@@ -1070,11 +1073,10 @@ impl Runtime {
             persist: true,
             record_usage: true,
         };
-        // A live turn supersedes a review still running from the last one (Hermes cancels it so
-        // the two don't compete for the model).
-        if let Some(review) = open.review.lock().take() {
-            review.cancel();
-        }
+        // A review still running from the last turn is left alone (Hermes cancels it, so the two
+        // don't compete for the model; here it would waste the requests it already made, Phase 4):
+        // one that hasn't made its first request waits for this turn to end, one that has is on
+        // its own copy of the conversation and finishes. See `session::ReviewHandle`.
         let review_memory = text.is_some() && open.nudges.lock().tick_memory();
         let review_provider_id = aux
             .review
@@ -2352,10 +2354,39 @@ impl ReviewSetup {
             tracing::info!("review skipped: {why}");
             return;
         }
-        let cancel = CancellationToken::new();
-        if let Some(previous) = session.review.lock().replace(cancel.clone()) {
-            previous.cancel();
-        }
+        let (mut memory, mut skills) = (memory, skills);
+        let handle = {
+            // Under `running` (lock order: running, then review): a paused review takes its
+            // snapshot and sets `started` under this lock, so it can't start between the check
+            // below and its cancellation.
+            let _running = session.running.lock();
+            let mut slot = session.review.lock();
+            if let Some(previous) = slot.as_ref() {
+                // One already past its first request finishes (cancelling it would waste what it
+                // spent); a newly due review is skipped, except one the user asked for with
+                // /refine, which replaces it. The skipped review's turns aren't lost: every
+                // review reads the whole conversation, so the next one due sees them.
+                if previous.has_started() && !requested {
+                    tracing::info!("review skipped: one is still running");
+                    return;
+                }
+                if !previous.has_started() {
+                    // A paused /refine stays (it covers memory and skills, and the user waits
+                    // for its report); a paused due review is replaced by this one, which will
+                    // see the same conversation, and takes over what it was to cover.
+                    if previous.requested && !requested {
+                        tracing::info!("review skipped: a /refine is waiting to run");
+                        return;
+                    }
+                    memory |= previous.memory;
+                    skills |= previous.skills;
+                }
+                previous.cancel.cancel();
+            }
+            let handle = session::ReviewHandle::new(memory, skills, requested);
+            *slot = Some(handle.clone());
+            handle
+        };
         let session_id = session.record.lock().id.clone();
         let context = self.ledger.context(Purpose::Review, Some(&session_id));
         tokio::spawn(hermes_llm::observer::scope(context, review::run(review::ReviewJob {
@@ -2371,7 +2402,7 @@ impl ReviewSetup {
             focus,
             requested,
             budget: self.budget,
-            cancel,
+            handle,
         })));
     }
 }

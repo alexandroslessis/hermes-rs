@@ -321,3 +321,18 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   them silently, a hand-edited `desktop-config.json` value out of range is ignored (the profile's
   value stays). `ACP` reads the profile once at start: a switch in the desktop reaches a running
   `hermes-acp.exe` only after the editor restarts it.
+
+- **A background review outlives the turn that follows it** (Phase 4). It works on a private copy
+  of the conversation (`persist: false`) and may only call memory/skill tools, which serialise on
+  their own mutexes; it takes that copy under the session's `running` lock, so it never copies a
+  half-written turn, and a turn starting first makes it wait. Its `read_file` calls run under
+  `files::SIDE_READ`, so they don't satisfy the turn's read-before-write guard. It shares
+  `SessionTools` with the turn otherwise: the per-turn memory failure counter is reset by the
+  turn's `begin_turn` and counts the review's failures too. Its usage rows go to the same
+  session in `sessions.db`, so the context gauge (last row's input tokens) can briefly show the
+  review's. Tests that start a turn right after one finishes must not assume the review has
+  already taken its snapshot.
+- **Under `requests` nothing side-job-shaped reaches the main model unasked**: no title request
+  (heuristic title) and no approval judge without an aux approval model. A test that expects a
+  model title or a judge request pins `balanced` (the ACP tests write
+  `desktop-config.json` with `budget.profile`).

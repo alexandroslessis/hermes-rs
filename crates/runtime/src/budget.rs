@@ -14,7 +14,7 @@
 //! rebuild the prompt anyway, take the profile the session runs under then.
 //!
 //! A knob whose `requests` or `tokens` value needs a later phase (review `idle_once`, skills
-//! preload, heuristic titles, per-cluster curator, deferred tool schemas) holds its `balanced`
+//! preload, per-cluster curator, deferred tool schemas) holds its `balanced`
 //! value until that phase lands: the enum has the variant, [`for_profile`] says which phase flips
 //! it in a comment, and nothing consumes the later variant yet.
 
@@ -86,12 +86,13 @@ pub enum SkillsIndex {
     NamesOnly,
 }
 
-/// How session titles are made. Phase 4 adds the heuristic.
+/// How session titles are made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitleMode {
     /// A model request (today).
     Model,
-    /// From the first message, no request (Phase 4).
+    /// From the first message, no request ([`crate::titles::heuristic_title`]). Used only while no
+    /// auxiliary title model is set; with one, the model's title is the upgrade.
     Heuristic,
 }
 
@@ -155,6 +156,13 @@ pub struct BudgetKnobs {
 }
 
 impl BudgetKnobs {
+    /// Whether a side job with no model of its own (the smart-approval judge) may borrow the
+    /// session's main model. Under `requests` it may not: the main provider's quota is for the
+    /// main turns (Phase 4), so the flagged command asks the user instead.
+    pub fn side_jobs_may_use_main_model(&self) -> bool {
+        self.profile != BudgetProfile::Requests
+    }
+
     /// Today's behaviour. Each value is the constant it replaced (a test pins them).
     pub const BALANCED: BudgetKnobs = BudgetKnobs {
         profile: BudgetProfile::Balanced,
@@ -227,8 +235,8 @@ pub fn for_profile(profile: BudgetProfile) -> BudgetKnobs {
             // Phase 5: SkillsIndex::CategoriesAndRetrieval, preload 3.
             skills_index: balanced.skills_index,
             skills_preload: balanced.skills_preload,
-            // Phase 4: TitleMode::Heuristic.
-            titles: balanced.titles,
+            // Phase 4: titles from the first message, no request.
+            titles: TitleMode::Heuristic,
             tool_schemas: balanced.tool_schemas,
         },
         BudgetProfile::Tokens => BudgetKnobs {
@@ -439,6 +447,10 @@ mod tests {
             (r.delegate_max_children, r.delegate_child_iterations),
             (3, 60)
         );
+        // Phase 4: heuristic titles, and no borrowing the main model for side jobs.
+        assert_eq!(r.titles, TitleMode::Heuristic);
+        assert!(!r.side_jobs_may_use_main_model());
+        assert!(BudgetKnobs::BALANCED.side_jobs_may_use_main_model());
         // Later phases: still balanced.
         let b = BudgetKnobs::BALANCED;
         assert_eq!(
@@ -447,7 +459,6 @@ mod tests {
                 r.curator_mode,
                 r.skills_index,
                 r.skills_preload,
-                r.titles,
                 r.tool_schemas
             ),
             (
@@ -455,7 +466,6 @@ mod tests {
                 b.curator_mode,
                 b.skills_index,
                 b.skills_preload,
-                b.titles,
                 b.tool_schemas
             )
         );

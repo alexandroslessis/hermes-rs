@@ -27,6 +27,13 @@ struct Stamp {
     hash: u64,
 }
 
+tokio::task_local! {
+    /// Set while a background review reads a file for itself: the read isn't the session's, so it
+    /// leaves the session's read-before-write record alone. Otherwise a review running beside a
+    /// turn (Phase 4) could satisfy the turn's guard for a file the turn's model never saw.
+    pub(crate) static SIDE_READ: ();
+}
+
 #[derive(Default)]
 pub struct FileState {
     seen: Mutex<HashMap<String, Stamp>>,
@@ -213,7 +220,7 @@ pub async fn read_file(tools: &SessionTools, args: Value) -> ToolOutput {
     if next <= total_lines {
         result["truncated"] = json!(true);
         result["next_offset"] = json!(next);
-    } else if offset == 1 {
+    } else if offset == 1 && SIDE_READ.try_with(|_| ()).is_err() {
         tools.files.record(&path, &bytes);
     }
     ToolOutput::ok(result)

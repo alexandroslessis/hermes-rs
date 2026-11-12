@@ -20,11 +20,12 @@ use hermes_tools::{ReviewTools, SessionTools, UserBridge};
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 use crate::ops;
-use crate::session::{HermesEffect, OpenSession, TurnRuntime, TurnSession};
+use crate::session::{HermesEffect, OpenSession, ReviewHandle, TurnRuntime, TurnSession};
 
+/// How often a paused review checks whether the turn that paused it has ended.
+const PAUSE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 /// Model calls one review may make (Hermes's `_REVIEW_MAX_ITERATIONS`).
 const REVIEW_MAX_ITERATIONS: u32 = 16;
 /// User turns between memory reviews (Hermes's `memory.nudge_interval`).
@@ -109,7 +110,9 @@ pub struct ReviewJob {
     /// Requested by the user (`/refine`): memory keeps every operation, and the result is
     /// reported even when nothing changed.
     pub requested: bool,
-    pub cancel: CancellationToken,
+    /// The review's slot in its session (`OpenSession::review`): its cancel token, and the flag
+    /// that says whether it has made its first request.
+    pub handle: ReviewHandle,
     /// The budget knobs of the turn that started the review.
     pub budget: crate::budget::BudgetKnobs,
 }
@@ -118,7 +121,11 @@ pub struct ReviewJob {
 pub async fn run(job: ReviewJob) {
     let session = job.session.clone();
     let session_id = session.record.lock().id.clone();
-    let (bridge, requested, cancel) = (job.bridge.clone(), job.requested, job.cancel.clone());
+    let (bridge, requested, cancel) = (
+        job.bridge.clone(),
+        job.requested,
+        job.handle.cancel.clone(),
+    );
     let result = review(job).await;
     // Done: free the slot, unless a newer review took it (taking it cancels this one).
     if !cancel.is_cancelled() {
@@ -147,12 +154,31 @@ async fn review(job: ReviewJob) -> Result<Vec<String>> {
         skills,
         focus,
         requested,
-        cancel,
+        handle,
         budget,
         ..
     } = job;
-    // The conversation as it is now, plus the review prompt; the copy never touches the session.
-    let mut conversation = session.conversation.lock().clone();
+    let cancel = handle.cancel.clone();
+    // The conversation as it is when no turn is running, plus the review prompt; the copy never
+    // touches the session. A turn that starts first pauses the review here (before its first
+    // request): the snapshot is taken under the `running` lock, which `begin_turn` holds while it
+    // claims the session, so the review never copies a conversation a turn is appending to (a
+    // half-finished tool exchange, or a user message with no answer yet).
+    let mut conversation = loop {
+        {
+            let running = session.running.lock();
+            if running.is_none() {
+                handle
+                    .started
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                break session.conversation.lock().clone();
+            }
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return Ok(Vec::new()),
+            _ = tokio::time::sleep(PAUSE_POLL) => {}
+        }
+    };
     let reviewed = conversation.messages().len();
     let prompt = hermes_prompts::review::review_message(memory, skills, focus.as_deref());
     conversation.push(
