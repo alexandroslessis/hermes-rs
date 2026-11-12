@@ -23,6 +23,8 @@ hermes_prompts.workspace = true
 hermes_store.workspace = true
 hermes_tools.workspace = true
 parking_lot.workspace = true
+# `signals.rs` matches words (`\b`, case-insensitive letters), which needs the Unicode tables.
+regex = { workspace = true, features = ["unicode"] }
 rmcp = { workspace = true, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-io"] }
 http.workspace = true
 serde.workspace = true

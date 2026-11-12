@@ -85,6 +85,14 @@ pub struct TurnState {
     pub compression_failed: bool,
     /// The conversation length right after the last compaction: no second one until it grows.
     pub compacted_at: Option<usize>,
+    /// Every tool call of the turn as `GuardedTools` saw it, for the learning signals
+    /// (`signals.rs`); kept here rather than read back from the conversation, which a
+    /// compaction mid-turn may have rewritten.
+    pub calls: Vec<crate::signals::CallRecord>,
+    /// All calls, including those past `signals::MAX_CALL_RECORDS`.
+    pub call_count: usize,
+    /// The `/steer` texts delivered this turn (the user's words, read for signals).
+    pub steers: Vec<String>,
 }
 
 pub type SharedTurnState = Arc<Mutex<TurnState>>;
@@ -565,6 +573,7 @@ impl Operation<TurnSession, HermesEffect> for DeliverSteer {
             "delivering /steer after the tool batch ({} chars)",
             text.len()
         );
+        self.state.lock().steers.push(text.clone());
         let marked = format!(
             "{}\n{text}\n{}",
             hermes_prompts::text::STEER_MARKER_OPEN.trim_end(),
@@ -748,11 +757,13 @@ impl ToolProvider<TurnSession> for GuardedTools {
                     .find_map(|content| content.as_text().map(|t| t.text.clone()))
                     .unwrap_or_default();
                 let failed = classify_failure(&name, &text, result.is_error == Some(true));
-                let observation = self
-                    .state
-                    .lock()
-                    .guardrails
-                    .observe(&name, &args, request_id, &text, failed);
+                let observation = {
+                    let mut state = self.state.lock();
+                    record_call(&mut state, &name, &args, &text, failed);
+                    state
+                        .guardrails
+                        .observe(&name, &args, request_id, &text, failed)
+                };
                 let spilled = match &observation.stub {
                     Some(_) => None,
                     None => spill_oversized(
@@ -785,13 +796,13 @@ impl ToolProvider<TurnSession> for GuardedTools {
                 Ok(result)
             }
             Err(error) => {
-                let observation = self.state.lock().guardrails.observe(
-                    &name,
-                    &args,
-                    request_id,
-                    &error.message,
-                    true,
-                );
+                let observation = {
+                    let mut state = self.state.lock();
+                    record_call(&mut state, &name, &args, &error.message, true);
+                    state
+                        .guardrails
+                        .observe(&name, &args, request_id, &error.message, true)
+                };
                 if observation.notes.is_empty() {
                     return Err(error);
                 }
@@ -804,6 +815,12 @@ impl ToolProvider<TurnSession> for GuardedTools {
             }
         }
     }
+}
+
+/// Notes a finished call in the turn's record (the learning signals read it when the turn ends).
+fn record_call(state: &mut TurnState, name: &str, args: &Value, output: &str, failed: bool) {
+    let record = crate::signals::CallRecord::new(name, args, output, failed);
+    crate::signals::push_call(&mut state.calls, &mut state.call_count, record);
 }
 
 // ---- length truncation --------------------------------------------------------------------------

@@ -40,7 +40,7 @@ it calls into. Everything runs in one process.
 | Crate | Package | Role | Notes |
 |---|---|---|---|
 | `crates/desktop` | `hermes-desktop` | The app: Tauri window, axum server, the protocol layer | The main app. Most feature work lands here. |
-| `crates/runtime` | `hermes_runtime` | Sessions and turns over the agent: `Runtime` | `lib.rs` (API), `session.rs`, `ops.rs` (per-turn tool guards), `delegate.rs` + `subagents.rs`, `compress.rs`, `review.rs` (background review), `curator.rs`, `mcp.rs`, `commands.rs` (`/diff`, `/usage`…), `guards.rs`, `changes.rs` |
+| `crates/runtime` | `hermes_runtime` | Sessions and turns over the agent: `Runtime` | `lib.rs` (API), `session.rs`, `ops.rs` (per-turn tool guards), `delegate.rs` + `subagents.rs`, `compress.rs`, `review.rs` (background review), `signals.rs` (learning signals: what each turn says is worth learning, scored locally into `signals/<id>.json`), `curator.rs`, `mcp.rs`, `commands.rs` (`/diff`, `/usage`…), `guards.rs`, `changes.rs` |
 | `crates/agent` | `hermes_agent` | The agent state machine (from Goose): stream a reply, run tool calls, repeat | `events.rs` has `AgentEvent` |
 | `crates/llm` | `hermes_llm` | Messages, the OpenAI-compatible provider, retries (from Goose) | `conversation::message::{Message, MessageContent}`; `observer.rs` is where every model POST is reported (purpose, session, provider) to the request ledger |
 | `crates/tools` | `hermes_tools` | Every agent tool + `SessionTools` (the per-session tool set) | One module per tool family; `paths.rs` resolves paths; `path_policy.rs` classifies where file edits and terminal commands may go (workspace, app data, skills/memory, persistence places, outside); `approval.rs` the dangerous-command check; `taint.rs` what the session has read that the user didn't write (see Taint in PITFALLS.md); `staging.rs` the writes a tainted session's `memory` / `skill_manage` calls leave for the user (`staging/<id>.json`, applied through the stores' own write paths); `index.rs` the local FTS5 index (`index.db`) over skills and memory, kept fresh by write hooks on `SkillStore` / `MemoryStore` |
@@ -197,7 +197,10 @@ Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`
    (`hermes_tools`), persists each message to the store, and emits `AgentEvent`s.
 5. Gateway forwards those as page events, records generation stats (`note_generation`), and on
    `TurnFinished` sends `message.complete`, runs the next queued prompt, titles a new session
-   (`title_session`, aux "titles" model), and the background review may run.
+   (`title_session`, aux "titles" model), and the background review may run. Just before
+   `TurnFinished` the runtime scores the turn's learning signals (`signals.rs`: corrections,
+   denials, workarounds, long turns, explicit requests; no request) and hands them to the signal
+   store's writer thread; a rewind or `/undo` adds one too.
 6. Approvals and clarify questions: the runtime calls its `UserBridge` (`hub::DesktopBridge`),
    which emits `approval.request`/`clarify.request` and waits for the page's
    `approval.respond`/`clarify.respond`.

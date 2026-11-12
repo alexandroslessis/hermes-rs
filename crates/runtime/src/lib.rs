@@ -15,6 +15,7 @@ mod ops;
 pub mod preinject;
 mod review;
 mod session;
+pub mod signals;
 pub mod subagents;
 pub mod titles;
 mod turnlock;
@@ -428,6 +429,8 @@ pub struct Runtime {
     web: Arc<hermes_tools::web::Web>,
     /// Counts every model request per provider and purpose (`requests.json`).
     ledger: ledger::Ledger,
+    /// The sessions' learning signals (`signals/<id>.json`), written by their own thread.
+    signals: signals::SignalStore,
     /// The configured MCP servers (Settings), shared by every session.
     mcp: Arc<mcp::McpManager>,
     config: RuntimeConfig,
@@ -483,6 +486,7 @@ impl Runtime {
             false,
         ));
         let ledger = ledger::Ledger::open(config.data_dir.join("requests.json"));
+        let signals = signals::SignalStore::open(config.data_dir.join("signals"));
         let initial_budget = config.budget;
         Ok(Self {
             store: Arc::new(store),
@@ -497,6 +501,7 @@ impl Runtime {
             ))),
             windows_version: windows_version(),
             ledger,
+            signals,
             config,
             bridge,
             sessions: Mutex::new(HashMap::new()),
@@ -890,6 +895,14 @@ impl Runtime {
     /// turn continues from the conversation as it was before that message. The todo list goes
     /// back to what it was then. Refused while a turn runs.
     pub fn rewind(&self, session_id: &str, keep: usize) -> Result<Vec<Message>> {
+        self.rewind_as(session_id, keep, "rewind")
+    }
+
+    /// [`Self::rewind`], saying what asked for it (`rewind`: the page's edit, regenerate,
+    /// `/undo` and `/retry`; `undo`: the typed `/undo`; `rollback`: a checkpoint restore) for
+    /// the learning signal it leaves: dropping something the agent did is a strong signal that
+    /// it got something wrong (`signals.rs`). Earlier signals stay.
+    fn rewind_as(&self, session_id: &str, keep: usize, via: &str) -> Result<Vec<Message>> {
         let open = self.open_fresh(session_id)?;
         if open.running.lock().is_some() {
             anyhow::bail!("a turn is running in this session");
@@ -898,17 +911,29 @@ impl Runtime {
         // them while it appends would leave a mix of both.
         let _lock = turnlock::TurnLock::acquire(&self.config.data_dir, session_id)?;
         self.reload_if_stale(&open, session_id);
-        let conversation = {
+        let (conversation, signal) = {
             let mut conversation = open.conversation.lock();
+            let signal = signals::rewind_signal(conversation.messages(), keep, via, |m| {
+                m.metadata.operation_note(COMMAND_NOTE, "command").is_some()
+            });
             conversation.messages_mut().truncate(keep);
             // Rewound past a compaction's handoff: the turns it summarized come back.
             compress::undo(&mut conversation);
-            conversation.clone()
+            (conversation.clone(), signal)
         };
         *open.context.lock() = None;
         self.store
             .replace_messages(session_id, conversation.messages())?;
         open.tools.reset_todos(restore_todos(&conversation));
+        if let Some(signal) = signal {
+            self.signals.record(
+                session_id,
+                signals::Analysis {
+                    signals: vec![signal],
+                    denial_reason: None,
+                },
+            );
+        }
         Ok(conversation.messages().clone())
     }
 
@@ -1181,6 +1206,10 @@ impl Runtime {
         // fails `start_turn`) and added in the task, once the index has answered.
         let mut held: Option<Message> = None;
         let query_text = text.map(str::to_string);
+        // What the learning signals need from before the message is added (`signals.rs`); the
+        // rest is gathered when the turn ends. No request, nothing the model sees.
+        let signal_base = signals::TurnBase::before(open.conversation.lock().messages(), text);
+        let mut signal_message_id: Option<String> = None;
         let first_events = match text {
             Some(_) if deferred.is_some() => Ok(Vec::new()),
             Some(text) if inject => {
@@ -1192,6 +1221,7 @@ impl Runtime {
             Some(text) => user_message(&open, text, context_length, &Default::default(), &[])
                 .and_then(|user| {
                     runtime.append(user.clone())?;
+                    signal_message_id = user.id.clone();
                     let mut events = vec![AgentEvent::Message(user)];
                     // A scripted first step: the assistant's tool call, which the turn's tool
                     // step runs before any model call.
@@ -1256,7 +1286,9 @@ impl Runtime {
         let request_context = self.ledger.context(hermes_llm::observer::Purpose::Main, Some(&session_id));
         // A daily-limit 429 that ends the turn teaches the ledger the provider's limit.
         let (learn_ledger, learn_provider) = (self.ledger.clone(), provider.id.clone());
+        let signal_store = self.signals.clone();
         let turn = tokio::spawn(hermes_llm::observer::scope(request_context, async move {
+            let mut signal_message_id = signal_message_id;
             if deferred.is_some() || held.is_some() {
                 let built: Result<Message> = match deferred {
                     Some((text, images)) => {
@@ -1328,6 +1360,7 @@ impl Runtime {
                     .and_then(|user| runtime.append(user.clone()).map(|()| user));
                 match added {
                     Ok(user) if !turn_cancel.is_cancelled() => {
+                        signal_message_id = user.id.clone();
                         turn_start = runtime.session.conversation.lock().len();
                         let _ = events_tx.send(RuntimeEvent::Agent(AgentEvent::Message(user)));
                     }
@@ -1415,6 +1448,9 @@ impl Runtime {
             drop(machine);
             drop(emit);
             let _ = forward.await;
+            // Read while the turn still holds the session, so the next one can't add to it yet.
+            let signal_answer =
+                signals::final_answer(runtime.session.conversation.lock().messages());
             *runtime.session.running.lock() = None;
             *runtime.session.turn_state.lock() = None;
             if let Some(text) = state.lock().pending_steer.take() {
@@ -1445,6 +1481,20 @@ impl Runtime {
             }
             *last_activity.lock() = std::time::Instant::now();
             let finished = status == TurnStatus::Completed;
+            // The learning signals: computed here from what the turn already has (no request),
+            // written by the signal store's own thread (no disk work on this task).
+            let outcome = {
+                let mut state = state.lock();
+                signals::TurnOutcome {
+                    message_id: signal_message_id,
+                    steers: std::mem::take(&mut state.steers),
+                    calls: std::mem::take(&mut state.calls),
+                    call_count: state.call_count,
+                    completed: finished,
+                    answer: signal_answer,
+                }
+            };
+            signal_store.record(&session_id, signals::analyze(&signal_base, &outcome));
             let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
             review_setup.after_turn(&runtime.session, turn_start, review_memory, finished);
         }));
@@ -1741,7 +1791,7 @@ impl Runtime {
         let Some(index) = last_turn else {
             return Ok(0);
         };
-        self.rewind(session_id, index)?;
+        self.rewind_as(session_id, index, "rollback")?;
         Ok(total - index)
     }
 
@@ -1874,7 +1924,7 @@ impl Runtime {
                 .count();
             (removed, typed)
         };
-        self.rewind(session_id, start)?;
+        self.rewind_as(session_id, start, "undo")?;
         let report = format!(
             "↩️ Undid {undone} turn{} ({removed} message{}). The message is back in the box to edit and resend.",
             if undone == 1 { "" } else { "s" },
@@ -2241,7 +2291,20 @@ impl Runtime {
         let id = session_id.to_string();
         let _ =
             tokio::task::spawn_blocking(move || hermes_tools::taint::forget(&data_dir, &id)).await;
+        self.signals.forget(session_id);
         Ok(())
+    }
+
+    /// The session's learning signals (`signals.rs`), after every change made before this
+    /// call: the score, whether a review is due, and the evidence for it (Phase 7 CP7.2/7.3).
+    pub async fn signals(&self, session_id: &str) -> signals::SessionSignals {
+        self.signals.snapshot(session_id).await
+    }
+
+    /// Records that a review covered the session's signals up to `seq` (their score no longer
+    /// counts toward the next review).
+    pub fn mark_signals_reviewed(&self, session_id: &str, seq: u64) {
+        self.signals.mark_reviewed(session_id, seq);
     }
 }
 

@@ -5663,3 +5663,157 @@ async fn a_pending_item_outlives_its_session_and_a_restart() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].session_id, session);
 }
+
+// ---- learning signals (Phase 7 CP7.1) ----------------------------------------------------------
+
+/// Every request the mock has seen, of any purpose.
+fn total_requests(h: &Harness) -> usize {
+    h.counts.lock().values().sum()
+}
+
+#[tokio::test]
+async fn a_correction_costs_no_request_and_survives_a_restart() {
+    let h = harness(vec![
+        text_reply("I ran npm install."),
+        text_reply("Switched to pnpm."),
+    ])
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "Install the deps.").await;
+    assert!(h.runtime.signals(&session).await.signals.is_empty());
+    let events = run_turn(&h, &session, "No, that's wrong. Use pnpm instead.").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    // The same two requests as any two text turns: signals are computed locally.
+    assert_eq!(total_requests(&h), 2);
+    assert_requests(&h, Purpose::Main, 2..=2);
+    let signals = h.runtime.signals(&session).await;
+    assert_eq!(signals.signals.len(), 1, "{signals:?}");
+    let signal = &signals.signals[0];
+    assert!(matches!(
+        signal.kind,
+        hermes_runtime::signals::SignalKind::Correction { .. }
+    ));
+    assert_eq!(signal.turn, 2);
+    let evidence: Vec<&str> = signal.evidence.iter().map(|e| e.text.as_str()).collect();
+    assert_eq!(
+        evidence,
+        vec![
+            "Install the deps.",
+            "I ran npm install.",
+            "No, that's wrong. Use pnpm instead.",
+            "Switched to pnpm."
+        ]
+    );
+    // Nothing the model sees changed: the same system prompt, and the user's message as typed.
+    let requests = h.requests.lock().clone();
+    assert_eq!(sent_messages(&requests[0])[0], sent_messages(&requests[1])[0]);
+    let last = sent_messages(&requests[1]).last().unwrap().to_string();
+    assert!(last.contains("No, that's wrong. Use pnpm instead.") && !last.contains("Correction"));
+    assert!(h.data.path().join("signals").join(format!("{session}.json")).exists());
+
+    // A second runtime on the same data folder (the app restarted) reads it back.
+    let reopened = runtime_in(h.data.path());
+    let again = reopened.signals(&session).await;
+    assert_eq!(again.signals, signals.signals);
+
+    // Deleting the session deletes its file.
+    h.runtime.delete_session(&session).await.unwrap();
+    assert!(h.runtime.signals(&session).await.signals.is_empty());
+}
+
+#[tokio::test]
+async fn undoing_a_turn_adds_a_strong_signal_and_keeps_earlier_ones() {
+    let h = harness(vec![
+        text_reply("Done with npm."),
+        text_reply("Second answer."),
+        text_reply("Third answer."),
+    ])
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "Install the deps.").await;
+    run_turn(&h, &session, "Don't use npm, use pnpm.").await;
+    let before = h.runtime.signals(&session).await;
+    assert_eq!(before.signals.len(), 1);
+    assert!(!before.triggered());
+    h.runtime.undo(&session, "").unwrap();
+    let after = h.runtime.signals(&session).await;
+    assert_eq!(after.signals.len(), 2);
+    assert_eq!(after.signals[0], before.signals[0]);
+    assert_eq!(
+        after.signals[1].kind,
+        hermes_runtime::signals::SignalKind::Rewind {
+            via: "undo".into(),
+            turns: 1
+        }
+    );
+    assert!(after.triggered(), "score {}", after.score());
+    // The undone message sent again (as `/undo` invites) is the same correction: not counted
+    // twice.
+    run_turn(&h, &session, "Don't use npm, use pnpm.").await;
+    assert_eq!(h.runtime.signals(&session).await.signals.len(), 2);
+    // The page's rewind (edit, regenerate, /retry) counts too; a rewind with nothing the agent
+    // did in it does not.
+    h.runtime.rewind(&session, 0).unwrap();
+    let rewound = h.runtime.signals(&session).await;
+    assert_eq!(rewound.signals.len(), 3);
+    h.runtime.rewind(&session, 0).unwrap();
+    assert_eq!(h.runtime.signals(&session).await.signals.len(), 3);
+    assert_eq!(total_requests(&h), 3);
+}
+
+#[tokio::test]
+async fn a_denied_command_leaves_a_denial_signal() {
+    use hermes_tools::approval::ApprovalChoice;
+    let (h, _asked, _result) = approval_run(ApprovalChoice::Deny, "rm -rf build").await;
+    let session = h.runtime.store().list_sessions(10).unwrap()[0].id.clone();
+    let signals = h.runtime.signals(&session).await;
+    assert_eq!(signals.signals.len(), 1, "{signals:?}");
+    assert_eq!(
+        signals.signals[0].kind,
+        hermes_runtime::signals::SignalKind::Denial {
+            what: "terminal: rm -rf build".into(),
+            reason: None
+        }
+    );
+    assert_eq!(total_requests(&h), 2);
+}
+
+#[tokio::test]
+async fn a_long_turn_that_ends_with_an_answer_is_a_signal() {
+    let calls: Vec<(String, Value)> = (0..15)
+        .map(|i| {
+            (
+                format!("t{i}"),
+                json!({"todos": [{"id": "1", "content": format!("step {i}"), "status": "pending"}]}),
+            )
+        })
+        .collect();
+    let batch: Vec<(&str, &str, Value)> = calls
+        .iter()
+        .map(|(id, args)| (id.as_str(), "todo_list", args.clone()))
+        .collect();
+    let h = harness(vec![tool_reply(&batch), text_reply("All fifteen steps planned.")]).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "Plan the migration.").await;
+    assert_eq!(total_requests(&h), 2);
+    let signals = h.runtime.signals(&session).await;
+    assert!(
+        matches!(
+            &signals.signals[..],
+            [s] if matches!(&s.kind, hermes_runtime::signals::SignalKind::LongTurn { calls: 15, .. })
+        ),
+        "{signals:?}"
+    );
+}
+
+#[tokio::test]
+async fn side_questions_add_no_signals() {
+    let h = harness(vec![text_reply("Hi."), text_reply("You said hello.")]).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "Hello").await;
+    h.runtime
+        .side_question(&session, &h.provider, "No, that's wrong. From now on, always use pnpm.")
+        .await
+        .unwrap();
+    assert!(h.runtime.signals(&session).await.signals.is_empty());
+}

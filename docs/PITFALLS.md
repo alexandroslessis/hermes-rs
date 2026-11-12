@@ -511,3 +511,19 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   methods it doesn't know; the Memory and Skills screens call them since CP6.3.
 - **Sessions built without a data folder can't stage** (`StagingStore::usable`): a tainted write is
   then refused, never written (fail closed). Only tests build such sessions.
+
+## Learning signals (Phase 7 CP7.1 of `docs/backend/PHASES.md`)
+
+- `signals/<id>.json` is written by the signal store's own thread, after the turn's events are
+  sent. A test or check must read it through `Runtime::signals(id).await` (which waits for every
+  change sent before it), not the file, or it races the writer.
+- Only main turns (`begin_turn`) and rewinds add signals; the review, curator, subagents, `/bg`
+  and `/btw` never do. Hermes's `/retry` after a provider error (`retry_turn`) is not a signal;
+  the page's `/retry` (a `session.rewind` and resend) is.
+- Phrases are matched in English only, on the user's own words (code, quotes, logs, pasted
+  e-mails removed). A Greek or Spanish correction gives no textual signal; the non-textual ones
+  (undo, denial, workaround, long turn) still count.
+- Excerpts in `signals/<id>.json` are masked with `hermes_tools::redact` before they are kept; a
+  test that expects a pasted key verbatim in the evidence is wrong. A terminal "workaround"
+  needs the success to retry what failed (a shared word other than the program); probing
+  commands (`rg`, `test -f`, `git status`…) never count, since they fail as an answer.
