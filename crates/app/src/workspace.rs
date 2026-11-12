@@ -717,8 +717,24 @@ impl Workspace {
                 }
             }
         };
+        // Counted in the request ledger as a `title`, and skipped when the quota is running low.
+        let ledger = backend(cx).runtime.ledger().clone();
+        let titled = session_id.clone();
         let request = backend(cx).tokio.spawn(async move {
-            hermes_runtime::generate_title(&provider, &model, &opening).await
+            let purpose = hermes_llm::observer::Purpose::Title;
+            if hermes_runtime::governor::Governor::new(ledger.clone())
+                .check(&provider.id, purpose)
+                .is_denied()
+            {
+                return Ok(None);
+            }
+            ledger
+                .scoped(
+                    purpose,
+                    Some(&titled),
+                    hermes_runtime::generate_title(&provider, &model, &opening),
+                )
+                .await
         });
         cx.spawn(async move |this, cx| {
             let title = match request.await {

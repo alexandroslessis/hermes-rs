@@ -65,6 +65,14 @@ impl DayCounts {
 pub struct ProviderDays {
     /// Where the provider's day starts, as minutes east of UTC.
     pub reset_offset_minutes: i32,
+    /// The daily request limit the user set for this provider (Settings); `None` = not set.
+    /// Settings are its only source (applied at start and on every change), so it is not written
+    /// to the file: a limit removed from Settings must not live on in `requests.json`.
+    #[serde(skip)]
+    pub daily_limit: Option<u32>,
+    /// The limit the provider's own 429 told us most recently ("800 of 800"); used when none is
+    /// set.
+    pub learned_limit: Option<u32>,
     /// `YYYY-MM-DD` -> counts.
     pub days: BTreeMap<String, DayCounts>,
 }
@@ -85,6 +93,35 @@ impl Snapshot {
             .and_then(|p| p.days.get(&day_key(now, p.reset_offset_minutes)).cloned())
             .unwrap_or_default()
     }
+}
+
+/// One provider's entry in Settings' `requests.limits`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderLimit {
+    pub provider: String,
+    /// `None` = no limit set.
+    pub daily_limit: Option<u32>,
+    /// Where the provider's day starts, as minutes east of UTC.
+    pub reset_offset_minutes: i32,
+}
+
+/// What a provider has used today.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Usage {
+    /// Requests made today (all purposes).
+    pub used: u64,
+    /// The daily limit, from Settings or learned from a 429; `None` when unknown.
+    pub limit: Option<u32>,
+    /// Unix time when today's count starts over (the provider's next midnight).
+    pub resets_at: i64,
+    pub by_purpose: BTreeMap<String, u64>,
+    pub rate_limited: u64,
+}
+
+/// The next midnight, as unix time, in a zone `offset_minutes` east of UTC.
+fn next_reset(now: i64, offset_minutes: i32) -> i64 {
+    let local = now + i64::from(offset_minutes) * 60;
+    (local.div_euclid(86_400) + 1) * 86_400 - i64::from(offset_minutes) * 60
 }
 
 /// The calendar date (`YYYY-MM-DD`) of unix time `secs` in a zone `offset_minutes` east of UTC.
@@ -114,6 +151,37 @@ impl Snapshot {
         entry.days.entry(key).or_default().rate_limited += 1;
     }
 
+    fn set_limit(&mut self, provider: &str, limit: Option<u32>) {
+        self.providers.entry(provider.to_string()).or_default().daily_limit = limit;
+    }
+
+    /// Remembers the limit the provider reported last (a provider may raise or lower it). A limit
+    /// set in Settings still wins while it is set.
+    fn learn_limit(&mut self, provider: &str, limit: u32) {
+        if limit > 0 {
+            self.providers
+                .entry(provider.to_string())
+                .or_default()
+                .learned_limit = Some(limit);
+        }
+    }
+
+    /// Settings' whole `requests.limits`: every listed provider gets its limit and day start, and
+    /// every other provider goes back to no configured limit and a UTC day.
+    fn configure(&mut self, limits: &[ProviderLimit]) {
+        for (id, entry) in self.providers.iter_mut() {
+            if !limits.iter().any(|limit| &limit.provider == id) {
+                entry.daily_limit = None;
+                entry.reset_offset_minutes = 0;
+            }
+        }
+        for limit in limits {
+            let entry = self.providers.entry(limit.provider.clone()).or_default();
+            entry.daily_limit = limit.daily_limit;
+            entry.reset_offset_minutes = limit.reset_offset_minutes;
+        }
+    }
+
     fn set_reset_offset(&mut self, provider: &str, minutes: i32) {
         self.providers
             .entry(provider.to_string())
@@ -128,6 +196,32 @@ fn prune(entry: &mut ProviderDays, now: i64) {
     entry.days.retain(|day, _| day.as_str() >= cutoff.as_str());
 }
 
+/// The daily limit a provider's 429 message states as "N of N" ("...daily request limit reached
+/// (800 of 800)"): `Some(N)` when both numbers are the same, `None` otherwise.
+pub fn daily_limit_in(message: &str) -> Option<u32> {
+    // Thousands separators ("1,000 of 1,000") are dropped first, so the numbers stay whole.
+    let chars: Vec<char> = message.chars().collect();
+    let message: String = chars
+        .iter()
+        .enumerate()
+        .filter(|&(i, &c)| {
+            !(c == ','
+                && i > 0
+                && chars[i - 1].is_ascii_digit()
+                && chars.get(i + 1).is_some_and(char::is_ascii_digit))
+        })
+        .map(|(_, &c)| c)
+        .collect();
+    let words: Vec<&str> = message
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | '.' | ';' | ':'))
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.windows(3).find_map(|w| {
+        let (used, limit) = (w[0].parse::<u32>().ok()?, w[2].parse::<u32>().ok()?);
+        (w[1].eq_ignore_ascii_case("of") && used == limit && limit > 0).then_some(limit)
+    })
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -138,6 +232,9 @@ enum Message {
     Record { provider: String, purpose: Purpose, at: i64 },
     RateLimited { provider: String, at: i64 },
     ResetOffset { provider: String, minutes: i32 },
+    SetLimit { provider: String, limit: Option<u32> },
+    LearnLimit { provider: String, limit: u32 },
+    Configure(Vec<ProviderLimit>),
     Snapshot(tokio::sync::oneshot::Sender<Snapshot>),
     /// Write now, then answer.
     Flush(mpsc::Sender<()>),
@@ -146,6 +243,9 @@ enum Message {
 
 struct Inner {
     tx: mpsc::Sender<Message>,
+    /// The counts, written only by the ledger thread; readers (the governor, the status method)
+    /// take the read lock for a moment. The request path never touches it.
+    shared: Arc<parking_lot::RwLock<Snapshot>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -180,15 +280,19 @@ impl Ledger {
 
     /// [`Self::open`] with another flush interval (tests).
     pub fn open_with(path: PathBuf, flush_every: Duration) -> Self {
-        let state = load(&path);
+        let shared = Arc::new(parking_lot::RwLock::new(load(&path)));
         let (tx, rx) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("hermes-ledger".into())
-            .spawn(move || run(rx, state, &path, flush_every))
+            .spawn({
+                let shared = shared.clone();
+                move || run(rx, shared, &path, flush_every)
+            })
             .ok();
         Self {
             inner: Arc::new(Inner {
                 tx,
+                shared,
                 thread: Mutex::new(thread),
             }),
         }
@@ -222,6 +326,63 @@ impl Ledger {
             provider: provider.to_string(),
             minutes,
         });
+    }
+
+    /// The daily request limit the user set for `provider` (`None` clears it).
+    pub fn set_limit(&self, provider: &str, limit: Option<u32>) {
+        let _ = self.inner.tx.send(Message::SetLimit {
+            provider: provider.to_string(),
+            limit,
+        });
+    }
+
+    /// Applies Settings' `requests.limits` as a whole (see [`ProviderLimit`]): providers not
+    /// listed lose any configured limit and day start.
+    pub fn configure(&self, limits: Vec<ProviderLimit>) {
+        let _ = self.inner.tx.send(Message::Configure(limits));
+    }
+
+    /// A limit the provider itself reported (the latest one is kept).
+    pub fn learn_limit(&self, provider: &str, limit: u32) {
+        let _ = self.inner.tx.send(Message::LearnLimit {
+            provider: provider.to_string(),
+            limit,
+        });
+    }
+
+    /// Today's usage of `provider`, read without waiting for the ledger thread (it may lag the
+    /// latest few requests by a moment).
+    pub fn usage(&self, provider: &str) -> Usage {
+        self.usage_at(provider, unix_now())
+    }
+
+    /// [`Self::usage`] at a given unix time (tests).
+    pub fn usage_at(&self, provider: &str, now: i64) -> Usage {
+        let shared = self.inner.shared.read();
+        let entry = shared.providers.get(provider);
+        let offset = entry.map_or(0, |p| p.reset_offset_minutes);
+        let today = entry
+            .and_then(|p| p.days.get(&day_key(now, offset)))
+            .cloned()
+            .unwrap_or_default();
+        Usage {
+            used: today.total(),
+            limit: entry.and_then(|p| p.daily_limit.or(p.learned_limit)),
+            resets_at: next_reset(now, offset),
+            by_purpose: today.by_purpose,
+            rate_limited: today.rate_limited,
+        }
+    }
+
+    /// Runs `future` as a request context that counts into this ledger (a task's own purpose,
+    /// for work started outside a turn: titles, the curator, /btw...).
+    pub async fn scoped<F: std::future::Future>(
+        &self,
+        purpose: Purpose,
+        session_id: Option<&str>,
+        future: F,
+    ) -> F::Output {
+        hermes_llm::observer::scope(self.context(purpose, session_id), future).await
     }
 
     /// The counts as they are now (including requests still waiting for the next file write).
@@ -314,7 +475,12 @@ fn save(path: &Path, snapshot: &Snapshot) -> bool {
 
 /// The ledger thread: applies messages, writes the file when something changed and the last write
 /// is older than `flush_every`.
-fn run(rx: mpsc::Receiver<Message>, mut state: Snapshot, path: &Path, flush_every: Duration) {
+fn run(
+    rx: mpsc::Receiver<Message>,
+    shared: Arc<parking_lot::RwLock<Snapshot>>,
+    path: &Path,
+    flush_every: Duration,
+) {
     let mut dirty = false;
     let mut due: Option<std::time::Instant> = None;
     loop {
@@ -328,22 +494,34 @@ fn run(rx: mpsc::Receiver<Message>, mut state: Snapshot, path: &Path, flush_ever
         };
         match message {
             Some(Message::Record { provider, purpose, at }) => {
-                state.record(&provider, purpose, at);
+                shared.write().record(&provider, purpose, at);
                 dirty = true;
             }
             Some(Message::RateLimited { provider, at }) => {
-                state.record_rate_limited(&provider, at);
+                shared.write().record_rate_limited(&provider, at);
                 dirty = true;
             }
             Some(Message::ResetOffset { provider, minutes }) => {
-                state.set_reset_offset(&provider, minutes);
+                shared.write().set_reset_offset(&provider, minutes);
+                dirty = true;
+            }
+            Some(Message::SetLimit { provider, limit }) => {
+                shared.write().set_limit(&provider, limit);
+                dirty = true;
+            }
+            Some(Message::LearnLimit { provider, limit }) => {
+                shared.write().learn_limit(&provider, limit);
+                dirty = true;
+            }
+            Some(Message::Configure(limits)) => {
+                shared.write().configure(&limits);
                 dirty = true;
             }
             Some(Message::Snapshot(reply)) => {
-                let _ = reply.send(state.clone());
+                let _ = reply.send(shared.read().clone());
             }
             Some(Message::Flush(reply)) => {
-                if dirty && save(path, &state) {
+                if dirty && save(path, &shared.read()) {
                     dirty = false;
                     due = None;
                 }
@@ -351,13 +529,13 @@ fn run(rx: mpsc::Receiver<Message>, mut state: Snapshot, path: &Path, flush_ever
             }
             Some(Message::Shutdown) => {
                 if dirty {
-                    save(path, &state);
+                    save(path, &shared.read());
                 }
                 return;
             }
             None => {
                 // The debounce interval ran out (a failed write stays dirty: another interval).
-                if dirty && save(path, &state) {
+                if dirty && save(path, &shared.read()) {
                     dirty = false;
                 }
                 due = None;
@@ -519,6 +697,81 @@ mod tests {
         let ledger = Ledger::open(path.clone());
         assert_eq!(ledger.snapshot().await, Snapshot::default());
         assert!(dir.path().join("requests.json.bad").join("marker").exists());
+    }
+
+    #[test]
+    fn the_daily_limit_is_read_from_an_n_of_n_message() {
+        assert_eq!(
+            daily_limit_in("Rate limit exceeded: user daily request limit reached (800 of 800). Retry after 19919 seconds."),
+            Some(800)
+        );
+        assert_eq!(daily_limit_in("You have used 50 of 50 requests"), Some(50));
+        assert_eq!(daily_limit_in("limit reached (1,000 of 1,000), retry later"), Some(1000));
+        // Not "N of N": a partial count, other numbers, no numbers.
+        assert_eq!(daily_limit_in("(790 of 800)"), None);
+        assert_eq!(daily_limit_in("retry after 30 seconds"), None);
+        assert_eq!(daily_limit_in("0 of 0"), None);
+    }
+
+    #[test]
+    fn a_configured_limit_wins_over_a_learned_one_and_the_latest_learned_one_is_kept() {
+        let mut state = Snapshot::default();
+        state.learn_limit("p", 800);
+        state.learn_limit("p", 900);
+        state.learn_limit("p", 0);
+        assert_eq!(state.providers["p"].learned_limit, Some(900));
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open(dir.path().join("requests.json"));
+        ledger.learn_limit("p", 800);
+        ledger.set_limit("p", Some(500));
+        ledger.flush_blocking();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while ledger.usage_at("p", NOON).limit != Some(500) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(ledger.usage_at("p", NOON).limit, Some(500));
+        ledger.set_limit("p", None);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while ledger.usage_at("p", NOON).limit != Some(800) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(ledger.usage_at("p", NOON).limit, Some(800));
+    }
+
+    #[test]
+    fn settings_replace_the_configured_limits_and_are_not_written_to_the_file() {
+        let mut state = Snapshot::default();
+        state.learn_limit("learned", 800);
+        let limit = |provider: &str, daily_limit, reset_offset_minutes| ProviderLimit {
+            provider: provider.into(),
+            daily_limit,
+            reset_offset_minutes,
+        };
+        state.configure(&[limit("a", Some(100), 120), limit("b", Some(50), 0)]);
+        assert_eq!(state.providers["a"].daily_limit, Some(100));
+        assert_eq!(state.providers["a"].reset_offset_minutes, 120);
+        // `a` removed from Settings: its limit and day start go; `b` stays; learned ones stay.
+        state.configure(&[limit("b", Some(50), 0)]);
+        assert_eq!(state.providers["a"].daily_limit, None);
+        assert_eq!(state.providers["a"].reset_offset_minutes, 0);
+        assert_eq!(state.providers["b"].daily_limit, Some(50));
+        assert_eq!(state.providers["learned"].learned_limit, Some(800));
+        // The file never carries a configured limit (Settings is its only source).
+        let written = serde_json::to_value(&state).unwrap();
+        assert!(written["providers"]["b"].get("daily_limit").is_none(), "{written}");
+        assert_eq!(written["providers"]["learned"]["learned_limit"], 800);
+    }
+
+    #[test]
+    fn the_reset_is_the_providers_next_midnight() {
+        // NOON UTC: the next UTC midnight is 12 h later; in UTC+2 it is 10 h later (22:00 UTC).
+        assert_eq!(next_reset(NOON, 0), NOON + 12 * 3600);
+        assert_eq!(next_reset(NOON, 120), NOON + 10 * 3600);
+        assert_eq!(next_reset(NOON, -300), NOON + 17 * 3600);
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open(dir.path().join("requests.json"));
+        assert_eq!(ledger.usage_at("none", NOON).resets_at, NOON + 12 * 3600);
+        assert_eq!(ledger.usage_at("none", NOON).limit, None);
     }
 
     #[tokio::test]

@@ -141,6 +141,40 @@ where
     }
 }
 
+/// Runs `future` with the current context's purpose replaced (same observer and session): for a
+/// step *inside* a task that already has a context, such as the approval judge or a compression
+/// summary inside a turn. Without a context the future runs as it is (nothing is counted).
+pub async fn with_purpose<F: Future>(purpose: Purpose, future: F) -> F::Output {
+    match current() {
+        Some(mut context) => {
+            context.purpose = purpose;
+            CONTEXT.scope(context, future).await
+        }
+        None => future.await,
+    }
+}
+
+/// Like [`spawn_in_context`] but the new task is labelled `purpose` instead of inheriting the
+/// parent's (a review spawned from inside a turn is a `review`, not a `main`).
+pub fn spawn_with_purpose<F>(purpose: Purpose, future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match current() {
+        Some(mut context) => {
+            context.purpose = purpose;
+            tokio::spawn(CONTEXT.scope(context, future))
+        }
+        None => tokio::spawn(future),
+    }
+}
+
+/// The current context's purpose, if there is one.
+pub fn current_purpose() -> Option<Purpose> {
+    CONTEXT.try_with(|context| context.purpose).ok()
+}
+
 /// An announced request, to be finished with its outcome.
 pub(crate) struct Observation {
     context: RequestContext,
@@ -261,6 +295,24 @@ mod tests {
             *recorder.seen.lock(),
             vec![("prov".to_string(), Purpose::Review, Some("s1".to_string()), Some(429))]
         );
+    }
+
+    #[tokio::test]
+    async fn with_purpose_relabels_inside_a_context_and_spawn_with_purpose_labels_the_child() {
+        let recorder = Arc::new(Recorder::default());
+        scope(context(&recorder, Purpose::Main), async {
+            with_purpose(Purpose::Approval, async {
+                assert_eq!(current_purpose(), Some(Purpose::Approval));
+                assert_eq!(current().unwrap().session_id.as_deref(), Some("s1"));
+            })
+            .await;
+            assert_eq!(current_purpose(), Some(Purpose::Main));
+            let child = spawn_with_purpose(Purpose::Review, async { current_purpose() }).await.unwrap();
+            assert_eq!(child, Some(Purpose::Review));
+        })
+        .await;
+        // No context: nothing to relabel, the future just runs.
+        assert_eq!(with_purpose(Purpose::Title, async { current_purpose() }).await, None);
     }
 
     #[tokio::test]

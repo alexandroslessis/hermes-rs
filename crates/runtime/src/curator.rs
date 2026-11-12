@@ -15,6 +15,7 @@ use hermes_agent::machine::{StateMachine, Step};
 use hermes_agent::operation::Emitter;
 use hermes_agent::tool::{ToolOperation, ToolProvider};
 use hermes_llm::conversation::Conversation;
+use hermes_llm::observer::Purpose;
 use hermes_llm::conversation::message::{Message, MessageContent};
 use hermes_llm::model::ModelConfig;
 use hermes_store::SessionRecord;
@@ -96,7 +97,20 @@ impl Runtime {
             Some(_) if candidates.starts_with("No agent-created skills") => {
                 ("skipped (no candidates)".to_string(), String::new())
             }
-            Some(model) => match self.consolidate(&model, &candidates).await {
+            // Low on the provider's daily request quota: the consolidation waits for another day.
+            Some(model)
+                if self
+                    .governor()
+                    .check(&model.provider.id, Purpose::Curator)
+                    .is_denied() =>
+            {
+                ("skipped (request quota is low)".to_string(), String::new())
+            }
+            Some(model) => match self
+                .ledger
+                .scoped(Purpose::Curator, None, self.consolidate(&model, &candidates))
+                .await
+            {
                 Ok(text) => {
                     let short: String = text.chars().take(240).collect();
                     let short = if text.chars().count() > 240 {

@@ -943,10 +943,12 @@ async fn summarize(summarizer: &Summarizer, prompt: &str) -> Result<String> {
         config = config.with_merged_request_params(params.clone());
     }
     let request = [Message::user().with_text(prompt)];
-    let (reply, _) = summarizer
-        .llm
-        .complete(&config, "", &request, &[])
-        .await
+    // A compression summary is a `compress` request even when it is made inside a turn.
+    let (reply, _) = hermes_llm::observer::with_purpose(
+        hermes_llm::observer::Purpose::Compress,
+        summarizer.llm.complete(&config, "", &request, &[]),
+    )
+    .await
         .map_err(|error| anyhow::anyhow!("the summary request failed: {error}"))?;
     let text: String = reply
         .content

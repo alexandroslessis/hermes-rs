@@ -141,3 +141,145 @@ today, relative to each record's own time. The `sessions.db` schema is not touch
 **Tests** (CARGO_TARGET_DIR=target/claude): `cargo test -p hermes_llm -p hermes_runtime`: llm lib
 466 passed (7 ignored), stream 1, request_observer 3; runtime lib 36 (10 ledger); turns 79 passed,
 7 ignored. `cargo build --workspace --exclude hermes-desktop` OK.
+
+## CP2.2 — Every caller's purpose, governor, `requests.status`
+Worktree: C:\Users\alexandros\repos\hermes-rs-p2   Branch: backend/p2-ledger   Model: Sonnet 5.5
+Built on CP2.1 as reviewed and committed (97de1fb).
+Done:
+- **Every caller labelled** (the reviewer's table): inside a turn the context is *re-purposed*
+  (`observer::with_purpose`: approval judge -> `approval`, compression summaries -> `compress`,
+  delegate children -> `delegate`); work started outside a turn gets its own context from the
+  ledger (`Ledger::context` / `Ledger::scoped`: review, manual `/compress`, `/bg`, `/btw`, titles,
+  curator). New in `hermes_llm::observer`: `with_purpose`, `spawn_with_purpose`, `current_purpose`.
+- **Purpose header**: `x-hermes-rs-purpose: <purpose>` on POSTs to loopback hosts only
+  (`127.0.0.1`, `localhost`, `[::1]`), set inside a context; never sent to a real provider. The
+  `turns.rs` mock already counted by it (Phase 0), so S4 is now 10 `main` + 1 `review` and S5 is
+  2 `main` + 2 `delegate`.
+- **Quota state in the ledger**: `ProviderDays.daily_limit` (from Settings) and `learned_limit`
+  (from a 429); `Ledger::set_limit`, `learn_limit`, `usage()` (sync, read from a shared
+  `RwLock<Snapshot>` that only the ledger thread writes; the request path still takes no lock),
+  `Usage {used, limit, resets_at, by_purpose, rate_limited}`. `ledger::daily_limit_in` reads
+  "N of N" from a 429 message; a daily-limit 429 that ends a main turn teaches the ledger.
+- **`crates/runtime/src/governor.rs`**: `decide(usage, purpose, provider) -> Allow|Warn|Deny`, table
+  in the module doc (under 20% left: review/curator/title wait; under 5%: also delegate and the
+  approval judge, main is warned; nothing left: everything refused with the reset time).
+  `Runtime::governor()`.
+- **Where it applies**: `begin_turn` (refused only at 0; a `RuntimeEvent::Notice` when under 5%),
+  `background` (/bg: only at 0), review start (deferred when low; `/refine` counts as the user's own
+  work), the curator (skipped with a summary line), titles (desktop), approval judge (escalates to
+  the user), `delegate_task` (error telling the model to do the work itself).
+- **Desktop**: `requests.status` gateway method (`{provider, used, limit, resets_at, by_purpose,
+  rate_limited}`, active provider by default); settings `requests.limits.<provider id>`:
+  `daily_limit`, `reset_offset_minutes` read in `apply_settings`; `RuntimeEvent::Notice` becomes a
+  `status.update` `{kind: "quota", text}`; the GPUI app ignores it.
+Files: crates/llm/src/{observer,api_client}.rs, crates/llm/tests/request_observer.rs,
+  crates/runtime/src/{ledger,governor,lib,compress,curator,delegate}.rs, crates/runtime/tests/turns.rs,
+  crates/desktop/src/gateway.rs, crates/app/src/chat.rs
+Tests (CARGO_TARGET_DIR=target/claude): `hermes_llm` 467 + 4 observer; `hermes_runtime` lib (14
+  ledger, 7 governor ...), `turns` 85 passed / 7 ignored, `hermes-desktop` 158 + acp 67; `cargo build
+  --workspace` OK (this worktree has a `target/hermes-src` junction to the main checkout's webapp,
+  gitignored, so the desktop crate builds). New `turns` scenarios: used-up quota refuses the turn
+  before any request (and `/bg`); nearly used up warns but runs; review waits at 15% left (main 10,
+  review 0); delegation refused at 4% (main 2, delegate 0); `/btw` and `/compress` labelled and the
+  ledger agrees with the mock; a daily-limit 429 teaches the limit. Governor table tests incl. the
+  exact 20% / 5% edges and "main is only refused at zero" over every count 0..800.
+Request counts: baselines now split by purpose (S4: main 10 + review 1; S5: main 2 + delegate 2).
+Deviations from the plan:
+- Day boundary stays a fixed UTC offset (`reset_offset_minutes`), not a named `reset_tz`: no tz
+  database dependency; UTC and fixed-offset providers behave exactly as planned.
+- Quota config is a config-record key (`requests.limits.<id>`), not a field of the provider
+  settings struct (which the page's Providers screen owns); the Settings field the user checklist
+  mentions needs a page patch and comes with CP2.3's display.
+- Clearing a limit means setting `daily_limit` to null/0; deleting the whole `requests.limits`
+  entry doesn't clear it until restart (the ledger keeps what it was given).
+- The 429 limit is learned only from a *main* turn's final error message (the one place the body
+  text reaches us); a 429 in a review or a title doesn't teach it.
+- Not done from the plan list: the per-turn request count in the transcript metadata and the ACP
+  usage update ("if the shape allows") are left for CP2.3 with the display; `x-hermes-rs-purpose`
+  and the quota are in place for them.
+For the reviewer:
+- **No caller left unlabelled** is the focus: I re-grepped every `.complete(`, `response_post` and
+  `tokio::spawn` that makes model requests (list in the CP2.1 review table). Please re-check
+  `Runtime::refine` (it reuses `ReviewSetup::start`), the curator's own `SessionTools` agent loop
+  (runs inside `ledger.scoped(Curator)`) and `delegate.rs`'s children (inside `with_purpose`).
+  Anything missing shows up as an uncounted request and one `warn`.
+- **The governor can't block the main turn except at 0**: `decide` is pure and tested over every
+  count; `begin_turn` is the only place that refuses (before any state is taken: no lock, no
+  message). `retry_turn` goes through it too.
+- A review/curator/title denied by the governor is skipped, not queued: it is simply asked again the
+  next time its trigger fires.
+- `Ledger::usage()` takes a read lock on the shared snapshot while the thread takes the write lock
+  per message and holds a read lock during a file write; contention is one writer thread, no
+  deadlock path (it never waits for a reader).
+- The `status.update` kind `quota` is not one the page knows; I did not check how the page treats an
+  unknown kind (the Hermes frontend ignores unknown ones as far as I saw). Needs a look in CP2.3.
+
+### Review (Opus 5.5)
+`main` had not moved (still 5a9d388 under 97de1fb), so nothing was merged. Ran `/code-review high`
+and checked the review focus by reading the code.
+
+**Review focus**
+- *No caller left unlabelled*: grepped `.complete(`, `.stream(`, `response_post`, `api_post`,
+  `tokio::spawn`, `generate_title` in runtime, desktop, agent, llm and app. Every model request
+  runs in a context with the right purpose: main turn (`Main`), approval judge and auto-compression
+  inside the turn (`with_purpose` → `Approval` / `Compress`), delegate children (run inline in the
+  tool call under `with_purpose(Delegate)`; `delegate.rs`'s relay spawn makes no request), review
+  and `/refine` (`ReviewSetup::start` → `scope(Review)`), manual `/compress`, `/bg` (`Delegate`),
+  `/btw`, desktop titles, the curator (its agent loop runs inline in `ledger.scoped(Curator)`; the
+  drain spawn makes no request). ACP goes through the `Gateway`, so it inherits all of these.
+  `smart_review` has no callers (its guard has `governor: None`; a future caller must scope it).
+  `hermes_agent::CompactingProvider` / `compaction::summarize` are not used outside their tests.
+  Discovery's `api/show` POST is unlabelled by design (CP2.1 fix 1). **One miss, fixed**: the GPUI
+  app's titles (`crates/app/src/workspace.rs`).
+- *Governor blocks the main turn only at 0*: `decide` returns `Deny` for `Main` only when
+  `left == 0` (tested over 0..800). `begin_turn` (used by `start_turn`, `start_turn_with_call`,
+  `start_turn_with_images`, `retry_turn`) checks after `open()` and before the running guard, the
+  turn lock, `turn_state`, or any message, so a refusal leaves nothing behind. `/bg` checks before
+  `open()`. In the gateway a refusal happens after the existing pre-start steps (first-line title,
+  `pending_images` taken, rewind on edit), the same as for any other start error such as "already
+  running"; a refused queued prompt surfaces as `message.complete` with the error, as before.
+- *Ledger lock*: only the ledger thread writes the `RwLock<Snapshot>`, per message and briefly;
+  it holds a read lock during the file write. Readers (`usage()`: governor, `requests.status`) never
+  hold it across anything else, and nothing calls `usage()` on the ledger thread. The request path
+  (`observer` → channel send) takes no lock. No deadlock path.
+- *`status.update` kind `quota`*: the page's handler (`gateway-event/status.ts`) acts on
+  `compacting`/`compressing`/`compacted`/`ready`/`process`/`goal` and fallback text (a regex on
+  "model fallback|provider fallback|switch(ed|ing) to fallback", which our text can't match), and
+  returns `true` for everything else: an unknown kind is silently ignored. Harmless; CP2.3 shows it.
+- `sessions.db` schema: untouched (all new state is in `requests.json`).
+
+**Fixed**
+1. A daily limit from Settings was written to `requests.json`, and `apply_settings` only touched
+   providers still listed, so removing a `requests.limits` entry (or the whole key) left the old
+   limit in force for good, across restarts. Now `daily_limit` is `#[serde(skip)]` (Settings is
+   its only source) and `apply_settings` calls the new `Ledger::configure(Vec<ProviderLimit>)`,
+   which replaces the configured limits as a whole: unlisted providers go back to no limit and a
+   UTC day. New unit test. (The note's deviation "doesn't clear it until restart" is now void.)
+2. `learn_limit` kept the first learned value for ever and learned nothing while a Settings limit
+   was set, so a provider that raised its quota stayed governed by the old number. Now the latest
+   "N of N" wins (a configured limit still takes precedence while set). Test updated.
+3. `daily_limit_in` split numbers at commas: "1,000 of 1,000" was not recognised. Thousands
+   separators are dropped first. Test case added.
+4. `apply_settings` cast `daily_limit` with `as u32` (wraps); now `u32::try_from`, and an offset
+   beyond ±24 h is treated as absent.
+5. GPUI app titles were sent outside any context (uncounted, and the one `warn` spent on them).
+   Now `ledger.scoped(Title, …)` and skipped when the governor denies a title, like the desktop.
+6. `PORTING.md`: added the `governor.rs` row (**diverged**), per rule 2.
+
+**Left, and why**
+- `/review` starts its turn with a scripted `delegate_task` call, which the governor refuses below
+  5% left like any delegation; the model then reviews on its own. The user asked for it, so one
+  could argue it should count as `Main` (as `/refine` does), but the tool can't tell a scripted
+  prelude from the model's own call without new plumbing, and below 5% saving requests is the
+  point. Revisit in Phase 3 (budget profiles) if it bites.
+- A limit learned from a 429 is learned only from a *main* turn's final error (implementer's
+  deviation): accepted.
+- The governor reads the ledger's shared snapshot, which may lag the last few requests by a
+  moment, so at the boundary one extra request can slip through. Accepted (the provider's own 429
+  is the hard stop).
+- The gateway's refused-start path drops `pending_images` and may already have set the first-line
+  title; that predates this checkpoint and applies to every start error.
+
+**Tests** (CARGO_TARGET_DIR=target/claude): `cargo test -p hermes_llm -p hermes_runtime -p
+hermes-desktop`: llm lib 467 (7 ignored), stream 1, request_observer 4; runtime lib 47; turns 85
+passed, 7 ignored; desktop 158 + acp 67. `cargo build --workspace` OK, no warnings.

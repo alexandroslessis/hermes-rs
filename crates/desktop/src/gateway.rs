@@ -225,6 +225,29 @@ impl Gateway {
                 })
                 .unwrap_or_default(),
         );
+        // Each provider's daily request limit and where its day starts (`requests.limits.<id>`:
+        // `daily_limit`, `reset_offset_minutes`), for the request ledger and its governor.
+        // Applied as a whole: a provider removed from the key (or the key removed) loses its limit.
+        // 0, a missing value or one out of range means "no limit"; an offset is at most ±24 h.
+        let limits = self.rest.config_value("requests.limits");
+        self.runtime.ledger().configure(
+            limits
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(provider, limit)| hermes_runtime::ledger::ProviderLimit {
+                    provider: provider.clone(),
+                    daily_limit: limit["daily_limit"]
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .filter(|n| *n > 0),
+                    reset_offset_minutes: limit["reset_offset_minutes"]
+                        .as_i64()
+                        .filter(|m| m.abs() <= 24 * 60)
+                        .unwrap_or(0) as i32,
+                })
+                .collect(),
+        );
         // File checkpoints (`/rollback`), before the turn's first write.
         self.runtime
             .checkpoints()
@@ -518,6 +541,18 @@ impl Gateway {
             "model.options" => Ok(self
                 .model_options(&settings, params["session_id"].as_str())
                 .await),
+            // Today's model requests for a provider (the active one by default): used, limit, when
+            // the count starts over, and the split by purpose. Ours, not Hermes's.
+            "requests.status" => {
+                let provider = params["provider"]
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| settings.active().map(|p| p.id.clone()));
+                match provider {
+                    Some(provider) => Ok(requests_status(&self.runtime, &provider)),
+                    None => Err((INVALID_PARAMS, "No provider is configured".to_string())),
+                }
+            }
             "config.get" => Ok(json!({
                 "value": params["key"]
                     .as_str()
@@ -2919,6 +2954,15 @@ impl Gateway {
                             this.emit(&id, name, payload);
                         }
                     }
+                    // The provider's daily request quota is nearly used up (our own notice: the page
+                    // shows `status.update` kinds it knows and ignores the rest; CP2.3 adds the display).
+                    RuntimeEvent::Notice(text) => {
+                        this.emit(
+                            &id,
+                            "status.update",
+                            json!({"kind": "quota", "text": text}),
+                        );
+                    }
                     // A steer the turn ended before reading: it runs next, as Hermes does.
                     RuntimeEvent::SteerUndelivered(text) => {
                         this.enqueue(&id, json!({"text": text, "shown": true}), true);
@@ -3071,7 +3115,19 @@ impl Gateway {
         effort: Option<&str>,
         opening: &str,
     ) {
-        match hermes_runtime::generate_title_with_effort(provider, model, effort, opening).await {
+        // A title is optional: skipped when the daily request quota is running low.
+        if let hermes_runtime::governor::Verdict::Deny(why) =
+            self.runtime.governor().check(&provider.id, hermes_llm::observer::Purpose::Title)
+        {
+            tracing::info!("titling {id} skipped: {why}");
+            return;
+        }
+        let titled = self.runtime.ledger().scoped(
+            hermes_llm::observer::Purpose::Title,
+            Some(id),
+            hermes_runtime::generate_title_with_effort(provider, model, effort, opening),
+        );
+        match titled.await {
             Ok(Some(title)) => {
                 let _ = self.runtime.store().set_title(id, &title);
                 self.emit(
@@ -3820,4 +3876,17 @@ fn session_id(params: &Value) -> Result<String, (i64, String)> {
 
 fn send(outbox: &Outbox, frame: Value) {
     let _ = outbox.send(frame.to_string());
+}
+
+/// `requests.status`: the request ledger's numbers for one provider, as the page reads them.
+fn requests_status(runtime: &hermes_runtime::Runtime, provider: &str) -> Value {
+    let usage = runtime.ledger().usage(provider);
+    json!({
+        "provider": provider,
+        "used": usage.used,
+        "limit": usage.limit,
+        "resets_at": usage.resets_at,
+        "by_purpose": usage.by_purpose,
+        "rate_limited": usage.rate_limited,
+    })
 }

@@ -578,6 +578,17 @@ impl<'a> ApiRequestBuilder<'a> {
         ApiResponse::from_response(response).await
     }
 
+    /// Tells a loopback server (the test mocks) why the request is sent: `x-hermes-rs-purpose`.
+    /// Never sent to a real provider.
+    fn with_purpose_header(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match crate::observer::current_purpose() {
+            Some(purpose) if is_loopback_host(&self.client.host) => {
+                request.header("x-hermes-rs-purpose", purpose.as_str())
+            }
+            _ => request,
+        }
+    }
+
     async fn send_bounded(&self, request: reqwest::RequestBuilder) -> Result<Response> {
         if self.streaming {
             Ok(crate::http_status::send_bounded(request, self.client.timeout).await?)
@@ -590,6 +601,7 @@ impl<'a> ApiRequestBuilder<'a> {
     /// [`crate::observer`]) hears about it, retries included since each try calls this again.
     pub async fn response_post(self, payload: &Value) -> Result<Response> {
         let request = self.send_request(|url, client| client.post(url)).await?;
+        let request = self.with_purpose_header(request);
         let observation = crate::observer::begin(
             self.client.provider_id.as_deref(),
             payload.get("model").and_then(Value::as_str),
@@ -650,6 +662,14 @@ impl<'a> ApiRequestBuilder<'a> {
 
         Ok(request)
     }
+}
+
+/// Whether `host` (a base URL) is this machine: `127.0.0.1`, `localhost` or `[::1]`.
+fn is_loopback_host(host: &str) -> bool {
+    url::Url::parse(host)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]" | "::1"))
 }
 
 fn finish_observation(observation: Option<crate::observer::Observation>, result: &Result<Response>) {

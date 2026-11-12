@@ -155,3 +155,22 @@ async fn a_request_outside_a_context_still_works_and_is_not_counted() {
     assert_eq!(seen.len(), 1, "only the request that kept its context");
     assert_eq!(seen[0].2, Purpose::Delegate);
 }
+
+#[tokio::test]
+async fn a_loopback_server_is_told_the_purpose_in_a_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ok_stream())
+        .mount(&server)
+        .await;
+    let recorder = Arc::new(Recorder::default());
+    observer::scope(context(&recorder, Purpose::Curator), ask(&provider_for(&server)))
+        .await
+        .unwrap();
+    // A request with no context carries no purpose header.
+    ask(&provider_for(&server)).await.unwrap();
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(received[0].headers.get("x-hermes-rs-purpose").unwrap(), "curator");
+    assert!(received[1].headers.get("x-hermes-rs-purpose").is_none());
+}

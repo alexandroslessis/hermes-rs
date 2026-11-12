@@ -3374,8 +3374,9 @@ async fn baseline_s4_ten_turn_session_with_review() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
-    // Until Phase 2 labels the review's requests, they count as `main` too: 10 turns + 1 review.
-    assert_requests(&h, Purpose::Main, 11..=11);
+    // 10 turns and one background review, each labelled with its own purpose.
+    assert_requests(&h, Purpose::Main, 10..=10);
+    assert_requests(&h, Purpose::Review, 1..=1);
     let requests = h.requests.lock().clone();
     assert_eq!(requests.len(), 11);
     // The eleventh is one combined memory + skill review, not two reviews or a stray turn.
@@ -3403,7 +3404,8 @@ async fn baseline_s5_delegate_two_children() {
     let events = run_turn(&h, &session, "delegate two counts").await;
     assert_eq!(finished_status(&events), TurnStatus::Completed);
     // The parent's two requests and one per child.
-    assert_requests(&h, Purpose::Main, 4..=4);
+    assert_requests(&h, Purpose::Main, 2..=2);
+    assert_requests(&h, Purpose::Delegate, 2..=2);
     assert_eq!(h.requests.lock().len(), 4);
 }
 
@@ -3529,4 +3531,199 @@ async fn the_ledger_counts_every_model_call_of_a_turn_as_main_and_writes_request
             .unwrap();
     assert_eq!(file["version"], 1);
     assert_eq!(file["providers"]["mock"]["days"].as_object().unwrap().len(), 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phase 2: the governor and the purpose of every request (docs/backend/PHASES.md).
+// ---------------------------------------------------------------------------------------------
+
+/// Pretends `used` of `limit` requests were already made today on the mock provider.
+async fn use_quota(h: &Harness, used: u64, limit: u32) {
+    let ledger = h.runtime.ledger();
+    ledger.set_limit("mock", Some(limit));
+    for _ in 0..used {
+        ledger.record("mock", hermes_llm::observer::Purpose::Main);
+    }
+    // The ledger thread applies them a moment later.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while (ledger.usage("mock").used < used || ledger.usage("mock").limit != Some(limit))
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_used_up_quota_refuses_the_turn_before_any_request_and_says_when_it_resets() {
+    let h = harness(vec![text_reply("never")]).await;
+    use_quota(&h, 5, 5).await;
+    let session = session_in(&h);
+    let refused = h
+        .runtime
+        .start_turn(&session, &h.provider, TurnOptions::default(), "hello")
+        .err()
+        .expect("the turn is refused");
+    let text = format!("{refused:#}");
+    assert!(
+        text.contains("used up") && text.contains("5 of 5") && text.contains("resets at"),
+        "{text}"
+    );
+    assert_eq!(h.requests.lock().len(), 0);
+    // Nothing is left running, and no message was added.
+    assert!(!h.runtime.is_running(&session));
+    assert!(h.runtime.messages(&session).unwrap().is_empty());
+    // /bg is the user's request too.
+    assert!(
+        h.runtime
+            .background(&session, &h.provider, TurnOptions::default(), "do it")
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_nearly_used_up_quota_warns_but_the_turn_goes_on() {
+    let h = harness(vec![text_reply("Fine.")]).await;
+    use_quota(&h, 97, 100).await; // 3% left
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "hello").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let notice = events.iter().find_map(|e| match e {
+        RuntimeEvent::Notice(text) => Some(text.clone()),
+        _ => None,
+    });
+    assert!(notice.unwrap().contains("3 of 100"), "{events:?}");
+    assert_requests(&h, Purpose::Main, 1..=1);
+    assert_eq!(last_text(&h, &session), "Fine.");
+}
+
+#[tokio::test]
+async fn a_background_review_waits_when_less_than_a_fifth_of_the_quota_is_left() {
+    let replies: Vec<String> = (0..10)
+        .map(|i| text_reply(&format!("answer {i}")))
+        .collect();
+    let h = harness(replies).await;
+    // 85 used before; the ten turns bring it to 95 of 100: under 20% left, not under 5%.
+    use_quota(&h, 85, 100).await;
+    let session = session_in(&h);
+    for i in 0..10 {
+        let events = run_turn(&h, &session, &format!("question {i}")).await;
+        assert_eq!(finished_status(&events), TurnStatus::Completed);
+        assert!(
+            !events.iter().any(|e| matches!(e, RuntimeEvent::Notice(_))),
+            "turn {i}"
+        );
+    }
+    // The review would have been due after the tenth turn: give it time to show up.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_requests(&h, Purpose::Main, 10..=10);
+    assert_requests(&h, Purpose::Review, 0..=0);
+    assert_eq!(h.requests.lock().len(), 10);
+}
+
+#[tokio::test]
+async fn delegation_stops_when_less_than_five_percent_of_the_quota_is_left() {
+    let h = harness(vec![
+        tool_reply(&[(
+            "d1",
+            "delegate_task",
+            json!({"tasks": [{"goal": "count files"}]}),
+        )]),
+        text_reply("I will do it myself."),
+    ])
+    .await;
+    use_quota(&h, 96, 100).await; // 4% left: the turn is warned, the child is refused
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "delegate counting").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    // The parent's two requests only: no child ever asked the model anything.
+    assert_requests(&h, Purpose::Main, 2..=2);
+    assert_requests(&h, Purpose::Delegate, 0..=0);
+    let second = h.requests.lock()[1].to_string();
+    assert!(second.contains("Do the work yourself"), "{second}");
+}
+
+#[tokio::test]
+async fn side_questions_and_manual_compression_are_labelled_btw_and_compress() {
+    // Enough turns for there to be a middle to summarize (as `compress_summarizes_the_middle...`).
+    let h = harness(vec![
+        text_reply("one"),
+        text_reply(&long_two()),
+        text_reply("three"),
+        text_reply("four"),
+        text_reply("Asked and answered."),
+        text_reply("## Goal
+the summary"),
+    ])
+    .await;
+    let session = session_in(&h);
+    for text in ["first", "second", "third", "fourth"] {
+        run_turn(&h, &session, text).await;
+    }
+    assert_requests(&h, Purpose::Main, 4..=4);
+    let answer = h
+        .runtime
+        .side_question(&session, &h.provider, "say that again?")
+        .await
+        .unwrap();
+    assert_eq!(answer, "Asked and answered.");
+    assert_requests(&h, Purpose::Btw, 1..=1);
+    // `compress` runs as its own task: its summary request is a `compress` one.
+    let mut turn = h
+        .runtime
+        .compress(&session, &h.provider, TurnOptions::default(), None)
+        .unwrap();
+    while let Some(event) = turn.events.recv().await {
+        if matches!(event, RuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    assert_requests(&h, Purpose::Compress, 1..=1);
+    assert_requests(&h, Purpose::Main, 4..=4);
+    // The ledger agrees with the mock, purpose by purpose.
+    let usage = h.runtime.ledger().usage("mock");
+    assert_eq!(usage.by_purpose.get("main"), Some(&4), "{usage:?}");
+    assert_eq!(usage.by_purpose.get("btw"), Some(&1), "{usage:?}");
+    assert_eq!(usage.by_purpose.get("compress"), Some(&1), "{usage:?}");
+}
+
+#[tokio::test]
+async fn a_daily_limit_429_teaches_the_ledger_the_providers_limit() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(RateLimited {
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+    let data = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let runtime = runtime_with(data.path(), Arc::new(Bridge));
+    let provider = ProviderConfig {
+        id: "mock".into(),
+        base_url: format!("{}/v1", server.uri()),
+        api_key: Some("key".into()),
+    };
+    let session = runtime
+        .create_session(&provider, "test-model", None, work.path())
+        .unwrap();
+    assert_eq!(runtime.ledger().usage("mock").limit, None);
+    let mut turn = runtime
+        .start_turn(&session.id, &provider, TurnOptions::default(), "hello")
+        .unwrap();
+    while let Some(event) = turn.events.recv().await {
+        if matches!(event, RuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while runtime.ledger().usage("mock").limit.is_none() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let usage = runtime.ledger().usage("mock");
+    assert_eq!(usage.limit, Some(800), "{usage:?}");
+    // Every attempt the provider refused is counted as a 429 as well as a request.
+    assert_eq!(usage.rate_limited as usize, requests.lock().len());
+    assert_eq!(usage.used as usize, requests.lock().len());
 }

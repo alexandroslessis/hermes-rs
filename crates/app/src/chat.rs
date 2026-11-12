@@ -2012,6 +2012,7 @@ impl ChatView {
                 cx.notify();
             }
             RuntimeEvent::Agent(_) => {}
+            RuntimeEvent::Notice(_) => {}
             RuntimeEvent::SteerUndelivered(text) => {
                 self.drop_pending_edit();
                 self.steering = None;

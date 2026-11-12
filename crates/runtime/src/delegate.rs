@@ -86,6 +86,9 @@ pub struct Delegator {
     pub subagents: Arc<crate::subagents::Subagents>,
     /// Tools the user switched off (Capabilities ▸ Tools), for children too.
     pub disabled: Arc<std::collections::HashSet<String>>,
+    /// The quota governor and the provider the children call: delegation stops when the daily
+    /// request quota is nearly gone.
+    pub quota: Option<(crate::governor::Governor, String)>,
 }
 
 /// The parent's tools plus `delegate_task`.
@@ -373,6 +376,14 @@ impl Delegator {
         if self.subagents.paused() {
             return json!({"success": false, "error": "Delegation is paused by the user: do the work yourself, or ask whether to resume delegation."});
         }
+        if let Some((governor, provider)) = &self.quota
+            && let crate::governor::Verdict::Deny(why) =
+                governor.check(provider, hermes_llm::observer::Purpose::Delegate)
+        {
+            return json!({"success": false, "error": format!(
+                "{why} Do the work yourself instead of delegating it."
+            )});
+        }
         if tasks.len() > MAX_CONCURRENT_CHILDREN {
             return json!({"success": false, "error": format!(
                 "Too many tasks ({}): at most {MAX_CONCURRENT_CHILDREN} subagents run in parallel. Split the work into smaller batches.",
@@ -417,7 +428,12 @@ impl Delegator {
                 self.run_child(task, &base_prompt, request_id, emit).await
             }
         });
-        let results = futures::future::join_all(runs).await;
+        // The children run inside this tool call: their requests are `delegate`, not `main`.
+        let results = hermes_llm::observer::with_purpose(
+            hermes_llm::observer::Purpose::Delegate,
+            futures::future::join_all(runs),
+        )
+        .await;
         json!({
             "results": results,
             "total_duration_seconds": (started.elapsed().as_secs_f64() * 100.0).round() / 100.0,

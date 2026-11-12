@@ -7,6 +7,7 @@ pub mod compress;
 mod curator;
 mod delegate;
 mod guards;
+pub mod governor;
 pub mod ledger;
 pub mod mcp;
 mod ops;
@@ -31,6 +32,7 @@ use hermes_llm::base::Provider;
 use hermes_llm::conversation::Conversation;
 use hermes_llm::conversation::message::{Message, MessageContent};
 use hermes_llm::discovery::DiscoveredModel;
+use hermes_llm::observer::Purpose;
 use hermes_llm::model::ModelConfig;
 use hermes_llm::openai_compatible::OpenAiCompatibleProvider;
 use hermes_memory::{MemoryConfig, MemoryStore};
@@ -139,6 +141,8 @@ struct SmartGuard {
     base_url: String,
     /// The approval model's own effort (Settings ▸ Model ▸ Auxiliary); off when unset.
     effort: Option<String>,
+    /// The quota governor and the id of the provider the judge calls; `None` = no accounting.
+    governor: Option<(governor::Governor, String)>,
 }
 
 #[async_trait::async_trait]
@@ -157,12 +161,22 @@ impl hermes_tools::approval::ApprovalGuard for SmartGuard {
                 &self.base_url,
                 self.effort.as_deref().unwrap_or("none"),
             ));
+        // Low on quota: don't spend a request on the judge, ask the user instead.
+        if let Some((governor, provider)) = &self.governor
+            && let governor::Verdict::Deny(why) = governor.check(provider, Purpose::Approval)
+        {
+            tracing::info!("smart approval skipped: {why}");
+            return Verdict::Escalate;
+        }
         let request =
             [Message::user().with_text(approval::smart_user_prompt(command, description))];
         let reply = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            self.llm
-                .complete(&config, approval::SMART_SYSTEM_PROMPT, &request, &[]),
+            hermes_llm::observer::with_purpose(
+                Purpose::Approval,
+                self.llm
+                    .complete(&config, approval::SMART_SYSTEM_PROMPT, &request, &[]),
+            ),
         )
         .await;
         match reply {
@@ -328,6 +342,9 @@ pub enum RuntimeEvent {
     Agent(AgentEvent),
     /// A `/steer` message the turn ended before delivering; Hermes sends it as the next message.
     SteerUndelivered(String),
+    /// Something the user should know before the turn goes on (the daily request quota is nearly
+    /// used up); the turn is not affected.
+    Notice(String),
     TurnFinished(TurnStatus),
 }
 
@@ -443,6 +460,11 @@ impl Runtime {
     /// The request ledger: today's model requests per provider and purpose.
     pub fn ledger(&self) -> &ledger::Ledger {
         &self.ledger
+    }
+
+    /// The quota governor over the ledger (see [`governor`]).
+    pub fn governor(&self) -> governor::Governor {
+        governor::Governor::new(self.ledger.clone())
     }
 
     /// The skills folder every session shares (the Skills screen edits it too).
@@ -925,6 +947,12 @@ impl Runtime {
             .map(|effort| effort_request_params(&provider.base_url, effort));
         let open = self.open(session_id)?;
         let cancel = CancellationToken::new();
+        // The daily request quota: refused only when it is used up, warned when nearly so.
+        let quota_notice = match self.governor().check(&provider.id, Purpose::Main) {
+            governor::Verdict::Deny(why) => anyhow::bail!("{why}"),
+            governor::Verdict::Warn(text) => Some(text),
+            governor::Verdict::Allow => None,
+        };
         {
             let mut running = open.running.lock();
             anyhow::ensure!(
@@ -966,6 +994,7 @@ impl Runtime {
         *open.turn_state.lock() = Some(state.clone());
         open.tools.begin_turn();
         open.tools.set_vision(supports_vision);
+        let governor = self.governor();
         // Smart approvals judge with the approval model, else the turn's.
         let guard: Option<Arc<dyn hermes_tools::approval::ApprovalGuard>> = match &aux.approval {
             Some(aux) => aux.provider.provider().ok().map(|llm| {
@@ -974,6 +1003,7 @@ impl Runtime {
                     model: aux.model.clone(),
                     base_url: aux.provider.base_url.clone(),
                     effort: aux.effort.clone(),
+                    governor: Some((governor.clone(), aux.provider.id.clone())),
                 }) as Arc<dyn hermes_tools::approval::ApprovalGuard>
             }),
             None => provider.provider().ok().map(|llm| {
@@ -982,6 +1012,7 @@ impl Runtime {
                     model: open.record.lock().model.clone(),
                     base_url: provider.base_url.clone(),
                     effort: None,
+                    governor: Some((governor.clone(), provider.id.clone())),
                 }) as Arc<dyn hermes_tools::approval::ApprovalGuard>
             }),
         };
@@ -999,6 +1030,10 @@ impl Runtime {
             review.cancel();
         }
         let review_memory = text.is_some() && open.nudges.lock().tick_memory();
+        let review_provider_id = aux
+            .review
+            .as_ref()
+            .map_or_else(|| provider.id.clone(), |aux| aux.provider.id.clone());
         // The background review runs on the auxiliary review model when one is set.
         let (review_llm, review_name, review_context, review_effort) = review_model;
         let review_setup = ReviewSetup {
@@ -1009,6 +1044,8 @@ impl Runtime {
             context_length: review_context,
             effort_params: review_effort,
             enabled: self.background_review.clone(),
+            ledger: self.ledger.clone(),
+            provider_id: review_provider_id,
         };
         // A message with `@url:` references or images is added once its pages are fetched and
         // its images prepared, in the turn's task (that can take seconds).
@@ -1051,6 +1088,7 @@ impl Runtime {
         let rebuild_prompt = self.prompt_rebuild(&open, context_length);
         let delegator = self.delegator(
             &open,
+            &provider.id,
             llm.clone(),
             &model,
             context_length,
@@ -1068,6 +1106,9 @@ impl Runtime {
         for event in first_events {
             let _ = events_tx.send(RuntimeEvent::Agent(event));
         }
+        if let Some(text) = quota_notice {
+            let _ = events_tx.send(RuntimeEvent::Notice(text));
+        }
         let max_iterations = self.config.max_iterations;
         let session_id = session_id.to_string();
         let turn_cancel = cancel.clone();
@@ -1078,6 +1119,8 @@ impl Runtime {
         // Every model call of the turn is a `main` request in the ledger (the context is a
         // task-local, so it is set around this task; tasks the turn spawns need their own).
         let request_context = self.ledger.context(hermes_llm::observer::Purpose::Main, Some(&session_id));
+        // A daily-limit 429 that ends the turn teaches the ledger the provider's limit.
+        let (learn_ledger, learn_provider) = (self.ledger.clone(), provider.id.clone());
         let turn = tokio::spawn(hermes_llm::observer::scope(request_context, async move {
             if let Some((text, images)) = deferred {
                 let session = runtime.session.clone();
@@ -1200,6 +1243,21 @@ impl Runtime {
                     TurnStatus::Failed(format!("{error:#}"))
                 }
             };
+            let limit_error = {
+                let conversation = runtime.session.conversation.lock();
+                conversation.messages().last().and_then(|last| {
+                    last.content
+                        .iter()
+                        .find_map(|content| content.as_error())
+                        .map(|error| error.message.clone())
+                })
+            };
+            if let Some(text) = limit_error
+                && hermes_llm::retry::is_usage_limit(&text)
+                && let Some(limit) = ledger::daily_limit_in(&text)
+            {
+                learn_ledger.learn_limit(&learn_provider, limit);
+            }
             *last_activity.lock() = std::time::Instant::now();
             let finished = status == TurnStatus::Completed;
             let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
@@ -1266,6 +1324,12 @@ impl Runtime {
             context_length,
             effort_params,
             enabled: self.background_review.clone(),
+            ledger: self.ledger.clone(),
+            provider_id: options
+                .aux
+                .review
+                .as_ref()
+                .map_or_else(|| provider.id.clone(), |aux| aux.provider.id.clone()),
         };
         let skills = SessionTools::tool_names().contains(&"skill_manage");
         setup.start(&open, true, skills, focus, true);
@@ -1313,7 +1377,8 @@ impl Runtime {
         let store = self.store.clone();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let turn_cancel = cancel.clone();
-        tokio::spawn(async move {
+        let context = self.ledger.context(Purpose::Compress, Some(session_id));
+        tokio::spawn(hermes_llm::observer::scope(context, async move {
             let _ = events_tx.send(RuntimeEvent::Agent(AgentEvent::Compacting));
             let conversation = open.conversation.lock().clone();
             let fixed = compress::estimate_text(&open.record.lock().system_prompt)
@@ -1345,7 +1410,7 @@ impl Runtime {
             };
             *open.running.lock() = None;
             let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
-        });
+        }));
         Ok(Turn {
             events: events_rx,
             cancel,
@@ -1688,6 +1753,7 @@ impl Runtime {
     fn delegator(
         &self,
         open: &Arc<OpenSession>,
+        provider_id: &str,
         llm: Arc<dyn Provider>,
         model: &str,
         context_length: Option<usize>,
@@ -1709,6 +1775,7 @@ impl Runtime {
             mcp: self.mcp.clone(),
             subagents: self.subagents.clone(),
             disabled: Arc::new(self.disabled_tools.lock().clone()),
+            quota: Some((self.governor(), provider_id.to_string())),
         })
     }
 
@@ -1723,6 +1790,10 @@ impl Runtime {
         options: TurnOptions,
         text: &str,
     ) -> Result<Background> {
+        // The user's own request: only held back when the daily quota is used up.
+        if let governor::Verdict::Deny(why) = self.governor().check(&provider.id, Purpose::Main) {
+            anyhow::bail!("{why}");
+        }
         let open = self.open(session_id)?;
         let llm = provider.provider()?;
         let model = open.record.lock().model.clone();
@@ -1733,6 +1804,7 @@ impl Runtime {
             .map(|effort| effort_request_params(&provider.base_url, effort));
         let delegator = self.delegator(
             &open,
+            &provider.id,
             llm,
             &model,
             options.context_length,
@@ -1744,7 +1816,8 @@ impl Runtime {
         let (events_tx, events) = mpsc::unbounded_channel();
         let emit = Emitter::new(events_tx, CancellationToken::new());
         let (goal, id) = (text.trim().to_string(), task_id.clone());
-        let done = tokio::spawn(async move {
+        let context = self.ledger.context(Purpose::Delegate, Some(session_id));
+        let done = tokio::spawn(hermes_llm::observer::scope(context, async move {
             let result = delegator.background(&goal, &id, &emit).await;
             match result["status"].as_str() {
                 Some("completed") => result["summary"].as_str().unwrap_or_default().to_string(),
@@ -1756,7 +1829,7 @@ impl Runtime {
                         .unwrap_or("the background task failed")
                 ),
             }
-        });
+        }));
         Ok(Background {
             task_id,
             events,
@@ -1828,15 +1901,18 @@ impl Runtime {
         }
         let llm = provider.provider()?;
         let config = ModelConfig::new(&model).with_max_tokens(Some(2048));
-        let (reply, _) = llm
-            .complete(
-                &config,
-                side::INSTRUCTIONS,
-                &[
-                    Message::user()
-                        .with_text(side::user_input(&side::transcript(&lines), question)),
-                ],
-                &[],
+        let (reply, _) = self
+            .ledger
+            .scoped(
+                Purpose::Btw,
+                Some(session_id),
+                llm.complete(
+                    &config,
+                    side::INSTRUCTIONS,
+                    &[Message::user()
+                        .with_text(side::user_input(&side::transcript(&lines), question))],
+                    &[],
+                ),
             )
             .await
             .map_err(|error| anyhow::anyhow!("side question failed: {error}"))?;
@@ -2144,6 +2220,10 @@ struct ReviewSetup {
     context_length: Option<usize>,
     effort_params: Option<HashMap<String, serde_json::Value>>,
     enabled: Arc<AtomicBool>,
+    /// Counts the review's requests and holds it back when the quota is low.
+    ledger: ledger::Ledger,
+    /// The provider the review model is on.
+    provider_id: String,
 }
 
 impl ReviewSetup {
@@ -2187,11 +2267,22 @@ impl ReviewSetup {
         focus: Option<String>,
         requested: bool,
     ) {
+        // Low on quota: a background review waits for another day (one the user asked for with
+        // /refine counts as their own work and is only held back when nothing is left).
+        let asked_as = if requested { Purpose::Main } else { Purpose::Review };
+        if let governor::Verdict::Deny(why) =
+            governor::Governor::new(self.ledger.clone()).check(&self.provider_id, asked_as)
+        {
+            tracing::info!("review skipped: {why}");
+            return;
+        }
         let cancel = CancellationToken::new();
         if let Some(previous) = session.review.lock().replace(cancel.clone()) {
             previous.cancel();
         }
-        tokio::spawn(review::run(review::ReviewJob {
+        let session_id = session.record.lock().id.clone();
+        let context = self.ledger.context(Purpose::Review, Some(&session_id));
+        tokio::spawn(hermes_llm::observer::scope(context, review::run(review::ReviewJob {
             session: session.clone(),
             store: self.store,
             bridge: self.bridge,
@@ -2204,7 +2295,7 @@ impl ReviewSetup {
             focus,
             requested,
             cancel,
-        }));
+        })));
     }
 }
 
@@ -2221,6 +2312,7 @@ pub async fn smart_review(
         model: model.to_string(),
         base_url: provider.base_url.clone(),
         effort: None,
+        governor: None,
     };
     Ok(guard.assess(command, description).await)
 }
