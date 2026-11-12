@@ -147,6 +147,13 @@ first on Settings ▸ Memory and at the top of Capabilities ▸ Skills, the diff
 on a stale item, the 409's `detail` sentence (unwrapped) on a refused Apply, Reject removing the card; it needs a
 webapp built with the patches (passing 2026-11-12).
 
+`review-check.mjs [port] [data folder]` checks when the background review runs (Phase 7 CP7.3) with its own provider on
+:47900: under `requests` with `budget.review_idle_minutes: 0.05`, a session with two corrections gets exactly one review
+request once quiet (the evidence review: its prompt, no tools, `response_format` json_schema, both corrections in the
+packet) and its memory entry lands in USER.md; no second review at the next quiet period; a smooth session gets none, idle
+or switched away from; an unknown `budget.review_mode` is refused. It puts USER.md and the idle knob back (passing
+2026-11-13 on the debug build).
+
 `keyboard-nav-check.mjs` checks arrow-key navigation through the page (DevTools, patches/0018 and
 0019): the file tree's ↑/↓ move the visible selection and ←/→ fold the selected folder, and the
 Settings rail's rows walk with ↑/↓ (wrap-around; arrows only move focus, the hash never changes).

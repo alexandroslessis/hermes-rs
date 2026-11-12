@@ -93,9 +93,12 @@ pub fn run() -> Result<()> {
                     .context("opening the data folder")?,
                 );
                 runtime.warm_up();
-                Ok(Arc::new(crate::gateway::Gateway::new_for_acp(
+                let gateway = Arc::new(crate::gateway::Gateway::new_for_acp(
                     runtime, hub, data_dir,
-                )))
+                ));
+                // A thread's background review uses its provider as a turn would (Phase 7).
+                crate::gateway::Gateway::install_review_route(&gateway);
+                Ok(gateway)
             })
             .await??;
         let ledger = gateway.runtime.ledger().clone();

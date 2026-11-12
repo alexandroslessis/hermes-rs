@@ -1154,3 +1154,68 @@ fn a_file_from_a_newer_version_is_left_alone() {
         newer
     );
 }
+
+#[test]
+fn remember_this_the_agent_already_saved_is_only_a_weak_signal() {
+    let history = vec![user("Install the deps."), assistant("I ran npm install.")];
+    let typed = "Remember this: I always use pnpm, never npm.";
+    let saved = CallRecord::new(
+        "memory",
+        &json!({"target": "user", "operations": [{"action": "add", "content": "Uses pnpm."}]}),
+        r#"{"success":true}"#,
+        false,
+    );
+    let analysis = analyze(&base(&history, typed), &outcome(vec![saved]));
+    assert_eq!(analysis.signals.len(), 1, "{analysis:?}");
+    assert!(!analysis.signals[0].is_explicit());
+    assert_eq!(analysis.signals[0].weight, 1.0);
+    // Its words are still the evidence.
+    assert!(analysis.signals[0].evidence.iter().any(|e| e.text == typed));
+    // A refused save, or none, leaves it explicit.
+    let refused = CallRecord::new(
+        "memory",
+        &json!({"target": "user", "operations": [{"action": "add", "content": "x"}]}),
+        r#"{"success":false,"error":"threat"}"#,
+        true,
+    );
+    for calls in [vec![refused], Vec::new()] {
+        let analysis = analyze(&base(&history, typed), &outcome(calls));
+        assert!(analysis.signals[0].is_explicit(), "{analysis:?}");
+    }
+}
+
+#[test]
+fn unfinished_review_tries_wait_from_the_second_on_and_a_review_resets_them() {
+    let hour = 3_600_000_i64;
+    let mut signals = SessionSignals::default();
+    signals.add(correction(3.0), 1);
+    assert_eq!(signals.retry_wait(10 * hour), None);
+    // The first try cut off (an exit): redone freely.
+    signals.review_started(10 * hour);
+    assert_eq!(signals.retry_wait(10 * hour), None);
+    // The second: an hour from its start, then two, ... at most a day.
+    signals.review_started(10 * hour);
+    let wait = signals.retry_wait(10 * hour + 1000).unwrap();
+    assert_eq!(wait, std::time::Duration::from_millis(3_600_000 - 1000));
+    assert_eq!(signals.retry_wait(11 * hour), None);
+    signals.review_started(20 * hour);
+    assert!(signals.retry_wait(21 * hour + 1).is_some());
+    assert_eq!(signals.retry_wait(22 * hour), None);
+    for _ in 0..20 {
+        signals.review_started(30 * hour);
+    }
+    assert!(signals.retry_wait(30 * hour + 23 * hour).is_some());
+    assert_eq!(signals.retry_wait(30 * hour + 24 * hour), None);
+    // A clock set back: no wait.
+    assert_eq!(signals.retry_wait(29 * hour), None);
+    // Survives the file; a reply read resets it.
+    let back: SessionSignals =
+        serde_json::from_slice(&serde_json::to_vec(&signals).unwrap()).unwrap();
+    assert_eq!(back.review_tries, 23);
+    signals.mark_reviewed(signals.next_seq);
+    assert_eq!(signals.review_tries, 0);
+    assert_eq!(signals.retry_wait(30 * hour), None);
+    // A file without tries doesn't mention them.
+    let text = serde_json::to_string(&signals).unwrap();
+    assert!(!text.contains("review_tries"), "{text}");
+}

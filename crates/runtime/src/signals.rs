@@ -277,9 +277,52 @@ pub struct SessionSignals {
     pub dropped: u64,
     pub dropped_weight: f32,
     pub signals: Vec<Signal>,
+    /// Scheduled reviews started since the signals were last marked reviewed, and when the last
+    /// one started (unix ms). On disk so that a review cut off by an exit (or a crash) or failing
+    /// after its request isn't sent again by every later run of the app (CP7.3,
+    /// [`Self::retry_wait`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub review_tries: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub review_started_ms: i64,
 }
 
+fn is_zero<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+/// The first wait after two reviews in a row that didn't cover the signals, doubling per further
+/// one up to [`RETRY_MAX`].
+pub const RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(3600);
+pub const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 impl SessionSignals {
+    /// How long a scheduled review must still wait because earlier ones started and never covered
+    /// the signals (cut off by an exit, or failed after a request), in this run of the app or an
+    /// earlier one. The first such review is redone freely (an app closed mid-review is the usual
+    /// case); from the second on the wait is [`RETRY_FIRST`], doubling, at most [`RETRY_MAX`]. A
+    /// clock set back counts as time passed.
+    pub fn retry_wait(&self, now_ms: i64) -> Option<std::time::Duration> {
+        if self.review_tries < 2 {
+            return None;
+        }
+        let wait = RETRY_FIRST
+            .saturating_mul(1 << (self.review_tries - 2).min(10))
+            .min(RETRY_MAX);
+        let elapsed = now_ms.saturating_sub(self.review_started_ms);
+        if elapsed < 0 {
+            return None;
+        }
+        wait.checked_sub(std::time::Duration::from_millis(elapsed as u64))
+            .filter(|left| !left.is_zero())
+    }
+
+    /// Records that a review of the signals started (see [`Self::retry_wait`]).
+    pub fn review_started(&mut self, now_ms: i64) {
+        self.review_tries = self.review_tries.saturating_add(1);
+        self.review_started_ms = now_ms;
+    }
+
     /// The signals not reviewed yet, oldest first: the evidence for the next review.
     pub fn evidence(&self) -> Vec<&Signal> {
         self.signals
@@ -295,7 +338,19 @@ impl SessionSignals {
 
     /// Whether a review is due: an explicit request, or the score at the threshold.
     pub fn triggered(&self) -> bool {
-        self.evidence().iter().any(|s| s.is_explicit()) || self.score() >= REVIEW_THRESHOLD
+        self.triggered_at(REVIEW_THRESHOLD)
+    }
+
+    /// [`Self::triggered`] at another threshold (the `review_threshold` budget knob).
+    pub fn triggered_at(&self, threshold: f32) -> bool {
+        self.evidence().iter().any(|s| s.is_explicit()) || self.score() >= threshold
+    }
+
+    /// The newest signal's `seq` when any is unreviewed: what a review that starts now covers
+    /// (signals that arrive while it runs get higher numbers and stay unreviewed).
+    pub fn unreviewed_upto(&self) -> Option<u64> {
+        // `next_seq` is the last number given out; pushed-out signals count too.
+        (!self.evidence().is_empty() || self.dropped > 0).then_some(self.next_seq)
     }
 
     /// Records that a review covered every signal up to `seq`. They stay in the file (Phase 8
@@ -304,6 +359,7 @@ impl SessionSignals {
         self.reviewed_seq = self.reviewed_seq.max(seq.min(self.next_seq));
         self.dropped = 0;
         self.dropped_weight = 0.0;
+        self.review_tries = 0;
     }
 
     /// Adds a signal (numbered and dated here) and keeps the file within its cap. A signal from
@@ -556,6 +612,21 @@ pub fn analyze(base: &TurnBase, outcome: &TurnOutcome) -> Analysis {
     if let Some(text) = typed
         && let Some(signal) = text_signal(text, context, turn, id.clone())
     {
+        // "Remember this" that the agent already saved with its `memory` tool in the same turn
+        // is done: it stays a weak signal (the review may still check the wording) instead of
+        // forcing a review that would only find the entry there.
+        let signal = if signal.is_explicit() && saved_to_memory(&outcome.calls) {
+            Signal::new(
+                SignalKind::Correction {
+                    phrases: vec!["remember (saved by the agent)".into()],
+                },
+                SAVED_REMEMBER_WEIGHT,
+                turn,
+                id.clone(),
+            )
+        } else {
+            signal
+        };
         signals.push(
             // Keyed with what it answered: the same words sent again to the same answer (after
             // `/undo` or a retry) are one correction, the same words to a later answer another.
@@ -751,6 +822,20 @@ pub fn final_answer(messages: &[Message]) -> Option<String> {
     (last.role == Role::Assistant && last.is_agent_visible() && last.error_kind().is_none())
         .then(|| last.as_concat_text())
         .filter(|text| !text.trim().is_empty())
+}
+
+/// The weight of a "remember this" the agent saved itself in the same turn.
+const SAVED_REMEMBER_WEIGHT: f32 = 1.0;
+
+/// Whether the turn wrote to memory: a `memory` call that adds or patches and went through (an
+/// entry staged for approval counts: the lesson already waits for the user).
+fn saved_to_memory(calls: &[CallRecord]) -> bool {
+    calls.iter().any(|c| {
+        c.name == "memory"
+            && !c.failed
+            && !c.denied
+            && (c.args.contains("\"add\"") || c.args.contains("\"patch\""))
+    })
 }
 
 fn text_signal(
@@ -1865,6 +1950,9 @@ enum Op {
         session: String,
         upto: u64,
     },
+    ReviewStarted {
+        session: String,
+    },
     Forget {
         session: String,
     },
@@ -1951,6 +2039,14 @@ impl SignalStore {
         });
     }
 
+    /// Records that a review of the session's signals is about to send its request
+    /// ([`SessionSignals::retry_wait`]).
+    pub fn review_started(&self, session_id: &str) {
+        self.send(Op::ReviewStarted {
+            session: session_id.to_string(),
+        });
+    }
+
     /// Deletes a session's file.
     pub fn forget(&self, session_id: &str) {
         self.send(Op::Forget {
@@ -1996,6 +2092,10 @@ fn apply(dir: &Path, op: Op) {
         Op::Reviewed { session, upto } => (
             session,
             Box::new(move |signals| signals.mark_reviewed(upto)),
+        ),
+        Op::ReviewStarted { session } => (
+            session,
+            Box::new(move |signals| signals.review_started(now)),
         ),
     };
     // A file a newer version wrote is left alone (rewriting it in this format would lose what

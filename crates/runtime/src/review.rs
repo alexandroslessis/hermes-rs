@@ -3,6 +3,14 @@
 //! memories and improve skills. The copy has the session's frozen prompt and tool list (so its
 //! requests reuse the prompt cache), may only dispatch the review tools, and its messages never
 //! join the session. `/refine` runs the same review on request.
+//!
+//! Phase 7 (`docs/backend/PHASES.md`) diverges on when it runs (`budget.review_mode`): under
+//! `nudges` (the `balanced` and `tokens` profiles) Hermes's counters start it as before and a
+//! learning-signal score at the threshold (`signals.rs`) starts it too, and a finished review of
+//! memory and skills marks the signals it saw reviewed; under `agentic` it is exactly Hermes's
+//! (kept for comparison, to be deleted a few weeks after Phase 7); under `idle_once` (the
+//! `requests` profile) only `/refine` runs it, and the evidence review (`review_once.rs`,
+//! scheduled by `review_schedule.rs`) replaces it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -115,6 +123,10 @@ pub struct ReviewJob {
     pub handle: ReviewHandle,
     /// The budget knobs of the turn that started the review.
     pub budget: crate::budget::BudgetKnobs,
+    /// The session's learning signals (Phase 7), except under `review_mode = agentic` (the review
+    /// exactly as before signals existed): a review of both memory and skills that finishes marks
+    /// the signals it saw at its start reviewed, so they don't start another one.
+    pub signals: Option<crate::signals::SignalStore>,
 }
 
 /// Runs a review and reports what it changed to the app.
@@ -126,6 +138,7 @@ pub async fn run(job: ReviewJob) {
         job.requested,
         job.handle.cancel.clone(),
     );
+    let signals = job.signals.clone();
     let result = review(job).await;
     // Done: free the slot, unless a newer review took it (taking it cancels this one).
     if !cancel.is_cancelled() {
@@ -133,7 +146,10 @@ pub async fn run(job: ReviewJob) {
     }
     match result {
         Ok(_) if cancel.is_cancelled() => {}
-        Ok(actions) => {
+        Ok((actions, covered)) => {
+            if let (Some(signals), Some(upto)) = (&signals, covered) {
+                signals.mark_reviewed(&session_id, upto);
+            }
             if !actions.is_empty() || requested {
                 bridge.review_finished(&session_id, actions, requested);
             }
@@ -142,7 +158,9 @@ pub async fn run(job: ReviewJob) {
     }
 }
 
-async fn review(job: ReviewJob) -> Result<Vec<String>> {
+/// The review's lines for the app, and the highest signal `seq` it covered (when it reviewed both
+/// memory and skills and the session had unreviewed signals at its start).
+async fn review(job: ReviewJob) -> Result<(Vec<String>, Option<u64>)> {
     let ReviewJob {
         session,
         store,
@@ -156,9 +174,19 @@ async fn review(job: ReviewJob) -> Result<Vec<String>> {
         requested,
         handle,
         budget,
+        signals,
         ..
     } = job;
     let cancel = handle.cancel.clone();
+    // The signals this review covers, read before the conversation (so every one of them is from
+    // a turn in the copy below; one recorded later stays unreviewed).
+    let covered = match signals.filter(|_| memory && skills) {
+        Some(signals) => {
+            let id = session.record.lock().id.clone();
+            signals.snapshot(&id).await.unreviewed_upto()
+        }
+        None => None,
+    };
     // The conversation as it is when no turn is running, plus the review prompt; the copy never
     // touches the session. A turn that starts first pauses the review here (before its first
     // request): the snapshot is taken under the `running` lock, which `begin_turn` holds while it
@@ -175,7 +203,7 @@ async fn review(job: ReviewJob) -> Result<Vec<String>> {
             }
         }
         tokio::select! {
-            _ = cancel.cancelled() => return Ok(Vec::new()),
+            _ = cancel.cancelled() => return Ok((Vec::new(), None)),
             _ = tokio::time::sleep(PAUSE_POLL) => {}
         }
     };
@@ -259,7 +287,15 @@ async fn review(job: ReviewJob) -> Result<Vec<String>> {
     let _ = drain.await;
     result?;
     let messages = fork.conversation.lock().messages().clone();
-    Ok(summarize(messages.get(reviewed..).unwrap_or_default()))
+    // A review that ended on an error (the provider refused or broke off: `ExitOnError` ends the
+    // run normally, with the error as the last message) covered nothing: its signals stay
+    // unreviewed (`Scheduler::nudge_due` keeps the score from restarting it after every turn).
+    let failed = messages
+        .get(reviewed..)
+        .and_then(<[Message]>::last)
+        .is_some_and(|last| last.error_kind().is_some());
+    let covered = covered.filter(|_| !failed);
+    Ok((summarize(messages.get(reviewed..).unwrap_or_default()), covered))
 }
 
 /// Hermes's `summarize_background_review_actions`: one line per change the review's memory and

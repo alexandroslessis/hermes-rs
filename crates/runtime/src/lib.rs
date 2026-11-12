@@ -15,6 +15,7 @@ mod ops;
 pub mod preinject;
 mod review;
 pub mod review_once;
+pub mod review_schedule;
 mod session;
 pub mod signals;
 pub mod subagents;
@@ -448,7 +449,10 @@ pub struct Runtime {
     config: RuntimeConfig,
     bridge: Arc<dyn UserBridge>,
     windows_version: String,
-    sessions: Mutex<HashMap<String, Arc<OpenSession>>>,
+    sessions: Arc<Mutex<HashMap<String, Arc<OpenSession>>>>,
+    /// When the evidence review runs (`review_schedule.rs`): per-session idle timers, the
+    /// one-review-at-a-time slot, back-off and the hourly cap.
+    scheduler: review_schedule::Scheduler,
     /// Hermes's `background_review.enabled`: review memory and skills after turns.
     background_review: Arc<AtomicBool>,
     /// When a turn last started or ended: the curator waits for the app to be idle.
@@ -459,8 +463,16 @@ pub struct Runtime {
     disabled_tools: Mutex<std::collections::HashSet<String>>,
     /// The knobs now (the config's `budget`): each turn and each new session takes them as it
     /// starts.
-    budget: Mutex<budget::BudgetKnobs>,
+    budget: Arc<Mutex<budget::BudgetKnobs>>,
     curator_running: AtomicBool,
+}
+
+impl Drop for Runtime {
+    /// Review timers and scheduled reviews stop with the runtime (an app exit). Nothing is lost:
+    /// signals are on disk, and an interrupted review marked nothing reviewed, so it runs again.
+    fn drop(&mut self) {
+        self.scheduler.shutdown();
+    }
 }
 
 impl Runtime {
@@ -499,9 +511,25 @@ impl Runtime {
         ));
         let ledger = ledger::Ledger::open(config.data_dir.join("requests.json"));
         let signals = signals::SignalStore::open(config.data_dir.join("signals"));
-        let initial_budget = config.budget;
+        let budget = Arc::new(Mutex::new(config.budget));
+        let store = Arc::new(store);
+        let sessions: Arc<Mutex<HashMap<String, Arc<OpenSession>>>> = Arc::default();
+        let background_review = Arc::new(AtomicBool::new(true));
+        let scheduler = review_schedule::Scheduler::new(review_schedule::Env {
+            store: store.clone(),
+            memory: memory.clone(),
+            skills: skills.clone(),
+            index: index.clone(),
+            ledger: ledger.clone(),
+            signals: signals.clone(),
+            data_dir: config.data_dir.clone(),
+            bridge: bridge.clone(),
+            budget: budget.clone(),
+            enabled: background_review.clone(),
+            open: sessions.clone(),
+        });
         Ok(Self {
-            store: Arc::new(store),
+            store,
             memory,
             skills,
             index,
@@ -516,12 +544,13 @@ impl Runtime {
             signals,
             config,
             bridge,
-            sessions: Mutex::new(HashMap::new()),
-            background_review: Arc::new(AtomicBool::new(true)),
+            sessions,
+            scheduler,
+            background_review,
             last_activity: Arc::new(Mutex::new(std::time::Instant::now())),
             subagents: Arc::default(),
             disabled_tools: Mutex::new(Default::default()),
-            budget: Mutex::new(initial_budget),
+            budget,
             curator_running: AtomicBool::new(false),
         })
     }
@@ -946,6 +975,8 @@ impl Runtime {
                 },
             );
         }
+        // Activity: the idle clock starts again (a rewind may be what made the review due).
+        self.scheduler.idle_from_now(session_id);
         Ok(conversation.messages().clone())
     }
 
@@ -1082,6 +1113,8 @@ impl Runtime {
         images: Vec<Vec<u8>>,
         prelude: Option<rmcp::model::CallToolRequestParams>,
     ) -> Result<Turn> {
+        // The session's review route, should its review run once it goes quiet.
+        let review_route = options.clone();
         let TurnOptions {
             context_length,
             effort,
@@ -1108,6 +1141,9 @@ impl Runtime {
             let lock = turnlock::TurnLock::acquire(&self.config.data_dir, session_id)?;
             *running = Some(session::RunGuard::new(cancel.clone(), Some(lock)));
         }
+        // Activity: no review timer while the turn runs (its end arms one again).
+        self.scheduler
+            .turn_started(session_id, provider, &review_route);
         // Another process may have added to the conversation since it was loaded.
         self.reload_if_stale(&open, session_id);
         let model = open.record.lock().model.clone();
@@ -1197,7 +1233,10 @@ impl Runtime {
             ledger: self.ledger.clone(),
             provider_id: review_provider_id,
             budget,
+            scheduler: self.scheduler.clone(),
+            signals: self.signals.clone(),
         };
+        let scheduler = self.scheduler.clone();
         // The local index may attach relevant skills and memory to the message (Phase 5). Its
         // query blocks (SQLite), so a message that gets one is added in the turn's task, like
         // the ones with `@url:` references or images below. Not for a scripted first step (the
@@ -1384,6 +1423,7 @@ impl Runtime {
                             Ok(_) => TurnStatus::Cancelled,
                         };
                         let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
+                        scheduler.idle_from_now(&session_id);
                         return;
                     }
                 }
@@ -1508,7 +1548,14 @@ impl Runtime {
             };
             signal_store.record(&session_id, signals::analyze(&signal_base, &outcome));
             let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
-            review_setup.after_turn(&runtime.session, turn_start, review_memory, finished);
+            if let Some(setup) =
+                review_setup.after_turn(&runtime.session, turn_start, review_memory, finished)
+            {
+                // `nudges`: no counter is due, but the learning signals may be.
+                setup.after_turn_signals(&runtime.session).await;
+            }
+            // `idle_once`: the session's review waits for it to go quiet from here.
+            scheduler.idle_from_now(&session_id);
         }));
         tokio::spawn(async move {
             if let Err(error) = turn.await
@@ -1580,7 +1627,15 @@ impl Runtime {
                 .as_ref()
                 .map_or_else(|| provider.id.clone(), |aux| aux.provider.id.clone()),
             budget,
+            scheduler: self.scheduler.clone(),
+            signals: self.signals.clone(),
         };
+        // One review per session at a time: the user's report would never come if it were
+        // skipped silently.
+        anyhow::ensure!(
+            !self.scheduler.is_busy(session_id),
+            "This session is being reviewed in the background; refine it when that ends."
+        );
         let skills = SessionTools::tool_names().contains(&"skill_manage");
         setup.start(&open, true, skills, focus, true);
         Ok(())
@@ -2284,8 +2339,15 @@ impl Runtime {
         Ok(())
     }
 
-    /// Stops the session's shell and background processes and forgets its in-memory state.
+    /// Stops the session's shell and background processes and forgets its in-memory state. A
+    /// closed session is one the user left: under `idle_once` its review runs shortly after
+    /// (`review_schedule::LEFT_DELAY`), if its signals call for one.
     pub async fn close(&self, session_id: &str) {
+        self.close_quietly(session_id).await;
+        self.scheduler.left(session_id);
+    }
+
+    async fn close_quietly(&self, session_id: &str) {
         let open = self.sessions.lock().remove(session_id);
         if let Some(open) = open {
             if let Some(cancel) = open.running.lock().as_ref() {
@@ -2296,7 +2358,9 @@ impl Runtime {
     }
 
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
-        self.close(session_id).await;
+        // No review for a deleted session: its timer and a review in flight stop.
+        self.scheduler.forget(session_id);
+        self.close_quietly(session_id).await;
         self.store.delete_session(session_id)?;
         let _ = std::fs::remove_dir_all(self.scratch_dir(session_id));
         let data_dir = self.config.data_dir.clone();
@@ -2304,7 +2368,38 @@ impl Runtime {
         let _ =
             tokio::task::spawn_blocking(move || hermes_tools::taint::forget(&data_dir, &id)).await;
         self.signals.forget(session_id);
+        // A cancelled turn's end may have armed a timer meanwhile.
+        self.scheduler.forget(session_id);
         Ok(())
+    }
+
+    /// The page opened (resumed) the session: activity, so under `idle_once` its review waits
+    /// for the idle time from now. This is also how a session left with signals at the threshold
+    /// by an earlier run of the app gets its review: when it is next opened and goes quiet.
+    pub fn note_session_viewed(&self, session_id: &str) {
+        self.scheduler.idle_from_now(session_id);
+    }
+
+    /// The user switched away from the session (the page opened another): under `idle_once` its
+    /// review runs shortly after (`review_schedule::LEFT_DELAY`) unless they come back first.
+    pub fn note_session_left(&self, session_id: &str) {
+        if !self.is_running(session_id) {
+            self.scheduler.left(session_id);
+        }
+    }
+
+    /// How a session's scheduled review stands (timer, running, attempts, back-off, last outcome).
+    pub fn review_schedule_status(
+        &self,
+        session_id: &str,
+    ) -> review_schedule::ReviewScheduleStatus {
+        self.scheduler.status(session_id)
+    }
+
+    /// The provider and options a scheduled review uses for a session (the gateway's, as a turn
+    /// would get them now). Without one, the session's last turn in this process decides.
+    pub fn set_review_route(&self, route: Option<review_schedule::RouteFn>) {
+        self.scheduler.set_route(route);
     }
 
     /// The session's learning signals (`signals.rs`), after every change made before this
@@ -2324,7 +2419,9 @@ impl Runtime {
     /// the reply's operations applied (or staged, when the session is tainted or
     /// `settings.require_approval` is on). On the auxiliary review model when one is set, counted
     /// as `review`, held back by the quota governor. The signals are marked reviewed only when a
-    /// reply was read. CP7.3 calls this from the scheduler; it reports nothing to the app itself.
+    /// reply was read. The scheduler (`review_schedule.rs`) runs the same review when a session
+    /// goes quiet; this runs it now (it reports nothing to the app), unless a review of the
+    /// session is already running (then `Skipped`, nothing sent).
     pub async fn review_once(
         &self,
         session_id: &str,
@@ -2332,100 +2429,18 @@ impl Runtime {
         options: &TurnOptions,
         settings: review_once::ReviewOnceSettings,
     ) -> Result<review_once::ReviewOutcome> {
-        let open = self.open(session_id)?;
-        let evidence: Vec<signals::Signal> = self
-            .signals(session_id)
+        // The session is opened (as before CP7.3: a caller may review a session not open yet).
+        self.open(session_id)?;
+        // One review per session at a time (also against a scheduled one or an agentic one).
+        let Some(_claim) = self.scheduler.claim(session_id) else {
+            return Ok(review_once::ReviewOutcome::skipped(
+                "a review of this session is running",
+            ));
+        };
+        self.scheduler
+            .env()
+            .review_once(session_id, provider, options, settings)
             .await
-            .evidence()
-            .into_iter()
-            .cloned()
-            .collect();
-        if evidence.is_empty() {
-            return Ok(review_once::ReviewOutcome::nothing());
-        }
-        let budget = self.budget();
-        let (llm, model, base_url, context_length, effort_params, provider_id) =
-            match &options.aux.review {
-                Some(aux) => (
-                    aux.provider.one_shot_provider(budget.http_retries)?,
-                    aux.model.clone(),
-                    aux.provider.base_url.clone(),
-                    aux.context_length,
-                    aux_effort_params(aux),
-                    aux.provider.id.clone(),
-                ),
-                None => (
-                    provider.one_shot_provider(budget.http_retries)?,
-                    open.record.lock().model.clone(),
-                    provider.base_url.clone(),
-                    options.context_length,
-                    options
-                        .effort
-                        .as_deref()
-                        .map(|effort| effort_request_params(&provider.base_url, effort)),
-                    provider.id.clone(),
-                ),
-            };
-        if let governor::Verdict::Deny(why) = self.governor().check(&provider_id, Purpose::Review) {
-            tracing::info!("review skipped: {why}");
-            return Ok(review_once::ReviewOutcome::skipped(why));
-        }
-        let messages = open.conversation.lock().messages().clone();
-        let query = hermes_tools::index::IndexQuery {
-            message: review_once::topic(&messages, &evidence),
-            last_assistant: None,
-            project: hermes_tools::index::project_name(&open.tools.cwd()),
-        };
-        let (memory, skills, index) = (self.memory.clone(), self.skills.clone(), self.index());
-        let input = tokio::task::spawn_blocking(move || {
-            review_once::gather(&messages, &memory, &skills, index.as_deref(), query)
-        })
-        .await?;
-        // A session that read something the user didn't write may carry an injection into the
-        // evidence: everything it would write waits for the user (Phase 6).
-        let taint = open.tools.taint();
-        let hold = if taint.is_tainted() {
-            Some(review_once::Hold {
-                reason: taint
-                    .reason()
-                    .unwrap_or_else(|| "this session read untrusted content".into()),
-                sources: taint.sources.clone(),
-            })
-        } else if settings.require_approval {
-            Some(review_once::Hold {
-                reason: "review.require_approval is on".into(),
-                sources: Vec::new(),
-            })
-        } else {
-            None
-        };
-        let job = review_once::OnceJob {
-            model: review_once::ReviewModel {
-                llm,
-                model,
-                base_url,
-                context_length,
-                effort_params,
-            },
-            settings,
-            input,
-            apply: review_once::ApplyContext {
-                memory: self.memory.clone(),
-                skills: self.skills.clone(),
-                staging: self.staging(),
-                session_id: session_id.to_string(),
-                hold,
-                shown: Default::default(),
-            },
-            store: self.store.clone(),
-        };
-        let context = self.ledger.context(Purpose::Review, Some(session_id));
-        let outcome =
-            hermes_llm::observer::scope(context, review_once::run_review_once(job, evidence)).await;
-        if let Some(seq) = outcome.reviewed_seq {
-            self.mark_signals_reviewed(session_id, seq);
-        }
-        Ok(outcome)
     }
 }
 
@@ -2645,20 +2660,28 @@ struct ReviewSetup {
     ledger: ledger::Ledger,
     /// The provider the review model is on.
     provider_id: String,
-    /// The turn's budget knobs (the review loop's limits).
+    /// The turn's budget knobs (the review loop's limits, and `review_mode`).
     budget: budget::BudgetKnobs,
+    /// The evidence review's slot: an agentic review never runs beside it.
+    scheduler: review_schedule::Scheduler,
+    /// The learning signals: the `nudges` score trigger, and what a finished review covered.
+    signals: signals::SignalStore,
 }
 
 impl ReviewSetup {
     /// Hermes's turn finalizer: counts the turn toward the skill nudge, then reviews memory
     /// and/or skills when one is due, the turn ended with an answer, and reviews are on.
+    ///
+    /// By `review_mode` (Phase 7): `agentic` is exactly that; `nudges` also hands the setup back
+    /// when the turn could be reviewed but no counter was due, for [`Self::after_turn_signals`];
+    /// `idle_once` starts nothing here (the scheduler reviews the session when it goes quiet).
     fn after_turn(
         self,
         session: &Arc<OpenSession>,
         turn_start: usize,
         review_memory: bool,
         finished: bool,
-    ) {
+    ) -> Option<Self> {
         let (review_skills, answered) = {
             let conversation = session.conversation.lock();
             let messages = conversation.messages();
@@ -2673,13 +2696,43 @@ impl ReviewSetup {
             });
             (review_skills, answered)
         };
-        if !finished || !answered || !(review_memory || review_skills) {
-            return;
+        let mode = self.budget.review_mode;
+        if mode == budget::ReviewMode::IdleOnce {
+            return None;
+        }
+        if !finished || !answered {
+            return None;
+        }
+        if !(review_memory || review_skills) {
+            return (mode == budget::ReviewMode::Nudges && self.enabled.load(Ordering::Relaxed))
+                .then_some(self);
         }
         if !self.enabled.load(Ordering::Relaxed) {
-            return;
+            return None;
         }
         self.start(session, review_memory, review_skills, None, false);
+        None
+    }
+
+    /// `nudges`: the session's learning signals reached the threshold (two corrections, an undone
+    /// turn, "remember this"...): the same review a due counter starts, of memory and skills.
+    async fn after_turn_signals(self, session: &Arc<OpenSession>) {
+        let id = session.record.lock().id.clone();
+        let signals = self.signals.snapshot(&id).await;
+        if !signals.triggered_at(self.budget.review_threshold) {
+            return;
+        }
+        // One the score started that hasn't covered them yet (running, or failed) holds it back:
+        // a failing review must not be restarted after every turn.
+        if !self.scheduler.nudge_due(&id, signals.reviewed_seq) {
+            return;
+        }
+        tracing::info!(
+            "session {id}: learning signals at {:.2} reached the threshold; reviewing",
+            signals.score()
+        );
+        let skills = SessionTools::tool_names().contains(&"skill_manage");
+        self.start(session, true, skills, None, false);
     }
 
     fn start(
@@ -2700,12 +2753,20 @@ impl ReviewSetup {
             return;
         }
         let (mut memory, mut skills) = (memory, skills);
+        let session_id = session.record.lock().id.clone();
         let handle = {
             // Under `running` (lock order: running, then review): a paused review takes its
             // snapshot and sets `started` under this lock, so it can't start between the check
             // below and its cancellation.
             let _running = session.running.lock();
             let mut slot = session.review.lock();
+            // One review per session at a time (Phase 7): an evidence review holds it. Checked
+            // under the slot's lock, which the evidence review's claim checks after taking its
+            // own, so one of the two always sees the other.
+            if self.scheduler.is_busy(&session_id) {
+                tracing::info!("review skipped: an evidence review of the session is running");
+                return;
+            }
             if let Some(previous) = slot.as_ref() {
                 // One already past its first request finishes (cancelling it would waste what it
                 // spent); a newly due review is skipped, except one the user asked for with
@@ -2732,8 +2793,8 @@ impl ReviewSetup {
             *slot = Some(handle.clone());
             handle
         };
-        let session_id = session.record.lock().id.clone();
         let context = self.ledger.context(Purpose::Review, Some(&session_id));
+        let signals = (self.budget.review_mode != budget::ReviewMode::Agentic).then_some(self.signals);
         tokio::spawn(hermes_llm::observer::scope(context, review::run(review::ReviewJob {
             session: session.clone(),
             store: self.store,
@@ -2748,6 +2809,7 @@ impl ReviewSetup {
             requested,
             budget: self.budget,
             handle,
+            signals,
         })));
     }
 }

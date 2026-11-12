@@ -88,7 +88,9 @@ fn config_defaults() -> Value {
         // How the agent spends model requests and tokens (`hermes_runtime::budget`): `requests`
         // (the default, also for a config without the key), `balanced` (how it worked before
         // profiles) or `tokens`. Per-knob overrides sit beside it (`budget.max_iterations`...).
-        "budget": {"profile": "requests"},
+        // `review_mode` "" is the profile's own background review (Phase 7: `idle_once` under
+        // `requests`, `nudges` otherwise); a Settings select can pick another.
+        "budget": {"profile": "requests", "review_mode": ""},
         // On by default (Hermes's is opt-in): a coding harness keeps a way back from the agent's
         // edits, as Claude Code does. Settings ▸ Safety ▸ Checkpoints switches it.
         "checkpoints": {"enabled": true},
@@ -295,6 +297,10 @@ fn config_schema() -> serde_json::Map<String, Value> {
             "budget.profile" => Some(select(
                 "How the agent spends model requests and tokens. Requests: the fewest requests per task (whole files per read, bigger tool results, tighter retry caps, fewer subagents, late compression). Balanced: how it worked before profiles. Tokens: the smallest context (smaller tool results, early compression, skill names only). Takes effect on the next message; wording in the agent's instructions, and the skill list, change for new chats.",
                 &["requests", "balanced", "tokens"],
+            )),
+            "budget.review_mode" => Some(select(
+                "When the agent reviews a session to learn from it (memory, skills). Empty: the profile's choice. idle_once: one request when the chat has been idle 10 minutes or you switch away, only after corrections or other signals (the Requests profile's). nudges: the tool-using review every 10 turns, and after corrections (Balanced and Tokens). agentic: the tool-using review every 10 turns only, as before (kept for comparison).",
+                &["", "idle_once", "nudges", "agentic"],
             )),
             "approvals.mode" => Some(select(
                 "Dangerous command approval mode",
@@ -682,6 +688,17 @@ mod tests {
         // Not an object: it would replace the stored one whole, so it is dropped.
         assert_eq!(put(r#"{"config":{"budget":"balanced"}}"#), 200);
         assert_eq!(rest.config_value("budget.profile"), "tokens");
+        // The background review (Phase 7): the profile's own by default, a select, validated.
+        assert_eq!(rest.config_value("budget.review_mode"), "");
+        assert_eq!(schema["budget.review_mode"]["type"], "select");
+        assert_eq!(
+            schema["budget.review_mode"]["options"],
+            json!(["", "idle_once", "nudges", "agentic"])
+        );
+        assert_eq!(put(r#"{"config":{"budget":{"review_mode":"agentic"}}}"#), 200);
+        assert_eq!(rest.config_value("budget.review_mode"), "agentic");
+        assert_eq!(put(r#"{"config":{"budget":{"review_mode":"never"}}}"#), 200);
+        assert_eq!(rest.config_value("budget.review_mode"), "agentic");
     }
 
     #[test]

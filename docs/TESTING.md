@@ -65,6 +65,17 @@ Read the existing tests near the area you change before writing a new one; the h
   `arxiv` skill (`ARXIV_ASK`) under `harness_profile(.., Requests)`; helpers `user_contents(request)` (the user
   messages of a request as text) and `system_of(request)`. The whole suite also passes under
   `HERMES_TEST_PROFILE=requests`, where messages the index matches get a `<context>` block.
+- Review scheduling tests (Phase 7 CP7.3, after the `// Phase 7 CP7.3` banner): `review_budget(profile,
+  mode, idle)` / `idle_once(idle)` set a sub-second idle time on the knob directly (the config refuses
+  under 3 s), `scheduled_harness` holds the `review` replies back with a delay, `wait_for` polls
+  `request_count` or `h.runtime.review_schedule_status(id)`. Tests that run the evidence review by hand
+  or count requests around corrections use `quiet_budget()` (`agentic`): under `balanced` two
+  corrections now start an agentic review on their own. The scheduled tests wait up to 60 s: with the
+  whole suite running, the first index refresh and skill git commits of a fresh data folder are slow.
+  To make an agentic review fail at once, script a broken stream (`"data: {not json\n\ndata: [DONE]\n\n"`):
+  a `REFUSE_400` makes it keep retrying across the following turns. An app restart is a second
+  `runtime_with_budget(h.data.path(), ..)` dropped mid-review (`an_exit_mid_review_...`,
+  `reviews_cut_off_twice_...`).
 - Known flaky under heavy load: `an_exhausted_budget_ends_with_a_toolless_summary` (timing).
   Re-run it alone before suspecting your change.
 

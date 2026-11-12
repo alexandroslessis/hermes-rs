@@ -30,8 +30,9 @@
 //! the contract allows, and every one of them meets the same limits and threat scans as a direct
 //! write. The caller marks the signals reviewed only when a reply was read (no ops included).
 //!
-//! Scheduling (when this runs) is CP7.3; until then the nudge-driven agentic review in
-//! `review.rs` stays the active one and nothing calls this but tests (and `Runtime::review_once`).
+//! When it runs is `review_schedule.rs` (CP7.3): under `review_mode = idle_once` (the `requests`
+//! profile), once a session has gone quiet with signals at the threshold; `Runtime::review_once`
+//! runs it on demand. `nudges` and `agentic` keep the agentic review of `review.rs`.
 //!
 //! Not from Hermes; `PORTING.md` marks the review `diverged`.
 
@@ -75,7 +76,8 @@ pub enum ReplyFormat {
     Text,
 }
 
-/// The review's settings (knobs; CP7.3 reads them from the config).
+/// The review's settings. The scheduler uses the defaults: `memory.write_approval` (Settings ▸
+/// Memory) already stages every review write, so `require_approval` stays a runtime-only switch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewOnceSettings {
     /// The packet's token budget ([`PACKET_MAX_TOKENS`]).
@@ -146,6 +148,11 @@ impl ReviewOutcome {
     /// Not run, and why.
     pub fn skipped(why: impl Into<String>) -> Self {
         Self::ended(ReviewStatus::Skipped(why.into()))
+    }
+
+    /// Failed before sending anything, and why.
+    pub fn failed(why: impl Into<String>) -> Self {
+        Self::ended(ReviewStatus::Failed(why.into()))
     }
 
     /// One line per change for the app (Hermes's review summary wording), without repeats.

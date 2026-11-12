@@ -530,9 +530,9 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 
 ## The evidence review (Phase 7 CP7.2)
 
-- `Runtime::review_once` is not called by the app yet: the nudge-driven agentic review
-  (`review.rs`) is still the one that runs after turns. CP7.3 schedules the new one. Calling both
-  on the same session today could write the same lesson twice.
+- Under `requests` (`review_mode = idle_once`) the scheduler (`review_schedule.rs`, CP7.3) runs
+  it; `Runtime::review_once` runs it on demand and answers `Skipped("a review of this session is
+  running")` while any review of the session (scheduled, agentic, `/refine`) holds it.
 - Its provider never retries a 4xx (`with_transient_only`): a 400 to `response_format` is answered
   by the review itself (one text request), and a plain retry would spend the same refused
   request again. The "refused json_schema" memory is per process and keyed by base URL + model,
@@ -565,3 +565,47 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   mitigation, not the defence. The defence is that the reply can only name the contract's
   operations, every write meets the stores' threat scans and limits, and a tainted session's
   writes all go to `staging/`.
+
+## When the review runs (Phase 7 CP7.3, `review_schedule.rs`)
+
+- `budget.review_mode` decides: `idle_once` (the `requests` profile) = the evidence review once a
+  session has been quiet `review_idle_minutes` (10) or was switched away from / closed, only if its
+  signals reached `review_threshold` (3.0); `nudges` (`balanced`, `tokens`) = Hermes's counters
+  **plus** the score, both starting the agentic review; `agentic` = Hermes's counters only, exactly
+  as before Phase 7 (for comparison; delete it a few weeks after Phase 7). Settings ▸ Model ▸ Main
+  shows it as a select only with patch 0027 in the webapp build (the backend schema alone isn't
+  enough: Hermes's Settings lists only the keys its `SECTIONS` names); "" = the profile's.
+- A test that counts requests around corrections must pick its mode: under `balanced` (the suite's
+  default) two corrections now start an agentic review at the turn's end. `quiet_budget()` in
+  `turns.rs` (`agentic`) is the "nothing on its own" budget the CP7.1/7.2 tests use.
+- Under `idle_once` a quiet session's timer fires once; nothing re-fires until there is activity
+  again (a turn, a rewind, the page resuming it). A smooth session costs a snapshot read, never a
+  request. "Switched away" is the gateway seeing a `session.resume` (not `session.history`) or
+  `session.create` of another id **on the same socket**; the left session's review waits
+  `LEFT_DELAY` (3 s) so flicking back and forth starts nothing. The page's `session.close` RPC is
+  only sent on delete or a drift abort and is not hooked; ACP `session/close` (`Runtime::close`) is.
+- One review per session at a time, of any kind: a trigger during one is dropped (not queued); the
+  signals stay unreviewed for the next idle. `/refine` is refused (an error to the user) while an
+  evidence review runs, rather than silently skipped.
+- The per-process back-off and the hourly cap live in memory. What survives a restart is
+  `review_tries` / `review_started_ms` in `signals/<id>.json`: written just before the review's
+  request, cleared when a reply is read. The first cut-off review (the app closed mid-review) is
+  redone at the next idle; from the second unfinished one on the session waits 1 h, doubling to
+  24 h, so a crash loop can't send a review per start. A review the governor held back (quota under
+  20%) is not a failure and is tried at the next idle. The hourly cap counts starts per process: a
+  restart opens a new window, but only sessions the page opens again are armed after one.
+- Timers use tokio's monotonic clock: after a sleep/resume, timers that came due fire together;
+  the hourly cap (6) bounds how many reviews that starts. Two windows on one session: switching
+  one of them away doesn't count as leaving while the other still shows it.
+- After a restart nothing sweeps old sessions: a session with unreviewed signals is reviewed only
+  when it next goes idle in this process (the page opening it counts). Deliberate: no startup burst.
+- `nudges`: a finished agentic review of memory **and** skills marks the signals it saw (read
+  before its conversation snapshot) reviewed, so the score doesn't restart it after every turn; a
+  memory-only counter review marks nothing. The agent loop's `ExitOnError` ends a failed review
+  *normally* (the error is the last message), so `review.rs` checks that message: a review that
+  ended on an error covers nothing. A score-started review that didn't cover the signals holds the
+  score trigger back for an hour (`Scheduler::nudge_due`), else a failing review would be started
+  again after every turn.
+- A "remember this" the agent already saved with its `memory` tool (add/patch, not refused) in the
+  same turn is recorded as a weak signal (1.0), not an explicit one, so it doesn't force a review
+  that would only find the entry there.

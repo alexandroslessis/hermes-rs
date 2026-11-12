@@ -46,7 +46,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 4 | Side jobs off the main quota — ✅ 2026-11-12 | S–M | 3 | Sonnet | A |
 | 5 | Local index (FTS5) and per-turn pre-injection — ✅ 2026-11-12 | M | 3 | Sonnet | A |
 | 6 | Taint tracking and the staging area — ✅ 2026-11-12 | M | 1 | Sonnet | B |
-| 7 | Review rewrite: signals, evidence packet, one shot | M–L | 5, 6 | **Opus** | C |
+| 7 | Review rewrite: signals, evidence packet, one shot — ✅ 2026-11-13 | M–L | 5, 6 | **Opus** | C |
 | 8 | Skills v2: outcomes, provenance, project skills, curator v2 | M–L | 7 | Sonnet | B |
 | 9 | Memory v2: tiers, structured entries, links | L | 5, 7 | Sonnet (CP9.1 **Opus**) | B |
 | 10 | Fewer round trips: script tool, first-turn context, batching | M | 3 | Sonnet | A |
@@ -984,13 +984,13 @@ phase under `requests`.
 
 | Scenario | Baseline | After 3 | After 5 | After 7 | After 10 |
 |---|---|---|---|---|---|
-| S1 read 3, edit 1 | 5 | 5 | 5 | | |
-| S2 empty reply after tools | 3 | 3 | 3 | | |
-| S2b empty first reply | 2 | 2 | 2 | | |
-| S3 truncated call | 3 | 3 | 3 | | |
-| S4 ten turns (incl. review) | 11 | 11 | 11 | | |
-| S5 delegate two | 4 | 4 | 4 | | |
-| S6 task a skill covers (CP5.2) | 2 (`skill_view`) | 2 | 1 | | |
+| S1 read 3, edit 1 | 5 | 5 | 5 | 5 | |
+| S2 empty reply after tools | 3 | 3 | 3 | 3 | |
+| S2b empty first reply | 2 | 2 | 2 | 2 | |
+| S3 truncated call | 3 | 3 | 3 | 3 | |
+| S4 ten turns (incl. review) | 11 | 11 | 11 | 10 (0 review) | |
+| S5 delegate two | 4 | 4 | 4 | 4 | |
+| S6 task a skill covers (CP5.2) | 2 (`skill_view`) | 2 | 1 | 1 | |
 
 Phase 0 baselines (2026-11-11, `balanced` = today's behaviour; all counted as `main` until Phase 2
 labels requests). After 3 (`requests`, 2026-11-12): unchanged. Phase 3 only moves caps the
@@ -1016,6 +1016,16 @@ After 5 (`requests`, 2026-11-12): S1-S5 unchanged (`baseline_s*` run under every
 messages match no skill well enough to be attached). New scenario S6, a task a bundled skill
 covers (`s6_*` in `turns.rs`, the `arxiv` skill): `balanced` 2 main requests (`skill_view`, then
 the answer), `requests` 1 (the skill's body rides on the user message in a `<context>` block).
+
+After 7 (`requests`, 2026-11-13): S4 (ten smooth turns) 11 -> 10: `idle_once` has no counters and a
+smooth session leaves no learning signal, so no review, not at the tenth turn and not at idle
+(`s4_ten_turn_session_with_review`). The same ten turns with two corrections: exactly 1 review
+request (the evidence review: one request, no tools), made once the session goes quiet, none while
+the turns run (`s4_requests_two_corrections_make_exactly_one_review_at_idle`); a session with no
+signals: 0, idle or switched away from. An evidence review is 1 request (2 with its one repair, at
+most 3); at most `review_per_hour` (6) start per hour. S1-S3, S5, S6 unchanged. `balanced` /
+`tokens` (`nudges`): S1-S6 unchanged (S4 still 11, the counter review); a session whose signals
+reach the threshold gets the agentic review at that turn's end instead of waiting for the counters.
 
 Since Phase 2 the mock also splits them by purpose (the `x-hermes-rs-purpose` header): S1-S3 are
 all `main`; S4 is 10 `main` + 1 `review`; S5 is 2 `main` + 2 `delegate`. The totals above are

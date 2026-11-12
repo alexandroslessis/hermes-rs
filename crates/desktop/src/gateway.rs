@@ -99,6 +99,9 @@ pub struct Gateway {
     branch_keys: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// Archived sessions and the auto-archive sweep (`archive.rs`).
     archive: crate::archive::Archive,
+    /// Each page socket and the session it shows now (its last `session.resume` or
+    /// `session.create`): opening another one is "switched away from" the first (Phase 7).
+    viewing: std::sync::Mutex<Vec<(Outbox, String)>>,
 }
 
 impl Gateway {
@@ -137,6 +140,7 @@ impl Gateway {
             )),
             archive: crate::archive::Archive::load(&data_dir_for_stats),
             branch_keys: Default::default(),
+            viewing: Default::default(),
             generation: std::sync::Mutex::new(
                 std::fs::read(data_dir_for_stats.join(GENERATION_FILE))
                     .ok()
@@ -157,6 +161,7 @@ impl Gateway {
     /// Background work that needs the shared gateway: the hourly auto-archive check (it sweeps at
     /// most once a day, and only when Settings ▸ Sessions turned it on).
     pub fn schedule(this: &Arc<Self>) {
+        Self::install_review_route(this);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -169,6 +174,46 @@ impl Gateway {
                 let _ = tokio::task::spawn_blocking(move || this.auto_archive()).await;
             }
         });
+    }
+
+    /// How a session's background review reaches its model (Phase 7, `review_schedule.rs`): the
+    /// session's provider and the options a turn of it would get now (its window, effort, the
+    /// auxiliary review model). Holds the gateway weakly: the runtime it is installed in is the
+    /// gateway's own.
+    pub fn install_review_route(this: &Arc<Self>) {
+        let weak = Arc::downgrade(this);
+        this.runtime.set_review_route(Some(Arc::new(move |id: &str| {
+            let gateway = weak.upgrade()?;
+            let settings = Settings::load(&gateway.data_dir);
+            let provider = gateway.provider_for(id, &settings).ok()?;
+            Some((provider, gateway.turn_options(id)))
+        })));
+    }
+
+    /// The page on `outbox` now shows session `id`: the one it showed before was switched away
+    /// from (under `idle_once` its review may run now), and `id` is active again (its review
+    /// waits for the idle time). A page that only reconnects shows the same id: nothing is left.
+    fn viewing(&self, id: &str, outbox: &Outbox) {
+        let left = {
+            let Ok(mut viewing) = self.viewing.lock() else {
+                return;
+            };
+            viewing.retain(|(page, _)| !page.is_closed());
+            let left = match viewing.iter_mut().find(|(page, _)| page.same_channel(outbox)) {
+                Some((_, shown)) if shown != id => Some(std::mem::replace(shown, id.to_string())),
+                Some(_) => None,
+                None => {
+                    viewing.push((outbox.clone(), id.to_string()));
+                    None
+                }
+            };
+            // Another window that still shows it hasn't left it.
+            left.filter(|left| !viewing.iter().any(|(_, shown)| shown == left))
+        };
+        if let Some(left) = left {
+            self.runtime.note_session_left(&left);
+        }
+        self.runtime.note_session_viewed(id);
     }
 
     /// Settings ▸ Sessions' auto-archive (`archive.rs`): when it's on, sessions idle for
@@ -925,7 +970,17 @@ impl Gateway {
             // Nothing to release: a session lives in the store, not in a worker.
             "session.close" => Ok(json!({"closed": true})),
             "session.create" => self.create_session(params, &settings, outbox),
-            "session.resume" | "session.history" => self.resume_session(params, outbox),
+            "session.resume" | "session.history" => {
+                let resumed = self.resume_session(params, outbox);
+                // Only a resume is the page showing the session (`session.history` reads it).
+                if method == "session.resume"
+                    && resumed.is_ok()
+                    && let Ok(id) = session_id(params)
+                {
+                    self.viewing(&id, outbox);
+                }
+                resumed
+            }
             "prompt.submit" => {
                 // What the model takes (images, its window) is asked of the provider once, before
                 // the turn starts.
@@ -2687,6 +2742,7 @@ impl Gateway {
                 self.runtime.copy_taint(parent, &record.id);
             }
         }
+        self.viewing(&record.id, outbox);
         self.subscribe(&record.id, outbox);
         Ok(json!({
             "session_id": record.id,

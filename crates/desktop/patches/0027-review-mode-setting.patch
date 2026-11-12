@@ -1,0 +1,23 @@
+diff --git a/apps/desktop/src/app/settings/constants.ts b/apps/desktop/src/app/settings/constants.ts
+index 9d3ac6a..9231212 100644
+--- a/apps/desktop/src/app/settings/constants.ts
++++ b/apps/desktop/src/app/settings/constants.ts
+@@ -570,7 +570,8 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
+     }
+   },
+   budget: {
+-    profile: 'Budget profile'
++    profile: 'Budget profile',
++    reviewMode: 'Review mode'
+   },
+   memory: {
+     memoryEnabled: 'Persistent Memory',
+@@ -719,6 +720,8 @@ export const SECTIONS: DesktopConfigSection[] = [
+       'model_context_length',
+       // hermes-rs: how the agent spends model requests and tokens (budget.profile)
+       'budget.profile',
++      // hermes-rs: when the background review runs (budget.review_mode, Phase 7)
++      'budget.review_mode',
+       'fallback_providers',
+       'delegation.model',
+       'delegation.provider',

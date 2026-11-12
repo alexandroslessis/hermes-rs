@@ -13,8 +13,8 @@
 //! from the next *session* (prompt caching, ground rule 8); a compaction or a model switch, which
 //! rebuild the prompt anyway, take the profile the session runs under then.
 //!
-//! A knob whose `requests` or `tokens` value needs a later phase (review `idle_once`,
-//! per-cluster curator, deferred tool schemas) holds its `balanced`
+//! A knob whose `requests` or `tokens` value needs a later phase (per-cluster curator, deferred
+//! tool schemas) holds its `balanced`
 //! value until that phase lands: the enum has the variant, [`for_profile`] says which phase flips
 //! it in a comment, and nothing consumes the later variant yet.
 
@@ -57,13 +57,41 @@ impl BudgetProfile {
     }
 }
 
-/// When the background review runs. Phase 7 adds `idle_once` as the `requests` value.
+/// When the background review runs, and which one (Phase 7, `review_schedule.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewMode {
-    /// Counter-based nudges (today).
+    /// Hermes's counters (every 10 user turns for memory, every 10 model calls without a
+    /// `skill_manage` for skills) start the agentic review (`review.rs`: the conversation replayed
+    /// to a forked agent with tools), and so does a learning-signal score at the threshold. The
+    /// `balanced` and `tokens` value.
     Nudges,
-    /// One review when the session goes idle (Phase 7).
+    /// The evidence review (`review_once.rs`: one request, no tools), once, when the session has
+    /// been idle for `review_idle_minutes` or was closed or switched away from, if its signals
+    /// reached the threshold. The `requests` value.
     IdleOnce,
+    /// The review exactly as before Phase 7: the counters and the agentic review, no signals. Kept
+    /// for comparison only (`budget.review_mode: agentic`); to be deleted a few weeks after Phase 7
+    /// lands.
+    Agentic,
+}
+
+impl ReviewMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Nudges => "nudges",
+            Self::IdleOnce => "idle_once",
+            Self::Agentic => "agentic",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "nudges" => Some(Self::Nudges),
+            "idle_once" => Some(Self::IdleOnce),
+            "agentic" => Some(Self::Agentic),
+            _ => None,
+        }
+    }
 }
 
 /// How the curator consolidates. Phase 8 adds one-shot-per-cluster as the `requests` value.
@@ -145,6 +173,14 @@ pub struct BudgetKnobs {
     /// `delegate_task`: each child's iteration budget.
     pub delegate_child_iterations: u32,
     pub review_mode: ReviewMode,
+    /// The learning-signal score at which a session is worth a review (`signals.rs`; an explicit
+    /// "remember this" or `/learn` always is).
+    pub review_threshold: f32,
+    /// `idle_once`: minutes without activity before the session's review runs.
+    pub review_idle_minutes: f64,
+    /// `idle_once`: evidence reviews the scheduler starts per hour, across all sessions (an app
+    /// start with many sessions waiting can't send a burst of requests).
+    pub review_per_hour: u32,
     /// Model calls one curator pass may make (when `curator_mode` is `Loop`).
     pub curator_max_iterations: u32,
     pub curator_mode: CuratorMode,
@@ -184,6 +220,9 @@ impl BudgetKnobs {
         delegate_max_children: 10,
         delegate_child_iterations: 250,
         review_mode: ReviewMode::Nudges,
+        review_threshold: crate::signals::REVIEW_THRESHOLD,
+        review_idle_minutes: 10.0,
+        review_per_hour: 6,
         curator_max_iterations: 200,
         curator_mode: CuratorMode::Loop,
         skills_index: SkillsIndex::Full,
@@ -230,8 +269,11 @@ pub fn for_profile(profile: BudgetProfile) -> BudgetKnobs {
             search_context_factor: 2,
             delegate_max_children: 3,
             delegate_child_iterations: 60,
-            // Phase 7: ReviewMode::IdleOnce.
-            review_mode: balanced.review_mode,
+            // Phase 7: one evidence review when the session goes idle.
+            review_mode: ReviewMode::IdleOnce,
+            review_threshold: balanced.review_threshold,
+            review_idle_minutes: balanced.review_idle_minutes,
+            review_per_hour: balanced.review_per_hour,
             // Phase 8: CuratorMode::PerCluster.
             curator_max_iterations: balanced.curator_max_iterations,
             curator_mode: balanced.curator_mode,
@@ -263,7 +305,7 @@ pub fn for_profile(profile: BudgetProfile) -> BudgetKnobs {
 
 /// What `budget.*` in the config can set: the profile, and each of these numbers on top of it
 /// (`budget.max_iterations: 100`). Names are the knob's field names.
-pub const OVERRIDE_KEYS: [&str; 16] = [
+pub const OVERRIDE_KEYS: [&str; 20] = [
     "skills_preload",
     "memory_preload",
     "max_iterations",
@@ -280,6 +322,10 @@ pub const OVERRIDE_KEYS: [&str; 16] = [
     "delegate_max_children",
     "delegate_child_iterations",
     "curator_max_iterations",
+    "review_mode",
+    "review_threshold",
+    "review_idle_minutes",
+    "review_per_hour",
 ];
 
 /// Checks one `budget.<key>` value and applies it to `knobs`. `null` clears an override (nothing
@@ -332,6 +378,32 @@ pub fn apply_override(
         "curator_max_iterations" => {
             knobs.curator_max_iterations = count(key, value, 1, 10_000)? as u32
         }
+        // "" is the Settings select's "the profile's own" (no override).
+        "review_mode" if value.as_str().is_some_and(|v| v.trim().is_empty()) => {}
+        "review_mode" => {
+            knobs.review_mode = value
+                .as_str()
+                .and_then(ReviewMode::parse)
+                .ok_or_else(|| "budget.review_mode must be idle_once, nudges or agentic".to_string())?
+        }
+        // Below 1 one correction would start a review; above 50 only an explicit request would.
+        "review_threshold" => {
+            knobs.review_threshold = value
+                .as_f64()
+                .filter(|f| (1.0..=50.0).contains(f))
+                .ok_or_else(|| "budget.review_threshold must be a number from 1 to 50".to_string())?
+                as f32
+        }
+        // Fractions are fine (0.05 = 3 seconds, for a live check); a day at most.
+        "review_idle_minutes" => {
+            knobs.review_idle_minutes = value
+                .as_f64()
+                .filter(|f| (0.05..=1440.0).contains(f))
+                .ok_or_else(|| {
+                    "budget.review_idle_minutes must be a number from 0.05 to 1440".to_string()
+                })?
+        }
+        "review_per_hour" => knobs.review_per_hour = count(key, value, 1, 60)? as u32,
         // 0 switches the injection off (balanced's value): a valid choice.
         "skills_preload" => knobs.skills_preload = count(key, value, 0, 10)? as u32,
         "memory_preload" => knobs.memory_preload = count(key, value, 0, 20)? as u32,
@@ -394,7 +466,11 @@ mod tests {
         assert_eq!(k.search_context_factor, 1); // search.rs: context as asked
         assert_eq!(k.delegate_max_children, 10); // delegate.rs MAX_CONCURRENT_CHILDREN (gone: the page is told the effective one)
         assert_eq!(k.delegate_child_iterations, 250); // delegate.rs CHILD_MAX_ITERATIONS
+        // Phase 7: the counters as before (plus the signal score as one more trigger).
         assert_eq!(k.review_mode, ReviewMode::Nudges);
+        assert_eq!(k.review_threshold, 3.0);
+        assert_eq!(k.review_idle_minutes, 10.0);
+        assert_eq!(k.review_per_hour, 6);
         assert_eq!(k.curator_max_iterations, 200); // curator.rs CURATOR_MAX_ITERATIONS
         assert_eq!(k.curator_mode, CuratorMode::Loop);
         assert_eq!(k.skills_index, SkillsIndex::Full);
@@ -465,12 +541,11 @@ mod tests {
         // Phase 5: categories in the prompt, the top 3 skills and memory entries on the message.
         assert_eq!(r.skills_index, SkillsIndex::CategoriesAndRetrieval);
         assert_eq!((r.skills_preload, r.memory_preload), (3, 3));
+        // Phase 7: the evidence review at idle.
+        assert_eq!(r.review_mode, ReviewMode::IdleOnce);
         // Later phases: still balanced.
         let b = BudgetKnobs::BALANCED;
-        assert_eq!(
-            (r.review_mode, r.curator_mode, r.tool_schemas),
-            (b.review_mode, b.curator_mode, b.tool_schemas)
-        );
+        assert_eq!((r.curator_mode, r.tool_schemas), (b.curator_mode, b.tool_schemas));
 
         let t = for_profile(BudgetProfile::Tokens);
         assert_eq!(
@@ -503,6 +578,44 @@ mod tests {
         assert_eq!((knobs.skills_preload, knobs.memory_preload), (0, 5));
         let knobs = from_config(&json!({"profile": "balanced", "skills_preload": 2}));
         assert_eq!(knobs.skills_preload, 2);
+    }
+
+    #[test]
+    fn the_review_knobs_are_validated() {
+        use serde_json::json;
+        for mode in ["idle_once", "nudges", "agentic", " Agentic "] {
+            assert!(check_config_value("review_mode", &json!(mode)).is_ok(), "{mode}");
+        }
+        assert!(check_config_value("review_mode", &json!("never")).is_err());
+        // The Settings select's empty choice: the profile's own mode.
+        assert!(check_config_value("review_mode", &json!("")).is_ok());
+        assert_eq!(
+            from_config(&json!({"profile": "requests", "review_mode": ""})).review_mode,
+            ReviewMode::IdleOnce
+        );
+        assert!(check_config_value("review_mode", &json!(1)).is_err());
+        assert!(check_config_value("review_threshold", &json!(0.5)).is_err());
+        assert!(check_config_value("review_threshold", &json!(4.5)).is_ok());
+        assert!(check_config_value("review_idle_minutes", &json!(0)).is_err());
+        assert!(check_config_value("review_idle_minutes", &json!(0.05)).is_ok());
+        assert!(check_config_value("review_idle_minutes", &json!(2000)).is_err());
+        assert!(check_config_value("review_per_hour", &json!(0)).is_err());
+        let knobs = from_config(&json!({
+            "profile": "requests",
+            "review_mode": "agentic",
+            "review_threshold": 5,
+            "review_idle_minutes": 0.5,
+            "review_per_hour": 2,
+        }));
+        assert_eq!(knobs.review_mode, ReviewMode::Agentic);
+        assert_eq!(
+            (knobs.review_threshold, knobs.review_idle_minutes, knobs.review_per_hour),
+            (5.0, 0.5, 2)
+        );
+        // A bad value in a hand-edited file leaves the profile's.
+        let knobs = from_config(&json!({"profile": "balanced", "review_mode": "never"}));
+        assert_eq!(knobs.review_mode, ReviewMode::Nudges);
+        assert_eq!(from_config(&json!({"profile": "tokens"})).review_mode, ReviewMode::Nudges);
     }
 
     #[test]

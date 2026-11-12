@@ -261,6 +261,17 @@ files before 0003/0004, 6.6 MB in 109 after.
   skill listed), a refused Apply shows the 409's sentence. Not looked at as a screenshot (layout by
   DOM boxes only); no i18n keys.
 
+- **0027-review-mode-setting.patch** (`app/settings/constants.ts`): lists `budget.review_mode`
+  after `budget.profile` in the Model section, labelled "Review mode" (Phase 7). As with 0022,
+  Hermes's Settings page only shows keys its `SECTIONS` list names; the subpage already takes
+  `budget.` (0022). The field is the backend schema's select (`rest.rs`: "", idle_once, nudges,
+  agentic, with a description); "" is the profile's own mode (the default stored in the config), and
+  an unknown value is dropped by `Rest::save_config`. Without the patch the mode still works through
+  `config.set` and the config file. **Written 2026-11-13 and checked with `git apply --verbose`
+  in order 0001..0027 against the pinned source (no skipped file), but not built into a webapp or
+  tried in the page** (a webapp build needs the npm workspace): run `build-hermes-webapp.ps1` and
+  look at Settings ▸ Model ▸ Main before relying on it.
+
 ## To do
 
 - **Skill hub** (install from Capabilities ▸ Skills ▸ Discover): `tools/skills_hub*.py` and
