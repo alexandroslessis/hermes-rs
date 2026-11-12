@@ -527,3 +527,41 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   test that expects a pasted key verbatim in the evidence is wrong. A terminal "workaround"
   needs the success to retry what failed (a shared word other than the program); probing
   commands (`rg`, `test -f`, `git status`…) never count, since they fail as an answer.
+
+## The evidence review (Phase 7 CP7.2)
+
+- `Runtime::review_once` is not called by the app yet: the nudge-driven agentic review
+  (`review.rs`) is still the one that runs after turns. CP7.3 schedules the new one. Calling both
+  on the same session today could write the same lesson twice.
+- Its provider never retries a 4xx (`with_transient_only`): a 400 to `response_format` is answered
+  by the review itself (one text request), and a plain retry would spend the same refused
+  request again. The "refused json_schema" memory is per process and keyed by base URL + model,
+  and is kept only when the text request then goes through. Tests share it: a mock server can
+  get a port a finished test freed, so a test that makes or checks that memory reviews under a
+  model name of its own (`review_as` in `turns.rs`).
+- A skill patch is checked against the fingerprint of SKILL.md **when the packet was built**: if
+  the user (or the curator) edits the skill while the review request is out, the patch is refused
+  ("changed after the review read it"), never merged. A diff must apply exactly: line numbers may
+  be off (the exact lines are then looked up, and must occur once), the text may not.
+- A skill whose shown text was cut (over 12k characters, or the room left), had a secret masked,
+  or had a packet tag defused (`<skill`, `</excerpt`… become `&lt;…`) is not "shown whole": a
+  full-body replacement of it is refused (it would drop the cut tail or write the mask), only a
+  diff can change it, and a diff whose context includes the masked text won't apply.
+- Memory operations are applied one at a time (each a one-item `MemoryStore::apply` batch), not
+  as one batch: a refused one doesn't take the others down, but an add that only fits after a
+  remove listed later in the reply is refused for the limit. A memory **replace or remove** is
+  always staged, tainted or not (nobody watches a background review; the evidence quotes tool
+  output an untainted session can still carry, e.g. a README in the project): a test expecting
+  one applied directly is wrong. Only adds and skill writes of an untainted session apply.
+- The packet's token count is pessimistic on purpose (`packet::estimate_tokens`: an ASCII
+  character 1/3 token, other characters 1/2 token per UTF-8 byte), not `compress.rs`'s bytes / 4,
+  and the budget also leaves the window room for the system prompt, the schema, the repair turn
+  and a reply (`reserved_tokens`). A small window gives budget 0 and the review is `Failed`
+  with no request; an unknown window keeps the 24k knob. No `max_tokens` is sent (a cap a model
+  doesn't take is a 400, which would read as a json_schema refusal).
+- A diff hunk that only adds lines (no context) is refused unless SKILL.md is empty; `---`/`+++`
+  headers, when present, must name `SKILL.md` and never `/dev/null` as the new file.
+- The packet is redacted and the prompt says the packet is evidence, not instructions; that is a
+  mitigation, not the defence. The defence is that the reply can only name the contract's
+  operations, every write meets the stores' threat scans and limits, and a tainted session's
+  writes all go to `staging/`.

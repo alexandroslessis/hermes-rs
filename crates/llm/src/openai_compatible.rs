@@ -36,6 +36,8 @@ pub struct OpenAiCompatibleProvider {
     supports_streaming: bool,
     /// Retries of a failed request; `None` keeps [`RetryConfig`]'s default.
     max_retries: Option<usize>,
+    /// Retry only transient failures (5xx, network, rate limits), never a 4xx.
+    transient_only: bool,
 }
 
 impl OpenAiCompatibleProvider {
@@ -46,7 +48,16 @@ impl OpenAiCompatibleProvider {
             completions_prefix,
             supports_streaming: true,
             max_retries: None,
+            transient_only: false,
         }
+    }
+
+    /// Never retries a client error (4xx): for a one-shot side job whose 400 means "this server
+    /// doesn't take that request" (hermes-rs's review asking for `response_format`), where the
+    /// caller falls back itself and a retry would only spend the same request again.
+    pub fn with_transient_only(mut self) -> Self {
+        self.transient_only = true;
+        self
     }
 
     pub fn with_supports_streaming(mut self, supports_streaming: bool) -> Self {
@@ -192,6 +203,9 @@ impl Provider for OpenAiCompatibleProvider {
         let mut config = RetryConfig::default();
         if let Some(max_retries) = self.max_retries {
             config.max_retries = max_retries;
+        }
+        if self.transient_only {
+            config = config.transient_only();
         }
         config
     }

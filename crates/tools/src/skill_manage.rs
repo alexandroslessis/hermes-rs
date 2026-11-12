@@ -16,7 +16,8 @@ use crate::skills::{
 };
 
 const MAX_NAME_LENGTH: usize = 64;
-const MAX_SKILL_CONTENT_CHARS: usize = 100_000;
+/// The largest SKILL.md, in characters (Hermes's `MAX_SKILL_CONTENT_CHARS`).
+pub const MAX_SKILL_CONTENT_CHARS: usize = 100_000;
 const MAX_SKILL_FILE_BYTES: usize = 1_048_576;
 const MAX_BATCH_OPS: usize = 20;
 const NAME_RULE: &str = "Use lowercase letters, numbers, hyphens, dots, and underscores.";
@@ -88,6 +89,12 @@ fn check_identifier(value: &str, label: &str, invalid: String) -> Option<String>
         .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c));
     (!valid).then_some(invalid)
+}
+
+/// Why `name` can't name a skill (Hermes's `_validate_name`), or `None` when it can. Writers
+/// other than the tool (the evidence review) check model-chosen names with this first.
+pub fn validate_skill_name(name: &str) -> Option<String> {
+    validate_name(name)
 }
 
 fn validate_name(name: &str) -> Option<String> {

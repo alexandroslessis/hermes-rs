@@ -23,7 +23,7 @@ pub mod references;
 mod review;
 mod search;
 mod shell;
-mod skill_manage;
+pub mod skill_manage;
 pub mod skills;
 pub mod staging;
 pub mod taint;

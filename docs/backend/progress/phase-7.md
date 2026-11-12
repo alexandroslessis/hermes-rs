@@ -155,3 +155,193 @@ reviewer corpus, huge message, resend dedupe, secrets masked, probing/unrelated 
 newer file left alone), `--test turns` 142 / 7 ignored under default, balanced, requests, tokens;
 `hermes_tools`, `hermes_memory`, `hermes_store`, `hermes_prompts`, `hermes-desktop` green;
 `cargo build --workspace` OK.
+
+## CP7.2 — evidence packet, one-shot request, JSON contract + repair, deterministic apply, staging
+Worktree: C:\Users\alexandros\repos\hermes-rs-p7   Branch: backend/p7-review   Model: Opus 5.5 (subagent)
+On top of the CP7.1 commit 123e118. Uncommitted.
+Done:
+- **New `crates/runtime/src/review_once.rs`** (+ `review_once/{packet,contract,apply,udiff,tests}.rs`,
+  `golden_packet.txt`). `run_review_once(OnceJob, evidence: Vec<Signal>) -> ReviewOutcome` (crate-
+  private) and the public wrapper `Runtime::review_once(session, provider, &TurnOptions,
+  ReviewOnceSettings) -> ReviewOutcome` that CP7.3 calls. `ReviewOutcome { status: Done |
+  NothingToReview | Skipped | Failed, requests, json_schema, ops: Vec<OpReport>, reviewed_seq,
+  packet_tokens, budget_tokens }`, `actions()` gives Hermes's summary lines for the app.
+  `ReviewOnceSettings { packet_tokens (24k), require_approval, format: Auto | JsonSchema | Text }`
+  (knobs; CP7.3 reads them from the config). Nothing calls it from the app yet: the agentic
+  review is untouched and still the active one.
+- **Packet** (`packet.rs`): signals with excerpts, skills used in the session (`skill_view` of
+  SKILL.md, the `preinject` note, `/skill` invocations; first-use order), top 3 related skills
+  from the index (query: the user excerpts of the signals + the first message, project name;
+  index default floor 2.5; used ones excluded), MEMORY.md / USER.md entries with usage. Fixed
+  order, no clock. Budget: `min(knob, window/2)` tokens at bytes/4 (compress.rs's estimator);
+  one writer refuses what doesn't fit, so the bound holds by construction (test over 11 budgets
+  0..200k on a worst-case input). Priority: signals (≤40%, chosen explicit → weight → age, shown
+  by seq, "N weaker left out"), used skills (≤30%), related (≤20%), memory gets the rest (≥10%,
+  whole entries, "N more entries not shown"). Skill bodies cut at 12k chars or the room left.
+  Everything through `redact(.., Output)`; `<excerpt`/`<skill`/`<entry` tags inside untrusted
+  text become `&lt;…`. A skill is "shown whole" only if not cut, masked or defused.
+- **Request**: one `complete()` with no tools, system = `evidence_review_prompt` (new, in
+  `crates/prompts/src/review.rs` beside the agentic one), user = the packet; `response_format:
+  json_schema` (strict schema, `contract::schema`) merged into the request params with the
+  effort params. Aux review model when set, else the session's model; governor `Review` check
+  first; the caller scopes the ledger context `Purpose::Review`; usage recorded like the agentic
+  review. New `ProviderConfig::one_shot_provider` = `OpenAiCompatibleProvider::with_transient_only`
+  (new in `hermes_llm`): 5xx/network/429 still retried `http_retries` times, a 4xx never.
+- **Contract + repair** (`contract.rs`): the object is taken from the whole text, one code fence,
+  or first `{`..last `}`; >512 KB, not an object, or `memory`/`skills` not a list = malformed →
+  exactly one repair request (packet, the bad reply cut to 4k, `evidence_review_repair(why)`),
+  then give up (`Failed`, logged, signals not marked). A 400/422 to the json_schema request →
+  the same request once in text, remembered per (base URL, model) for the process. Max 3
+  requests (refused schema + text + repair); normally 1.
+- **Validation per op**: allowed fields only (unknown → rejected, also `"exec"` at top level is
+  reported, not obeyed), `op`/`target` enums, string-or-null types, add/replace/remove field
+  rules, memory text/old ≤1000 chars, why ≤500, patch ≤100k (SKILL.md's limit), skill names via
+  `skill_manage::validate_skill_name` (new pub wrapper), one op per skill, ≤8 memory / ≤4 skill
+  ops. Each refusal is an `OpReport` with its reason and a `tracing::info!` line.
+- **Apply** (`apply.rs`, in `spawn_blocking`), one op at a time: memory → `MemoryStore::apply`
+  (one-item batch: limits, threat scan); disabled store refused. Skills: create (name must not
+  exist; full body, or a diff against "") / patch (must be shown in the packet; SKILL.md must
+  still have the fingerprint read for the packet; a unified diff applied strictly by `udiff.rs`,
+  or a full body only if shown whole; a no-op refused) → `SkillOp` `create`/`edit` through
+  `SkillStore::apply_staged(ops, WriteOrigin::Review, [FileBase])` (base re-checked under the
+  write lock, validation, threat scan of the skill, git commit, index hook). Never delete, no
+  supporting files. Hold (tainted session → its reason and sources; `require_approval` →
+  "review.require_approval is on"; a store's `write_approval` → "write approval is on") →
+  `StagingStore::stage_memory_ops` / `stage_skill_ops`, one item per op (same dry-run checks).
+- **Strict diff** (`udiff.rs`): header counts must match the body; context/removed lines must
+  match exactly (only a trailing `\r` ignored); text before the first hunk or after a complete
+  hunk, overlapping/out-of-order hunks → rejected. Like `git apply`, a hunk whose exact lines are
+  at another line than stated is applied if they occur exactly once after the previous hunk;
+  never fuzz. CRLF and "\ No newline" kept. A model's dropped space on an empty context line is
+  read as the empty line.
+- Signals marked reviewed (`mark_signals_reviewed(max seq of the packet's input)`) only after a
+  reply was read, including an empty or all-refused one.
+- Small public additions: `hermes_tools::skill_manage` is now `pub mod`;
+  `skill_manage::MAX_SKILL_CONTENT_CHARS` and `validate_skill_name` pub.
+- Docs: PORTING (diverged row), ARCHITECTURE (crate row), GAPS (CP7.2), PITFALLS (new section).
+Files: crates/runtime/src/{review_once.rs, review_once/apply.rs, review_once/contract.rs,
+  review_once/packet.rs, review_once/udiff.rs, review_once/tests.rs, review_once/golden_packet.txt}
+  (new), crates/runtime/src/lib.rs, crates/runtime/tests/turns.rs, crates/prompts/src/review.rs,
+  crates/llm/src/openai_compatible.rs, crates/tools/src/{lib.rs, skill_manage.rs}, GAPS.md,
+  PORTING.md, docs/ARCHITECTURE.md, docs/PITFALLS.md, docs/backend/progress/phase-7.md
+Tests (CARGO_TARGET_DIR=target/claude):
+- `cargo test -p hermes_runtime --lib`: 125 passed (22 new: packet golden + determinism, budget
+  over 11 budgets, priority/explicit-first/memory-keeps-its-tenth, cut/masked not whole, window
+  budget, used skills; apply: memory add/replace/remove + skill patch/create one by one with
+  commits, threat-scan and limit refusals, disabled store, strict patches (fuzzy diff, unshown
+  skill, no-op, existing create, no front matter, threat in body, full body of a cut skill,
+  changed-after-read), hold → staged then approvable, `write_approval` → staged; contract:
+  extraction, per-op refusals with exact reasons, oversize/too many, strict schema; udiff: 9).
+- `cargo test -p hermes_runtime --test turns`: 155 passed / 7 ignored under default, balanced,
+  requests and tokens. 13 new: one request applied (purpose `review` 1, main 2, no tools,
+  `response_format` strict, packet ≤ budget, signals reviewed, second call 0 requests); no
+  signals → 0 requests; empty reply → Done, reviewed; malformed twice → exactly 2 requests,
+  Failed, nothing applied, still triggered; repair success → 2; 400 to json_schema → 2 (second
+  without `response_format`, text contract) and the next review 1 in text; `ReplyFormat::Text`;
+  invalid ops refused individually (7 of 8) with the valid add applied; injection in evidence
+  (steered model: threat-scan, unknown op/field, bad remove, evil create all refused; only a
+  plain add applied); tainted session → 2 staged items with reason/sources, USER.md and skills
+  untouched; `require_approval` → staged; a `skill_view`ed skill: unclean diff refused (file
+  unchanged, "shown whole" in packet), clean diff applied next review (2 review requests); aux
+  review model → 0 on main, 1 on the aux server, budget = half its window.
+- `cargo test -p hermes_prompts` (+1: the prompt's contract, no "Be ACTIVE"), `hermes_tools`,
+  `hermes_memory`, `hermes_store`: prompts 23, tools 181 (+1 ignored), memory and store green;
+  `hermes-desktop` 174 + 68 (acp); `cargo build --workspace` OK. Clippy: no warnings in the new
+  code (`-A clippy::redundant_clone` for the known `hermes_tools` errors).
+Request counts: S1–S6 unchanged (nothing schedules the new review yet). New facts, asserted in
+  `turns.rs`: an evidence review = 1 `review` request; 2 with the repair; 2 when the server
+  refuses json_schema (then 1 for later reviews in the process); at most 3; 0 with no
+  unreviewed signals or when the governor defers it.
+Deviations from the plan:
+- Packet sections have share caps (40/30/20/rest) on top of the priority order, so memory always
+  keeps ~10% of the budget (it is what stops duplicate adds); with the default 24k budget nothing
+  real is cut.
+- The diff applier tolerates wrong line numbers when the exact old lines occur once (git apply's
+  offset, never fuzz). Say if you want stated-position-only.
+- Memory replace/remove of an untainted session are applied directly (the brief's design);
+  Hermes's agentic review stages unattended patches/removals (`unattended_tool`). Injection needs
+  untrusted content, which taints the session, which stages everything.
+- Fallback on any 400/422 (not only ones naming `response_format`), at most once per review.
+For the reviewer:
+- Budget proof is "one writer refuses what doesn't fit" + the test; the system prompt (~2.5k
+  tokens) is not in the budget (the window/2 cap leaves room for it and the reply).
+- `mark_signals_reviewed(max_seq)` also covers signals left out of the packet for budget (the
+  weakest ones). Alternative: mark only the shown ones (needs a different store API).
+- No max_tokens on the request: a long `create` cut by a provider's default limit is malformed →
+  repair → probably cut again → give up.
+- Two `review_once` calls on one session at once (or one next to the agentic review) could both
+  apply; CP7.3 must own the slot/no-double-review guard.
+- The strict json_schema (type arrays with null, every field required) is OpenAI's documented
+  shape; not checked against a real OpenRouter/LM Studio/Ollama endpoint (no live check: nothing
+  page-facing).
+- `ReviewOutcome` is not reported to the page (`bridge.review_finished`); CP7.3 decides.
+- Only new files and my hunks were rustfmt'ed; lib.rs, turns.rs, openai_compatible.rs (imports
+  under edition 2024) keep their pre-existing rustfmt diffs.
+- Mid-session I ran a stray `git stash` in this worktree (refs/stash is shared with the main
+  checkout) and popped it at once (`stash@{0}` on backend/p7-review, dropped after a clean pop);
+  the stash list is as before. Nothing else touched.
+
+### Review (Opus 5.5)
+Main had not moved (branch at 123e118); no merge. `/code-review` not available in the subagent;
+reviewed by reading every new file and the diff, thinking as an attacker who controls text that
+reaches the packet (pasted pages, project files read without taint, tool output).
+Findings and fixes:
+- **Budget estimate not conservative** (fixed): bytes/4 counts CJK at 0.75 tokens a character
+  (real tokenizers spend ~1-1.5), and code/JSON at ~4 chars a token (real ~3), so a "24k" packet
+  could be ~2x that. `packet::estimate_tokens` now counts an ASCII character 1/3 token and other
+  characters 1/2 token per UTF-8 byte (CJK 1.5, emoji 2), never less than bytes/4; the writer,
+  section shares, skill cuts and memory room all count in these units. New test on a CJK session
+  (a CJK character a token + ASCII/4 still fits every budget).
+- **Budget ignored the rest of the request** (fixed): the ~2.5-3.5k-token system prompt, the
+  schema, the repair turn (quoted reply up to 4k *characters*) and the reply were outside it, and
+  `window/2` alone overflowed small windows (4k window: 2k packet + 3k prompt). `budget_for(knob,
+  window, reserved)` = min(knob, window/2, window − reserved), `reserved_tokens` = text prompt +
+  schema + repair text + `REPAIR_QUOTE_TOKENS` (1000; the repair quote is now cut by the same
+  estimator) + reply room (min(16k, window/4)). A window too small gives 0 → `Failed`, no request.
+  Unknown window: the 24k knob (documented). Test: packet + reserve ≤ window for 6k-128k windows.
+- **No `max_tokens`** (kept, documented): sending a cap a model doesn't accept is a 400, which the
+  review would read as a json_schema refusal; the main turns send none either. Reply room is
+  reserved in the budget instead.
+- **No wall-clock limit** (fixed): a streaming provider that trickles is only bound by the 600 s
+  idle timeout; each request now has a 10-minute `tokio::time::timeout` (→ `Failed`).
+- **A 400 poisoned the json_schema memory** (fixed): any 400/422 (bad model name, proxy error)
+  switched the endpoint to text for the process. Now remembered only when the text request then
+  goes through. New turns test (400, 400 → Failed, 2 requests, not reviewed; next review asks for
+  json_schema again).
+- **Flaky test, pre-existing** (fixed): the json_schema memory is process-global and a later
+  test's mock server can get a freed port, so `the_evidence_review_makes_one_request...` failed
+  once in a full run (json_schema false). The two tests that make/check the memory now review
+  under a model name of their own (`review_as`).
+- **Untainted memory replace/remove applied directly** (fixed, deviation reverted): that was
+  weaker than the agentic review it replaces (`MemoryStore::unattended_tool`, Hermes's
+  `_background_delete_gate`), and taint doesn't cover project files (a README read in the
+  workspace reaches excerpts as tool text). Replace/remove now always go to staging ("a
+  background review may not change or delete memory entries unattended"); adds and skill writes
+  of an untainted session still apply (same power as the main agent's own tools there).
+- **Diff applier** (tightened): `---`/`+++` paths were ignored: now at most one pair, naming
+  `SKILL.md` (no `..`, no drive), never `+++ /dev/null` (deletion), `--- /dev/null` only for an
+  empty file (it used to prepend a whole second copy). A context-free insertion hunk was placed by
+  its line number alone (wrong place silently): now refused unless the file is empty. rename /
+  binary / deleted-file headers were already refused. The offset leniency (exact lines, unique
+  after the previous hunk) is kept: it never fuzzes and an ambiguous match is refused.
+- Checked, no change: every op type reaches `MemoryStore::apply` / `stage_memory_ops` or
+  `SkillStore::apply_staged` / `stage_skill_ops` (limits, threat scan, frontmatter, size, git
+  commit; staged items re-checked on apply); skill names are ASCII `[a-z0-9._-]` (no traversal,
+  no lookalikes; a trailing-dot name colliding on Windows is refused by create's non-empty-dir
+  check; reserved device names like `con` only fail the write); ops capped 8/4, oversize fields,
+  duplicates per skill refused; reply ≤512 KB, serde_json's recursion limit (128) handles deep
+  nesting, BOM/fences/trailing prose are tolerated only to find one object; `why` is never stored
+  or shown; staging carries the session taint's reason/sources; signals marked only after a read
+  reply; old agentic review untouched; no blocking work on async workers; store schema untouched;
+  main session prompt untouched; `with_transient_only` is opt-in (no other caller changes);
+  `pub mod skill_manage` only newly exposes `fingerprint`, `validate_skill_name` and the size
+  constant (everything else was already re-exported).
+Left, with reasons:
+- Signals left out of the packet for budget are marked reviewed too (the watermark API can't
+  express "only the shown ones"; with 32 capped signals only the weakest beyond ~40% of 24k drop).
+- For CP7.3: one review per session at a time (also vs the agentic review; two at once can both
+  apply or stage the same lesson), take the evidence and `max_seq` at the start so signals added
+  meanwhile stay unreviewed (already so), a `Failed` review with 0 requests (window too small,
+  budget 0) must not be retried every idle period, decide whether `ReviewOutcome` reaches the page,
+  and the final prompt wording.
+Tests (CARGO_TARGET_DIR=target/claude): `hermes_runtime` lib 128 (3 new: CJK estimate, reserve fits the window, diff headers; insertion test reworked), `--test turns` 156 passed / 7 ignored under default, balanced, requests, tokens (1 new: a 400 the text request gets too); `hermes_tools` 181, `hermes_memory`, `hermes_store`, `hermes_prompts` 23, `hermes_llm` green; `hermes-desktop` 174 + 68 (acp); `cargo build --workspace` OK.

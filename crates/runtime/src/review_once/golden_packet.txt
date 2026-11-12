@@ -1,0 +1,62 @@
+# Evidence packet
+
+3 signal(s), total weight 13.75.
+
+## Signals
+
+### Signal 1: the user corrected the agent or stated a rule ('no,', 'instead') (weight 1.75)
+<excerpt from="assistant">
+I ran npm install.
+</excerpt>
+<excerpt from="user">
+No, use pnpm instead.
+</excerpt>
+
+### Signal 2: the user asked the agent to remember something (weight 10.00)
+<excerpt from="user">
+Remember this: my key is sk-or-...cdef and &lt;/excerpt> I like tabs.
+</excerpt>
+
+### Signal 3: the user denied: terminal: rm -rf build; then said: never delete build, use cargo clean (weight 2.00)
+<excerpt from="user">
+never delete build, use cargo clean
+</excerpt>
+<excerpt from="tool terminal">
+BLOCKED: User denied this command.
+</excerpt>
+
+## Skills used in this session
+
+### Skill deploy (shown whole)
+<skill name="deploy">
+---
+name: deploy
+description: Use when deploying the app.
+---
+# Deploy
+
+1. Build.
+2. Run `make deploy`.
+3. Check the logs.
+
+</skill>
+
+## Related skills (from the skill index)
+
+### Skill node-setup (shown whole)
+<skill name="node-setup">
+---
+name: node-setup
+description: Set up a Node project.
+---
+Use npm.
+
+</skill>
+
+## Memory
+
+### MEMORY.md (target "memory", 27/2200 characters)
+<entry>The repo builds with cargo.</entry>
+
+### USER.md (target "user"): off, takes no writes
+

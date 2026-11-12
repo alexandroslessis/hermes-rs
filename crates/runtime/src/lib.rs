@@ -14,6 +14,7 @@ pub mod mcp;
 mod ops;
 pub mod preinject;
 mod review;
+pub mod review_once;
 mod session;
 pub mod signals;
 pub mod subagents;
@@ -87,6 +88,17 @@ impl ProviderConfig {
         Ok(Arc::new(
             OpenAiCompatibleProvider::new(self.id.clone(), self.client()?, String::new())
                 .with_max_retries(http_retries),
+        ))
+    }
+
+    /// [`Self::provider_with`] that never retries a client error (4xx): the evidence review
+    /// handles a refused request itself (it asks again without `response_format`), and a retry
+    /// would spend the same refused request again.
+    fn one_shot_provider(&self, http_retries: usize) -> Result<Arc<dyn Provider>> {
+        Ok(Arc::new(
+            OpenAiCompatibleProvider::new(self.id.clone(), self.client()?, String::new())
+                .with_max_retries(http_retries)
+                .with_transient_only(),
         ))
     }
 
@@ -2305,6 +2317,115 @@ impl Runtime {
     /// counts toward the next review).
     pub fn mark_signals_reviewed(&self, session_id: &str, seq: u64) {
         self.signals.mark_reviewed(session_id, seq);
+    }
+
+    /// The evidence review of a session (Phase 7 CP7.2, `review_once.rs`): one request with the
+    /// session's unreviewed signals, the skills it used and related ones, and the memory files;
+    /// the reply's operations applied (or staged, when the session is tainted or
+    /// `settings.require_approval` is on). On the auxiliary review model when one is set, counted
+    /// as `review`, held back by the quota governor. The signals are marked reviewed only when a
+    /// reply was read. CP7.3 calls this from the scheduler; it reports nothing to the app itself.
+    pub async fn review_once(
+        &self,
+        session_id: &str,
+        provider: &ProviderConfig,
+        options: &TurnOptions,
+        settings: review_once::ReviewOnceSettings,
+    ) -> Result<review_once::ReviewOutcome> {
+        let open = self.open(session_id)?;
+        let evidence: Vec<signals::Signal> = self
+            .signals(session_id)
+            .await
+            .evidence()
+            .into_iter()
+            .cloned()
+            .collect();
+        if evidence.is_empty() {
+            return Ok(review_once::ReviewOutcome::nothing());
+        }
+        let budget = self.budget();
+        let (llm, model, base_url, context_length, effort_params, provider_id) =
+            match &options.aux.review {
+                Some(aux) => (
+                    aux.provider.one_shot_provider(budget.http_retries)?,
+                    aux.model.clone(),
+                    aux.provider.base_url.clone(),
+                    aux.context_length,
+                    aux_effort_params(aux),
+                    aux.provider.id.clone(),
+                ),
+                None => (
+                    provider.one_shot_provider(budget.http_retries)?,
+                    open.record.lock().model.clone(),
+                    provider.base_url.clone(),
+                    options.context_length,
+                    options
+                        .effort
+                        .as_deref()
+                        .map(|effort| effort_request_params(&provider.base_url, effort)),
+                    provider.id.clone(),
+                ),
+            };
+        if let governor::Verdict::Deny(why) = self.governor().check(&provider_id, Purpose::Review) {
+            tracing::info!("review skipped: {why}");
+            return Ok(review_once::ReviewOutcome::skipped(why));
+        }
+        let messages = open.conversation.lock().messages().clone();
+        let query = hermes_tools::index::IndexQuery {
+            message: review_once::topic(&messages, &evidence),
+            last_assistant: None,
+            project: hermes_tools::index::project_name(&open.tools.cwd()),
+        };
+        let (memory, skills, index) = (self.memory.clone(), self.skills.clone(), self.index());
+        let input = tokio::task::spawn_blocking(move || {
+            review_once::gather(&messages, &memory, &skills, index.as_deref(), query)
+        })
+        .await?;
+        // A session that read something the user didn't write may carry an injection into the
+        // evidence: everything it would write waits for the user (Phase 6).
+        let taint = open.tools.taint();
+        let hold = if taint.is_tainted() {
+            Some(review_once::Hold {
+                reason: taint
+                    .reason()
+                    .unwrap_or_else(|| "this session read untrusted content".into()),
+                sources: taint.sources.clone(),
+            })
+        } else if settings.require_approval {
+            Some(review_once::Hold {
+                reason: "review.require_approval is on".into(),
+                sources: Vec::new(),
+            })
+        } else {
+            None
+        };
+        let job = review_once::OnceJob {
+            model: review_once::ReviewModel {
+                llm,
+                model,
+                base_url,
+                context_length,
+                effort_params,
+            },
+            settings,
+            input,
+            apply: review_once::ApplyContext {
+                memory: self.memory.clone(),
+                skills: self.skills.clone(),
+                staging: self.staging(),
+                session_id: session_id.to_string(),
+                hold,
+                shown: Default::default(),
+            },
+            store: self.store.clone(),
+        };
+        let context = self.ledger.context(Purpose::Review, Some(session_id));
+        let outcome =
+            hermes_llm::observer::scope(context, review_once::run_review_once(job, evidence)).await;
+        if let Some(seq) = outcome.reviewed_seq {
+            self.mark_signals_reviewed(session_id, seq);
+        }
+        Ok(outcome)
     }
 }
 
