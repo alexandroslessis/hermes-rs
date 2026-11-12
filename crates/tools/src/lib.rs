@@ -25,6 +25,7 @@ mod search;
 mod shell;
 mod skill_manage;
 pub mod skills;
+pub mod taint;
 mod todo;
 pub mod vision;
 pub mod web;
@@ -171,10 +172,33 @@ pub struct SessionTools {
     vision: std::sync::atomic::AtomicBool,
     /// The budget profile's limits for this turn (set as the turn starts).
     limits: parking_lot::Mutex<ToolLimits>,
+    /// What the session has read that isn't the user's (see [`taint`]).
+    taint: parking_lot::Mutex<TaintCell>,
+}
+
+/// The session's [`taint::Taint`] with what goes along with it.
+#[derive(Default)]
+struct TaintCell {
+    taint: taint::Taint,
+    /// Whether the session level is saved to `taint.json` (not for a subagent's own tools).
+    persist: bool,
+    /// Warnings for the transcript that the runtime hasn't collected yet (Yolo let something run).
+    warnings: Vec<String>,
 }
 
 impl SessionTools {
     pub fn new(config: SessionToolsConfig) -> Self {
+        // A session that was tainted when it was last open still is.
+        let carried = taint::load(&config.data_dir, &config.session_id);
+        let taint = TaintCell {
+            taint: taint::Taint {
+                turn: false,
+                session: carried.is_some(),
+                sources: carried.unwrap_or_default(),
+            },
+            persist: true,
+            warnings: Vec::new(),
+        };
         Self {
             hints: parking_lot::Mutex::new(hints::HintTracker::new(&config.cwd, &config.home)),
             shell: shell::ShellSession::new(config.shell, config.cwd, config.scratch_dir.clone()),
@@ -199,6 +223,7 @@ impl SessionTools {
             mode: Default::default(),
             guard: Default::default(),
             session_approved: Default::default(),
+            taint: parking_lot::Mutex::new(taint),
         }
     }
 
@@ -345,6 +370,7 @@ impl SessionTools {
 
     /// Called when a turn starts: per-turn tool state resets.
     pub fn begin_turn(&self) {
+        self.taint.lock().taint.begin_turn();
         self.turn_checkpoints.lock().clear();
         *self.memory_failures.lock() = hermes_memory::TurnFailures::default();
     }
@@ -485,6 +511,106 @@ impl SessionTools {
     }
 }
 
+/// What the session has read that isn't the user's ([`taint`]).
+impl SessionTools {
+    /// The taint as it stands.
+    pub fn taint(&self) -> taint::Taint {
+        self.taint.lock().taint.clone()
+    }
+
+    /// Records a source read this turn. The session level is saved to `taint.json` before this
+    /// returns, so a session reopened (or a crash) later is still careful.
+    pub async fn mark_tainted(&self, source: String) {
+        let (sources, persist) = {
+            let mut cell = self.taint.lock();
+            cell.taint.mark(&source);
+            (cell.taint.sources.clone(), cell.persist)
+        };
+        tracing::info!("untrusted content read in {}: {source}", self.session_id);
+        if persist {
+            let (data_dir, session_id) = (self.data_dir.clone(), self.session_id.clone());
+            let _ =
+                tokio::task::spawn_blocking(move || taint::save(&data_dir, &session_id, &sources))
+                    .await;
+        }
+    }
+
+    /// A subagent's tools start as careful as its parent's. Not saved: the parent hears what the
+    /// child read when it finishes ([`Self::taint`]).
+    pub fn inherit_taint(&self, parent: &taint::Taint) {
+        let mut cell = self.taint.lock();
+        cell.persist = false;
+        cell.taint.session |= parent.is_tainted();
+        cell.taint.sources = parent.sources.clone();
+    }
+
+    /// Warnings for the transcript ("ran after reading untrusted content...") that Yolo left
+    /// behind since the last call; the runtime shows them.
+    pub fn take_taint_warnings(&self) -> Vec<String> {
+        std::mem::take(&mut self.taint.lock().warnings)
+    }
+
+    /// Why a risky action asks now ("this turn read a web page"), when the session is tainted.
+    fn taint_reason(&self) -> Option<String> {
+        self.taint.lock().taint.reason()
+    }
+
+    /// Yolo let `what` run on a tainted session: say so, in the transcript and the log.
+    fn warn_tainted(&self, what: &str) {
+        let mut cell = self.taint.lock();
+        let warning = cell.taint.warning();
+        tracing::warn!("{warning} ({})", what.chars().take(200).collect::<String>());
+        cell.warnings.push(warning);
+    }
+
+    /// Taints the session when the tool call that just ended returned content someone else wrote:
+    /// web tools, a web image, a terminal command that fetches from the network (`curl`...), and
+    /// `read_file` / `search_files` / `vision_analyze` on a path outside the working folder. MCP
+    /// results are tainted by the provider that calls the server (it knows which servers are
+    /// trusted). A failed call returned nothing worth distrusting.
+    pub async fn taint_after_call(&self, name: &str, args: &Value, failed: bool) {
+        if failed {
+            return;
+        }
+        if let Some(source) = taint::source_for_call(name, args) {
+            self.mark_tainted(source).await;
+            return;
+        }
+        let path = match name {
+            "terminal" => {
+                let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+                if let Some(source) = taint::command_source(command) {
+                    self.mark_tainted(source).await;
+                }
+                return;
+            }
+            // `search_files` without a path searches the working folder.
+            "read_file" | "search_files" => args.get("path").and_then(Value::as_str).unwrap_or("."),
+            // A local image (a web one was handled above; a `data:` URL is the model's own).
+            "vision_analyze" => match args.get("image_url").and_then(Value::as_str).map(str::trim) {
+                Some(image) if !image.is_empty() && !image.starts_with("data:") => image,
+                _ => return,
+            },
+            _ => return,
+        };
+        let resolved = self.resolve(path);
+        let ctx = path_policy::PolicyContext::new(
+            self.cwd(),
+            self.scratch_dir.clone(),
+            self.data_dir.clone(),
+            self.home.clone(),
+        );
+        let target = resolved.clone();
+        let class = tokio::task::spawn_blocking(move || path_policy::classify(&target, &ctx))
+            .await
+            .ok();
+        if class == Some(path_policy::PathClass::Outside) {
+            self.mark_tainted(taint::outside_file_source(&self.shown(&resolved)))
+                .await;
+        }
+    }
+}
+
 impl SessionTools {
     /// The session's background processes, as the `process` tool lists them.
     pub fn process_list(&self) -> Vec<Value> {
@@ -584,7 +710,15 @@ impl SessionTools {
         let persistence = path_flag.as_ref().is_some_and(|flag| flag.persistence);
         // Manual and Plan ask about every command, not only the flagged ones; a command touching a
         // persistence place asks in every mode, even Yolo, and is never smart-approved.
-        let always_ask = matches!(mode, ApprovalMode::Manual | ApprovalMode::Plan) || persistence;
+        // While the session is tainted, a flagged command always asks (never smart-approved, never
+        // remembered), in every mode but Yolo, which only warns (decision D2).
+        let taint_reason = self.taint_reason();
+        let path_desc = path_flag.as_ref().map(|flag| flag.description);
+        let flagged = approval::dangerous(command).or(path_desc);
+        let taint_ask = taint_reason.is_some() && flagged.is_some() && mode != ApprovalMode::Yolo;
+        let warn_yolo = taint_reason.is_some() && flagged.is_some() && mode == ApprovalMode::Yolo;
+        let always_ask =
+            matches!(mode, ApprovalMode::Manual | ApprovalMode::Plan) || persistence || taint_ask;
         // The lock is taken per call: holding it across the match would deadlock the arm below.
         let first = approval::gate(command, store, &self.session_approved.lock());
         let gate = match first {
@@ -614,10 +748,16 @@ impl SessionTools {
             )
         };
         let mut request = match gate {
-            approval::Gate::Run { approved } if !always_ask => return Ok(approved),
+            approval::Gate::Run { approved } if !always_ask => {
+                if warn_yolo {
+                    self.warn_tainted(command);
+                }
+                return Ok(approved);
+            }
             approval::Gate::Run { .. } => approval::CommandApproval {
                 command: command.to_string(),
                 description: approval::dangerous(command)
+                    .or(path_desc.filter(|_| taint_ask))
                     .unwrap_or("run a command")
                     .to_string(),
                 once_only: true,
@@ -628,7 +768,14 @@ impl SessionTools {
         request.once_only = always_ask;
         let key = request.description.clone();
         if mode == ApprovalMode::Yolo && !persistence {
+            if warn_yolo {
+                self.warn_tainted(command);
+            }
             return Ok(None);
+        }
+        // The question says why it is asked (the remembered key above does not carry it).
+        if let Some(reason) = taint_reason.filter(|_| flagged.is_some()) {
+            request.description = format!("{} ({reason})", request.description);
         }
         // Smart approvals: the reviewer decides first; only an uncertain verdict reaches the user.
         let guard = self.guard.lock().clone();
@@ -736,12 +883,23 @@ impl SessionTools {
             }
             _ => None,
         };
+        // A write that leaves the working folder on a tainted session: Yolo only warns.
+        let taint_reason = self
+            .taint_reason()
+            .filter(|_| matches!(class, PathClass::Outside | PathClass::Persistence));
         let Some(description) = description else {
+            if taint_reason.is_some() && mode == ApprovalMode::Yolo {
+                self.warn_tainted(&format!("{name} {path}"));
+            }
             return Ok(());
+        };
+        let description = match taint_reason {
+            Some(reason) => format!("{description} ({reason})"),
+            None => description.to_string(),
         };
         let request = approval::CommandApproval {
             command: format!("{name} {path}"),
-            description: description.to_string(),
+            description,
             once_only: true,
         };
         match tokio::time::timeout(
@@ -1148,6 +1306,310 @@ pub(crate) mod tests {
         let mine = "python .data/skills/my-skill/scripts/run.py";
         assert!(tools.check_command(mine).await.is_ok());
         assert_eq!(bridge.asked.lock().len(), 2);
+    }
+
+    /// A reviewer that approves everything: what taint must override.
+    struct ApproveAll;
+
+    #[async_trait]
+    impl approval::ApprovalGuard for ApproveAll {
+        async fn assess(&self, _command: &str, _description: &str) -> approval::Verdict {
+            approval::Verdict::Approve
+        }
+    }
+
+    const FLAGGED: &str = "rm -rf build";
+
+    #[tokio::test]
+    async fn a_tainted_session_always_asks_for_flagged_commands_and_says_why() {
+        for mode in [
+            ApprovalMode::Manual,
+            ApprovalMode::AcceptEdits,
+            ApprovalMode::Auto,
+        ] {
+            let bridge = AskBridge::new(approval::ApprovalChoice::Session);
+            let (_dir, tools) = guarded(bridge.clone());
+            tools.set_mode(mode);
+            tools.set_guard(Some(Arc::new(ApproveAll)));
+            // Clean: Manual asks every time; the others ask once or never (smart approval).
+            assert!(tools.check_command(FLAGGED).await.is_ok(), "{mode:?}");
+            let clean_asks = bridge.asked.lock().len();
+            tools.mark_tainted("a web page".into()).await;
+            // Tainted: asks even though "for this session" was allowed and the reviewer would
+            // approve, and the question names the reason.
+            assert!(tools.check_command(FLAGGED).await.is_ok(), "{mode:?}");
+            assert!(tools.check_command(FLAGGED).await.is_ok(), "{mode:?}");
+            let asked = bridge.asked.lock().clone();
+            assert_eq!(asked.len(), clean_asks + 2, "{mode:?}: {asked:?}");
+            assert_eq!(
+                asked.last().unwrap(),
+                "recursive delete (this turn read a web page)",
+                "{mode:?}"
+            );
+            assert!(tools.take_taint_warnings().is_empty(), "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn smart_approval_is_skipped_only_while_tainted() {
+        let bridge = AskBridge::new(approval::ApprovalChoice::Deny);
+        let (_dir, tools) = guarded(bridge.clone());
+        tools.set_mode(ApprovalMode::Auto);
+        tools.set_guard(Some(Arc::new(ApproveAll)));
+        assert!(tools.check_command(FLAGGED).await.is_ok());
+        assert!(bridge.asked.lock().is_empty(), "the reviewer approved");
+        tools.mark_tainted("web search results".into()).await;
+        assert!(tools.check_command(FLAGGED).await.is_err());
+        assert_eq!(bridge.asked.lock().len(), 1, "now the user is asked");
+    }
+
+    #[tokio::test]
+    async fn only_flagged_commands_are_affected_by_taint() {
+        let bridge = AskBridge::new(approval::ApprovalChoice::Deny);
+        let (_dir, tools) = guarded(bridge.clone());
+        tools.set_mode(ApprovalMode::AcceptEdits);
+        tools.mark_tainted("a web page".into()).await;
+        for command in ["cargo build", "git status", "echo hi > out.txt"] {
+            assert!(tools.check_command(command).await.is_ok(), "{command}");
+        }
+        assert!(bridge.asked.lock().is_empty());
+        // A flagged path (the data folder) counts as flagged too.
+        assert!(
+            tools
+                .check_command("echo {} > .data/desktop-config.json")
+                .await
+                .is_err()
+        );
+        assert!(bridge.asked.lock()[0].contains("this turn read a web page"));
+    }
+
+    #[tokio::test]
+    async fn yolo_never_blocks_a_tainted_session_but_warns() {
+        let bridge = AskBridge::new(approval::ApprovalChoice::Deny);
+        let (_dir, tools) = guarded(bridge.clone());
+        tools.set_mode(ApprovalMode::Yolo);
+        // Clean: no warning.
+        assert!(tools.check_command(FLAGGED).await.is_ok());
+        assert!(tools.take_taint_warnings().is_empty());
+        tools.mark_tainted("a web page".into()).await;
+        // An ordinary command: nothing to warn about.
+        assert!(tools.check_command("cargo build").await.is_ok());
+        assert!(tools.take_taint_warnings().is_empty());
+        // A flagged one runs, without asking, and leaves one warning.
+        assert!(tools.check_command(FLAGGED).await.is_ok());
+        assert_eq!(
+            tools.take_taint_warnings(),
+            ["ran after reading untrusted content: a web page"]
+        );
+        assert!(tools.take_taint_warnings().is_empty(), "taken once");
+        assert!(bridge.asked.lock().is_empty());
+        // Also with Settings' approvals "off", where the gate itself lets everything through.
+        tools.approvals.as_ref().unwrap().set_ask(false);
+        assert!(tools.check_command(FLAGGED).await.is_ok());
+        assert_eq!(tools.take_taint_warnings().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_write_outside_the_workspace_on_a_tainted_session_asks_or_warns() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let file = |name: &str| elsewhere.path().join(name).display().to_string();
+        for (mode, target) in [
+            (ApprovalMode::AcceptEdits, file("a.txt")),
+            (ApprovalMode::Auto, file("b.txt")),
+        ] {
+            let bridge = AskBridge::new(approval::ApprovalChoice::Once);
+            let (_dir, tools) = tools_with_bridge(bridge.clone());
+            tools.set_mode(mode);
+            tools.mark_tainted("a web page".into()).await;
+            assert!(!write(&tools, &target).await.is_error, "{mode:?}");
+            assert_eq!(
+                *bridge.asked.lock(),
+                ["edit a file outside the working folder (this turn read a web page)"],
+                "{mode:?}"
+            );
+            // Inside the workspace nothing changes.
+            assert!(!write(&tools, "in.txt").await.is_error);
+            assert_eq!(bridge.asked.lock().len(), 1, "{mode:?}");
+            assert!(tools.take_taint_warnings().is_empty());
+        }
+        // Yolo: written, not asked, one warning (none for the workspace file).
+        let bridge = AskBridge::new(approval::ApprovalChoice::Deny);
+        let (_dir, tools) = tools_with_bridge(bridge.clone());
+        tools.set_mode(ApprovalMode::Yolo);
+        tools.mark_tainted("a web page".into()).await;
+        assert!(!write(&tools, &file("c.txt")).await.is_error);
+        assert!(!write(&tools, "in.txt").await.is_error);
+        assert!(bridge.asked.lock().is_empty());
+        assert_eq!(
+            tools.take_taint_warnings(),
+            ["ran after reading untrusted content: a web page"]
+        );
+    }
+
+    #[tokio::test]
+    async fn web_tools_web_images_and_outside_reads_taint_but_failures_and_workspace_reads_do_not()
+    {
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("a.txt"), "hello").unwrap();
+        let outside = elsewhere.path().join("a.txt").display().to_string();
+        let (dir, tools) = tools_in();
+        std::fs::write(dir.path().join("mine.txt"), "mine").unwrap();
+        // Nothing yet; own files and ordinary tools do not taint; a failed call read nothing.
+        tools
+            .taint_after_call("read_file", &json!({"path": "mine.txt"}), false)
+            .await;
+        tools
+            .taint_after_call("search_files", &json!({"pattern": "x"}), false)
+            .await;
+        tools.taint_after_call("terminal", &json!({}), false).await;
+        tools
+            .taint_after_call("terminal", &json!({"command": "cargo build"}), false)
+            .await;
+        tools
+            .taint_after_call("vision_analyze", &json!({"image_url": "mine.txt"}), false)
+            .await;
+        tools
+            .taint_after_call("vision_analyze", &json!({"image_url": "data:image/png;base64,AA"}), false)
+            .await;
+        tools
+            .taint_after_call("web_search", &json!({"query": "x"}), true)
+            .await;
+        tools
+            .taint_after_call("read_file", &json!({"path": &outside}), true)
+            .await;
+        assert!(!tools.taint().is_tainted());
+
+        tools
+            .taint_after_call("web_search", &json!({"query": "x"}), false)
+            .await;
+        tools
+            .taint_after_call("web_extract", &json!({"urls": ["a.test"]}), false)
+            .await;
+        tools
+            .taint_after_call(
+                "vision_analyze",
+                &json!({"image_url": "https://a.test/i.png"}),
+                false,
+            )
+            .await;
+        tools
+            .taint_after_call("read_file", &json!({"path": &outside}), false)
+            .await;
+        tools
+            .taint_after_call(
+                "search_files",
+                &json!({"pattern": "h", "path": elsewhere.path().display().to_string()}),
+                false,
+            )
+            .await;
+        tools
+            .taint_after_call("terminal", &json!({"command": "curl -s https://a.test"}), false)
+            .await;
+        tools
+            .taint_after_call("vision_analyze", &json!({"image_url": &outside}), false)
+            .await;
+        let taint = tools.taint();
+        assert!(taint.turn && !taint.session);
+        for expected in [
+            "web search results",
+            "a web page",
+            "an image from the web",
+            "the output of a command that fetched from the network",
+        ] {
+            assert!(taint.sources.contains(&expected.to_string()), "{expected}");
+        }
+        assert_eq!(
+            taint
+                .sources
+                .iter()
+                .filter(|s| s.starts_with("a file outside the working folder"))
+                .count(),
+            2,
+            "{:?}",
+            taint.sources
+        );
+    }
+
+    #[tokio::test]
+    async fn the_session_level_survives_the_next_turn_and_a_reopened_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = || {
+            SessionTools::new(SessionToolsConfig {
+                session_id: "ses_keep".into(),
+                cwd: dir.path().to_path_buf(),
+                home: dir.path().join("home"),
+                data_dir: dir.path().join(".data"),
+                scratch_dir: dir.path().join(".data").join("scratch"),
+                shell: detect_shell(),
+                bridge: Arc::new(TestBridge::default()),
+                todos: Vec::new(),
+                memory: None,
+                history: None,
+                skills: None,
+                approvals: None,
+                checkpoints: None,
+                web: None,
+            })
+        };
+        let tools = make();
+        assert!(!tools.taint().is_tainted());
+        tools.mark_tainted("a web page".into()).await;
+        tools.begin_turn();
+        let taint = tools.taint();
+        assert!(!taint.turn && taint.session);
+        assert_eq!(
+            taint.reason().unwrap(),
+            "earlier in this session the agent read a web page"
+        );
+        // Reopened (a new process, say): still careful, with the same sources.
+        let reopened = make().taint();
+        assert!(reopened.session && !reopened.turn);
+        assert_eq!(reopened.sources, ["a web page"]);
+        // Another session in the same folder is not.
+        let other = SessionTools::new(SessionToolsConfig {
+            session_id: "ses_other".into(),
+            cwd: dir.path().to_path_buf(),
+            home: dir.path().join("home"),
+            data_dir: dir.path().join(".data"),
+            scratch_dir: dir.path().join(".data").join("scratch"),
+            shell: detect_shell(),
+            bridge: Arc::new(TestBridge::default()),
+            todos: Vec::new(),
+            memory: None,
+            history: None,
+            skills: None,
+            approvals: None,
+            checkpoints: None,
+            web: None,
+        });
+        assert!(!other.taint().is_tainted());
+    }
+
+    #[tokio::test]
+    async fn a_child_starts_as_careful_as_its_parent_and_saves_nothing() {
+        let (dir, parent) = tools_in();
+        parent.mark_tainted("a web page".into()).await;
+        let child = SessionTools::new(SessionToolsConfig {
+            session_id: "ses_test:sa-0".into(),
+            cwd: dir.path().to_path_buf(),
+            home: dir.path().join("home"),
+            data_dir: dir.path().join(".data"),
+            scratch_dir: dir.path().join(".data").join("scratch"),
+            shell: detect_shell(),
+            bridge: Arc::new(TestBridge::default()),
+            todos: Vec::new(),
+            memory: None,
+            history: None,
+            skills: None,
+            approvals: None,
+            checkpoints: None,
+            web: None,
+        });
+        child.inherit_taint(&parent.taint());
+        assert!(child.taint().session);
+        child.mark_tainted("web search results".into()).await;
+        assert!(taint::load(&dir.path().join(".data"), "ses_test:sa-0").is_none());
+        assert!(taint::load(&dir.path().join(".data"), "ses_test").is_some());
     }
 
     #[tokio::test]

@@ -209,6 +209,7 @@ impl Runtime {
             state: state.clone(),
             result_limit: ops::result_size_limit(model.options.context_length, &budget),
             disabled: Default::default(),
+            taint: None,
         });
         let mut model_config =
             ModelConfig::new(&model.model).with_context_limit(model.options.context_length);

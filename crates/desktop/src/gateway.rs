@@ -2532,6 +2532,8 @@ impl Gateway {
                     .store()
                     .replace_messages(&made.id, &kept)
                     .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                // The branch carries the parent's untrusted text, so its taint too (Phase 6).
+                self.runtime.copy_taint(&parent, &made.id);
                 let taken: Vec<String> = self
                     .runtime
                     .store()
@@ -2639,6 +2641,10 @@ impl Gateway {
             .filter(|p| !p.is_empty())
         {
             self.branches.link(&record.id, parent);
+            // Seeded from the parent's rows: as careful as the parent (Phase 6).
+            if !seeded.is_empty() {
+                self.runtime.copy_taint(parent, &record.id);
+            }
         }
         self.subscribe(&record.id, outbox);
         Ok(json!({
@@ -2937,6 +2943,11 @@ impl Gateway {
                     // A subagent's activity: the page's live subagent rows.
                     RuntimeEvent::Agent(AgentEvent::Subagent { kind, payload }) => {
                         this.emit(&id, kind, payload);
+                    }
+                    // A status line for the transcript: the page keeps `fallback` ones as a system
+                    // line (Phase 6 uses it for "ran after reading untrusted content").
+                    RuntimeEvent::Agent(AgentEvent::Status { kind, text }) => {
+                        this.emit(&id, "status.update", json!({"kind": kind, "text": text}));
                     }
                     // Live progress from inside a running tool call (the terminal's output
                     // tail): the running row shows the message beside its timer, and the

@@ -111,8 +111,7 @@ impl ToolProvider<TurnSession> for DelegatingTools {
         emit: &Emitter,
     ) -> Result<CallToolResult, ErrorData> {
         if call.name.starts_with("mcp__") {
-            let arguments = call.arguments.unwrap_or_default();
-            return Ok(self.delegator.mcp.call(&call.name, arguments).await);
+            return Ok(call_mcp(&self.delegator.mcp, &self.inner, call).await);
         }
         if call.name != "delegate_task" {
             return self.inner.call(session, request_id, call, emit).await;
@@ -127,6 +126,27 @@ impl ToolProvider<TurnSession> for DelegatingTools {
             CallToolResult::success(vec![ContentBlock::text(text)])
         })
     }
+}
+
+/// Calls an MCP tool. What a server returns is text the user didn't write, so the session is
+/// tainted by it unless the server is marked `trusted` (errors count too: the text is the
+/// server's).
+async fn call_mcp(
+    mcp: &crate::mcp::McpManager,
+    tools: &SessionTools,
+    call: CallToolRequestParams,
+) -> CallToolResult {
+    // Looked up before the call: a server that disconnects while answering drops its tool list,
+    // and what it answered must still taint.
+    let server = mcp.server_of(&call.name);
+    let arguments = call.arguments.unwrap_or_default();
+    let result = mcp.call(&call.name, arguments).await;
+    if let Some((server, false)) = server {
+        tools
+            .mark_tainted(hermes_tools::taint::mcp_source(&server))
+            .await;
+    }
+    result
 }
 
 /// A child's tools: the session's own, minus the ones subagents can't use.
@@ -154,8 +174,7 @@ impl ToolProvider<TurnSession> for ChildToolProvider {
         emit: &Emitter,
     ) -> Result<CallToolResult, ErrorData> {
         if call.name.starts_with("mcp__") {
-            let arguments = call.arguments.unwrap_or_default();
-            return Ok(self.mcp.call(&call.name, arguments).await);
+            return Ok(call_mcp(&self.mcp, &self.inner, call).await);
         }
         if BLOCKED_TOOLS.contains(&call.name.as_ref()) {
             let text = json!({"success": false, "error": format!("{} is not available to subagents.", call.name)});
@@ -248,6 +267,13 @@ impl Relay {
 
     fn event(&mut self, event: AgentEvent) {
         match event {
+            // A warning from the child's tools ("ran after reading untrusted content") belongs in
+            // the parent's transcript.
+            AgentEvent::Status { kind, text } => {
+                if let Some(emit) = &self.emit {
+                    emit.emit(AgentEvent::Status { kind, text });
+                }
+            }
             AgentEvent::Usage(usage) => {
                 self.input_tokens += usage.usage.input_tokens.unwrap_or(0).max(0) as u64;
                 self.output_tokens += usage.usage.output_tokens.unwrap_or(0).max(0) as u64;
@@ -494,6 +520,9 @@ impl Delegator {
         // The thread's mode holds for its subagents: Plan and Manual must not be escaped by
         // delegating (a child can't ask, so what would ask is refused), YOLO carries over.
         tools.set_mode(self.parent.tools.mode());
+        // A child is as careful as its parent; what it reads on its own is reported back below.
+        let inherited = self.parent.tools.taint();
+        tools.inherit_taint(&inherited);
         let mut record = self.parent.record.lock().clone();
         record.system_prompt = format!(
             "{base_prompt}\n\n{}",
@@ -577,6 +606,7 @@ impl Delegator {
             state: state.clone(),
             result_limit: ops::result_size_limit(self.context_length, &self.budget),
             disabled: self.disabled.clone(),
+            taint: Some(tools.clone()),
         });
         let mut model_config = ModelConfig::new(&self.model)
             .with_context_limit(self.context_length)
@@ -631,6 +661,16 @@ impl Delegator {
         let relay = relay.await.unwrap_or_default();
         self.subagents.finish(&subagent_id);
         tools.shutdown().await;
+        // What the child read that the parent had not: the parent's own commands are now as
+        // suspect as the child's (its summary carries the untrusted content upward).
+        for source in tools.taint().sources {
+            if !inherited.sources.contains(&source) {
+                self.parent
+                    .tools
+                    .mark_tainted(hermes_tools::taint::child_source(&source))
+                    .await;
+            }
+        }
 
         let messages = child.conversation.lock().messages().clone();
         let replies: Vec<&Message> = messages

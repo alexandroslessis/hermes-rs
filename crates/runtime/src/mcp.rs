@@ -52,6 +52,15 @@ pub struct McpServerConfig {
     pub connect_timeout: Option<u64>,
     #[serde(default, skip_serializing_if = "ToolFilter::is_empty")]
     pub tools: ToolFilter,
+    /// Not Hermes's: `true` says the server's results are the user's own (a local notes server),
+    /// so reading them doesn't make the session "careful" (taint, Phase 6). Off by default: what
+    /// an MCP server returns may be text a stranger wrote.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub trusted: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// `tools.include` / `tools.exclude`: which of a server's tools are offered.
@@ -415,6 +424,17 @@ impl McpManager {
             .collect()
     }
 
+    /// The server an `mcp__` tool belongs to, and whether the user marked it `trusted`.
+    pub fn server_of(&self, tool_name: &str) -> Option<(String, bool)> {
+        self.servers.lock().iter().find_map(|(name, server)| {
+            server
+                .tools
+                .iter()
+                .any(|(tool, _)| tool.name == tool_name)
+                .then(|| (name.clone(), server.config.trusted))
+        })
+    }
+
     /// Calls an `mcp__` tool on its server, within the server's timeout.
     pub async fn call(&self, name: &str, arguments: JsonObject) -> CallToolResult {
         let found = self
@@ -460,12 +480,28 @@ impl McpManager {
         T: rmcp::transport::IntoTransport<RoleClient, E, A>,
         E: std::error::Error + Send + Sync + 'static,
     {
+        self.connect_transport_with(name, McpServerConfig::default(), transport)
+            .await
+    }
+
+    /// [`Self::connect_transport`] for a server with this configuration (tests).
+    #[doc(hidden)]
+    pub async fn connect_transport_with<T, E, A>(
+        &self,
+        name: &str,
+        config: McpServerConfig,
+        transport: T,
+    ) -> Result<(), String>
+    where
+        T: rmcp::transport::IntoTransport<RoleClient, E, A>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
         let client = ().serve(transport).await.map_err(|e| format!("{e}"))?;
         let tools = client.list_all_tools().await.map_err(|e| format!("{e}"))?;
         self.servers.lock().insert(
             name.to_string(),
             Server {
-                config: McpServerConfig::default(),
+                config,
                 status: ServerStatus::Connecting,
                 tools: Vec::new(),
                 client: None,

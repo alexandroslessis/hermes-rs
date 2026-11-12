@@ -380,3 +380,61 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   are probed side by side, 3 s each at most; a configured local provider that is down is not
   offered even when it lists its models itself (`discover_models` off). A live check on a machine
   where Ollama or LM Studio runs will also see that server in `GET /api/model/auxiliary/local`.
+
+## Taint (Phase 6 of `docs/backend/PHASES.md`)
+
+- **What taints, and what does not.** `web_search`, `web_extract`, `browser_*` and `vision_analyze`
+  on an `http(s)` image taint when the call succeeded; `@url:` references taint when a page was
+  fetched (`runtime/src/lib.rs`, the deferred-message path); an MCP result taints unless the
+  server's config has `"trusted": true` (not a Hermes key; errors count, the text is the server's);
+  `read_file` and `search_files` taint when the path classifies `Outside` (the working folder, the
+  scratch folder, the data folder and the skills/memory folders do not; persistence places such as
+  `~/.ssh` are not `Outside` either); a subagent that read anything taints its parent
+  (`delegate.rs`, "a subagent that read ..."). A terminal command that names a fetcher (`curl`,
+  `wget`, `Invoke-WebRequest`/`iwr`, `Invoke-RestMethod`/`irm`, `Net.WebClient`...: `taint::
+  command_source`, a name check) taints; other terminal output does not (build logs, `git`), nor
+  does `python -c "urllib..."` or a `git clone` whose files are then read *inside* the working
+  folder. `vision_analyze` on a local image outside the working folder taints like `read_file`.
+  Skill and memory content (staged in CP6.2), `session_search`, MCP *tool descriptions* (in every
+  request from the start; tainting on them would make every session with a server careful) and
+  the user's own attachments do not taint.
+- **Parallel tool calls** in one assistant message run concurrently (`ToolOperation`,
+  `join_all`), so a sibling call is checked before another sibling's result has tainted the
+  session. That is not a hole: the model wrote every call of the batch *before* any of their
+  results existed, so no call in the batch can have been steered by a sibling's result; the next
+  batch, written after reading them, is checked tainted.
+- **Branches.** `session.branch` (and `session.create` seeded with a parent's rows) copies the
+  parent's taint to the new session (`Runtime::copy_taint`), even when the branch was cut before
+  the tainting read. Rewind and `/undo` don't clear it either: conservative on purpose.
+- **Two levels, one effect.** `Taint.turn` is set during the turn; at the next turn it becomes
+  `Taint.session`. Both have the same effects (the plan said "a lower level" for the session one
+  without naming a difference); only the wording of the question differs ("this turn read ..." /
+  "earlier in this session the agent read ..."). Nothing clears the flag; a session that read
+  untrusted content stays careful for good. The desktop does not configure MCP servers
+  (Settings has no MCP screen yet), so `trusted` can only be set where `mcp_servers` is written
+  (the frozen GPUI app's config).
+- **Persistence.** The session level is `taint.json` in the data folder (`{session_id: {sources}}`),
+  written when a source is read and removed when the session is deleted. Compression does not
+  touch it (the tools outlive the conversation rewrite) and reopening a session loads it in
+  `SessionTools::new`. A subagent's tools inherit the parent's taint, never save it, and hand what
+  they read back to the parent when they finish. A damaged file reads as "clean" (it is written
+  through a temp file and a rename, so only an outside hand damages it), and the desktop app and
+  `hermes-acp.exe` are separate processes: two of them writing within the same moment can lose
+  one entry (the in-memory taint of a running session is unaffected; only a reopen would miss it).
+  Source names are one line, at most 160 characters (a path in one comes from the model).
+- **What changes while tainted** (`SessionTools::check_command` / `check_edit`): a *flagged*
+  command (dangerous pattern or protected path, not every command) asks every time in Manual,
+  Accept edits and Auto, is never smart-approved and its answer is not remembered; the question
+  carries the reason in its description ("recursive delete (this turn read a web page)"). The
+  Phase 1 rule that an `Outside` write asks in Accept edits and Auto already existed, so the only
+  addition there is the reason text. In Yolo nothing blocks: the action runs and
+  `take_taint_warnings()` hands the line "ran after reading untrusted content: <sources>" to
+  `GuardedTools`, which emits it after the call. A command that touches a persistence place asks in
+  Yolo as before, with the reason added, and gives no warning.
+- **The warning rides on `status.update` with `kind: "fallback"`.** The page only keeps one
+  `status.update` kind in the conversation, the fallback-model switch (`status.ts`, a system line
+  with the event's `text`); every other kind is ignored or drives the compaction indicator. There
+  is no page-compatible "notice" event, so the warning borrows that kind rather than inventing a
+  new event or a patch. The line lives in the page's session state only (it is not stored, so it
+  is gone after a reload) and is also logged (`warn`). Zed (ACP) shows it as a thought. If the
+  page ever treats `fallback` as more than a line, move this to a patch (`crates/desktop/patches/`).

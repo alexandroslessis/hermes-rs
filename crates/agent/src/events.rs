@@ -36,6 +36,12 @@ pub enum AgentEvent {
         kind: &'static str,
         payload: serde_json::Value,
     },
+    /// A line for the transcript's status row (`status.update`): `kind` is the page's own kind
+    /// name, `text` what it shows. Used for "ran after reading untrusted content" (Phase 6).
+    Status {
+        kind: &'static str,
+        text: String,
+    },
     /// Live progress from inside a running tool call (the terminal's output tail; Hermes's
     /// `agent/tool_progress_relay.py` fires the same `tool.progress` wire event for MCP tools).
     /// Emitted from the tool's own thread, throttled there.

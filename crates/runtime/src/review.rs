@@ -220,6 +220,7 @@ async fn review(job: ReviewJob) -> Result<Vec<String>> {
         state: state.clone(),
         result_limit: ops::result_size_limit(context_length, &budget),
         disabled: Default::default(),
+        taint: None,
     });
     let mut model_config = ModelConfig::new(&model).with_context_limit(context_length);
     if let Some(params) = effort_params {

@@ -680,6 +680,30 @@ pub struct GuardedTools {
     pub result_limit: usize,
     /// Tools the user switched off (Capabilities ▸ Tools): not offered, and refused if called.
     pub disabled: Arc<std::collections::HashSet<String>>,
+    /// The session's tools, whose taint a result can raise (web, outside files...) and whose
+    /// Yolo warnings are shown after the call. `None` for the review and curator agents.
+    pub taint: Option<Arc<hermes_tools::SessionTools>>,
+}
+
+/// The `status.update` kind the page shows as a line in the transcript. Hermes uses it for
+/// "switched to fallback model"; it is the one status kind the page keeps in the conversation
+/// (`status.ts`), so a Yolo warning rides on it. See PITFALLS.md.
+pub const TAINT_STATUS_KIND: &str = "fallback";
+
+impl GuardedTools {
+    /// After a call: what it read may taint the session, and what Yolo let through is reported.
+    async fn after_call(&self, name: &str, args: &Value, failed: bool, emit: &Emitter) {
+        let Some(tools) = &self.taint else {
+            return;
+        };
+        tools.taint_after_call(name, args, failed).await;
+        for text in tools.take_taint_warnings() {
+            emit.emit(hermes_agent::events::AgentEvent::Status {
+                kind: TAINT_STATUS_KIND,
+                text,
+            });
+        }
+    }
 }
 
 #[async_trait]
@@ -714,6 +738,8 @@ impl ToolProvider<TurnSession> for GuardedTools {
         }
         let args = Value::Object(call.arguments.clone().unwrap_or_default());
         let result = self.inner.call(session, request_id, call, emit).await;
+        let failed = result.as_ref().map_or(true, |r| r.is_error == Some(true));
+        self.after_call(&name, &args, failed, emit).await;
         match result {
             Ok(mut result) => {
                 let text = result
@@ -1044,5 +1070,102 @@ mod tests {
             "Preview (first 1456 chars):\n{}\n...",
             line.repeat(16)
         )));
+    }
+
+    /// A provider whose every call returns the same text, as a success or as an error.
+    struct Canned {
+        error: bool,
+    }
+
+    #[async_trait]
+    impl ToolProvider<TurnSession> for Canned {
+        async fn tools(&self, _session: &TurnSession) -> Result<Vec<Tool>> {
+            Ok(Vec::new())
+        }
+
+        async fn call(
+            &self,
+            _session: &TurnSession,
+            _request_id: &str,
+            _call: CallToolRequestParams,
+            _emit: &Emitter,
+        ) -> Result<CallToolResult, ErrorData> {
+            let content = vec![ContentBlock::text("{\"results\": []}")];
+            Ok(if self.error {
+                CallToolResult::error(content)
+            } else {
+                CallToolResult::success(content)
+            })
+        }
+    }
+
+    struct QuietBridge;
+
+    #[async_trait]
+    impl hermes_tools::UserBridge for QuietBridge {
+        async fn clarify(
+            &self,
+            _session_id: &str,
+            _request: hermes_tools::ClarifyRequest,
+        ) -> hermes_tools::ClarifyOutcome {
+            hermes_tools::ClarifyOutcome::Undelivered
+        }
+
+        fn process_finished(&self, _session_id: &str, _notice: hermes_tools::ProcessNotice) {}
+    }
+
+    /// Calls `name` through `GuardedTools` over a canned provider; returns the session's tools.
+    async fn guarded_call(name: &str, error: bool) -> Arc<hermes_tools::SessionTools> {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = Arc::new(hermes_tools::SessionTools::new(
+            hermes_tools::SessionToolsConfig {
+                session_id: "s1".into(),
+                cwd: dir.path().to_path_buf(),
+                home: dir.path().join("home"),
+                data_dir: dir.path().join("data"),
+                scratch_dir: dir.path().join("scratch"),
+                shell: hermes_tools::detect_shell(),
+                bridge: Arc::new(QuietBridge),
+                todos: Vec::new(),
+                memory: None,
+                history: None,
+                skills: None,
+                approvals: None,
+                checkpoints: None,
+                web: None,
+            },
+        ));
+        let guarded = GuardedTools {
+            inner: Arc::new(Canned { error }),
+            scratch_dir: dir.path().join("scratch"),
+            state: Default::default(),
+            result_limit: 100_000,
+            disabled: Default::default(),
+            taint: Some(tools.clone()),
+        };
+        let session = TurnSession {
+            id: "s1".into(),
+            system_prompt: String::new(),
+            conversation: Conversation::new_unvalidated(Vec::new()),
+            max_tokens: None,
+            context: None,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let emit = Emitter::new(tx, tokio_util::sync::CancellationToken::new());
+        let call = CallToolRequestParams::new(name.to_string());
+        let _ = guarded.call(&session, "c1", call, &emit).await;
+        tools
+    }
+
+    #[tokio::test]
+    async fn guarded_web_results_taint_the_session_unless_the_call_failed() {
+        for name in ["web_search", "web_extract"] {
+            assert!(guarded_call(name, false).await.taint().turn, "{name}");
+            assert!(
+                !guarded_call(name, true).await.taint().is_tainted(),
+                "{name}"
+            );
+        }
+        assert!(!guarded_call("todo_list", false).await.taint().is_tainted());
     }
 }

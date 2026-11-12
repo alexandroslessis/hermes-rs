@@ -4963,3 +4963,366 @@ async fn the_prompts_a_slash_command_writes_get_no_block() {
     let sent = user_contents(&h.requests.lock()[0])[0].clone();
     assert!(!sent.starts_with("<context>"), "{sent}");
 }
+
+// ---- taint (Phase 6, CP6.1) -------------------------------------------------------------------
+//
+// Untrusted sources here: the calculator MCP server (not marked trusted) and a file outside the
+// working folder. The web tools need the network, so their wiring is tested in `ops.rs` and in
+// `hermes_tools` (`taint_after_call`).
+
+/// Connects the calculator as MCP server `calc` with `trusted` as given.
+async fn connect_calc(h: &Harness, trusted: bool) {
+    use rmcp::ServiceExt as _;
+    let (client_write, server_read) = tokio::io::duplex(64 * 1024);
+    let (server_write, client_read) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let running = Calculator.serve((server_read, server_write)).await.unwrap();
+        let _ = running.waiting().await;
+    });
+    let config = hermes_runtime::mcp::McpServerConfig {
+        trusted,
+        ..Default::default()
+    };
+    h.runtime
+        .mcp()
+        .connect_transport_with("calc", config, (client_read, client_write))
+        .await
+        .unwrap();
+}
+
+fn add_call() -> String {
+    tool_reply(&[("m1", "mcp__calc__add", json!({"a": 2, "b": 3}))])
+}
+
+fn flagged_call() -> String {
+    tool_reply(&[("t1", "terminal", json!({"command": "rm -rf build"}))])
+}
+
+/// The warning lines a turn put in the transcript.
+fn taint_warnings(events: &[RuntimeEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::Agent(AgentEvent::Status { kind, text }) => {
+                assert_eq!(*kind, "fallback", "the one status kind the page keeps");
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A harness whose approvals are answered `choice` (and recorded), with a `build` folder to
+/// delete and the calculator connected.
+async fn taint_harness(
+    replies: Vec<String>,
+    choice: hermes_tools::approval::ApprovalChoice,
+    trusted: bool,
+) -> (Harness, Arc<Mutex<Vec<String>>>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let h = harness_with(
+        replies,
+        Arc::new(ApproveBridge {
+            choice,
+            asked: asked.clone(),
+        }),
+    )
+    .await;
+    std::fs::create_dir_all(h.work.path().join("build")).unwrap();
+    connect_calc(&h, trusted).await;
+    (h, asked)
+}
+
+#[tokio::test]
+async fn a_flagged_command_after_untrusted_content_asks_in_auto_with_the_reason() {
+    use hermes_tools::ApprovalMode;
+    use hermes_tools::approval::ApprovalChoice;
+    let (h, asked) = taint_harness(
+        vec![add_call(), flagged_call(), text_reply("Done.")],
+        ApprovalChoice::Deny,
+        false,
+    )
+    .await;
+    let session = session_in(&h);
+    h.runtime
+        .set_approval_mode(&session, ApprovalMode::Auto)
+        .unwrap();
+    let events = run_turn(&h, &session, "add 2 and 3, then clean up").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!(
+        *asked.lock(),
+        ["recursive delete (this turn read results from MCP server calc)"]
+    );
+    assert!(h.work.path().join("build").exists(), "declined: not run");
+    // The reviewer was not consulted: the turn made exactly its three requests.
+    assert_eq!(h.requests.lock().len(), 3);
+    assert!(taint_warnings(&events).is_empty());
+    let taint = h.runtime.taint(&session).unwrap();
+    assert!(taint.turn && taint.is_tainted());
+}
+
+#[tokio::test]
+async fn the_same_in_yolo_runs_and_leaves_a_warning_in_the_transcript() {
+    use hermes_tools::ApprovalMode;
+    use hermes_tools::approval::ApprovalChoice;
+    let (h, asked) = taint_harness(
+        vec![add_call(), flagged_call(), text_reply("Done.")],
+        ApprovalChoice::Deny,
+        false,
+    )
+    .await;
+    let session = session_in(&h);
+    h.runtime
+        .set_approval_mode(&session, ApprovalMode::Yolo)
+        .unwrap();
+    let events = run_turn(&h, &session, "add 2 and 3, then clean up").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert!(asked.lock().is_empty(), "Yolo never blocks");
+    assert!(!h.work.path().join("build").exists(), "it ran");
+    assert_eq!(
+        taint_warnings(&events),
+        ["ran after reading untrusted content: results from MCP server calc"]
+    );
+}
+
+#[tokio::test]
+async fn a_clean_turn_is_unchanged_no_asks_no_warnings_no_extra_requests() {
+    use hermes_tools::ApprovalMode;
+    use hermes_tools::approval::ApprovalChoice;
+    let (h, asked) = taint_harness(
+        vec![flagged_call(), text_reply("Done.")],
+        ApprovalChoice::Deny,
+        false,
+    )
+    .await;
+    let session = session_in(&h);
+    h.runtime
+        .set_approval_mode(&session, ApprovalMode::Yolo)
+        .unwrap();
+    let events = run_turn(&h, &session, "clean up").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert!(asked.lock().is_empty());
+    assert!(taint_warnings(&events).is_empty());
+    assert_eq!(h.requests.lock().len(), 2);
+    assert!(!h.runtime.taint(&session).unwrap().is_tainted());
+    assert!(!h.work.path().join("build").exists());
+}
+
+#[tokio::test]
+async fn a_trusted_mcp_server_does_not_taint_the_session() {
+    use hermes_tools::ApprovalMode;
+    use hermes_tools::approval::ApprovalChoice;
+    let (h, asked) = taint_harness(
+        vec![add_call(), flagged_call(), text_reply("Done.")],
+        ApprovalChoice::Once,
+        true,
+    )
+    .await;
+    let session = session_in(&h);
+    h.runtime
+        .set_approval_mode(&session, ApprovalMode::AcceptEdits)
+        .unwrap();
+    let events = run_turn(&h, &session, "add 2 and 3, then clean up").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    // Asked as any flagged command is, without a reason.
+    assert_eq!(*asked.lock(), ["recursive delete"]);
+    assert!(!h.runtime.taint(&session).unwrap().is_tainted());
+}
+
+#[tokio::test]
+async fn reading_a_file_outside_the_working_folder_taints_the_session() {
+    use hermes_tools::ApprovalMode;
+    use hermes_tools::approval::ApprovalChoice;
+    let elsewhere = tempfile::tempdir().unwrap();
+    let outside = elsewhere.path().join("notes.txt");
+    std::fs::write(&outside, "hello").unwrap();
+    let (h, asked) = taint_harness(
+        vec![
+            tool_reply(&[(
+                "r1",
+                "read_file",
+                json!({"path": outside.display().to_string()}),
+            )]),
+            flagged_call(),
+            text_reply("Done."),
+        ],
+        ApprovalChoice::Once,
+        false,
+    )
+    .await;
+    let session = session_in(&h);
+    h.runtime
+        .set_approval_mode(&session, ApprovalMode::AcceptEdits)
+        .unwrap();
+    run_turn(&h, &session, "read that, then clean up").await;
+    let asked = asked.lock().clone();
+    assert_eq!(asked.len(), 1);
+    assert!(
+        asked[0]
+            .starts_with("recursive delete (this turn read a file outside the working folder ("),
+        "{asked:?}"
+    );
+}
+
+#[tokio::test]
+async fn reading_a_file_inside_the_working_folder_does_not_taint() {
+    use hermes_tools::ApprovalMode;
+    use hermes_tools::approval::ApprovalChoice;
+    let (h, asked) = taint_harness(
+        vec![
+            tool_reply(&[("r1", "read_file", json!({"path": "mine.txt"}))]),
+            flagged_call(),
+            text_reply("Done."),
+        ],
+        ApprovalChoice::Once,
+        false,
+    )
+    .await;
+    std::fs::write(h.work.path().join("mine.txt"), "x").unwrap();
+    let session = session_in(&h);
+    h.runtime
+        .set_approval_mode(&session, ApprovalMode::AcceptEdits)
+        .unwrap();
+    run_turn(&h, &session, "read that, then clean up").await;
+    assert_eq!(*asked.lock(), ["recursive delete"]);
+}
+
+#[tokio::test]
+async fn taint_survives_the_next_turn_compression_and_a_reopened_session() {
+    use hermes_tools::ApprovalMode;
+    use hermes_tools::approval::ApprovalChoice;
+    let (h, asked) = taint_harness(
+        vec![
+            text_reply("one"),
+            text_reply(&long_two()),
+            add_call(),
+            text_reply("5"),
+            text_reply("four"),
+            text_reply("five"),
+            text_reply("## Goal\nthe summary"),
+            flagged_call(),
+            text_reply("Done."),
+        ],
+        ApprovalChoice::Once,
+        false,
+    )
+    .await;
+    let session = session_in(&h);
+    h.runtime
+        .set_approval_mode(&session, ApprovalMode::AcceptEdits)
+        .unwrap();
+    for text in ["first", "second", "add 2 and 3", "fourth", "fifth"] {
+        run_turn(&h, &session, text).await;
+    }
+    let taint = h.runtime.taint(&session).unwrap();
+    assert!(taint.session && !taint.turn, "{taint:?}");
+
+    let events = collect(
+        h.runtime
+            .compress(&session, &h.provider, TurnOptions::default(), None)
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::Agent(AgentEvent::Compacted { .. })))
+    );
+    // The tool result that tainted the session is summarized away; the taint is not.
+    assert!(h.runtime.taint(&session).unwrap().session);
+
+    // A fresh runtime on the same data folder (a restart) reopens the session: still tainted.
+    let reopened = runtime_in(h.data.path());
+    let taint = reopened.taint(&session).unwrap();
+    assert!(taint.session, "{taint:?}");
+    assert_eq!(taint.sources, ["results from MCP server calc"]);
+    drop(reopened);
+
+    // And the next turn's flagged command asks, saying it was an earlier turn.
+    run_turn(&h, &session, "clean up").await;
+    assert_eq!(
+        *asked.lock(),
+        ["recursive delete (earlier in this session the agent read results from MCP server calc)"]
+    );
+}
+
+#[tokio::test]
+async fn a_subagent_that_read_untrusted_content_taints_the_parent() {
+    use hermes_tools::ApprovalMode;
+    use hermes_tools::approval::ApprovalChoice;
+    let (h, asked) = taint_harness(
+        vec![
+            tool_reply(&[(
+                "d1",
+                "delegate_task",
+                json!({"tasks": [{"goal": "add 2 and 3 with the calculator"}]}),
+            )]),
+            add_call(),
+            text_reply("The sum is 5."),
+            flagged_call(),
+            text_reply("Done."),
+        ],
+        ApprovalChoice::Deny,
+        false,
+    )
+    .await;
+    let session = session_in(&h);
+    h.runtime
+        .set_approval_mode(&session, ApprovalMode::AcceptEdits)
+        .unwrap();
+    let events = run_turn(&h, &session, "delegate the sum, then clean up").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    // The parent never called the calculator itself, yet its command now asks and says why.
+    assert_eq!(
+        *asked.lock(),
+        ["recursive delete (this turn read a subagent that read results from MCP server calc)"]
+    );
+    assert!(h.work.path().join("build").exists());
+    assert!(h.runtime.taint(&session).unwrap().turn);
+}
+
+#[tokio::test]
+async fn deleting_a_session_forgets_its_taint() {
+    use hermes_tools::approval::ApprovalChoice;
+    let (h, _asked) = taint_harness(
+        vec![add_call(), text_reply("5")],
+        ApprovalChoice::Once,
+        false,
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "add 2 and 3").await;
+    assert!(hermes_tools::taint::load(h.data.path(), &session).is_some());
+    h.runtime.delete_session(&session).await.unwrap();
+    assert!(hermes_tools::taint::load(h.data.path(), &session).is_none());
+}
+
+#[tokio::test]
+async fn a_branch_of_a_tainted_session_starts_tainted_and_one_of_a_clean_session_does_not() {
+    use hermes_tools::approval::ApprovalChoice;
+    let (h, _asked) = taint_harness(
+        vec![add_call(), text_reply("5")],
+        ApprovalChoice::Once,
+        false,
+    )
+    .await;
+    let tainted = session_in(&h);
+    let clean = session_in(&h);
+    run_turn(&h, &tainted, "add 2 and 3").await;
+    // Made the way the gateway's branch makes one: a new session, then the copy, then opened.
+    let branch = session_in(&h);
+    h.runtime.copy_taint(&tainted, &branch);
+    let taint = h.runtime.taint(&branch).unwrap();
+    assert!(taint.session, "{taint:?}");
+    assert_eq!(taint.sources, h.runtime.taint(&tainted).unwrap().sources);
+    // From a closed parent too (only the file is left).
+    h.runtime.delete_session(&branch).await.unwrap();
+    let other = session_in(&h);
+    h.runtime.close(&tainted).await;
+    h.runtime.copy_taint(&tainted, &other);
+    assert!(h.runtime.taint(&other).unwrap().session);
+    // A clean parent gives a clean branch.
+    let clean_branch = session_in(&h);
+    h.runtime.copy_taint(&clean, &clean_branch);
+    assert!(!h.runtime.taint(&clean_branch).unwrap().is_tainted());
+}

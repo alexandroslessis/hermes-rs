@@ -1252,6 +1252,10 @@ impl Runtime {
                             };
                             pages.insert(url, page);
                         }
+                        // A fetched page is text a stranger wrote: the session turns careful.
+                        if let Some(source) = hermes_tools::taint::reference_source(&pages) {
+                            runtime.session.tools.mark_tainted(source).await;
+                        }
                         attachments.and_then(|attachments| {
                             user_message(
                                 &runtime.session,
@@ -1340,6 +1344,7 @@ impl Runtime {
                 state: state.clone(),
                 result_limit: ops::result_size_limit(context_length, &budget),
                 disabled: disabled.clone(),
+                taint: Some(runtime.session.tools.clone()),
             });
             let mut model_config = ModelConfig::new(&model)
                 .with_context_limit(context_length)
@@ -1615,6 +1620,26 @@ impl Runtime {
             memory,
             conversation: compress::estimate_messages(open.conversation.lock().messages()),
         })
+    }
+
+    /// What the session has read that isn't the user's (Phase 6): the page's "careful" state.
+    pub fn taint(&self, session_id: &str) -> Result<hermes_tools::taint::Taint> {
+        Ok(self.open(session_id)?.tools.taint())
+    }
+
+    /// A session made from another one's messages (a branch) starts as careful as that one: it
+    /// carries the same untrusted text. The whole taint is copied even when the branch was cut
+    /// before the tainting read (the conservative side). Call it before `to` is opened. Blocking
+    /// (a small file): the gateway's branch handler already does its store work in line.
+    pub fn copy_taint(&self, from: &str, to: &str) {
+        let open = self.sessions.lock().get(from).cloned();
+        let sources = match open {
+            Some(open) => Some(open.tools.taint()).filter(|t| t.is_tainted()).map(|t| t.sources),
+            None => hermes_tools::taint::load(&self.config.data_dir, from),
+        };
+        if let Some(sources) = sources {
+            hermes_tools::taint::save(&self.config.data_dir, to, &sources);
+        }
     }
 
     /// The MCP servers (Settings configures them; their tools join every turn).
@@ -2191,6 +2216,10 @@ impl Runtime {
         self.close(session_id).await;
         self.store.delete_session(session_id)?;
         let _ = std::fs::remove_dir_all(self.scratch_dir(session_id));
+        let data_dir = self.config.data_dir.clone();
+        let id = session_id.to_string();
+        let _ =
+            tokio::task::spawn_blocking(move || hermes_tools::taint::forget(&data_dir, &id)).await;
         Ok(())
     }
 }
