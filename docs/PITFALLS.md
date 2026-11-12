@@ -301,3 +301,23 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   from the next turn. The warning near zero goes out as
   `status.update` `{kind: "quota"}`, a kind the page ignores.
 - **ACP shows no quota**: `usage_update` carries tokens (`used`, `size`) only.
+
+## Budget profiles (Phase 3 of `docs/backend/PHASES.md`)
+
+- **The default is `requests`, not today's behaviour.** A config without `budget.profile` (every
+  existing install) runs `requests` caps: 150 iterations, 2 strikes for invented or cut-off tool
+  calls, compression at 90%/85%, 3 subagents at once. `balanced` is the old constants. The `turns`
+  harness pins `balanced` unless `HERMES_TEST_PROFILE` says otherwise, so a test passing there
+  says nothing about the user's default: name the profile with `harness_profile` when it matters.
+- **Knobs apply from the next turn; the wording from the next session.** The budget paragraph in
+  the system prompt (and `tokens`' names-only skills block) is chosen at `create_session` and
+  stored with the session, so switching the profile doesn't change a running or resumed session's
+  prompt. Sessions created before Phase 3 have no budget paragraph at all. A compaction or a model
+  switch rebuilds the prompt anyway (cache miss either way) and then takes the profile in force.
+- **Tool schemas state no profile-dependent number** (`read_file`'s `limit`, `delegate_task`'s
+  width): a schema rides in every request of every session while the profile can change. Don't add
+  "default: N" back; the tool result and the delegate refusal state the real limit.
+- **Bad overrides**: `config.set budget.<knob>` refuses them (`-32602`), `PUT /api/config` drops
+  them silently, a hand-edited `desktop-config.json` value out of range is ignored (the profile's
+  value stays). `ACP` reads the profile once at start: a switch in the desktop reaches a running
+  `hermes-acp.exe` only after the editor restarts it.

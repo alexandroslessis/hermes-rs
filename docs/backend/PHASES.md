@@ -42,7 +42,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 0 | Groundwork: rules, request-counting test harness | S | — | Sonnet | A |
 | 1 | Path policy, env scrub, skill-script flag — ✅ 2026-11-12 | S–M | — | Sonnet | B |
 | 2 | Request ledger — ✅ 2026-11-12 | M | 0 | Sonnet | A |
-| 3 | Budget profiles and the knobs they set | M | 2 | Sonnet | A |
+| 3 | Budget profiles and the knobs they set — ✅ 2026-11-12 | M | 2 | Sonnet | A |
 | 4 | Side jobs off the main quota | S–M | 3 | Sonnet | A |
 | 5 | Local index (FTS5) and per-turn pre-injection | M | 3 | Sonnet | A |
 | 6 | Taint tracking and the staging area | M | 1 | Sonnet | B |
@@ -970,15 +970,18 @@ phase under `requests`.
 
 | Scenario | Baseline | After 3 | After 5 | After 7 | After 10 |
 |---|---|---|---|---|---|
-| S1 read 3, edit 1 | 5 | | | | |
-| S2 empty reply after tools | 3 | | | | |
-| S2b empty first reply | 2 | | | | |
-| S3 truncated call | 3 | | | | |
-| S4 ten turns (incl. review) | 11 | | | | |
-| S5 delegate two | 4 | | | | |
+| S1 read 3, edit 1 | 5 | 5 | | | |
+| S2 empty reply after tools | 3 | 3 | | | |
+| S2b empty first reply | 2 | 2 | | | |
+| S3 truncated call | 3 | 3 | | | |
+| S4 ten turns (incl. review) | 11 | 11 | | | |
+| S5 delegate two | 4 | 4 | | | |
 
 Phase 0 baselines (2026-11-11, `balanced` = today's behaviour; all counted as `main` until Phase 2
-labels requests): S1 = 4 tool rounds + answer; S2 = tool round + empty reply + answer after
+labels requests). After 3 (`requests`, 2026-11-12): unchanged. Phase 3 only moves caps the
+scenarios don't reach and adds prompt wording; the request-lowering `requests` values (review
+`idle_once`, skills preload, heuristic titles) wait for Phases 4, 5 and 7, so the plan's "lower
+than baseline for S2, S3, S5" is not met yet. Phase 0's breakdown: S1 = 4 tool rounds + answer; S2 = tool round + empty reply + answer after
 `EmptyResponseRecovery`'s nudge; S2b = empty first reply + the inference step's own retry (it never
 reaches `EmptyResponseRecovery`); S3 =
 cut-off tool call + retry + answer; S4 = 10 turns + 1 background review (memory and skill counters

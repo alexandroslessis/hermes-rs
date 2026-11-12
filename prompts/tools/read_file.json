@@ -16,9 +16,7 @@
       },
       "limit": {
         "type": "integer",
-        "description": "Maximum number of lines to read (default: 2000, max: 2000). Reads are additionally capped at a ~100K-character budget with a next_offset continuation.",
-        "default": 2000,
-        "maximum": 2000
+        "description": "Maximum number of lines to read. Omit it to read as much as one call allows (the limit follows the user's budget profile, a few thousand lines). Reads are additionally capped at a ~100K-character budget; when a file is longer, the result has a next_offset to continue from."
       }
     },
     "required": ["path"]

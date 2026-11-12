@@ -202,7 +202,7 @@ Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`
    `approval.respond`/`clarify.respond`.
 
 Delegation: the `delegate_task` tool goes to `Delegator` (`runtime/src/delegate.rs`), which runs
-child agents (max `MAX_CONCURRENT_CHILDREN`), registers them in `Subagents` (`subagents.rs`) for
+child agents (at most the budget profile's `delegate_max_children`), registers them in `Subagents` (`subagents.rs`) for
 `subagent.list/tail/steer/interrupt`, and relays their progress as `AgentEvent::Subagent{kind,
 payload}` → `subagent.*` events. `/bg` (`Runtime::background`) is a detached child; `/btw`
 (`Runtime::side_question`) is one tool-less request over a snapshot.
@@ -218,7 +218,7 @@ Two settings files, with different owners — don't mix them up:
 | `ui-preferences.json` | `rest.rs` | the page's interface preferences |
 
 `Gateway::apply_settings()` pushes `desktop-config.json` values into the runtime (approvals mode,
-checkpoints, memory limits, disabled toolsets). Call it after any settings write that affects the
+checkpoints, memory limits, disabled toolsets, budget knobs). Call it after any settings write that affects the
 runtime; it runs at startup and after `PUT /api/config`. Defaults and descriptions for keys
 Hermes's page shows live in `rest.rs`.
 
@@ -231,6 +231,15 @@ allow / warn / deny per purpose. The limit comes from Settings ▸ Providers ▸
 (`daily_request_limit`, patch 0021) or the `requests.limits.<provider id>` config key, else it is
 learned from a provider's "N of N" 429. The page sees it as `requests.status` and as the status
 bar's allowance gauge (`plan_gauge` in `session.usage`).
+
+**Budget profiles** (Phase 3): `runtime/src/budget.rs` holds every limit the agent loop spends
+requests or tokens on (iteration budget, retry caps, compression thresholds, result/read/search
+sizes, delegation width) as `BudgetKnobs`, bundled by `budget.profile` = `requests` (default, also
+for configs without the key) | `balanced` (the old constants) | `tokens`, with per-knob overrides
+`budget.<knob>`. `apply_settings` hands them to `Runtime::set_budget`; each turn copies
+`Runtime::budget()` once. The profile's wording in the system prompt (and `tokens`' names-only
+skills block) is chosen when a session is created and stored with it. Settings ▸ Model ▸ Main
+shows the select via patch 0022.
 
 Data folder (`%APPDATA%\hermes-rs`, or `HERMES_RS_HOME`):
 

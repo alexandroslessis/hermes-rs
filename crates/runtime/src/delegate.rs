@@ -34,9 +34,6 @@ use crate::compress;
 use crate::ops;
 use crate::session::{HermesEffect, OpenSession, TurnRuntime, TurnSession};
 
-/// `delegation.max_concurrent_children` under the `balanced` profile (the page is told this
-/// number; a turn enforces its own profile's `delegate_max_children`).
-pub const MAX_CONCURRENT_CHILDREN: usize = crate::budget::BudgetKnobs::BALANCED.delegate_max_children;
 /// `DEFAULT_MAX_SUMMARY_CHARS`.
 const MAX_SUMMARY_CHARS: usize = 24_000;
 /// `DELEGATE_BLOCKED_TOOLS` that exist here.

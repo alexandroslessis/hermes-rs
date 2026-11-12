@@ -231,6 +231,12 @@ impl Gateway {
             &Settings::load(&self.data_dir),
             &self.rest.config_value("requests.limits"),
         ));
+        // The budget profile and its overrides (`budget.*`): knobs for the next turn; the prompt
+        // wording and the skills block they pick apply to sessions made after this.
+        self.runtime
+            .set_budget(hermes_runtime::budget::from_config(
+                &self.rest.config_value("budget"),
+            ));
         // File checkpoints (`/rollback`), before the turn's first write.
         self.runtime
             .checkpoints()
@@ -565,6 +571,15 @@ impl Gateway {
                         Ok(json!({"key": key, "value": effort, "ok": true}))
                     }
                     ("", _) => Err((INVALID_PARAMS, "key is required".to_string())),
+                    // `budget.profile` and the per-knob overrides: a bad value is refused here
+                    // (0 for a cap, an unknown profile), not stored and then ignored.
+                    (key, _) if key.starts_with("budget.") => {
+                        hermes_runtime::budget::check_config_value(&key["budget.".len()..], &value)
+                            .map_err(|why| (INVALID_PARAMS, why))?;
+                        self.rest.set_config_value(key, value.clone());
+                        self.apply_settings();
+                        Ok(json!({"key": key, "value": value, "ok": true}))
+                    }
                     _ => {
                         let key = if key == "reasoning" {
                             "agent.reasoning_effort"
@@ -1043,7 +1058,8 @@ impl Gateway {
                 "active": self.runtime.subagents().active(),
                 "paused": self.runtime.subagents().paused(),
                 "max_spawn_depth": 1,
-                "max_concurrent_children": hermes_runtime::MAX_CONCURRENT_CHILDREN,
+                // What a turn started now would allow (the budget profile's, with overrides).
+                "max_concurrent_children": self.runtime.budget().delegate_max_children,
             })),
             "delegation.pause" => {
                 let paused = params["paused"].as_bool().unwrap_or(true);
@@ -3993,4 +4009,90 @@ fn requests_status(runtime: &hermes_runtime::Runtime, provider: &str) -> Value {
         "by_purpose": usage.by_purpose,
         "rate_limited": usage.rate_limited,
     })
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// A gateway on a temporary data folder, nothing configured.
+    fn gateway(dir: &std::path::Path) -> Arc<Gateway> {
+        let config = hermes_runtime::RuntimeConfig {
+            data_dir: dir.to_path_buf(),
+            ..hermes_runtime::RuntimeConfig::for_current_user().unwrap()
+        };
+        let hub = Arc::new(Hub::default());
+        let runtime = Arc::new(
+            Runtime::new(config, Arc::new(crate::hub::DesktopBridge { hub: hub.clone() })).unwrap(),
+        );
+        Arc::new(Gateway::new_for_acp(runtime, hub, dir.to_path_buf()))
+    }
+
+    async fn call(gateway: &Arc<Gateway>, method: &str, params: Value) -> RpcResult {
+        let (outbox, _events) = tokio::sync::mpsc::unbounded_channel();
+        gateway.clone().call(method, params, &outbox).await
+    }
+
+    #[tokio::test]
+    async fn a_data_folder_without_the_key_runs_requests() {
+        use hermes_runtime::budget::{BudgetProfile, for_profile};
+        let dir = tempfile::tempdir().unwrap();
+        // An existing config that has never heard of budget profiles.
+        std::fs::write(
+            dir.path().join("desktop-config.json"),
+            r#"{"display": {"show_reasoning": false}}"#,
+        )
+        .unwrap();
+        let gateway = gateway(dir.path());
+        assert_eq!(
+            gateway.runtime.budget(),
+            for_profile(BudgetProfile::Requests)
+        );
+        let answer = call(&gateway, "config.get", json!({"key": "budget.profile"}))
+            .await
+            .unwrap();
+        assert_eq!(answer["value"], "requests");
+    }
+
+    #[tokio::test]
+    async fn config_set_switches_the_profile_and_refuses_bad_values() {
+        use hermes_runtime::budget::{BudgetKnobs, BudgetProfile, for_profile};
+        let dir = tempfile::tempdir().unwrap();
+        let gateway = gateway(dir.path());
+        let set = |key: &str, value: Value| {
+            let gateway = gateway.clone();
+            let params = json!({"key": key, "value": value});
+            async move { call(&gateway, "config.set", params).await }
+        };
+        set("budget.profile", json!("balanced")).await.unwrap();
+        assert_eq!(gateway.runtime.budget(), BudgetKnobs::BALANCED);
+        // The delegation status tells the effective width, not balanced's 10.
+        set("budget.profile", json!("requests")).await.unwrap();
+        let status = call(&gateway, "delegation.status", json!({})).await.unwrap();
+        assert_eq!(status["max_concurrent_children"], 3);
+        set("budget.profile", json!("tokens")).await.unwrap();
+        assert_eq!(gateway.runtime.budget(), for_profile(BudgetProfile::Tokens));
+        let status = call(&gateway, "delegation.status", json!({})).await.unwrap();
+        assert_eq!(status["max_concurrent_children"], 10);
+        // Per-knob overrides sit on top.
+        set("budget.max_iterations", json!(42)).await.unwrap();
+        assert_eq!(gateway.runtime.budget().max_iterations, 42);
+        assert_eq!(gateway.runtime.budget().profile, BudgetProfile::Tokens);
+        // Refused: an unknown profile, and 0 for the caps that would break a turn.
+        for (key, value) in [
+            ("budget.profile", json!("fast")),
+            ("budget.result_size_pct", json!(0)),
+            ("budget.length_continuations", json!(0)),
+            ("budget.invalid_tool_retries", json!(0)),
+            ("budget.nonsense", json!(1)),
+        ] {
+            let error = set(key, value).await.unwrap_err();
+            assert_eq!(error.0, INVALID_PARAMS, "{key}");
+        }
+        assert_eq!(gateway.runtime.budget().max_iterations, 42);
+        assert_eq!(gateway.runtime.budget().result_size_pct, 50);
+        // Saved to the config record, so the next start reads it back.
+        let saved = std::fs::read_to_string(dir.path().join("desktop-config.json")).unwrap();
+        assert!(saved.contains("\"tokens\""), "{saved}");
+    }
 }

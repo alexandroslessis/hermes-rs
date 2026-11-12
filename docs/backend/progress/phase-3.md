@@ -144,3 +144,162 @@ drift is pre-existing across Phase 2 files; not reformatted here.
 Tests (CARGO_TARGET_DIR=target/claude): `cargo test -p hermes_runtime` lib 53, `turns` 89 passed /
 7 ignored; the same `turns` under `HERMES_TEST_PROFILE=requests` and `=tokens`: 89 / 7 ignored;
 `cargo test -p hermes_tools -p hermes_agent -p hermes_llm`: green; `cargo build --workspace`: OK.
+
+## CP3.2 — `budget.profile`: config, Settings, default `requests`, prompt wording at session start
+Worktree: C:\Users\alexandros\repos\hermes-rs-p3   Branch: backend/p3-budget   Model: Sonnet 5.5 (subagent)
+On top of CP3.1 (reviewed; uncommitted when this was written).
+Done:
+- **Config key.** `budget.profile` (`requests | balanced | tokens`) plus flat per-knob overrides beside it
+  (`budget.max_iterations`, `budget.http_retries`, `budget.compress_at_small_window`, ...: `OVERRIDE_KEYS`,
+  14 numbers). `budget.rs`: `from_config(&Value) -> BudgetKnobs` (profile, then each valid override; a
+  missing, unknown or non-string profile is `requests`, so configs without the key get it),
+  `check_config_value(key, value)` and `apply_override` (one table of ranges). `BudgetKnobs` has a new
+  `profile` field (which profile the knobs started from; overrides keep it), so the prompt wording follows
+  the profile, not a knob value.
+- **Overrides refuse bad values** (reviewer's CP3.1 item): 0 is refused for `max_iterations`,
+  `length_continuations`, `invalid_tool_retries`, `truncated_tool_retries`, `result_size_pct`,
+  `read_file_max_lines`, `search_context_factor`, `delegate_max_children`, `delegate_child_iterations`,
+  `curator_max_iterations`; allowed for `empty_response_retries` and `http_retries` (0 = don't retry).
+  Fractions must be 0.2..0.95; every count has a ceiling. Refused through `config.set` (INVALID_PARAMS with
+  the reason) and dropped by `Rest::save_config` (the page's `PUT /api/config`); a hand-edited
+  `desktop-config.json` with a bad value is ignored by `from_config` (the profile's value stays).
+- **Runtime.** `Runtime.budget: Mutex<BudgetKnobs>` (`budget()` / `set_budget()`); the six places that read
+  `config.budget` now call `self.budget()`, still once per turn (turn, `/refine`, `/compress`, `/bg`,
+  curator). `RuntimeConfig.budget` is the *initial* value; `for_current_user` now uses
+  `BudgetKnobs::default()` = `requests` (was `BALANCED`), so a runtime nobody configures (the GPUI app, the
+  example) is `requests` too.
+- **Gateway.** `apply_settings` (run at start, after `config.set`, after `PUT /api/config`, and by the ACP
+  gateway at start) sets the knobs from `config_value("budget")`. `config.set budget.*` validates, saves to
+  the config record and applies. `delegation.status` reports the effective `delegate_max_children`;
+  `MAX_CONCURRENT_CHILDREN` is deleted.
+- **Settings UI.** `rest.rs`: default `budget: {profile: "requests"}` (so `config.get` and `/api/config`
+  answer `requests` without a stored key) and a select schema entry with the three options and a
+  description. Hermes's Settings only shows keys in its `SECTIONS` list, so there is no field to reuse:
+  **patch 0022** (two lines in `constants.ts`, one in `config-subpages.ts`) puts `budget.profile` under
+  Settings ▸ Model ▸ Main as "Budget profile". `git apply --check` passes against the pinned source;
+  **not built into a webapp or tried in the page** (needs npm; same state as patch 0021).
+- **Prompt text, chosen at session start (step 4).** `PromptSource` carries a snapshot of the knobs taken
+  when the source is made (`prompt_source()`); a new session's prompt uses them and is stored, so it is
+  frozen with the session. Two profile-dependent pieces:
+  - A budget paragraph in the *stable* tier (`hermes_prompts::BUDGET_GUIDANCE_REQUESTS` / `_TOKENS`,
+    `SystemPromptInput.budget_guidance`): requests = batch independent calls, read whole files, load
+    skills and memory in the first step, don't stop to confirm what you can decide; tokens = keep the
+    context small. No numbers in it (the knobs can change mid-session, the prompt cannot). `balanced` adds
+    nothing, so its prompt is byte-identical to before.
+  - `tokens`: `SkillStore::index_prompt_with(names_only)`: names only, and without the "err on the side of
+    loading" push (the `skills_index: NamesOnly` knob from CP3.1 now has its consumer).
+- **Tool schemas that must not lie** (reviewer's item): the schema text is the same for every session of
+  every profile, so `read_file`'s `limit` lost "default: 2000, max: 2000" (and `default`/`maximum`) and now
+  says it follows the budget profile and that `next_offset` continues a longer file; `delegate_task`'s
+  `tasks` lost "up to 10" (the refusal already states the real limit). `prompts/tools/README.md` updated.
+  Consequence: existing sessions' schema text changes once on upgrade (one prompt-cache miss), and
+  `balanced` no longer tells the model the number 10. `prompts/hermes/...` (extracted Hermes text) untouched.
+- Not done: **ACP session config option** (not cheap: the ACP server has no plumbing for a config option
+  that isn't a model or mode). ACP reads the profile from the config at start.
+Files: crates/runtime/src/{budget.rs,lib.rs,delegate.rs}, crates/runtime/tests/turns.rs,
+  crates/prompts/src/{system.rs,lib.rs}, crates/tools/src/skills.rs, crates/desktop/src/{gateway.rs,rest.rs},
+  crates/desktop/patches/0022-budget-profile-setting.patch (+README), prompts/tools/{read_file,delegate_task}.json
+  (+README), scripts/perf/budget-check.mjs (+README), GAPS.md, PORTING.md, docs/{ARCHITECTURE,TESTING}.md
+Tests (CARGO_TARGET_DIR=target/claude):
+  - `cargo test -p hermes_runtime`: lib 56, `turns` 93 passed / 7 ignored (4 new: wording per profile at
+    session start; a running session keeps its prompt across a switch while a new session gets the new
+    wording; `tokens` lists skill names only; tool schemas state no profile-dependent number). The same
+    `turns` under `HERMES_TEST_PROFILE=requests` and `=tokens`: 93 / 7 ignored.
+  - `cargo test -p hermes-desktop`: lib 165 (new: `a_data_folder_without_the_key_runs_requests`,
+    `config_set_switches_the_profile_and_refuses_bad_values`, the REST default/select/filter test), `acp` 67.
+  - `cargo test -p hermes_tools -p hermes_prompts -p hermes_agent -p hermes_llm -p hermes_memory -p
+    hermes_store`: green (new: names-only skills block; budget guidance in the stable tier only).
+    `budget.rs`: 3 new unit tests (no key = `requests`, overrides on top, 0 refused).
+    `cargo build --workspace`: OK, no warnings.
+  - Live: `scripts/perf/budget-check.mjs` against my own instance (port 47810, debug build): 17 checks, all ok.
+Request counts: unchanged per profile (CP3.1's table). What changes is the default: a real user's turns now
+  run `requests` caps (150 iterations, 2 strikes, 90% compression, 3 children). The `turns` baselines are
+  unchanged: its harness pins `balanced` unless told otherwise.
+Deviations from the plan:
+- `for_current_user` is `requests` (the plan: default for everyone); the test harness pins `balanced` by name.
+- Overrides are flat `budget.<knob>` keys, not a nested `overrides` object (`deep_merge` and the dotted
+  `config.set` handle that for free). They are reachable through `config.set` and the config file, not the
+  Settings page (one field only; more fields would mean more patches).
+- `skills_index: NamesOnly` (tokens) is implemented now although the plan's table lists Phase 5 for the
+  index: step 4 ("prompt text that depends on the profile") covers it and the knob already existed.
+- `a_skill_written_in_one_session_is_indexed_and_invocable_in_the_next` asserts full skill descriptions, so
+  it pins `balanced`; under `tokens` the index has no descriptions by design.
+For the reviewer:
+- **Prompt text chosen at session start only**: `PromptSource.budget` is a copy taken in `prompt_source()`;
+  `create_session` builds the prompt once and stores it. Two paths rebuild a *running* session's prompt:
+  `prompt_rebuild` after a compaction and `set_session_route` (model switch). Both already rewrite it on
+  purpose (compression is the documented exception; a model switch already misses the cache), but they now
+  take the *current* profile's wording, so a session created under `requests` and compacted after a switch
+  to `tokens` gets the tokens wording. Left as is: storing the profile per session needs a side file. Say
+  if you want that.
+- **Children's prompts** (`child_base_prompt`) use the profile as it is at delegation time; they have their
+  own conversation, so there is no cache to protect.
+- **Configs without the key**: three places make it `requests`: `config_defaults()` (the page and
+  `config.get` see it), `from_config` (missing/unknown/non-string), `for_current_user`. Test:
+  `a_data_folder_without_the_key_runs_requests` starts a gateway on a `desktop-config.json` without it.
+- **Validation split**: `config.set` rejects (error to the caller), `PUT /api/config` silently drops invalid
+  `budget.*` entries (the page can't show a rejection for one key of a bulk save), a hand-edited file is
+  tolerated. The ranges live in one table (`apply_override`); check the ceilings (`read_file_max_lines`
+  100000, `max_iterations` 10000, ...) are acceptable.
+- **Schema text**: `read_file` no longer states a limit and `balanced` no longer states 10 children; check
+  you are fine with the model not knowing the numbers (tool results and the delegate refusal state them).
+- **ACP**: no config option; ACP is a separate process that reads the config once at start, so a profile
+  switched in the desktop applies to an already-running ACP agent only after its restart.
+- **Patch 0022 is untested in the page** (no webapp build here). Two small hunks; the schema side is checked
+  live (`budget-check.mjs`, first check).
+- `cargo fmt`: `budget.rs` formatted; the other touched files keep the drift from earlier phases.
+
+### Review (Opus 5.5)
+`main` had not moved since the branch was cut (no merge). `/code-review` not run (not available in
+this subagent); manual pass over every changed function and the code around it.
+
+Review focus, with evidence:
+- **Prompt text chosen at session start only.** `create_session` builds the prompt once from
+  `prompt_source(self.budget())` and stores it in `sessions.db`; every request sends
+  `session.system_prompt` (`ops.rs`), and `Runtime::open` loads it from the store, never rebuilds it.
+  So a running session keeps it across a switch (`switching_the_profile_leaves_a_running_sessions_prompt_alone`)
+  and a resumed one after a restart under another profile keeps it too (**new test**
+  `a_resumed_session_keeps_the_wording_it_started_with`: second runtime on the same data folder under
+  `tokens`, same system prompt byte for byte). The wording sits in the stable tier and states no number.
+  Tool schemas lost their profile-dependent numbers, so they are the same for every session: one
+  cache miss on upgrade, then stable.
+- **Configs without the key get `requests`**: `config_defaults()` (page and `config.get`),
+  `from_config` (missing / unknown / non-string), `for_current_user`. Tested in `budget.rs`,
+  `rest.rs` and `a_data_folder_without_the_key_runs_requests`; live check's second line.
+- Ground rules: `config.get/set` and `PUT /api/config` keep their shapes (`{key, value, ok}`, `-32602`
+  for a refusal, as other arms); `delegation.status` keeps its shape, only the number is now the
+  effective one. No schema change (profile lives in `desktop-config.json`). No new blocking work in
+  async handlers (the config write in `config.set` is the existing path). PORTING row is `diverged`.
+- Patch 0022: applied 0001–0022 in order to a `git archive` of the pinned commit in a scratch folder:
+  all apply. Read against the consumer: `sectionFieldEntries` (helpers.ts) takes `SECTIONS` keys and
+  `schema[k]`; `config-field.tsx` renders `type: "select"` from `schema.options` and takes the
+  description from the schema; without the `budget.` prefix on the Model ▸ Main subpage the field
+  would belong to no subpage (and Hermes's own `subpages.test.ts` would fail). Not built (no npm
+  packages here), so not driven in the page.
+
+Implementer's doubts:
+- **Rebuild after compaction / model switch takes the current profile's wording**: left, by design.
+  Both already rewrite the prompt (fresh memory snapshot and skills index too), so the cache is missed
+  anyway, and the wording then matches the knobs the session runs under. Storing the profile per
+  session (a side file) would buy nothing for caching. Documented in `budget.rs` and PITFALLS.
+- One-time schema-text cache miss on upgrade: acceptable (the same happens on any Hermes update of a
+  schema), and better than a schema lying under `requests`.
+- Override ceilings: **fixed** `result_size_pct` (was ≤1000; ×10 of 15% of the window lets one tool
+  result exceed the window): now ≤400, `requests`' own value. Others are fine (`read_file` is also
+  capped by its 100k-char budget; iteration counts only bound a runaway).
+
+Other findings, fixed:
+- **A turn could mix two profiles**: `begin_turn` copied the knobs once, but `prompt_rebuild` and
+  `child_base_prompt` called `prompt_source()`, which read `Runtime::budget()` again, so a
+  `config.set` landing mid-setup gave the compaction rebuild / children a different profile's wording
+  than the turn's knobs. `prompt_source` now takes the knobs; the turn and `/compress` pass their copy.
+- `PUT /api/config` with a non-object `budget` (`"budget": "tokens"`) replaced the stored object whole
+  (`deep_merge`); now dropped like other invalid budget values (test extended).
+
+Left: ACP session config option (not cheap, as the note says; ACP reads the config at start);
+`cargo fmt` drift from earlier phases.
+
+Tests (CARGO_TARGET_DIR=target/claude): `hermes_runtime` lib 56, `turns` 94 passed / 7 ignored, the
+same under `HERMES_TEST_PROFILE=requests` and `=tokens`; `hermes-desktop` 165 + `acp` 67;
+`hermes_tools`/`prompts`/`agent`/`llm`/`memory`/`store` green; `cargo build --workspace` OK.
+Live: `budget-check.mjs` on my own instance (47810, worktree debug build): 18/18 ok; instance stopped.

@@ -404,6 +404,12 @@ impl SkillStore {
 
     /// The `## Skills` block of the system prompt (Hermes's `_render_skills_index`).
     pub fn index_prompt(&self) -> Option<String> {
+        self.index_prompt_with(false)
+    }
+
+    /// The block with names only (the `tokens` budget profile; not in Hermes): no descriptions,
+    /// and no "err on the side of loading" push, since every load costs context there.
+    pub fn index_prompt_with(&self, names_only: bool) -> Option<String> {
         let catalog = self.catalog();
         if catalog.is_empty() {
             return None;
@@ -413,7 +419,14 @@ impl SkillStore {
             by_category
                 .entry(skill.category.clone().unwrap_or_else(|| "general".into()))
                 .or_default()
-                .push((&skill.name, clip_description(&skill.description)));
+                .push((
+                    &skill.name,
+                    if names_only {
+                        String::new()
+                    } else {
+                        clip_description(&skill.description)
+                    },
+                ));
         }
         let mut lines = Vec::new();
         for (category, mut rows) in by_category {
@@ -429,6 +442,16 @@ impl SkillStore {
                     format!("{indent}- {name}: {desc}")
                 });
             }
+        }
+        if names_only {
+            return Some(format!(
+                "## Skills\n\
+                 Saved instructions you can load with skill_view(name). Only the names are listed, to keep the context small: load a skill when its name clearly matches the task, not otherwise.\n\
+                 If a skill has issues, fix it with skill_manage(action='patch').\n\
+                 \n\
+                 <available_skills>\n{}\n</available_skills>",
+                lines.join("\n")
+            ));
         }
         Some(format!(
             "## Skills\n\
@@ -1064,6 +1087,14 @@ mod tests {
         let index = store.index_prompt().unwrap();
         assert!(index.contains("  software-development:\n"));
         assert!(index.contains("    - systematic-debugging: "));
+        assert_eq!(store.index_prompt_with(false).as_deref(), Some(index.as_str()));
+        // Names only (the tokens profile): no descriptions, no push to load.
+        let names = store.index_prompt_with(true).unwrap();
+        assert!(names.contains("    - systematic-debugging
+"));
+        assert!(!names.contains("systematic-debugging: "));
+        assert!(!names.contains("Err on the side of loading"));
+        assert!(names.len() < index.len() / 2);
         // A user edit is kept when the bundle is seeded again.
         std::fs::write(
             debugging.skill_md(),

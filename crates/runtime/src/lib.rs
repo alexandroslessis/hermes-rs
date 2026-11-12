@@ -47,7 +47,6 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub use curator::{CuratorModel, CuratorOutcome};
-pub use delegate::MAX_CONCURRENT_CHILDREN;
 pub use hermes_tools::{
     ClarifyAnswer, ClarifyOutcome, ClarifyQuestion, ClarifyRequest, ClarifyResponse, ProcessNotice,
 };
@@ -325,9 +324,10 @@ pub struct RuntimeConfig {
     /// `%APPDATA%\hermes-rs`: sessions.db, SOUL.md, scratch/.
     pub data_dir: PathBuf,
     pub shell: ShellKind,
-    /// The budget knobs (iteration budget, retries, compression thresholds, limits; see
-    /// [`budget`]). Every turn copies them once as it starts. `for_current_user` keeps `balanced`,
-    /// today's behaviour, until the profile setting arrives.
+    /// The budget knobs a run starts with (iteration budget, retries, compression thresholds,
+    /// limits; see [`budget`]): the default profile, `requests`. The desktop replaces them from
+    /// the `budget` config ([`Runtime::set_budget`]); every turn copies the current ones once as
+    /// it starts.
     pub budget: budget::BudgetKnobs,
     /// `MEMORY.md` / `USER.md` limits and the write-approval gate.
     pub memory: MemoryConfig,
@@ -348,7 +348,7 @@ impl RuntimeConfig {
         Ok(Self {
             data_dir,
             shell: hermes_tools::detect_shell(),
-            budget: budget::BudgetKnobs::BALANCED,
+            budget: budget::BudgetKnobs::default(),
             memory: MemoryConfig::default(),
             skills: SkillsConfig::default(),
         })
@@ -429,6 +429,9 @@ pub struct Runtime {
     subagents: Arc<subagents::Subagents>,
     /// Tools the user switched off (Capabilities ▸ Tools); each turn takes them as it starts.
     disabled_tools: Mutex<std::collections::HashSet<String>>,
+    /// The knobs now (the config's `budget`): each turn and each new session takes them as it
+    /// starts.
+    budget: Mutex<budget::BudgetKnobs>,
     curator_running: AtomicBool,
 }
 
@@ -448,6 +451,7 @@ impl Runtime {
             false,
         ));
         let ledger = ledger::Ledger::open(config.data_dir.join("requests.json"));
+        let initial_budget = config.budget;
         Ok(Self {
             store: Arc::new(store),
             memory: Arc::new(memory),
@@ -467,8 +471,22 @@ impl Runtime {
             last_activity: Arc::new(Mutex::new(std::time::Instant::now())),
             subagents: Arc::default(),
             disabled_tools: Mutex::new(Default::default()),
+            budget: Mutex::new(initial_budget),
             curator_running: AtomicBool::new(false),
         })
+    }
+
+    /// The budget knobs as they are now. A turn copies them once as it starts; a session's
+    /// system prompt takes its budget wording from them when it is made.
+    pub fn budget(&self) -> budget::BudgetKnobs {
+        *self.budget.lock()
+    }
+
+    /// Replaces the budget knobs (the `budget` config changed). Applies from the next turn;
+    /// what changes the prompt or the tool list applies from the next session, because a
+    /// session's prompt is frozen (prompt caching).
+    pub fn set_budget(&self, knobs: budget::BudgetKnobs) {
+        *self.budget.lock() = knobs;
     }
 
     pub fn store(&self) -> &Store {
@@ -599,14 +617,14 @@ impl Runtime {
         cwd: &Path,
         with_memory: bool,
     ) -> Result<String> {
-        self.prompt_source()
+        self.prompt_source(self.budget())
             .build(provider, model, context_length, cwd, with_memory)
     }
 
     /// Builds a throwaway system prompt on a background thread, so what's set up on first use
     /// (the threat-scan patterns, the skills index) is ready before the first new session.
     pub fn warm_up(&self) {
-        let source = self.prompt_source();
+        let source = self.prompt_source(self.budget());
         std::thread::spawn(move || {
             if let Some(home) = dirs::home_dir() {
                 let _ = source.build("warm-up", "warm-up", None, &home, true);
@@ -614,7 +632,9 @@ impl Runtime {
         });
     }
 
-    fn prompt_source(&self) -> PromptSource {
+    /// `budget`: the knobs whose wording the prompt takes (a new session: the current ones; a
+    /// turn's rebuilds: the turn's own copy, so a turn never mixes two profiles).
+    fn prompt_source(&self, budget: budget::BudgetKnobs) -> PromptSource {
         PromptSource {
             data_dir: self.config.data_dir.clone(),
             shell: self.config.shell.clone(),
@@ -622,6 +642,7 @@ impl Runtime {
             store: self.store.clone(),
             memory: self.memory.clone(),
             skills: self.skills.clone(),
+            budget,
         }
     }
 
@@ -631,8 +652,9 @@ impl Runtime {
         &self,
         open: &OpenSession,
         context_length: Option<usize>,
+        budget: budget::BudgetKnobs,
     ) -> delegate::BasePrompt {
-        let source = self.prompt_source();
+        let source = self.prompt_source(budget);
         let (provider, model, cwd) = {
             let record = open.record.lock();
             (
@@ -674,13 +696,16 @@ impl Runtime {
         })
     }
 
-    /// Rebuilds a session's frozen prompt as it would be built now (after a compaction).
+    /// Rebuilds a session's frozen prompt as it would be built now (after a compaction), with
+    /// the budget wording of the turn's knobs: compaction already rewrites the prompt, so it
+    /// follows the profile the session now runs under (no per-session profile is stored).
     fn prompt_rebuild(
         &self,
         open: &OpenSession,
         context_length: Option<usize>,
+        budget: budget::BudgetKnobs,
     ) -> compress::PromptRebuild {
-        let source = self.prompt_source();
+        let source = self.prompt_source(budget);
         let (provider, model, cwd) = {
             let record = open.record.lock();
             (
@@ -984,7 +1009,7 @@ impl Runtime {
         self.reload_if_stale(&open, session_id);
         let model = open.record.lock().model.clone();
         // The budget knobs, read once: everything this turn builds takes them from this copy.
-        let budget = self.config.budget;
+        let budget = self.budget();
         let models = provider.provider_with(budget.http_retries).and_then(|llm| {
             let summarizer = summarizer_for(&aux, &llm, &model, context_length, &budget)?;
             let review = match &aux.review {
@@ -1107,7 +1132,7 @@ impl Runtime {
         };
         let mut turn_start = open.conversation.lock().messages().len();
         let web = self.web.clone();
-        let rebuild_prompt = self.prompt_rebuild(&open, context_length);
+        let rebuild_prompt = self.prompt_rebuild(&open, context_length, budget);
         let delegator = self.delegator(
             &open,
             &provider.id,
@@ -1327,7 +1352,7 @@ impl Runtime {
             "Nothing to refine yet — send a message first."
         );
         // The budget knobs, read once for this review.
-        let budget = self.config.budget;
+        let budget = self.budget();
         let (llm, model, context_length, effort_params) = match &options.aux.review {
             Some(aux) => (
                 aux.provider.provider_with(budget.http_retries)?,
@@ -1389,7 +1414,7 @@ impl Runtime {
         }
         self.reload_if_stale(&open, session_id);
         // The budget knobs, read once for this compression.
-        let budget = self.config.budget;
+        let budget = self.budget();
         let llm = match provider.provider_with(budget.http_retries) {
             Ok(llm) => llm,
             Err(error) => {
@@ -1397,7 +1422,7 @@ impl Runtime {
                 return Err(error);
             }
         };
-        let rebuild_prompt = self.prompt_rebuild(&open, options.context_length);
+        let rebuild_prompt = self.prompt_rebuild(&open, options.context_length, budget);
         let model = open.record.lock().model.clone();
         let summarizer = match summarizer_for(&options.aux, &llm, &model, options.context_length, &budget) {
             Ok(summarizer) => summarizer,
@@ -1802,7 +1827,7 @@ impl Runtime {
             context_length,
             effort_params,
             supports_vision,
-            base_prompt: self.child_base_prompt(open, context_length),
+            base_prompt: self.child_base_prompt(open, context_length, budget),
             child_tools: self.child_tools(),
             summarizer,
             mcp: self.mcp.clone(),
@@ -1830,7 +1855,7 @@ impl Runtime {
         }
         let open = self.open(session_id)?;
         // The budget knobs, read once for the whole task.
-        let budget = self.config.budget;
+        let budget = self.budget();
         let llm = provider.provider_with(budget.http_retries)?;
         let model = open.record.lock().model.clone();
         let summarizer =
@@ -2138,6 +2163,9 @@ struct PromptSource {
     store: Arc<Store>,
     memory: Arc<MemoryStore>,
     skills: Arc<SkillStore>,
+    /// The knobs when this source was made: a new session's prompt takes its budget wording
+    /// and skills block from them, and keeps them (the prompt is frozen).
+    budget: budget::BudgetKnobs,
 }
 
 impl PromptSource {
@@ -2152,7 +2180,9 @@ impl PromptSource {
         let home = dirs::home_dir().context("no home directory")?;
         let soul = std::fs::read_to_string(self.data_dir.join("SOUL.md")).ok();
         let tool_names = SessionTools::tool_names();
-        let skills_index = self.skills.index_prompt();
+        let skills_index = self
+            .skills
+            .index_prompt_with(self.budget.skills_index == budget::SkillsIndex::NamesOnly);
         // Memory as it is now; writes during the session don't change this prompt.
         let snapshot = self.memory.snapshot();
         let memory = [snapshot.memory, snapshot.user]
@@ -2181,6 +2211,12 @@ impl PromptSource {
             soul: soul.as_deref(),
             memory: memory.as_deref(),
             skills_index: skills_index.as_deref(),
+            budget_guidance: match self.budget.profile {
+                // Balanced is the prompt from before profiles, byte for byte.
+                budget::BudgetProfile::Balanced => None,
+                budget::BudgetProfile::Requests => Some(hermes_prompts::BUDGET_GUIDANCE_REQUESTS),
+                budget::BudgetProfile::Tokens => Some(hermes_prompts::BUDGET_GUIDANCE_TOKENS),
+            },
             project: project.map(|p| (p.name.as_str(), p.folders.as_slice())),
             context_length,
             now: chrono::Local::now(),

@@ -191,6 +191,17 @@ files before 0003/0004, 6.6 MB in 109 after.
   source, but not built into a webapp or tried in the page** (a webapp build needs npm
   packages): run `build-hermes-webapp.ps1` and look at Settings ▸ Providers before relying on it.
 
+- **0022-budget-profile-setting.patch** (`app/settings/constants.ts`, `app/settings/config-subpages.ts`):
+  lists `budget.profile` under Settings ▸ Model ▸ Main, labelled "Budget profile". Hermes's Settings
+  page shows only the config keys its `SECTIONS` list names, so this is what lets the backend's schema
+  field (a select of requests / balanced / tokens with a description, `rest.rs` `config_schema`) appear.
+  A save goes through the page's normal config save, which `Rest::save_config` filters (an unknown
+  profile or a 0 cap is dropped) and `apply_settings` hands to the runtime. Without the patch the
+  profile still works through `config.set` and the config file. **Written 2026-11-12 and checked with
+  `git apply --check` against the pinned source, but not built into a webapp or tried in the page**
+  (a webapp build needs npm packages): run `build-hermes-webapp.ps1` and look at Settings ▸ Model ▸
+  Main before relying on it.
+
 ## To do
 
 - **Skill hub** (install from Capabilities ▸ Skills ▸ Discover): `tools/skills_hub*.py` and

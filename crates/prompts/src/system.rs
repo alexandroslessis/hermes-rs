@@ -37,11 +37,21 @@ pub struct SystemPromptInput<'a> {
     /// Rendered MEMORY.md / USER.md blocks (M3) and skills index (M4).
     pub memory: Option<&'a str>,
     pub skills_index: Option<&'a str>,
+    /// The budget profile's wording (`BUDGET_GUIDANCE_*`), frozen with the prompt for the
+    /// session. `None` for `balanced`: its prompt is the one from before profiles.
+    pub budget_guidance: Option<&'a str>,
     /// The project the working directory belongs to: its name and folders (primary first).
     pub project: Option<(&'a str, &'a [String])>,
     pub context_length: Option<usize>,
     pub now: DateTime<Local>,
 }
+
+/// Not in Hermes (it has no budget profiles): what the `requests` profile adds to the system
+/// prompt. No numbers in it: the knobs can change mid-session, the prompt cannot.
+pub const BUDGET_GUIDANCE_REQUESTS: &str = "Budget: the user's model provider limits how many requests you may make per day, not how large they are. Spend context freely and requests sparingly: batch independent tool calls into one step, read whole files and wide search results instead of slices, and load a skill or a memory entry in your first step when it may apply, so a task takes as few round trips as possible. Don't stop to confirm what you can decide yourself.";
+
+/// What the `tokens` profile adds to the system prompt (see [`BUDGET_GUIDANCE_REQUESTS`]).
+pub const BUDGET_GUIDANCE_TOKENS: &str = "Budget: the user is limited by tokens, not by requests. Keep the context small: search before reading, read only the lines you need, prefer narrow commands, keep tool output and your answers short, and don't repeat what is already in the conversation. An extra tool call is fine when it keeps the context smaller.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemPrompt {
@@ -147,6 +157,7 @@ pub fn build_system_prompt(input: &SystemPromptInput) -> SystemPrompt {
         .unwrap_or(text::IDENTITY);
     let mut stable = vec![Some(identity.to_string())];
     stable.extend(guidance_parts(input));
+    stable.push(input.budget_guidance.map(str::to_string));
 
     let context = vec![context_files_section(input.cwd, input.context_length)];
 
@@ -421,6 +432,7 @@ mod tests {
             soul: None,
             memory: None,
             skills_index: None,
+            budget_guidance: None,
             project: None,
             context_length: None,
             now: Local.with_ymd_and_hms(2026, 10, 31, 15, 0, 0).unwrap(),
@@ -435,6 +447,23 @@ mod tests {
         let first = build_system_prompt(&morning).full();
         morning.now = Local.with_ymd_and_hms(2026, 10, 31, 23, 59, 0).unwrap();
         assert_eq!(first, build_system_prompt(&morning).full());
+    }
+
+    #[test]
+    fn budget_guidance_is_in_the_stable_tier_and_only_when_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ["terminal"];
+        let plain = build_system_prompt(&input(dir.path(), "anthropic/claude", &tools));
+        assert!(!plain.full().contains("Budget:"));
+        let mut with = input(dir.path(), "anthropic/claude", &tools);
+        with.budget_guidance = Some(BUDGET_GUIDANCE_REQUESTS);
+        let with = build_system_prompt(&with);
+        assert!(with.stable.contains(BUDGET_GUIDANCE_REQUESTS));
+        assert!(!with.volatile.contains("Budget:"));
+        // Nothing else moves.
+        assert_eq!(with.context, plain.context);
+        assert_eq!(with.volatile, plain.volatile);
+        assert!(BUDGET_GUIDANCE_REQUESTS != BUDGET_GUIDANCE_TOKENS);
     }
 
     #[test]

@@ -1342,14 +1342,17 @@ async fn rewinding_is_refused_while_a_turn_runs() {
 #[tokio::test]
 async fn a_skill_written_in_one_session_is_indexed_and_invocable_in_the_next() {
     let skill = "---\nname: release-notes\ndescription: Use when writing release notes. Groups changes.\n---\n# Release notes\nGroup changes under Added / Fixed.\n";
-    let h = harness(vec![
+    // The full skills index is the other profiles' (`tokens` lists names only: its own test).
+    let h = harness_profile(vec![
         tool_reply(&[(
             "call_k",
             "skill_manage",
             json!({"operations": [{"action": "create", "name": "release-notes", "category": "writing", "content": skill}]}),
         )]),
         text_reply("Saved the skill."),
-    ])
+    ],
+    BudgetProfile::Balanced,
+    )
     .await;
     let first = session_in(&h);
     run_turn(&h, &first, "Save how we write release notes as a skill").await;
@@ -3932,4 +3935,129 @@ async fn delegation_width_follows_the_profile() {
     assert_requests(&h, Purpose::Delegate, 0..=0);
     let second = h.requests.lock()[1].to_string();
     assert!(second.contains("at most 3 subagents"), "{second}");
+}
+
+// --- CP3.2: the profile reaches the system prompt at session start, and only then ------------
+
+/// A session's system prompt as stored (what every request of the session carries).
+fn stored_prompt(h: &Harness, session: &str) -> String {
+    h.runtime
+        .store()
+        .session(session)
+        .unwrap()
+        .unwrap()
+        .system_prompt
+}
+
+#[tokio::test]
+async fn the_system_prompt_takes_its_budget_wording_when_the_session_starts() {
+    let h = harness_profile(vec![text_reply("a"), text_reply("b")], BudgetProfile::Requests).await;
+    let mut prompts = Vec::new();
+    for profile in BudgetProfile::ALL {
+        h.runtime.set_budget(for_profile(profile));
+        let session = session_in(&h);
+        prompts.push(stored_prompt(&h, &session));
+    }
+    let [requests, balanced, tokens] = [&prompts[0], &prompts[1], &prompts[2]];
+    assert!(requests.contains(hermes_prompts::BUDGET_GUIDANCE_REQUESTS));
+    assert!(tokens.contains(hermes_prompts::BUDGET_GUIDANCE_TOKENS));
+    // Balanced is the prompt from before profiles: neither wording.
+    assert!(!balanced.contains("Budget: the user"), "{balanced}");
+    assert!(!requests.contains(hermes_prompts::BUDGET_GUIDANCE_TOKENS));
+    assert!(!tokens.contains(hermes_prompts::BUDGET_GUIDANCE_REQUESTS));
+}
+
+#[tokio::test]
+async fn switching_the_profile_leaves_a_running_sessions_prompt_alone() {
+    let h = harness_profile(vec![text_reply("a"), text_reply("b")], BudgetProfile::Requests).await;
+    let old = session_in(&h);
+    let before = stored_prompt(&h, &old);
+    run_turn(&h, &old, "first").await;
+
+    // The profile changes between turns: the same session keeps its prompt, byte for byte (the
+    // prompt cache), while its knobs are the new profile's from the next turn.
+    h.runtime.set_budget(for_profile(BudgetProfile::Tokens));
+    run_turn(&h, &old, "second").await;
+    assert_eq!(stored_prompt(&h, &old), before);
+    let requests = h.requests.lock().clone();
+    let main: Vec<&Value> = requests
+        .iter()
+        .filter(|r| r["messages"][0]["role"] == "system")
+        .collect();
+    assert!(main.len() >= 2);
+    assert!(
+        main.iter().all(|r| r["messages"][0]["content"] == main[0]["messages"][0]["content"]),
+        "system prompt changed between turns"
+    );
+    assert!(main[1]["messages"][0]["content"].as_str().unwrap().contains(hermes_prompts::BUDGET_GUIDANCE_REQUESTS));
+
+    // A session started now gets the new wording.
+    let new = session_in(&h);
+    let after = stored_prompt(&h, &new);
+    assert!(after.contains(hermes_prompts::BUDGET_GUIDANCE_TOKENS));
+    assert!(!after.contains(hermes_prompts::BUDGET_GUIDANCE_REQUESTS));
+}
+
+#[tokio::test]
+async fn a_resumed_session_keeps_the_wording_it_started_with() {
+    let h = harness_profile(vec![text_reply("a"), text_reply("b")], BudgetProfile::Requests).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "first").await;
+    let first = h.requests.lock()[0]["messages"][0]["content"].clone();
+
+    // The app restarts under another profile and the session is resumed from disk: its stored
+    // prompt is sent as it was, not rebuilt with the new profile's wording.
+    let reopened = runtime_with_budget(
+        h.data.path(),
+        Arc::new(Bridge),
+        test_budget(Some(BudgetProfile::Tokens)),
+    );
+    let mut turn = reopened
+        .start_turn(&session, &h.provider, TurnOptions::default(), "second")
+        .unwrap();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(60), turn.events.recv())
+        .await
+        .unwrap()
+    {
+        if matches!(event, RuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    let second = h.requests.lock()[1]["messages"][0]["content"].clone();
+    assert_eq!(first, second);
+    assert!(second.as_str().unwrap().contains(hermes_prompts::BUDGET_GUIDANCE_REQUESTS));
+}
+
+#[tokio::test]
+async fn the_tokens_profile_lists_skill_names_only() {
+    let h = harness_profile(vec![], BudgetProfile::Balanced).await;
+    let full = stored_prompt(&h, &session_in(&h));
+    h.runtime.set_budget(for_profile(BudgetProfile::Tokens));
+    let names = stored_prompt(&h, &session_in(&h));
+    assert!(full.contains("<available_skills>") && names.contains("<available_skills>"));
+    assert!(full.contains("Err on the side of loading"));
+    assert!(!names.contains("Err on the side of loading"));
+    assert!(names.len() < full.len(), "{} vs {}", names.len(), full.len());
+}
+
+/// The schemas ride in every request of every session while the profile can change, so they
+/// state no number that depends on it.
+#[tokio::test]
+async fn tool_schemas_state_no_profile_dependent_limit() {
+    let h = harness_profile(vec![text_reply("ok")], BudgetProfile::Requests).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "hi").await;
+    let request = h.requests.lock()[0].clone();
+    let tools = request["tools"].as_array().unwrap();
+    let schema = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t["function"]["name"] == name)
+            .unwrap()["function"]
+            .to_string()
+    };
+    let read_file = schema("read_file");
+    assert!(!read_file.contains("2000") && !read_file.contains("\"maximum\""), "{read_file}");
+    let delegate = schema("delegate_task");
+    assert!(!delegate.contains("up to 10"), "{delegate}");
 }

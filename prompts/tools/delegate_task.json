@@ -21,7 +21,7 @@
           },
           "required": ["goal"]
         },
-        "description": "The task(s), up to 10 in parallel. Each entry spawns one subagent with isolated context and terminal session; a single task is a one-entry array. Required."
+        "description": "The task(s), run in parallel (how many at once follows the user's budget profile: a longer list is refused, and the error states the limit). Each entry spawns one subagent with isolated context and terminal session; a single task is a one-entry array. Required."
       }
     },
     "required": ["tasks"]

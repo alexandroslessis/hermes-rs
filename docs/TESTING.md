@@ -56,7 +56,11 @@ Read the existing tests near the area you change before writing a new one; the h
 - `run_turn(&h, session, text)` returns all `RuntimeEvent`s up to `TurnFinished`.
 - `h.requests` holds every request body: assert on what the model was sent (`sent_messages`,
   `request["tools"]`). `last_text(&h, session)` reads the stored reply.
-- Run: `cargo test -p hermes_runtime --test turns`.
+- Run: `cargo test -p hermes_runtime --test turns`. The harness runs `balanced` unless
+  `HERMES_TEST_PROFILE=requests|tokens` says otherwise (the whole suite passes under each; a test that
+  depends on one profile's caps or prompt wording names it with `harness_profile`). The profile also
+  decides the system prompt's wording (stored with the session at creation), so read a session's prompt
+  through `h.runtime.store().session(id)`.
 - Known flaky under heavy load: `an_exhausted_budget_ends_with_a_toolless_summary` (timing).
   Re-run it alone before suspecting your change.
 

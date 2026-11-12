@@ -1,0 +1,37 @@
+diff --git a/apps/desktop/src/app/settings/config-subpages.ts b/apps/desktop/src/app/settings/config-subpages.ts
+index 4f17c65..d19fc78 100644
+--- a/apps/desktop/src/app/settings/config-subpages.ts
++++ b/apps/desktop/src/app/settings/config-subpages.ts
+@@ -15,7 +15,8 @@ const CONFIG_SUBPAGE_DEFINITIONS: Record<string, ConfigSubpageDefinition[]> = {
+       id: 'main',
+       labelKey: 'modelMain',
+       fields: ['model', 'model_context_length', 'agent.reasoning_effort', 'agent.service_tier'],
+-      prefixes: ['model.']
++      // hermes-rs: the budget profile sits with the model settings
++      prefixes: ['model.', 'budget.']
+     },
+     { id: 'fallbacks', labelKey: 'modelFallbacks', fields: ['fallback_providers'] },
+     { id: 'auxiliary', labelKey: 'modelAuxiliary', prefixes: ['auxiliary.'] },
+diff --git a/apps/desktop/src/app/settings/constants.ts b/apps/desktop/src/app/settings/constants.ts
+index 80bac5b..9d3ac6a 100644
+--- a/apps/desktop/src/app/settings/constants.ts
++++ b/apps/desktop/src/app/settings/constants.ts
+@@ -569,6 +569,9 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
+       voice: 'DeepInfra Voice'
+     }
+   },
++  budget: {
++    profile: 'Budget profile'
++  },
+   memory: {
+     memoryEnabled: 'Persistent Memory',
+     userProfileEnabled: 'User Profile',
+@@ -714,6 +717,8 @@ export const SECTIONS: DesktopConfigSection[] = [
+     icon: Box,
+     keys: [
+       'model_context_length',
++      // hermes-rs: how the agent spends model requests and tokens (budget.profile)
++      'budget.profile',
+       'fallback_providers',
+       'delegation.model',
+       'delegation.provider',

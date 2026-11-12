@@ -85,6 +85,10 @@ fn config_defaults() -> Value {
             "tool_progress": "all",
         },
         "approvals": {"mode": "manual"},
+        // How the agent spends model requests and tokens (`hermes_runtime::budget`): `requests`
+        // (the default, also for a config without the key), `balanced` (how it worked before
+        // profiles) or `tokens`. Per-knob overrides sit beside it (`budget.max_iterations`...).
+        "budget": {"profile": "requests"},
         // On by default (Hermes's is opt-in): a coding harness keeps a way back from the agent's
         // edits, as Claude Code does. Settings ▸ Safety ▸ Checkpoints switches it.
         "checkpoints": {"enabled": true},
@@ -288,6 +292,10 @@ fn config_schema() -> serde_json::Map<String, Value> {
                 "Input behavior while agent is running",
                 &["interrupt", "queue", "steer"],
             )),
+            "budget.profile" => Some(select(
+                "How the agent spends model requests and tokens. Requests: the fewest requests per task (whole files per read, bigger tool results, tighter retry caps, fewer subagents, late compression). Balanced: how it worked before profiles. Tokens: the smallest context (smaller tool results, early compression, skill names only). Takes effect on the next message; wording in the agent's instructions, and the skill list, change for new chats.",
+                &["requests", "balanced", "tokens"],
+            )),
             "approvals.mode" => Some(select(
                 "Dangerous command approval mode",
                 &["manual", "smart", "off"],
@@ -382,6 +390,20 @@ impl Rest {
         // The model is the hermes-rs settings' (the model picker changes it).
         if let Some(changes) = changes.as_object_mut() {
             changes.remove("model");
+        }
+        // Budget settings the runtime would refuse (an unknown profile, a 0 cap) are dropped
+        // here, as `config.set` refuses them.
+        // A `budget` that isn't an object would replace the stored one whole: dropped too.
+        if let Some(changes) = changes.as_object_mut() {
+            match changes.get_mut("budget") {
+                Some(Value::Object(budget)) => budget.retain(|key, value| {
+                    hermes_runtime::budget::check_config_value(key, value).is_ok()
+                }),
+                Some(_) => {
+                    changes.remove("budget");
+                }
+                None => {}
+            }
         }
         let mut config = self.config.lock().ok()?;
         deep_merge(&mut config, &changes);
@@ -634,6 +656,32 @@ mod tests {
         );
         assert_eq!(again["generation"], written["generation"]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_budget_profile_defaults_to_requests_and_is_a_select() {
+        let dir =
+            std::env::temp_dir().join(format!("hermes-desktop-rest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rest = Rest::new(dir);
+        // Nothing saved: the default.
+        assert_eq!(rest.config_value("budget.profile"), "requests");
+        let schema = config_schema();
+        assert_eq!(schema["budget.profile"]["type"], "select");
+        assert_eq!(
+            schema["budget.profile"]["options"],
+            json!(["requests", "balanced", "tokens"])
+        );
+        // The Settings page saves with PUT: a good profile is kept, bad values are dropped.
+        let put = |body: &str| rest.handle("PUT", "/api/config", None, body.as_bytes()).unwrap().0;
+        assert_eq!(put(r#"{"config":{"budget":{"profile":"tokens","max_iterations":0}}}"#), 200);
+        assert_eq!(rest.config_value("budget.profile"), "tokens");
+        assert_eq!(rest.config_value("budget.max_iterations"), Value::Null);
+        assert_eq!(put(r#"{"config":{"budget":{"profile":"fast"}}}"#), 200);
+        assert_eq!(rest.config_value("budget.profile"), "tokens");
+        // Not an object: it would replace the stored one whole, so it is dropped.
+        assert_eq!(put(r#"{"config":{"budget":"balanced"}}"#), 200);
+        assert_eq!(rest.config_value("budget.profile"), "tokens");
     }
 
     #[test]
