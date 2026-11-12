@@ -697,6 +697,14 @@ fn push_tokens(text: &str, max_chars: usize, max_tokens: usize, out: &mut Vec<St
     }
 }
 
+/// How many distinct search words `message` holds (stopwords and one-letter words left out, the
+/// way a query reads it), counting at most `max`.
+pub fn word_count(message: &str, max: usize) -> usize {
+    let mut tokens = Vec::new();
+    push_tokens(message, MESSAGE_CHARS, max, &mut tokens);
+    tokens.len()
+}
+
 fn query_tokens(query: &IndexQuery) -> Vec<String> {
     let mut tokens = Vec::new();
     push_tokens(&query.message, MESSAGE_CHARS, MESSAGE_TOKENS, &mut tokens);

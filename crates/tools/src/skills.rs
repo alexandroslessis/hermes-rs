@@ -85,6 +85,18 @@ pub struct SkillCommit {
     pub message: String,
 }
 
+/// How the system prompt's skills block is written (the `skills.index` budget knob). Chosen when a
+/// session starts and frozen with its prompt. Not in Hermes, which always lists everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexStyle {
+    /// Every skill with its description, and the push to load (Hermes's text).
+    Full,
+    /// Category names with counts; the relevant skills ride on the user's message.
+    Categories,
+    /// One line per skill, no descriptions.
+    Names,
+}
+
 pub struct SkillStore {
     root: PathBuf,
     config: Mutex<SkillsConfig>,
@@ -451,15 +463,38 @@ impl SkillStore {
 
     /// The `## Skills` block of the system prompt (Hermes's `_render_skills_index`).
     pub fn index_prompt(&self) -> Option<String> {
-        self.index_prompt_with(false)
+        self.index_prompt_with(IndexStyle::Full)
     }
 
-    /// The block with names only (the `tokens` budget profile; not in Hermes): no descriptions,
-    /// and no "err on the side of loading" push, since every load costs context there.
-    pub fn index_prompt_with(&self, names_only: bool) -> Option<String> {
+    /// The block in one of the three shapes the budget profiles choose from ([`IndexStyle`]).
+    /// `Full` is Hermes's text, byte for byte. `Categories` and `Names` (not in Hermes) drop the
+    /// "err on the side of loading" push: the relevant skills are attached to the user's message
+    /// (`categories`) or every load costs context (`names`).
+    pub fn index_prompt_with(&self, style: IndexStyle) -> Option<String> {
         let catalog = self.catalog();
         if catalog.is_empty() {
             return None;
+        }
+        let names_only = style == IndexStyle::Names;
+        if style == IndexStyle::Categories {
+            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+            for skill in &catalog {
+                *counts
+                    .entry(skill.category.clone().unwrap_or_else(|| "general".into()))
+                    .or_default() += 1;
+            }
+            let lines: Vec<String> = counts
+                .iter()
+                .map(|(category, n)| format!("  - {category} ({n})"))
+                .collect();
+            return Some(format!(
+                "## Skills\n\
+                 Saved instructions, grouped by category below (the number is how many skills a category holds). The skills that look relevant to the user's message are attached to it, in a <context> block: follow them. For anything else, list a category with skills_list(category) and load a skill with skill_view(name).\n\
+                 If a skill has issues, fix it with skill_manage(action='patch').\n\
+                 \n\
+                 <skill_categories>\n{}\n</skill_categories>",
+                lines.join("\n")
+            ));
         }
         let mut by_category: BTreeMap<String, Vec<(&str, String)>> = BTreeMap::new();
         for skill in &catalog {
@@ -1136,9 +1171,22 @@ mod tests {
         let index = store.index_prompt().unwrap();
         assert!(index.contains("  software-development:\n"));
         assert!(index.contains("    - systematic-debugging: "));
-        assert_eq!(store.index_prompt_with(false).as_deref(), Some(index.as_str()));
+        assert_eq!(
+            store.index_prompt_with(IndexStyle::Full).as_deref(),
+            Some(index.as_str())
+        );
+        // Categories (the requests profile): names of categories with counts, no skill names, no
+        // push to load, and it says the relevant skills are attached to the user's message.
+        let categories = store.index_prompt_with(IndexStyle::Categories).unwrap();
+        assert!(categories.contains("  - software-development ("));
+        assert!(!categories.contains("systematic-debugging"));
+        assert!(!categories.contains("Err on the side of loading"));
+        assert!(!categories.contains("MUST load"));
+        assert!(categories.contains("attached to it"));
+        assert!(categories.contains("skill_view"));
+        assert!(categories.len() < index.len() / 5);
         // Names only (the tokens profile): no descriptions, no push to load.
-        let names = store.index_prompt_with(true).unwrap();
+        let names = store.index_prompt_with(IndexStyle::Names).unwrap();
         assert!(names.contains("    - systematic-debugging
 "));
         assert!(!names.contains("systematic-debugging: "));

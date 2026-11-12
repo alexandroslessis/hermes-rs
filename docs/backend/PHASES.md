@@ -44,7 +44,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 2 | Request ledger — ✅ 2026-11-12 | M | 0 | Sonnet | A |
 | 3 | Budget profiles and the knobs they set — ✅ 2026-11-12 | M | 2 | Sonnet | A |
 | 4 | Side jobs off the main quota — ✅ 2026-11-12 | S–M | 3 | Sonnet | A |
-| 5 | Local index (FTS5) and per-turn pre-injection | M | 3 | Sonnet | A |
+| 5 | Local index (FTS5) and per-turn pre-injection — ✅ 2026-11-12 | M | 3 | Sonnet | A |
 | 6 | Taint tracking and the staging area | M | 1 | Sonnet | B |
 | 7 | Review rewrite: signals, evidence packet, one shot | M–L | 5, 6 | **Opus** | C |
 | 8 | Skills v2: outcomes, provenance, project skills, curator v2 | M–L | 7 | Sonnet | B |
@@ -401,7 +401,8 @@ the next turn; anything that changes the prompt or tool list applies from the ne
 | `review.mode` | nudges (today) | `idle_once` (Phase 7) | nudges | `review.rs` |
 | `curator.max_iterations` | 200 | one-shot per cluster (Phase 8) | 200 | `curator.rs` |
 | `skills.index` | full | categories + retrieval (Phase 5) | names only | `skills.rs` |
-| `skills.preload` (Phase 5) | off | top 3 | off | new |
+| `skills.preload` (Phase 5) | off | top 3 | off | `preinject.rs` |
+| `memory.preload` (Phase 5) | off | top 3 | off | `preinject.rs` |
 | `titles` | model | heuristic (Phase 4) | model | `lib.rs:223` |
 | `tool_schemas` (Phase 11) | all | all | deferred | `prompts/tools` |
 
@@ -983,12 +984,13 @@ phase under `requests`.
 
 | Scenario | Baseline | After 3 | After 5 | After 7 | After 10 |
 |---|---|---|---|---|---|
-| S1 read 3, edit 1 | 5 | 5 | | | |
-| S2 empty reply after tools | 3 | 3 | | | |
-| S2b empty first reply | 2 | 2 | | | |
-| S3 truncated call | 3 | 3 | | | |
-| S4 ten turns (incl. review) | 11 | 11 | | | |
-| S5 delegate two | 4 | 4 | | | |
+| S1 read 3, edit 1 | 5 | 5 | 5 | | |
+| S2 empty reply after tools | 3 | 3 | 3 | | |
+| S2b empty first reply | 2 | 2 | 2 | | |
+| S3 truncated call | 3 | 3 | 3 | | |
+| S4 ten turns (incl. review) | 11 | 11 | 11 | | |
+| S5 delegate two | 4 | 4 | 4 | | |
+| S6 task a skill covers (CP5.2) | 2 (`skill_view`) | 2 | 1 | | |
 
 Phase 0 baselines (2026-11-11, `balanced` = today's behaviour; all counted as `main` until Phase 2
 labels requests). After 3 (`requests`, 2026-11-12): unchanged. Phase 3 only moves caps the
@@ -1009,6 +1011,11 @@ judge requests per flagged command 1 -> 0 under `requests` without an aux approv
 compression summaries with an aux model 1 -> 0 on the main provider (1 only when the aux server
 fails); a review running when the next turn starts is no longer cancelled (its requests no longer
 wasted).
+
+After 5 (`requests`, 2026-11-12): S1-S5 unchanged (`baseline_s*` run under every profile; their
+messages match no skill well enough to be attached). New scenario S6, a task a bundled skill
+covers (`s6_*` in `turns.rs`, the `arxiv` skill): `balanced` 2 main requests (`skill_view`, then
+the answer), `requests` 1 (the skill's body rides on the user message in a `<context>` block).
 
 Since Phase 2 the mock also splits them by purpose (the `x-hermes-rs-purpose` header): S1-S3 are
 all `main`; S4 is 10 `main` + 1 `review`; S5 is 2 `main` + 2 `delegate`. The totals above are

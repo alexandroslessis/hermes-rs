@@ -322,6 +322,29 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   value stays). `ACP` reads the profile once at start: a switch in the desktop reaches a running
   `hermes-acp.exe` only after the editor restarts it.
 
+- **Under `requests` a user message may carry a `<context>` block** (Phase 5 CP5.2): the top skills and
+  memory entries the local index finds, in front of the user's text, stored with the message (the
+  `preinject` note says what; the `references` note's `typed` has what the user wrote). Anything that
+  shows or reuses the user's words must go through `hermes_runtime::preinject::user_text` / `strip`
+  (the transcript, `/undo`, rewind, the `/review` briefing and the compaction summarizer's input do;
+  session search's rows go through `hermes_store::without_attached_context`, the same cut);
+  `as_concat_text()` on a user message has the block. Never move it to the system prompt
+  and never rebuild it on resume: the stored bytes are what the provider's cache has seen. `/plan`,
+  `/init`, `/learn`, a skill or bundle command, a scripted first step (`/review`) and `/retry` get no
+  block (`@url:`/image messages do, in the same deferred step). "Already attached" counts only the
+  messages the model still sees: a compaction hides the summarized ones but keeps them in the
+  conversation. The index's floor for a skill to be attached is stricter than its own
+  (`preinject::MIN_SKILL_SCORE` 5.0), and a message needs two search words of its own: generic
+  messages score up to 4.4 on the bundled skills, and with Hermes's 230 skills "hello" reaches 5.2
+  (`ascii-art`) and "explain this error" 5.2 (`anatomy`, still attached: a known miss).
+- **The skills block of the system prompt has three shapes** (`skills::IndexStyle`): `Full`
+  (`balanced`, Hermes's text), `Categories` (`requests`: it says the relevant skills ride on the user's
+  message, so a session under `requests` that is then switched to `balanced` keeps a prompt that
+  lists no skill names: the model finds them with `skills_list`), `Names` (`tokens`). Subagents always
+  get `Full` instead of `Categories` (their task gets no block).
+- **Turn tests under `requests`**: a message that matches a bundled skill well gets a block, so a test
+  that compares the user message exactly names its profile or uses a text no skill matches.
+
 - **A background review outlives the turn that follows it** (Phase 4). It works on a private copy
   of the conversation (`persist: false`) and may only call memory/skill tools, which serialise on
   their own mutexes; it takes that copy under the session's `running` lock, so it never copies a

@@ -52,7 +52,7 @@ pub use process::ProcessNotice;
 pub use review::ReviewTools;
 pub use shell::{ShellKind, detect_shell, set_env_passthrough};
 pub use skill_manage::{PendingSkillWrite, SkillOp, WriteOrigin};
-pub use skills::{SkillCommit, SkillEntry, SkillStore, SkillsConfig};
+pub use skills::{IndexStyle, SkillCommit, SkillEntry, SkillStore, SkillsConfig};
 pub use todo::{TodoItem, TodoStatus};
 
 /// The tool limits a budget profile sets (`hermes_runtime::budget`); one copy per turn. The

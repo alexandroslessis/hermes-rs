@@ -237,9 +237,22 @@ requests or tokens on (iteration budget, retry caps, compression thresholds, res
 sizes, delegation width) as `BudgetKnobs`, bundled by `budget.profile` = `requests` (default, also
 for configs without the key) | `balanced` (the old constants) | `tokens`, with per-knob overrides
 `budget.<knob>`. `apply_settings` hands them to `Runtime::set_budget`; each turn copies
-`Runtime::budget()` once. The profile's wording in the system prompt (and `tokens`' names-only
-skills block) is chosen when a session is created and stored with it. Settings ▸ Model ▸ Main
-shows the select via patch 0022.
+`Runtime::budget()` once. The profile's wording in the system prompt (and the shape of its skills
+block: full, categories under `requests`, names under `tokens`) is chosen when a session is created
+and stored with it. Settings ▸ Model ▸ Main shows the select via patch 0022.
+
+**Per-turn pre-injection** (Phase 5): with `skills_preload` / `memory_preload` above 0 (`requests`:
+3 / 3), `Runtime::begin_turn` asks the local index (`Runtime::index()`, `tools/src/index.rs`) with the
+user's message, the last assistant message and the project name, off the async workers
+(`preinject::retrieve`, `spawn_blocking`, 3 s limit, any failure means no block), and the message
+is added in the turn's task with a `<context>` block in front of its text (`runtime/src/preinject.rs`).
+The block is part of the stored message, so resume, rewind and branches replay it byte for byte and the
+prompt cache holds; nothing per-turn reaches the system prompt. The message's `preinject` note lists
+what was attached (skill names, memory ids): that is how a skill is attached once per conversation
+(read off the messages the model still sees, so a rewind that drops the message, or a compaction
+that hides it from the model, frees it again), and how `preinject::strip` / `user_text` give the
+page, `/undo`, rewind, the `/review` briefing and the compaction summarizer only what the user
+typed (session search's rows: `hermes_store::without_attached_context`, the same cut).
 
 Data folder (`%APPDATA%\hermes-rs`, or `HERMES_RS_HOME`):
 

@@ -12,6 +12,7 @@ pub mod governor;
 pub mod ledger;
 pub mod mcp;
 mod ops;
+pub mod preinject;
 mod review;
 mod session;
 pub mod subagents;
@@ -692,6 +693,12 @@ impl Runtime {
         context_length: Option<usize>,
         budget: budget::BudgetKnobs,
     ) -> delegate::BasePrompt {
+        let mut budget = budget;
+        // Only a user message gets the relevant skills attached: a subagent's task doesn't, so
+        // its prompt keeps the full list (what `requests` showed before Phase 5).
+        if budget.skills_index == budget::SkillsIndex::CategoriesAndRetrieval {
+            budget.skills_index = budget::SkillsIndex::Full;
+        }
         let source = self.prompt_source(budget);
         let (provider, model, cwd) = {
             let record = open.record.lock();
@@ -1133,13 +1140,34 @@ impl Runtime {
             provider_id: review_provider_id,
             budget,
         };
+        // The local index may attach relevant skills and memory to the message (Phase 5). Its
+        // query blocks (SQLite), so a message that gets one is added in the turn's task, like
+        // the ones with `@url:` references or images below. Not for a scripted first step (the
+        // prelude is added by the synchronous path) nor for the prompts a slash command writes.
+        let inject = text.is_some_and(preinject::eligible)
+            && prelude.is_none()
+            && (budget.skills_preload > 0 || budget.memory_preload > 0)
+            && self.index.is_some();
+        let index_for_turn = self.index.clone().filter(|_| inject);
         // A message with `@url:` references or images is added once its pages are fetched and
         // its images prepared, in the turn's task (that can take seconds).
         let deferred = text
-            .filter(|t| !images.is_empty() || !hermes_tools::references::url_targets(t).is_empty())
+            .filter(|t| {
+                !images.is_empty() || !hermes_tools::references::url_targets(t).is_empty()
+            })
             .map(|t| (t.to_string(), images));
+        // The message of a turn that gets a block is built now (a refused `@` reference still
+        // fails `start_turn`) and added in the task, once the index has answered.
+        let mut held: Option<Message> = None;
+        let query_text = text.map(str::to_string);
         let first_events = match text {
             Some(_) if deferred.is_some() => Ok(Vec::new()),
+            Some(text) if inject => {
+                user_message(&open, text, context_length, &Default::default(), &[]).map(|user| {
+                    held = Some(user);
+                    Vec::new()
+                })
+            }
             Some(text) => user_message(&open, text, context_length, &Default::default(), &[])
                 .and_then(|user| {
                     runtime.append(user.clone())?;
@@ -1208,29 +1236,69 @@ impl Runtime {
         // A daily-limit 429 that ends the turn teaches the ledger the provider's limit.
         let (learn_ledger, learn_provider) = (self.ledger.clone(), provider.id.clone());
         let turn = tokio::spawn(hermes_llm::observer::scope(request_context, async move {
-            if let Some((text, images)) = deferred {
-                let session = runtime.session.clone();
-                let attachments =
-                    tokio::task::spawn_blocking(move || attach_images(&session, images))
-                        .await
-                        .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")));
-                let mut pages = hermes_tools::references::FetchedPages::new();
-                for url in hermes_tools::references::url_targets(&text) {
-                    let page = tokio::select! {
-                        page = web.fetch_for_reference(&url) => page,
-                        _ = turn_cancel.cancelled() => Err("cancelled".into()),
-                    };
-                    pages.insert(url, page);
-                }
-                let added = attachments
-                    .and_then(|attachments| {
-                        user_message(
-                            &runtime.session,
-                            &text,
-                            context_length,
-                            &pages,
-                            &attachments,
-                        )
+            if deferred.is_some() || held.is_some() {
+                let built: Result<Message> = match deferred {
+                    Some((text, images)) => {
+                        let session = runtime.session.clone();
+                        let attachments =
+                            tokio::task::spawn_blocking(move || attach_images(&session, images))
+                                .await
+                                .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")));
+                        let mut pages = hermes_tools::references::FetchedPages::new();
+                        for url in hermes_tools::references::url_targets(&text) {
+                            let page = tokio::select! {
+                                page = web.fetch_for_reference(&url) => page,
+                                _ = turn_cancel.cancelled() => Err("cancelled".into()),
+                            };
+                            pages.insert(url, page);
+                        }
+                        attachments.and_then(|attachments| {
+                            user_message(
+                                &runtime.session,
+                                &text,
+                                context_length,
+                                &pages,
+                                &attachments,
+                            )
+                        })
+                    }
+                    None => held.take().context("the message to add is missing"),
+                };
+                // What the index finds for this message; any trouble means no block.
+                let block = match index_for_turn.filter(|_| built.is_ok()) {
+                    Some(index) => {
+                        let (query, attached) = {
+                            let session = &runtime.session;
+                            // One lock at a time (the record's is released first).
+                            let cwd = PathBuf::from(session.record.lock().cwd.clone());
+                            let conversation = session.conversation.lock();
+                            (
+                                hermes_tools::index::IndexQuery {
+                                    message: query_text.clone().unwrap_or_default(),
+                                    last_assistant: preinject::last_assistant_text(
+                                        conversation.messages(),
+                                    ),
+                                    project: hermes_tools::index::project_name(&cwd),
+                                },
+                                preinject::already_attached(conversation.messages()),
+                            )
+                        };
+                        let limits = preinject::limits(
+                            &query.message,
+                            budget.skills_preload as usize,
+                            budget.memory_preload as usize,
+                        );
+                        tokio::select! {
+                            block = preinject::retrieve(index, query, limits, attached) => block,
+                            _ = turn_cancel.cancelled() => None,
+                        }
+                    }
+                    None => None,
+                };
+                let added = built
+                    .map(|user| match &block {
+                        Some(block) => block.attach(user),
+                        None => user,
                     })
                     .and_then(|user| runtime.append(user.clone()).map(|()| user));
                 match added {
@@ -1519,15 +1587,19 @@ impl Runtime {
     pub fn context_breakdown(&self, session_id: &str) -> Result<ContextBreakdown> {
         let open = self.open(session_id)?;
         let prompt = open.record.lock().system_prompt.clone();
-        let skills = match (
-            prompt.find("<available_skills>"),
-            prompt.find("</available_skills>"),
-        ) {
+        // The full list, or the categories a `requests` session's prompt has instead.
+        let skills = [
+            ("<available_skills>", "</available_skills>"),
+            ("<skill_categories>", "</skill_categories>"),
+        ]
+        .into_iter()
+        .find_map(|(open, close)| match (prompt.find(open), prompt.find(close)) {
             (Some(start), Some(end)) if end > start => {
-                compress::estimate_text(&prompt[start..end + "</available_skills>".len()])
+                Some(compress::estimate_text(&prompt[start..end + close.len()]))
             }
-            _ => 0,
-        };
+            _ => None,
+        })
+        .unwrap_or(0);
         let snapshot = self.memory.snapshot();
         let memory = [snapshot.memory, snapshot.user]
             .into_iter()
@@ -1748,7 +1820,7 @@ impl Runtime {
             let message = &conversation.messages()[start];
             let typed = hermes_tools::references::typed_text(message)
                 .map(str::to_string)
-                .unwrap_or_else(|| message.as_concat_text());
+                .unwrap_or_else(|| preinject::user_text(message));
             // Counted without command reports (/usage, /diff, …), which aren't the conversation.
             let removed = conversation.messages()[start..]
                 .iter()
@@ -2219,9 +2291,11 @@ impl PromptSource {
         let home = dirs::home_dir().context("no home directory")?;
         let soul = std::fs::read_to_string(self.data_dir.join("SOUL.md")).ok();
         let tool_names = SessionTools::tool_names();
-        let skills_index = self
-            .skills
-            .index_prompt_with(self.budget.skills_index == budget::SkillsIndex::NamesOnly);
+        let skills_index = self.skills.index_prompt_with(match self.budget.skills_index {
+            budget::SkillsIndex::Full => hermes_tools::IndexStyle::Full,
+            budget::SkillsIndex::CategoriesAndRetrieval => hermes_tools::IndexStyle::Categories,
+            budget::SkillsIndex::NamesOnly => hermes_tools::IndexStyle::Names,
+        });
         // Memory as it is now; writes during the session don't change this prompt.
         let snapshot = self.memory.snapshot();
         let memory = [snapshot.memory, snapshot.user]

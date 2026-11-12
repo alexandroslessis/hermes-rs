@@ -61,6 +61,10 @@ Read the existing tests near the area you change before writing a new one; the h
   depends on one profile's caps or prompt wording names it with `harness_profile`). The profile also
   decides the system prompt's wording (stored with the session at creation), so read a session's prompt
   through `h.runtime.store().session(id)`.
+- Pre-injection tests (`s6_*`, `a_skill_is_attached_once_...`, `resuming_and_rewinding_...`) use the bundled
+  `arxiv` skill (`ARXIV_ASK`) under `harness_profile(.., Requests)`; helpers `user_contents(request)` (the user
+  messages of a request as text) and `system_of(request)`. The whole suite also passes under
+  `HERMES_TEST_PROFILE=requests`, where messages the index matches get a `<context>` block.
 - Known flaky under heavy load: `an_exhausted_budget_ends_with_a_toolless_summary` (timing).
   Re-run it alone before suspecting your change.
 

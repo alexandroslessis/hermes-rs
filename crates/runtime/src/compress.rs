@@ -546,6 +546,9 @@ fn serialize(messages: &[Message]) -> Vec<String> {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        // The skills the local index attached are not the user's request (and up to 24k chars
+        // of them would push the request itself out of the bounded record). Ours, not Hermes's.
+        let text = crate::preinject::strip(message, text);
         let mut body = bounded(&strip_think_blocks(&text));
         let calls: Vec<String> = message
             .content
@@ -1240,5 +1243,16 @@ mod tests {
         );
         assert!(records[2].starts_with("[TOOL RESULT c1]: yyyy"));
         assert!(records[2].contains("chars omitted here"));
+    }
+
+    #[test]
+    fn the_summarizer_reads_the_request_not_the_attached_skills() {
+        let block = crate::preinject::Block {
+            text: format!("<context>\n{}\n</context>", "skill text ".repeat(3_000)),
+            skills: vec!["deploy".into()],
+            memory: vec![],
+        };
+        let user = block.attach(Message::user().with_text("ship the release"));
+        assert_eq!(serialize(&[user]), ["[USER]: ship the release"]);
     }
 }

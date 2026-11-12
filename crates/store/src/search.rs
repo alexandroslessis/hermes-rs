@@ -74,6 +74,45 @@ pub struct SearchQuery<'a> {
     pub limit: usize,
 }
 
+/// The operation note on a user message the local index attached a `<context>` block to (skills
+/// and memory for the model, Phase 5: `hermes_runtime::preinject`, which owns the block).
+pub const PREINJECT_NOTE: &str = "preinject";
+
+/// `text` (a user message's) without the `<context>` block the local index put in front of it,
+/// when the message carries the [`PREINJECT_NOTE`]; otherwise unchanged. Here so that session
+/// search indexes what the user wrote, not the skills attached to it.
+pub fn without_attached_context(message: &Message, text: String) -> String {
+    const OPEN: &str = "<context>";
+    const CLOSE: &str = "</context>";
+    if message
+        .metadata
+        .operation_note(PREINJECT_NOTE, "skills")
+        .is_none()
+        && message
+            .metadata
+            .operation_note(PREINJECT_NOTE, "memory")
+            .is_none()
+    {
+        return text;
+    }
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with(OPEN) {
+        return text;
+    }
+    // Bodies inside the block have their closing tags escaped, so the first one ends it.
+    match trimmed.find(CLOSE) {
+        Some(end) => {
+            let rest = &trimmed[end + CLOSE.len()..];
+            // The block is joined to the typed text with a blank line; the typed text keeps its
+            // own leading whitespace.
+            rest.strip_prefix("\n\n")
+                .unwrap_or(rest.trim_start())
+                .to_string()
+        }
+        None => text,
+    }
+}
+
 /// `(role, text, tool calls)` for a message the user saw, `None` for hidden scaffolding.
 fn row_for(message: &Message) -> Option<(&'static str, String, Option<Value>)> {
     if !message.is_user_visible() {
@@ -103,7 +142,13 @@ fn row_for(message: &Message) -> Option<(&'static str, String, Option<Value>)> {
         (Role::Assistant, false) => "assistant",
     };
     let calls = (!calls.is_empty()).then(|| Value::Array(calls));
-    Some((role, texts.join("\n"), calls))
+    let text = texts.join("\n");
+    let text = if role == "user" {
+        without_attached_context(message, text)
+    } else {
+        text
+    };
+    Some((role, text, calls))
 }
 
 /// Keeps the search row of the message at `seq` in step with the message.
@@ -361,6 +406,42 @@ mod tests {
                 .search(&query("deploy", &roles, &[]))
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// The skills the local index attached to a user message are not what the user wrote: search
+    /// finds the typed words only (otherwise every message with a skill attached matches it).
+    #[test]
+    fn the_attached_context_block_is_not_searchable() {
+        let store = Store::open_in_memory().unwrap();
+        let a = session(&store, "t");
+        let block = "<context>\n<relevant-skills>\n<skill name=\"zebra\">stripes</skill>\n</relevant-skills>\n</context>";
+        let mut user = Message::user().with_text(format!("{block}\n\n  ship the release"));
+        user.metadata
+            .set_operation_note(PREINJECT_NOTE, "skills", json!(["zebra"]));
+        store
+            .upsert_message(&a, 0, &user.with_generated_id_if_missing())
+            .unwrap();
+        let roles = vec!["user".to_string()];
+        assert!(
+            store
+                .search(&query("stripes", &roles, &[]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.search(&query("release", &roles, &[])).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store.search_rows(&a).unwrap()[0].content,
+            "  ship the release"
+        );
+        // Without the note, text that merely looks like a block is the user's own.
+        let plain = Message::user().with_text(format!("{block} x"));
+        assert_eq!(
+            without_attached_context(&plain, plain.as_concat_text()),
+            plain.as_concat_text()
         );
     }
 

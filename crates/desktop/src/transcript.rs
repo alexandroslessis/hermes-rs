@@ -204,6 +204,8 @@ pub fn messages(messages: &[Message], provider: &str, model: &str) -> Vec<Value>
         }
         let role = match message.role {
             Role::User => {
+                // The skills and memory the index attached are the model's, not the user's.
+                text = hermes_runtime::preinject::strip(message, text);
                 // A loaded skill shows as the command that loaded it.
                 if let Some(command) = crate::commands::typed_command(&text) {
                     text = command;
@@ -364,7 +366,7 @@ pub fn typed_prompts(messages: &[Message]) -> Vec<(usize, String, bool)> {
                 .content
                 .iter()
                 .any(|c| matches!(c, MessageContent::Image(_)));
-            (row_id(index), message.as_concat_text(), image)
+            (row_id(index), hermes_runtime::preinject::user_text(message), image)
         })
         .collect()
 }
@@ -410,6 +412,29 @@ mod tests {
     use super::*;
     use hermes_llm::errors::ProviderError;
     use std::time::Duration;
+
+    /// The skills and memory the index attached to a user message are the model's: the page's
+    /// transcript, the editor's typed prompts and the rewind box all show only what was typed.
+    #[test]
+    fn the_block_the_index_attached_never_reaches_the_page() {
+        let block = hermes_runtime::preinject::Block {
+            text: "<context>\n<relevant-skills>\nsecret steps\n</relevant-skills>\n</context>".into(),
+            skills: vec!["deploy".into()],
+            memory: vec![],
+        };
+        let mut user = Message::user().with_text(format!("{}\n\nship it", block.text));
+        block.note(&mut user);
+        let stored = vec![user.clone(), Message::assistant().with_text("done")];
+        let rows = messages(&stored, "", "");
+        assert_eq!(rows[0]["role"], "user");
+        assert_eq!(rows[0]["text"], "ship it");
+        assert_eq!(rows[1]["text"], "done");
+        assert_eq!(typed_prompts(&stored)[0].1, "ship it");
+        assert_eq!(hermes_runtime::preinject::user_text(&user), "ship it");
+        // A message without the note is shown as it is, even if it looks like a block.
+        let plain = vec![Message::user().with_text("<context>x</context> hi")];
+        assert_eq!(messages(&plain, "", "")[0]["text"], "<context>x</context> hi");
+    }
 
     #[test]
     fn the_error_a_turn_ended_on_is_reported_with_its_surface() {

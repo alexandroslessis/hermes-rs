@@ -13,8 +13,8 @@
 //! from the next *session* (prompt caching, ground rule 8); a compaction or a model switch, which
 //! rebuild the prompt anyway, take the profile the session runs under then.
 //!
-//! A knob whose `requests` or `tokens` value needs a later phase (review `idle_once`, skills
-//! preload, per-cluster curator, deferred tool schemas) holds its `balanced`
+//! A knob whose `requests` or `tokens` value needs a later phase (review `idle_once`,
+//! per-cluster curator, deferred tool schemas) holds its `balanced`
 //! value until that phase lands: the enum has the variant, [`for_profile`] says which phase flips
 //! it in a comment, and nothing consumes the later variant yet.
 
@@ -149,8 +149,10 @@ pub struct BudgetKnobs {
     pub curator_max_iterations: u32,
     pub curator_mode: CuratorMode,
     pub skills_index: SkillsIndex,
-    /// Skills loaded before the first model call (Phase 5); 0 = none.
+    /// Skills attached to the user's message by the local index (Phase 5): the top k, 0 = none.
     pub skills_preload: u32,
+    /// Memory entries attached the same way (top k), 0 = none.
+    pub memory_preload: u32,
     pub titles: TitleMode,
     pub tool_schemas: ToolSchemas,
 }
@@ -186,6 +188,7 @@ impl BudgetKnobs {
         curator_mode: CuratorMode::Loop,
         skills_index: SkillsIndex::Full,
         skills_preload: 0,
+        memory_preload: 0,
         titles: TitleMode::Model,
         tool_schemas: ToolSchemas::All,
     };
@@ -232,9 +235,11 @@ pub fn for_profile(profile: BudgetProfile) -> BudgetKnobs {
             // Phase 8: CuratorMode::PerCluster.
             curator_max_iterations: balanced.curator_max_iterations,
             curator_mode: balanced.curator_mode,
-            // Phase 5: SkillsIndex::CategoriesAndRetrieval, preload 3.
-            skills_index: balanced.skills_index,
-            skills_preload: balanced.skills_preload,
+            // Phase 5: the system prompt lists categories; the top 3 skills and top 3 memory
+            // entries for each message ride on it (the local index).
+            skills_index: SkillsIndex::CategoriesAndRetrieval,
+            skills_preload: 3,
+            memory_preload: 3,
             // Phase 4: titles from the first message, no request.
             titles: TitleMode::Heuristic,
             tool_schemas: balanced.tool_schemas,
@@ -258,7 +263,9 @@ pub fn for_profile(profile: BudgetProfile) -> BudgetKnobs {
 
 /// What `budget.*` in the config can set: the profile, and each of these numbers on top of it
 /// (`budget.max_iterations: 100`). Names are the knob's field names.
-pub const OVERRIDE_KEYS: [&str; 14] = [
+pub const OVERRIDE_KEYS: [&str; 16] = [
+    "skills_preload",
+    "memory_preload",
     "max_iterations",
     "empty_response_retries",
     "length_continuations",
@@ -325,6 +332,9 @@ pub fn apply_override(
         "curator_max_iterations" => {
             knobs.curator_max_iterations = count(key, value, 1, 10_000)? as u32
         }
+        // 0 switches the injection off (balanced's value): a valid choice.
+        "skills_preload" => knobs.skills_preload = count(key, value, 0, 10)? as u32,
+        "memory_preload" => knobs.memory_preload = count(key, value, 0, 20)? as u32,
         _ => return Err(format!("budget.{key} is not a budget setting")),
     }
     Ok(())
@@ -389,6 +399,7 @@ mod tests {
         assert_eq!(k.curator_mode, CuratorMode::Loop);
         assert_eq!(k.skills_index, SkillsIndex::Full);
         assert_eq!(k.skills_preload, 0);
+        assert_eq!(k.memory_preload, 0);
         assert_eq!(k.titles, TitleMode::Model);
         assert_eq!(k.tool_schemas, ToolSchemas::All);
     }
@@ -451,23 +462,14 @@ mod tests {
         assert_eq!(r.titles, TitleMode::Heuristic);
         assert!(!r.side_jobs_may_use_main_model());
         assert!(BudgetKnobs::BALANCED.side_jobs_may_use_main_model());
+        // Phase 5: categories in the prompt, the top 3 skills and memory entries on the message.
+        assert_eq!(r.skills_index, SkillsIndex::CategoriesAndRetrieval);
+        assert_eq!((r.skills_preload, r.memory_preload), (3, 3));
         // Later phases: still balanced.
         let b = BudgetKnobs::BALANCED;
         assert_eq!(
-            (
-                r.review_mode,
-                r.curator_mode,
-                r.skills_index,
-                r.skills_preload,
-                r.tool_schemas
-            ),
-            (
-                b.review_mode,
-                b.curator_mode,
-                b.skills_index,
-                b.skills_preload,
-                b.tool_schemas
-            )
+            (r.review_mode, r.curator_mode, r.tool_schemas),
+            (b.review_mode, b.curator_mode, b.tool_schemas)
         );
 
         let t = for_profile(BudgetProfile::Tokens);
@@ -477,6 +479,7 @@ mod tests {
         );
         assert_eq!(t.result_size_pct, 50);
         assert_eq!(t.skills_index, SkillsIndex::NamesOnly);
+        assert_eq!((t.skills_preload, t.memory_preload), (0, 0));
         // Everything else is today's.
         assert_eq!(
             BudgetKnobs {
@@ -488,6 +491,18 @@ mod tests {
             },
             b
         );
+    }
+
+    #[test]
+    fn the_preload_knobs_can_be_switched_off_or_raised() {
+        use serde_json::json;
+        assert!(check_config_value("skills_preload", &json!(0)).is_ok());
+        assert!(check_config_value("skills_preload", &json!(11)).is_err());
+        assert!(check_config_value("memory_preload", &json!(-1)).is_err());
+        let knobs = from_config(&json!({"profile": "requests", "skills_preload": 0, "memory_preload": 5}));
+        assert_eq!((knobs.skills_preload, knobs.memory_preload), (0, 5));
+        let knobs = from_config(&json!({"profile": "balanced", "skills_preload": 2}));
+        assert_eq!(knobs.skills_preload, 2);
     }
 
     #[test]

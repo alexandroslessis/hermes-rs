@@ -87,6 +87,11 @@ and refuses an unknown profile and a 0 for the result size and the continuation 
 reports the effective width; a session's system prompt has the wording of the profile it started under and keeps
 it when the profile changes, a session started after gets the new one, `balanced` adds none; the tool schemas
 state no profile-dependent number) with its own provider on :47900.
+`preinject-check.mjs` checks the per-turn pre-injection (Phase 5) with its own provider on :47900: under `requests` a message a
+bundled skill covers reaches the model with the skill body in a `<context>` block and costs one request (no `skill_view`),
+`session.resume`, the rewind box and the sidebar's search (`/api/sessions/search`) see only what was typed, the same skill is pointed at (not repeated) on the next message,
+"hello" gets no block, the system prompt lists categories and is the same bytes on every request, `balanced` sends the message
+as typed with the full skills list.
 `path-policy-check.mjs` checks the file tools' path policy (a model asking to write into the app's data, skills
  and memories folders is refused, naming the right tool, and nothing is written) with its own provider
  on :47900.

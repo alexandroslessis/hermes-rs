@@ -148,3 +148,167 @@ next write/startup/curator pass (CP5.2: a cheap `refresh()` per turn, minding th
 Tests (CARGO_TARGET_DIR=target/claude): tools lib 145 passed / 1 ignored (29 in `index::tests`), memory 22, store 15, prompts 11;
 runtime lib 64, `turns` 105 passed / 7 ignored; desktop lib 169, `acp` 68; `cargo build --workspace` ok, no warnings; clippy
 clean on the changed crates.
+
+## CP5.2 — per-turn pre-injection: the `<context>` block, hidden from the page, and the skills block variants
+Worktree: C:\Users\alexandros\repos\hermes-rs-p5   Branch: backend/p5-index   Model: Sonnet 5.5 (subagent)
+On top of CP5.1 (c58479d). Uncommitted.
+Done:
+- **New `crates/runtime/src/preinject.rs`.** `retrieve()` (async: `spawn_blocking` + a 3 s timeout; an error, panic or timeout is logged
+  and means no block) asks `LocalIndex::query` and `render()` builds the block (pure, unit-tested):
+  ```
+  <context>
+  <preamble: attached by the system, background not user text, follow like a loaded skill>
+  <relevant-skills> <skill name=".." category="..">full SKILL.md body (frontmatter cut)</skill> ... </relevant-skills>
+  <relevant-memory> <entry id="memory:ab12cd34" tier="memory">text</entry> ... </relevant-memory>
+  </context>
+
+  <what the user wrote, with any @-reference expansion>
+  ```
+  Bounds: 12 000 chars per skill, 24 000 for all skills of one block (a cut skill says `skill_view` has the rest), 800 per memory
+  entry; a body containing `</context>` is escaped so the block can't close early.
+- **Wiring in `Runtime::begin_turn`.** `inject` = eligible text (`preinject::eligible`: not a skill / bundle invocation, `/plan`, `/init`,
+  `/learn`), no scripted prelude (`/review`), a knob above 0, an index. The user message is built exactly as before (so a refused `@file`
+  still fails `start_turn` synchronously: a test caught that) but *held*, and added in the turn's task after the query
+  (`Block::attach` prepends the text and writes the notes), like the existing `@url`/image path. Query = typed text + last assistant
+  message + `project_name(cwd)`. `balanced` / `tokens`, and any message that gets no block, take the old synchronous path unchanged.
+- **Stored with the message, hidden from the page.** The block is part of the message's text (resume / rewind / branch / replay send the
+  same bytes). Two notes: `preinject` (`skills`: names newly attached, `memory`: ids) and, if absent, `references`/`typed` = what the
+  user wrote. `preinject::strip` / `user_text` cut the block; used in `transcript::messages` (what the page's `session.resume` shows),
+  `transcript::typed_prompts` (ACP `/undo`, `/retry`), the rewind box (`session.rewind`'s `target_message.content`) and `/undo`.
+  The page cuts `@file` expansions itself (its marker "--- Attached Context ---"); it knows nothing of `<context>`, hence the server-side cut.
+- **Attached once per conversation.** `already_attached(messages)` reads the `preinject` notes off the live conversation; a skill already
+  there is listed as `already provided earlier in this conversation` (no body); a memory id already there is skipped. A pointer-only block
+  is still sent (about 30 tokens).
+- **Knobs** (`budget.rs`): new `memory_preload`; `requests`: `skills_preload` 3, `memory_preload` 3, `skills_index` `CategoriesAndRetrieval`;
+  `balanced` 0 / 0 / `Full`; `tokens` 0 / 0 / `NamesOnly`. Overrides `budget.skills_preload` (0-10) and `budget.memory_preload` (0-20)
+  (`OVERRIDE_KEYS` 14 -> 16; 0 is valid: injection off).
+- **Threshold.** The index's own floor (2.5) lets generic messages through ("refactor this function" -> `test-driven-development` 4.4,
+  "explain this error" -> `dogfood` 2.9 on the 37 bundled skills; the first test run attached a 12 KB QA skill to "explain this error").
+  Injection therefore uses `MIN_SKILL_SCORE` 5.0 and a skill after the first must reach 50% of the best one (the index keeps 2.5 / 30%, its
+  goldens pin them). Weakest right answers on the bundled set: 5.2 (`github`, "open a pull request..."), 5.7 ("write a git commit").
+- **`IndexStyle` in `skills.rs`** (`Full` = Hermes's text byte for byte, `Categories`, `Names`; `index_prompt_with(style)` replaces the bool).
+  `Categories`: `## Skills` + "grouped by category (the number is how many skills a category holds); the skills that look relevant to the
+  user's message are attached to it in a <context> block: follow them; for anything else, list a category with skills_list(category) and load a
+  skill with skill_view(name)" + `<skill_categories>` lines `  - name (n)`. `Categories` and `Names` carry no "Err on the side of loading".
+  Chosen at session start from `skills_index` and frozen with the prompt (CP3.2's mechanism). Subagents' base prompt maps `Categories` back to
+  `Full` (their task gets no block).
+- Display/doc: `GAPS.md`, `PORTING.md` (new `preinject.rs` row, diverged; `budget.rs` row), `docs/ARCHITECTURE.md`, `docs/PITFALLS.md`,
+  `docs/TESTING.md`, `scripts/perf/README.md`, `docs/backend/PHASES.md` (knob table, baselines S6).
+Files: crates/runtime/{src/preinject.rs (new), src/lib.rs, src/budget.rs, tests/turns.rs}, crates/tools/src/{skills.rs,lib.rs},
+  crates/desktop/src/{transcript.rs,gateway.rs}, scripts/perf/preinject-check.mjs (new), scripts/perf/README.md, GAPS.md, PORTING.md,
+  docs/{ARCHITECTURE,PITFALLS,TESTING}.md, docs/backend/PHASES.md, docs/backend/progress/phase-5.md
+Tests (CARGO_TARGET_DIR=target/claude):
+  - `cargo test -p hermes_runtime --test turns`: 117 passed / 7 ignored under each of `HERMES_TEST_PROFILE=balanced`, `requests`, `tokens`
+    (105 + the 12 new). New: `s6_balanced_loads_the_skill_with_a_request_and_nothing_is_attached` (2 requests, user message byte for byte
+    as typed, full list), `s6_requests_attaches_the_skill_and_needs_no_skill_view` (1 request, body in the first request's user message, no
+    `skill_view`, categories prompt without the body), `s6_tokens_attaches_nothing_and_lists_names`, `the_page_sees_what_the_user_typed_not_the_block`,
+    `a_skill_is_attached_once_and_the_system_prompt_never_changes` (second message says "already provided earlier", body once in the request,
+    first message replayed identically, system prompt byte-identical), `resuming_and_rewinding_reproduce_the_stored_block` (reopened runtime
+    replays the same bytes; after a rewind the same text gives the same block again), `short_generic_messages_attach_nothing` (9 messages incl.
+    "hello", "explain this error", "refactor this function"), `a_relevant_memory_entry_is_attached_with_its_id` (frozen prompt unchanged),
+    `the_knobs_can_switch_the_attachment_off_or_widen_it`, `a_broken_index_never_breaks_a_turn` (`index.db` is a folder: no index, the turn
+    runs), `references_and_the_block_live_in_one_message`, `the_prompts_a_slash_command_writes_get_no_block`.
+  - `hermes_runtime` lib 74 (new `preinject` tests: render, once-only, bounds, closing-tag escape, strip, share filter; `budget` preload
+    knobs); `hermes_tools` lib 145 / 1 ignored (the `skills` test now checks the three `IndexStyle`s), memory 22, store 15, prompts 11;
+    `hermes-desktop` lib 170 (new `the_block_the_index_attached_never_reaches_the_page`), `acp` 68; `cargo build --workspace` ok.
+  - Live: `scripts/perf/preinject-check.mjs` against my own instance (debug build, port 47810, `target/perf`; stopped after): 14 checks ok
+    (1 main request, block in front of the message, no `skill_view`, categories prompt, `session.resume` row = typed text and no row has
+    the block, byte-identical replay, pointer on the second message, same system prompt, "hello" untouched, rewind box = typed text,
+    re-attached after the rewind, `balanced` as typed with the full list). `perf.ps1 -Do start` printed node-not-found noise (the worktree
+    has no `tools/node`; the main checkout's was used for the check); the instance itself started fine.
+Request counts: new scenario S6 "a task a bundled skill covers": `balanced` 2 main requests (`skill_view` round trip) -> `requests` 1.
+  S1-S5 unchanged (baseline table in PHASES.md has the S6 row).
+Deviations from the plan:
+- **"Already injected" is read off the conversation, not a JSON side file.** The `preinject` note on each stored user message lists the skill
+  names / memory ids; `already_attached(messages)` scans the live conversation. Same effect, and rewinds, branches and compactions that drop the
+  message also free the skill again (a side file would claim the model still has a skill it no longer sees). No file to keep in step.
+- Injection uses a stricter skill threshold than the index's (5.0 and 50% of the best, `preinject::MIN_SKILL_SCORE`) because 2.5 attached a 12 KB
+  QA skill to "explain this error" in the first test run. The index's own thresholds and goldens are untouched.
+- A message that gets a block is added in the turn's task (like `@url`/image messages), not synchronously, because the query is blocking SQLite
+  (ground rule 7); it is *built* synchronously so a refused `@file` still fails `start_turn`.
+- A pointer-only block ("already provided earlier") is still sent when every relevant skill was attached before.
+- New knob `memory_preload` (plan table lists only `skills.preload`); `requests` 3, others 0.
+- Subagents keep the `Full` skills list under `requests` (they get no block).
+For the reviewer:
+- **Caching.** Check `Block::attach` / `user_message` / the held-message path in `begin_turn`: nothing goes to the system prompt; the block is
+  stored in the message text; resume/rewind tests assert byte equality. Please re-read that a *failed* turn (`TurnFinished(Failed)` before the
+  message is added) can't leave a half state: the held message is simply dropped, `running` cleared.
+- **Display.** The page does not know `<context>`; every place that shows a user message's text must use `preinject::user_text`/`strip`. I
+  covered `transcript::messages`, `typed_prompts`, `/undo` and `session.rewind`. Not covered (acceptable?): session search over `sessions.db`
+  and the GPUI app (it prefers the `typed` note, so it is fine) and anything that exports the raw messages; compaction summaries and
+  `session_search` see the block text.
+- **Message text now varies per turn for plain messages**: a plain message that gets a block also gets a `references`/`typed` note (so `/undo`
+  and the GPUI app have the typed text). Nothing else reads that note.
+- **Threshold on a big skills set.** 5.0 / 50% was tuned on the 37 bundled skills (weakest right answer 5.2, strongest wrong 4.4); the CP5.1 review
+  ran the goldens on Hermes's 232 skills but the *preload* floor was not rerun there. If live use shows misses, `preinject::MIN_SKILL_SCORE` is the
+  one place (not yet a knob).
+- **Memory duplicates the frozen prompt.** The system prompt still carries the whole MEMORY.md/USER.md snapshot, so an attached entry that
+  existed at session start is a repeat (up to 3 per message, once per conversation); entries written during the session are new to the model.
+  Phase 9 (memory tiers) is where this goes away.
+- **Memory scoring with very few entries**: a lone entry scores ~0 in BM25 (no rarer word), so with 1-2 memories nothing is attached; the test
+  seeds 6. Looks acceptable (small memories are in the prompt anyway).
+- `index.query` refreshes first when dirty (up to hundreds of ms on a big skills folder) inside the 3 s limit; hand edits outside `commit()` are
+  still only picked up at the next write/startup (CP5.1 note): a per-turn `refresh()` was not added (stat walk cost ~210 ms for 400 skills).
+- A session started under `requests` whose profile is later switched to `balanced` keeps the categories prompt (no skill names) but gets no
+  block: the model must `skills_list` / `skill_view` (the prompt says so). Same frozen-prompt trade-off as the budget wording.
+- Not done: ACP session option for the profile (as before), no UI change (no patch needed: the block is cut server-side).
+
+### Review (Opus 5.5)
+Main had not moved (branch at c58479d on top of 8c1f5cc): no merge. `/code-review` not run (subagent); manual pass over the diff,
+`preinject.rs`, `begin_turn`, compaction, session search and every place that shows a user message's text.
+Review focus, with evidence:
+1. **Caching holds.** Nothing per-turn reaches the system prompt: the block is prepended to the user message in the turn's task
+   (`Block::attach`) and appended once; the `IndexStyle` is part of the prompt built at session creation and stored in the session
+   record (`record.system_prompt`), so resume, a profile switch and a model switch (rebuilds from the then-current profile, as since
+   CP3.2) behave like the budget wording. `a_skill_is_attached_once_and_the_system_prompt_never_changes` and the live check assert the
+   system prompt is byte-identical across requests. Retry/continue (`text = None`) never inject; a turn injects at most once.
+2. **Replay is byte for byte.** The block is stored in the message text; nothing recomputes it (resume / rewind / branch copy messages
+   verbatim, the provider request is built from stored messages): `resuming_and_rewinding_reproduce_the_stored_block`, live check.
+3. **The page shows the typed text**: transcript (`session.resume`, ACP history and export read `transcript::messages`), typed prompts
+   (ACP `/undo`, `/retry`), rewind box, `/undo`, titles (heuristic and model both take the submitted `text`, never the stored message),
+   session list (shows the title). **Found and fixed:** session search (`search_rows`, used by the sidebar's `/api/sessions/search`
+   and the agent's `session_search`) indexed the block: every message with a skill attached matched that skill's words and snippets
+   showed skill text. The cut now lives in `hermes_store::without_attached_context` (used by `row_for` and by `preinject::strip`, one
+   implementation). Test `the_attached_context_block_is_not_searchable`; live check now asserts a body word ("curl") doesn't find the
+   session and a typed word does. Also fixed: the `/review` briefing (`review_task`) quoted the block as the user's words; it now
+   strips it and counts attached skills as loaded (they never go through `skill_view`).
+Other findings, fixed:
+- **"Already attached" after a compaction was wrong.** A compaction doesn't drop the summarized messages, it hides them from the model
+  (`agent_visible = false`, kept for the page). `already_attached` scanned them, so a skill whose only copy had been summarized away
+  was answered with "already provided earlier" and never re-attached. Now only agent-visible messages count (unit test).
+- **The compaction summarizer read the block as the user's request**: `serialize` bounds each record (head + tail), so a 24k-char block
+  pushed the actual request out of the summarizer's input. `serialize` now strips the block (test
+  `the_summarizer_reads_the_request_not_the_attached_skills`). This answers the implementer's doubt about compaction summaries.
+- **Threshold on Hermes's full skill set** (probe on `../hermes-agent` skills + optional-skills, ~230): "hello" scored 5.2 (`ascii-art`)
+  and would have been attached; "explain this error" 5.2 (`anatomy`); "refactor this function" 5.2 (TDD). One search word says nothing
+  about a task, so a message now needs 2 search words of its own before a skill is attached (`MIN_MESSAGE_WORDS`, via the new
+  `index::word_count`; memory unaffected): "hello", "thanks", "continue", "ok, go on", "yes please" get no skill on any set. Real
+  tasks on the full set: arxiv 14.7, architecture-diagram 11.9, youtube 11.5, systematic-debugging 8.3 ("fix the bug in main.rs"),
+  requesting-code-review 8.4, pdf 7.1, microsoft-office 7.5 all pass. **Left:** "explain this error" -> `anatomy` (5.2) and "refactor
+  this function" -> TDD (5.2) still attach on the 230-skill set (not on the bundled 37); "open a pull request on github" -> `github`
+  scores 4.0 / 3.1 and is not attached (the model loads it). `MIN_SKILL_SCORE` should become a profile knob if live use shows misses.
+- `strip` trimmed the typed text's own leading whitespace; now it removes exactly the "\n\n" joint. Skill names/categories in the
+  block's attributes are escaped like bodies (a frontmatter `name` could close the block). The query read `record` inside the
+  `conversation` lock; now one lock at a time. `/context` counted 0 skills tokens under `requests` (it looked for
+  `<available_skills>` only); it now counts `<skill_categories>`.
+- PITFALLS said `@url:`/image messages get no block: they do (the deferred path queries too); corrected.
+Judged, no change:
+- "Already injected" read off the conversation's notes instead of the plan's side file: better (rewind/branch/compaction stay
+  consistent without a file to keep in step; the store schema is untouched; notes persist in the message JSON already used for
+  `references`). PORTING row and module doc say diverged.
+- A session started under `requests` then switched to `balanced`: categories prompt, no block; the prompt tells the model to use
+  `skills_list` / `skill_view`, the same frozen-prompt trade-off CP3.2 accepted. Acceptable. Subagents keep `Full`: right, a
+  delegated task gets no block.
+- Turn failures: a held message is dropped with `running` cleared before append; a cancel during the query appends the message
+  without a block and ends Cancelled (same as the `@url` path). The query is `spawn_blocking` under a 3 s timeout and also races
+  the turn's cancel, so a locked/slow index can't stall a turn; `a_broken_index_never_breaks_a_turn` covers a missing index.
+  UTF-8: `clip` counts chars, no byte slicing.
+- `balanced` is byte for byte today's: S6 balanced asserts the user message is exactly the typed text and the full list; S1-S5
+  hold under all three profiles. S6 under `requests`: 2 -> 1 main request, asserted with `assert_requests(.., 1..=1)` and no
+  `skill_view` in any request.
+Tests (CARGO_TARGET_DIR=target/claude): tools lib 145 / 1 ignored, memory 22, store 12 (1 new), prompts ok; runtime lib 76
+(2 new), `turns` 117 passed / 7 ignored under `HERMES_TEST_PROFILE` unset, `balanced`, `requests`, `tokens`; desktop lib 170,
+`acp` 68; `cargo build --workspace` ok, no warnings. Live: `preinject-check.mjs` against my own instance (debug, 47810,
+`target/perf`, stopped after): 16/16 ok.
+Docs: GAPS (Phase 5 done), PORTING (preinject row: search and summarizer cut), ARCHITECTURE, PITFALLS, scripts/perf/README,
+PHASES (phase map ✅ 2026-11-12, *After 5* column: S1-S5 unchanged, S6 2 -> 1).

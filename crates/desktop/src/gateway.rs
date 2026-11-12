@@ -1717,7 +1717,8 @@ impl Gateway {
         let Some(target) = before.get(keep) else {
             return Ok(nothing());
         };
-        let content = target.as_concat_text();
+        // What the user typed: without the skills and memory the index attached to it.
+        let content = hermes_runtime::preinject::user_text(target);
         let kept = self.runtime.rewind(&id, keep).map_err(error)?;
         Ok(json!({
             "session_id": id,
@@ -1838,7 +1839,14 @@ impl Gateway {
                         _ => None,
                     })
                     .collect();
-                let text = text.join("\n").trim().to_string();
+                let text = text.join("\n");
+                // What the user wrote, without the skills the local index attached.
+                let text = if is_user {
+                    hermes_runtime::preinject::strip(m, text)
+                } else {
+                    text
+                };
+                let text = text.trim().to_string();
                 // A command's prompt is shown as the command it was typed as.
                 let text = commands::typed_command(&text).unwrap_or(text);
                 (!text.is_empty()).then_some((is_user, text))
@@ -1847,6 +1855,20 @@ impl Gateway {
             .collect();
         recent.reverse();
         let mut skills: Vec<String> = Vec::new();
+        // The skills the local index attached count as loaded (Phase 5: no `skill_view` call).
+        for message in &messages {
+            if let Some(names) = message
+                .metadata
+                .operation_note(hermes_runtime::preinject::NOTE, "skills")
+                .and_then(Value::as_array)
+            {
+                for name in names.iter().filter_map(Value::as_str) {
+                    if !skills.iter().any(|s| s == name) && skills.len() < 8 {
+                        skills.push(name.to_string());
+                    }
+                }
+            }
+        }
         for request in messages
             .iter()
             .flat_map(|m| &m.content)

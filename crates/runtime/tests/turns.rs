@@ -4613,3 +4613,353 @@ async fn the_local_index_follows_skill_and_memory_writes() {
     // No model request was made by any of this.
     assert!(h.requests.lock().is_empty());
 }
+
+// --- CP5.2: per-turn pre-injection of the relevant skills and memory --------------------------
+
+/// The text of every user message in a request, in order.
+fn user_contents(request: &Value) -> Vec<String> {
+    sent_messages(request)
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .map(|m| match &m["content"] {
+            Value::String(text) => text.clone(),
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(|p| p["text"].as_str())
+                .collect::<Vec<_>>()
+                .join(""),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
+fn system_of(request: &Value) -> String {
+    request["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn asked_for_a_tool(requests: &[Value], name: &str) -> bool {
+    requests.iter().any(|r| {
+        sent_messages(r).iter().any(|m| {
+            m["tool_calls"]
+                .as_array()
+                .is_some_and(|calls| calls.iter().any(|c| c["function"]["name"] == name))
+        })
+    })
+}
+
+const ARXIV_ASK: &str = "search arxiv for papers on diffusion models";
+/// A line of the bundled `arxiv` skill's body.
+const ARXIV_BODY: &str = "# arXiv Research";
+
+/// S6: a task a bundled skill covers. `balanced`: the model loads the skill (`skill_view`), then
+/// answers: 2 requests. `requests`: the skill rides on the message, the model answers: 1.
+async fn s6_task_covered_by_a_skill(profile: BudgetProfile) -> Harness {
+    let replies = match profile {
+        BudgetProfile::Requests => vec![text_reply("Found 3 papers.")],
+        _ => vec![
+            tool_reply(&[("sv", "skill_view", json!({"name": "arxiv"}))]),
+            text_reply("Found 3 papers."),
+        ],
+    };
+    let h = harness_profile(replies, profile).await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, ARXIV_ASK).await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    h
+}
+
+#[tokio::test]
+async fn s6_balanced_loads_the_skill_with_a_request_and_nothing_is_attached() {
+    let h = s6_task_covered_by_a_skill(BudgetProfile::Balanced).await;
+    assert_requests(&h, Purpose::Main, 2..=2);
+    let requests = h.requests.lock().clone();
+    assert!(asked_for_a_tool(&requests, "skill_view"));
+    // Byte for byte today's message: just the text.
+    assert_eq!(user_contents(&requests[0]), [ARXIV_ASK]);
+    assert!(system_of(&requests[0]).contains("<available_skills>"));
+}
+
+#[tokio::test]
+async fn s6_tokens_attaches_nothing_and_lists_names() {
+    let h = harness_profile(vec![text_reply("ok")], BudgetProfile::Tokens).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, ARXIV_ASK).await;
+    let request = h.requests.lock()[0].clone();
+    assert_eq!(user_contents(&request), [ARXIV_ASK]);
+    assert!(system_of(&request).contains("<available_skills>"));
+}
+
+#[tokio::test]
+async fn s6_requests_attaches_the_skill_and_needs_no_skill_view() {
+    let h = s6_task_covered_by_a_skill(BudgetProfile::Requests).await;
+    // One request instead of two: the budget assertion for Phase 5.
+    assert_requests(&h, Purpose::Main, 1..=1);
+    let requests = h.requests.lock().clone();
+    assert!(!asked_for_a_tool(&requests, "skill_view"));
+    let sent = user_contents(&requests[0]);
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].starts_with("<context>\n"), "{}", sent[0]);
+    assert!(sent[0].contains("<relevant-skills>"));
+    assert!(sent[0].contains("<skill name=\"arxiv\""));
+    assert!(sent[0].contains(ARXIV_BODY), "the skill's full body is attached");
+    assert!(
+        sent[0].ends_with(&format!("</context>\n\n{ARXIV_ASK}")),
+        "{}",
+        sent[0]
+    );
+    // The system prompt lists categories, not skills, and says where the relevant ones are.
+    let system = system_of(&requests[0]);
+    assert!(system.contains("<skill_categories>"));
+    assert!(!system.contains("<available_skills>"));
+    assert!(!system.contains("Err on the side of loading"));
+    assert!(system.contains("attached to it"));
+    assert!(
+        !system.contains(ARXIV_BODY),
+        "nothing per-turn in the system prompt"
+    );
+}
+
+#[tokio::test]
+async fn the_page_sees_what_the_user_typed_not_the_block() {
+    let h = s6_task_covered_by_a_skill(BudgetProfile::Requests).await;
+    let session = h.runtime.store().list_sessions(10).unwrap()[0].id.clone();
+    let messages = h.runtime.messages(&session).unwrap();
+    let stored = messages[0].as_concat_text();
+    assert!(stored.starts_with("<context>") && stored.contains(ARXIV_BODY));
+    // The display text, as the transcript, /undo and rewind take it.
+    assert_eq!(hermes_runtime::preinject::user_text(&messages[0]), ARXIV_ASK);
+    assert_eq!(
+        hermes_tools::references::typed_text(&messages[0]),
+        Some(ARXIV_ASK)
+    );
+    assert_eq!(
+        messages[0].metadata.operation_note("preinject", "skills"),
+        Some(&json!(["arxiv"]))
+    );
+}
+
+#[tokio::test]
+async fn a_skill_is_attached_once_and_the_system_prompt_never_changes() {
+    let h = harness_profile(
+        vec![text_reply("one"), text_reply("two"), text_reply("three")],
+        BudgetProfile::Requests,
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, ARXIV_ASK).await;
+    run_turn(&h, &session, "now search arxiv for papers on transformers").await;
+    let requests = h.requests.lock().clone();
+    let second = user_contents(&requests[1]);
+    assert_eq!(second.len(), 2);
+    // History replays the stored first message exactly (the prompt cache holds)...
+    assert_eq!(second[0], user_contents(&requests[0])[0]);
+    // ...and the second message points at the skill instead of repeating it.
+    assert!(second[1].contains("already provided earlier"), "{}", second[1]);
+    assert_eq!(requests[1].to_string().matches(ARXIV_BODY).count(), 1);
+    // The system prompt is the same bytes on every request.
+    assert_eq!(system_of(&requests[0]), system_of(&requests[1]));
+    assert_eq!(requests[0]["messages"][0], requests[1]["messages"][0]);
+    // The display text of both messages is what was typed.
+    let messages = h.runtime.messages(&session).unwrap();
+    let typed: Vec<String> = messages
+        .iter()
+        .filter(|m| m.role == rmcp::model::Role::User)
+        .map(hermes_runtime::preinject::user_text)
+        .collect();
+    assert_eq!(
+        typed,
+        [ARXIV_ASK, "now search arxiv for papers on transformers"]
+    );
+}
+
+#[tokio::test]
+async fn resuming_and_rewinding_reproduce_the_stored_block() {
+    let h = harness_profile(
+        vec![text_reply("one"), text_reply("two"), text_reply("three")],
+        BudgetProfile::Requests,
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, ARXIV_ASK).await;
+    let stored = h.runtime.messages(&session).unwrap()[0].as_concat_text();
+
+    // The app restarts and the session is resumed from disk: the next request replays the
+    // very same first message.
+    let reopened = runtime_with_budget(
+        h.data.path(),
+        Arc::new(Bridge),
+        test_budget(Some(BudgetProfile::Requests)),
+    );
+    assert_eq!(
+        reopened.messages(&session).unwrap()[0].as_concat_text(),
+        stored
+    );
+    let mut turn = reopened
+        .start_turn(
+            &session,
+            &h.provider,
+            TurnOptions::default(),
+            "and what about summaries",
+        )
+        .unwrap();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(60), turn.events.recv())
+        .await
+        .unwrap()
+    {
+        if matches!(event, RuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    let resumed = h.requests.lock()[1].clone();
+    assert_eq!(user_contents(&resumed)[0], stored);
+    assert_eq!(system_of(&resumed), system_of(&h.requests.lock()[0]));
+    drop(reopened);
+
+    // Rewinding to before the message drops its block with it: asking again attaches the skill
+    // again (the model hasn't seen it any more), the same text as the first time.
+    h.runtime.rewind(&session, 0).unwrap();
+    run_turn(&h, &session, ARXIV_ASK).await;
+    let again = user_contents(&h.requests.lock()[2]);
+    assert_eq!(again, [stored]);
+}
+
+#[tokio::test]
+async fn short_generic_messages_attach_nothing() {
+    let h = harness_profile(
+        (0..9).map(|_| text_reply("ok")).collect(),
+        BudgetProfile::Requests,
+    )
+    .await;
+    let session = session_in(&h);
+    let texts = [
+        "hello",
+        "thanks, that looks good",
+        "ok, continue",
+        "explain this error",
+        "refactor this function",
+        "please run the tests",
+        "can you list the files in this folder",
+        "write a python script to rename files",
+        "what does this function do",
+    ];
+    for text in texts {
+        run_turn(&h, &session, text).await;
+    }
+    let requests = h.requests.lock().clone();
+    assert_eq!(user_contents(&requests[8]), texts);
+}
+
+#[tokio::test]
+async fn a_relevant_memory_entry_is_attached_with_its_id() {
+    let h = harness_profile(vec![text_reply("ok")], BudgetProfile::Requests).await;
+    let session = session_in(&h);
+    let before = stored_prompt(&h, &session);
+    // A few entries, as a real memory has (a lone entry has no word rarer than the others, and
+    // BM25 scores it at nothing).
+    for content in [
+        "The tulip beds are watered on Tuesdays.",
+        "The user prefers tabs over spaces in Go files.",
+        "The staging server is restarted every Friday evening.",
+        "Invoices are filed under the accounting folder by month.",
+        "The CI pipeline uses a self-hosted Windows runner.",
+        "The dog is called Pixel and is afraid of thunder.",
+    ] {
+        let reply = h.runtime.memory().apply(
+            hermes_memory::Target::Memory,
+            &[hermes_memory::Operation {
+                action: "add".into(),
+                content: Some(content.into()),
+                ..Default::default()
+            }],
+            &mut hermes_memory::TurnFailures::default(),
+        );
+        assert_eq!(reply["success"], true, "{reply}");
+    }
+    run_turn(&h, &session, "when are the tulip beds watered").await;
+    let request = h.requests.lock()[0].clone();
+    let sent = &user_contents(&request)[0];
+    assert!(sent.contains("<relevant-memory>"), "{sent}");
+    assert!(sent.contains("<entry id=\"memory:"));
+    assert!(sent.contains("watered on Tuesdays"));
+    assert!(!sent.contains("<relevant-skills>"), "{sent}");
+    // The frozen prompt neither had the entry nor got it.
+    assert_eq!(system_of(&request), before);
+    assert!(!system_of(&request).contains("Tuesdays"));
+}
+
+#[tokio::test]
+async fn the_knobs_can_switch_the_attachment_off_or_widen_it() {
+    let off = BudgetKnobs {
+        skills_preload: 0,
+        memory_preload: 0,
+        ..test_budget(Some(BudgetProfile::Requests))
+    };
+    let h = harness_budget(|_| vec![text_reply("ok")], Arc::new(Bridge), off).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, ARXIV_ASK).await;
+    assert_eq!(user_contents(&h.requests.lock()[0]), [ARXIV_ASK]);
+    // Balanced with the knob raised attaches too (and keeps its full skills list).
+    let on = BudgetKnobs {
+        skills_preload: 1,
+        ..test_budget(Some(BudgetProfile::Balanced))
+    };
+    let h = harness_budget(|_| vec![text_reply("ok")], Arc::new(Bridge), on).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, ARXIV_ASK).await;
+    let request = h.requests.lock()[0].clone();
+    assert!(user_contents(&request)[0].contains(ARXIV_BODY));
+    assert!(system_of(&request).contains("<available_skills>"));
+}
+
+#[tokio::test]
+async fn a_broken_index_never_breaks_a_turn() {
+    // `index.db` can't be opened (a folder is in its place): no index, no attachment, a turn.
+    let h = harness_budget(
+        |data| {
+            std::fs::create_dir_all(data.join("index.db")).unwrap();
+            vec![text_reply("answered")]
+        },
+        Arc::new(Bridge),
+        test_budget(Some(BudgetProfile::Requests)),
+    )
+    .await;
+    assert!(h.runtime.index().is_none());
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, ARXIV_ASK).await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!(user_contents(&h.requests.lock()[0]), [ARXIV_ASK]);
+}
+
+#[tokio::test]
+async fn references_and_the_block_live_in_one_message() {
+    let h = harness_profile(vec![text_reply("ok")], BudgetProfile::Requests).await;
+    std::fs::write(h.work.path().join("notes.md"), "line one\nline two\n").unwrap();
+    let session = session_in(&h);
+    let text = format!("{ARXIV_ASK} and read @file:notes.md");
+    run_turn(&h, &session, &text).await;
+    let sent = user_contents(&h.requests.lock()[0])[0].clone();
+    assert!(sent.starts_with("<context>"));
+    assert!(sent.contains("--- Attached Context ---") && sent.contains("line two"));
+    let message = h.runtime.messages(&session).unwrap()[0].clone();
+    assert_eq!(
+        hermes_tools::references::typed_text(&message),
+        Some(text.as_str())
+    );
+    assert!(hermes_runtime::preinject::user_text(&message).starts_with(&text));
+}
+
+#[tokio::test]
+async fn the_prompts_a_slash_command_writes_get_no_block() {
+    let h = harness_profile(vec![text_reply("ok")], BudgetProfile::Requests).await;
+    let session = session_in(&h);
+    let message = h
+        .runtime
+        .skill_command("/arxiv search for papers on diffusion models")
+        .expect("a skill command");
+    run_turn(&h, &session, &message).await;
+    let sent = user_contents(&h.requests.lock()[0])[0].clone();
+    assert!(!sent.starts_with("<context>"), "{sent}");
+}
