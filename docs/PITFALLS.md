@@ -119,14 +119,15 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   `cargo build -p hermes-desktop` before restarting the instance, or it serves the previous
   page. Check with `cdp.mjs "performance.getEntriesByType('resource').map(e => e.name)"`
   against the hashed file names in `dist-webapp/assets`.
-- **A patch in git's own format is silently skipped by the webapp build.** `git diff
-  --no-index` emits `diff --git` and `index` lines; the build's `git apply` (run inside the
-  hermes-rs repo, on the non-repo `target/hermes-src`) then skips every hunk and exits 0 —
-  the build prints "Applied" but the page still serves the old code, and `--check` says
-  "Skipped patch" instead of "Checking patch". Write patches in the traditional `diff -u`
-  format (`--- a/<path>` / `+++ b/<path>`, no `diff --git`/`index` lines — strip them with a
-  byte-safe `node -e` filter when the diff came from git), and confirm a fresh `--check`
-  prints "Checking patch".
+- **A patch in git's own format was silently skipped by the webapp build** (fixed 2026-11-12,
+  Phase 6 review). `git apply` run in `target/hermes-src` finds the enclosing hermes-rs repo,
+  reads a `diff --git` patch's paths as relative to *that* root and skips every file with exit
+  code 0 ("Skipped patch" only with `-v`). Patches 0022-0026 are in that format, so until then
+  no build had 0022 (budget profile) or 0023 (local aux models) in it, whatever their notes
+  said. `build-hermes-webapp.ps1` now sets `GIT_CEILING_DIRECTORIES` to `target\` (the export
+  is then not inside a repository, both formats apply relative to it) and stops on any
+  "Skipped patch" in `git apply --verbose`'s output. Checking a patch by hand inside the repo
+  has the same trap: set the same variable, and look for "Checking patch", not just exit 0.
 - **`cargo test` doesn't rebuild the app binary.** Run `cargo build -p hermes-desktop` before a
   live check, or you're testing the old exe.
 - **The user's build locks `target/debug`.** Always `target/claude`.
@@ -482,15 +483,31 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **The user's Apply is not tainted.** It calls the stores directly (`Runtime::apply_staged`), not a
   tool, so taint can't stage it again. Staged items outlive their session (deleting a session keeps
   its pending items) and a restart; `session_id` only says who asked.
-- **Two queues exist.** Hermes's `memory.write_approval` / `skills.write_approval` settings (and the
-  unattended review's staged memory patches/removals) still use their own per-store queues
-  (`pending/memory/`, `skills/.pending/`), shown by the GPUI app and `/memory`. The taint staging
-  area is separate (`staging/`); CP6.3 shows it in the page, and a later phase may fold the old
-  queues into it.
+- **One list in the page, two queues behind it (CP6.3).** The page shows `staging/` only (Settings ▸
+  Memory and Capabilities ▸ Skills, patches 0024-0026; Hermes's page has no screen for its own
+  `write_approval` queues). So the foreground `memory` / `skill_manage` calls of a session whose
+  `memory.write_approval` (a Settings switch) / `skills.write_approval` is on now stage here too, with
+  the reason "write approval is on" (`SessionTools::stages_memory` / `stages_skills`); otherwise that
+  switch would fill a queue nobody can see from the page. Still on the old per-store queues
+  (`pending/memory/`, `skills/.pending/`, listed by `/memory` and the GPUI app): items made before
+  CP6.3 (not imported), the unattended review's memory proposals, and the review's skill writes
+  while write approval is on; Phase 7 reworks the review onto `staging/`. Taint takes precedence
+  for the reason shown (`this turn read ...`). The fold is in `SessionTools`, so it holds for every
+  front end on the shared data folder: ACP (`hermes-acp.exe`, no review screen of its own) and the
+  frozen GPUI app (whose Memory / Skills views list only the old queues) now stage too, and those
+  items are reviewed in the desktop app's screens: nothing is lost, but a GPUI user won't see them
+  there. `/memory` in the desktop chat counts them ("N memory change(s) wait for your review in
+  Settings ▸ Memory & Context") beside the old queue.
+- **The Pending section is attacker-influenced text.** The page renders diff, reason, sources and
+  errors only as React text (never `dangerouslySetInnerHTML`), shows the `<U+XXXX>` forms as sent,
+  truncates nothing (the diff box scrolls), shows a stale item's reason with Reject only and a failed
+  Apply's message on the card. A new field added to the item must go through the same text path.
+  The section renders nothing on an error from `GET /api/staging` (an older backend), never a
+  guessed list.
 - **`staging.*` is ours** (not Hermes's contract): `staging.list` -> `{items, count}`,
   `staging.apply {id}` -> `{id, kind, applied: true, message}` or an error saying why,
   `staging.reject {id}` -> `{id, kind, rejected: true}`; REST mirror `GET /api/staging`,
   `POST /api/staging/<id>/apply|reject` (404 unknown, 409 could not apply). The page ignores
-  methods it doesn't know and nothing calls these before CP6.3.
+  methods it doesn't know; the Memory and Skills screens call them since CP6.3.
 - **Sessions built without a data folder can't stage** (`StagingStore::usable`): a tainted write is
   then refused, never written (fail closed). Only tests build such sessions.

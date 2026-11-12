@@ -2028,22 +2028,50 @@ impl Gateway {
                 Ok(out.join("\n"))
             }
             "memory" => {
-                let memory = self.runtime.memory();
-                let pending = memory.pending();
-                let gate = if memory.config().write_approval {
-                    "on"
-                } else {
-                    "off"
-                };
-                Ok(if pending.is_empty() {
-                    format!("No memory writes are waiting for approval (approval gate: {gate}).")
+                let runtime = self.runtime.clone();
+                // Both lists are files: off the async workers.
+                let (pending, gate, staged) = tokio::task::spawn_blocking(move || {
+                    let memory = runtime.memory();
+                    let gate = if memory.config().write_approval {
+                        "on"
+                    } else {
+                        "off"
+                    };
+                    // Since Phase 6 the agent's own writes wait in the staging area (reviewed in
+                    // Settings ▸ Memory & Context); the old queue holds older and review items.
+                    let staged = runtime
+                        .staging()
+                        .list()
+                        .iter()
+                        .filter(|item| item.kind == hermes_tools::staging::Kind::Memory)
+                        .count();
+                    (memory.pending(), gate, staged)
+                })
+                .await
+                .unwrap_or_default();
+                let review = (staged > 0).then(|| {
+                    format!(
+                        "{staged} memory change(s) wait for your review in Settings ▸ Memory & \
+                         Context."
+                    )
+                });
+                let mut out = if pending.is_empty() {
+                    if review.is_none() {
+                        vec![format!(
+                            "No memory writes are waiting for approval (approval gate: {gate})."
+                        )]
+                    } else {
+                        vec![format!("Approval gate: {gate}.")]
+                    }
                 } else {
                     let mut out = vec![format!(
                         "Memory writes waiting for approval (gate: {gate}):"
                     )];
                     out.extend(pending.iter().map(|w| format!("  {}  {}", w.id, w.summary)));
-                    out.join("\n")
-                })
+                    out
+                };
+                out.extend(review);
+                Ok(out.join("\n"))
             }
             "refine" => {
                 match need_id().and_then(|id| Ok((self.provider_for(&id, settings)?, id))) {

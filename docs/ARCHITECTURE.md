@@ -171,7 +171,7 @@ Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`
 | Settings (all other pages) | `rest.rs` (`config_defaults`, `config_schema`), gw `apply_settings` | `/api/config*` | — |
 | Settings ▸ Memory, the Star map | `learning.rs`, `hermes_memory` | `/api/learning/*`, `/api/memory*` | `memory-check.mjs` |
 | Capabilities ▸ Skills | `skills.rs` | `/api/skills*` | — |
-| Writes waiting for review (tainted sessions; no screen until CP6.3) | `staging.rs`, `hermes_tools::staging` | `staging.list/apply/reject` (ours), `/api/staging*` | — |
+| Writes waiting for review (tainted sessions, or write approval on): "Waiting for your review" on Settings ▸ Memory and Capabilities ▸ Skills (patches 0024-0026) | `staging.rs`, `hermes_tools::staging` | `staging.list/apply/reject` (ours), `/api/staging*` | — |
 | Capabilities ▸ Tools | `toolsets.rs`, runtime `set_disabled_tools` | `/api/tools/*` | `toolsets-check.mjs` |
 | Command Center ▸ Maintenance, logs, insights | `maintenance.rs`, gw | `/api/curator*`, `/api/logs`, `insights.get` | — |
 | Import Hermes sessions | `hermes_import.rs` | `session.foreign.*`, `/import-hermes` | `import-check.mjs` |

@@ -1,0 +1,258 @@
+diff --git a/apps/desktop/src/api/staging.ts b/apps/desktop/src/api/staging.ts
+new file mode 100644
+index 0000000..d6d64e6
+--- /dev/null
++++ b/apps/desktop/src/api/staging.ts
+@@ -0,0 +1,34 @@
++// hermes-rs: the staging area (`GET /api/staging`, `POST /api/staging/<id>/apply|reject`): memory
++// and skill writes the agent made after reading untrusted content wait here for the user.
++import { hermesApi } from '@/api/client'
++
++export type StagedKind = 'memory' | 'skill'
++
++export interface StagedItem {
++  created: number
++  /** Unified-diff text; control and hidden characters arrive spelled out as `<U+XXXX>`. */
++  diff: string
++  /** Why applying it failed, or why it is out of date. */
++  error: null | string
++  id: string
++  kind: StagedKind
++  reason: string
++  session_id: string
++  sources: string[]
++  status: 'pending' | 'stale'
++  summary: string
++}
++
++export async function listStagedItems(): Promise<StagedItem[]> {
++  const response = await hermesApi<{ items?: StagedItem[] }>({ path: '/api/staging' })
++
++  return Array.isArray(response?.items) ? response.items : []
++}
++
++export function applyStagedItem(id: string): Promise<{ message?: string }> {
++  return hermesApi({ body: {}, method: 'POST', path: `/api/staging/${encodeURIComponent(id)}/apply` })
++}
++
++export function rejectStagedItem(id: string): Promise<unknown> {
++  return hermesApi({ body: {}, method: 'POST', path: `/api/staging/${encodeURIComponent(id)}/reject` })
++}
+diff --git a/apps/desktop/src/components/staging-pending.tsx b/apps/desktop/src/components/staging-pending.tsx
+new file mode 100644
+index 0000000..665b75f
+--- /dev/null
++++ b/apps/desktop/src/components/staging-pending.tsx
+@@ -0,0 +1,212 @@
++// hermes-rs: "Waiting for your review" at the top of the Memory and Skills screens. After the agent
++// read untrusted content (a web page, an MCP result, a file outside the project) its memory and
++// skill writes are not saved; they are kept here with their diff until the user applies or
++// rejects them. Everything shown (diff, reason, sources, errors) is attacker-influenced text and is
++// rendered as React text only; hidden characters arrive already spelled out as `<U+XXXX>`.
++import { useCallback, useEffect, useRef, useState } from 'react'
++
++import { applyStagedItem, listStagedItems, rejectStagedItem, type StagedItem, type StagedKind } from '@/api/staging'
++import { Button } from '@/components/ui/button'
++import { queryClient } from '@/lib/query-client'
++import { notify } from '@/store/notifications'
++
++const errorText = (err: unknown) => {
++  // The page's REST client throws `Error('409: {"detail": "..."}')`: show the server's sentence.
++  const raw = err instanceof Error ? err.message : String(err)
++
++  try {
++    const parsed: unknown = JSON.parse(raw.replace(/^\d{3}:\s*/, ''))
++
++    if (parsed && typeof parsed === 'object' && typeof (parsed as { detail?: unknown }).detail === 'string') {
++      return (parsed as { detail: string }).detail
++    }
++  } catch {
++    // Not JSON: the message as it is.
++  }
++
++  return raw
++}
++
++function lineTone(line: string) {
++  if (line.startsWith('+')) {
++    return 'text-emerald-600 dark:text-emerald-400'
++  }
++
++  return line.startsWith('-') ? 'text-red-600 dark:text-red-400' : undefined
++}
++
++function DiffText({ text }: { text: string }) {
++  return (
++    <pre
++      className="max-h-72 overflow-auto rounded-md bg-(--ui-bg-quaternary) p-2 font-mono text-[0.6875rem] leading-4 whitespace-pre-wrap break-words"
++      data-testid="staging-diff"
++      tabIndex={0}
++    >
++      {text.split('\n').map((line, index) => (
++        <span className={lineTone(line)} key={index}>
++          {line}
++          {'\n'}
++        </span>
++      ))}
++    </pre>
++  )
++}
++
++function Item({
++  busy,
++  failure,
++  item,
++  onApply,
++  onReject
++}: {
++  busy: boolean
++  failure?: string
++  item: StagedItem
++  onApply: () => void
++  onReject: () => void
++}) {
++  const stale = item.status === 'stale'
++  const problem = failure || item.error
++
++  return (
++    <li className="grid gap-1.5 rounded-lg border border-border p-3" data-staging-id={item.id} data-status={item.status}>
++      <div className="flex items-start gap-2">
++        <div className="min-w-0 flex-1">
++          <div className="text-sm font-medium break-words text-foreground">{item.summary}</div>
++          {item.reason ? <div className="text-xs break-words text-muted-foreground">{item.reason}</div> : null}
++          {item.sources.length > 0 ? (
++            <div className="text-xs break-words text-muted-foreground">Read: {item.sources.join('; ')}</div>
++          ) : null}
++        </div>
++        <div className="flex shrink-0 gap-1.5">
++          {!stale && (
++            <Button disabled={busy} onClick={onApply} size="xs">
++              Apply
++            </Button>
++          )}
++          <Button disabled={busy} onClick={onReject} size="xs" variant="outline">
++            Reject
++          </Button>
++        </div>
++      </div>
++      {stale ? (
++        <div className="text-xs font-medium text-destructive">
++          Out of date: what this change was written against has changed, so it can no longer be applied. Reject it
++          and ask the agent again if you still want it.
++        </div>
++      ) : null}
++      {problem ? (
++        <div className="text-xs break-words whitespace-pre-wrap text-destructive" role="alert">
++          {problem}
++        </div>
++      ) : null}
++      <DiffText text={item.diff} />
++    </li>
++  )
++}
++
++export function StagingPending({ inset = false, kind }: { inset?: boolean; kind: StagedKind }) {
++  const [items, setItems] = useState<StagedItem[]>([])
++  const [busy, setBusy] = useState<Record<string, boolean>>({})
++  const [failures, setFailures] = useState<Record<string, string>>({})
++  const mounted = useRef(true)
++
++  const refresh = useCallback(async () => {
++    try {
++      const next = await listStagedItems()
++
++      if (mounted.current) {
++        setItems(next)
++      }
++    } catch {
++      // An older backend (no /api/staging) or a hiccup: show nothing rather than a wrong list.
++      if (mounted.current) {
++        setItems([])
++      }
++    }
++  }, [])
++
++  useEffect(() => {
++    mounted.current = true
++    void refresh()
++
++    const onFocus = () => void refresh()
++
++    window.addEventListener('focus', onFocus)
++
++    return () => {
++      mounted.current = false
++      window.removeEventListener('focus', onFocus)
++    }
++  }, [refresh])
++
++  const act = useCallback(
++    async (item: StagedItem, verb: 'apply' | 'reject') => {
++      setBusy(current => ({ ...current, [item.id]: true }))
++      setFailures(current => {
++        const { [item.id]: _gone, ...rest } = current
++
++        return rest
++      })
++
++      try {
++        if (verb === 'apply') {
++          const done = await applyStagedItem(item.id)
++
++          notify({ kind: 'success', message: done.message || 'The change was saved.', title: 'Applied' })
++
++          if (item.kind === 'skill') {
++            void queryClient.invalidateQueries({ queryKey: ['skills-list'] })
++          }
++        } else {
++          await rejectStagedItem(item.id)
++        }
++      } catch (err) {
++        if (mounted.current) {
++          setFailures(current => ({ ...current, [item.id]: errorText(err) }))
++        }
++      } finally {
++        if (mounted.current) {
++          setBusy(current => ({ ...current, [item.id]: false }))
++        }
++
++        await refresh()
++      }
++    },
++    [refresh]
++  )
++
++  const mine = items.filter(item => item.kind === kind)
++
++  if (mine.length === 0) {
++    return null
++  }
++
++  return (
++    <section
++      aria-label="Waiting for your review"
++      className={`${inset ? 'mx-6 ' : ''}mb-3 grid gap-2 rounded-lg border border-primary/30 p-3`}
++      data-testid={`staging-pending-${kind}`}
++    >
++      <div>
++        <div className="text-sm font-semibold text-foreground">Waiting for your review ({mine.length})</div>
++        <div className="text-xs text-muted-foreground">
++          The agent asked to make these {kind === 'memory' ? 'memory' : 'skill'} changes; they were not saved, and each
++          says why. Nothing changes until you apply one. Read the whole change: it may come from untrusted content.
++        </div>
++      </div>
++      <ul className={`grid gap-2${inset ? ' max-h-[45vh] overflow-y-auto' : ''}`}>
++        {mine.map(item => (
++          <Item
++            busy={Boolean(busy[item.id])}
++            failure={failures[item.id]}
++            item={item}
++            key={item.id}
++            onApply={() => void act(item, 'apply')}
++            onReject={() => void act(item, 'reject')}
++          />
++        ))}
++      </ul>
++    </section>
++  )
++}

@@ -36,11 +36,23 @@ Remove-Item $archive
 # hermes-rs's few changes to the frontend (crates/desktop/patches, in order). A patch that no
 # longer applies after a Hermes update stops the build: refresh it against the new commit.
 $patches = Join-Path $root 'crates\desktop\patches'
+# target\hermes-src sits inside the hermes-rs repository. Left alone, git finds that repository,
+# reads the paths of a `diff --git` patch as relative to ITS root and silently skips every file
+# (exit code 0; "Skipped patch" is printed only with --verbose): 0022 onwards were never applied
+# that way. The ceiling stops the search at target\, so the export is not inside a repository and
+# paths are relative to it; --verbose lets us refuse a patch that still skips a file.
+$env:GIT_CEILING_DIRECTORIES = Split-Path -Parent $src
 foreach ($patch in Get-ChildItem $patches -Filter *.patch | Sort-Object Name) {
-    git -C $src apply --whitespace=nowarn $patch.FullName
-    if ($LASTEXITCODE -ne 0) { Write-Error "$($patch.Name) doesn't apply to Hermes $Commit" }
+    # git writes its progress to stderr; Windows PowerShell turns that into errors under 'Stop'.
+    $ErrorActionPreference = 'Continue'
+    $out = git -C $src apply --verbose --whitespace=nowarn $patch.FullName 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($code -ne 0) { Write-Error "$($patch.Name) doesn't apply to Hermes ${Commit}:`n$out" }
+    if ($out -match 'Skipped patch') { Write-Error "$($patch.Name) was skipped by git apply:`n$out" }
     Write-Output "Applied $($patch.Name)"
 }
+Remove-Item Env:GIT_CEILING_DIRECTORIES
 
 $env:PATH = "$node;$env:PATH"
 Push-Location (Join-Path $src 'apps\desktop')

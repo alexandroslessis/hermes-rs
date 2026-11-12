@@ -215,6 +215,52 @@ files before 0003/0004, 6.6 MB in 109 after.
   packages): run `build-hermes-webapp.ps1` and look at Settings ▸ Model ▸ Auxiliary before relying
   on it. The backend route is checked live by `scripts/perf/local-aux-check.mjs`.
 
+- **0022 and 0023 were never in any build before 2026-11-12 (Phase 6 review).** They are in
+  `diff --git` format, which the build's `git apply` silently skipped inside the hermes-rs repo
+  (docs/PITFALLS.md); the script now applies both formats and stops on a skipped file. Since then
+  they apply in order and type-check with the rest of the page (`tsc -p . --noEmit` in the build
+  workspace), but were not looked at in the page.
+
+- **0024-staging-pending-component.patch** (new files `api/staging.ts`,
+  `components/staging-pending.tsx`), **0025-memory-pending-section.patch**
+  (`app/settings/memory/memory-layers.tsx`), **0026-skills-pending-section.patch**
+  (`app/capabilities/catalog/skill-catalog.tsx`): "Waiting for your review" at the top of
+  Settings ▸ Memory & Context ▸ Persistent memory (memory items) and of Capabilities ▸ Skills (skill
+  items: new skills, patches, curator merges), decision D3: no new panel. Hermes's plugin API has no
+  slot in either screen (`plugin.js` can only register into the areas Hermes defines, and
+  injecting DOM into React-owned screens breaks on re-render), so the screens get a small component
+  each. `StagingPending kind="memory"|"skill"` lists `GET /api/staging` (ours, `src/staging.rs`)
+  filtered by kind: per item the summary, the reason ("this turn read a web page"), the sources, the
+  whole diff in a scrollable box, and Apply / Reject (`POST /api/staging/<id>/apply|reject`).
+  It renders nothing when the kind has no items, and also when the route is missing (an older
+  backend). It lists again when the screen opens, on window focus and after every Apply / Reject;
+  an applied skill refreshes the skills list.
+  - Everything shown is attacker-influenced text and is rendered as React text only (diff lines in
+    `<pre>` spans coloured by their first character; never `dangerouslySetInnerHTML`); hidden
+    characters already arrive spelled out as `<U+XXXX>`; nothing is cut (the box scrolls).
+  - A stale item (what it was written against has changed) shows "Out of date ..." and its error
+    and offers Reject only; a pending item whose Apply failed keeps its error on the card (the
+    server's sentence: threat scan, limit, name taken) and offers Apply again and Reject.
+  - 0024 adds the files, 0025 / 0026 only mount it (0025 in `MemoryLayersSlot`, so the Command
+    Center's memory summary is unchanged; 0026 in `SkillCatalog`'s `notice` fragment, so it sits
+    under the filter bar and doesn't switch off the hub loader, which tests `!notice`). English
+    text, not i18n keys.
+  - **Old queues.** Hermes's `memory.write_approval` / `skills.write_approval` queues
+    (`pending/memory/`, `skills/.pending/`) have no screen in Hermes's page and none was written
+    for them; the page shows `staging/` only. The backend now routes the foreground `memory` and
+    `skill_manage` calls of a session whose write approval is on into `staging/` too (reason
+    "write approval is on"), so the Settings switch "Ask before the agent saves to memory" feeds the
+    one list. Items already in the old queues stay where they are (`/memory` lists them).
+  - Errors: the page's REST client throws `Error("409: {\"detail\": ...}")`, so the component
+    JSON-parses the message and shows `detail` (the server's whole sentence; Hermes's
+    `readableError` would cut anything over 180 characters).
+  **Written 2026-11-12; built, type-checked (`tsc -p . --noEmit`, no error in the patched files) and
+  driven in the page on the perf instance 2026-11-12 (Phase 6 review)** with
+  `scripts/perf/staging-check.mjs --dom` and by hand: both sections render first, the hostile diff
+  is inert text, stale = Reject only, Apply of a skill from the page creates it (toast, card gone,
+  skill listed), a refused Apply shows the 409's sentence. Not looked at as a screenshot (layout by
+  DOM boxes only); no i18n keys.
+
 ## To do
 
 - **Skill hub** (install from Capabilities ▸ Skills ▸ Discover): `tools/skills_hub*.py` and

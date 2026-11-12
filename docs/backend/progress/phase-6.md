@@ -383,3 +383,195 @@ Tests after the fixes (CARGO_TARGET_DIR=target/claude), all green: tools 181 pas
   memory 22, store 15, prompts 12; runtime lib 77; `--test turns` 135 passed / 7 ignored under the
   default profile and balanced, requests, tokens; hermes-desktop 174 + 68 (acp); `cargo build
   --workspace` OK. Request counts unchanged.
+
+## CP6.3 — Pending in the Memory and Skills screens, `write_approval` folded in, live check, docs
+Worktree: C:\Users\alexandros\repos\hermes-rs-p6   Branch: backend/p6-taint   Model: Sonnet 5.5 (subagent)
+CP6.1 and CP6.2 are committed on the branch; this is uncommitted on top of them.
+Done:
+- **Where the screens are.** Hermes's "memory screen" is Settings ▸ Memory & Context ▸ Persistent
+  memory (`MemoryLayersSlot` in `app/settings/memory/memory-layers.tsx`, mounted by
+  `config-settings.tsx`); it has no list of entries. The skills screen is Capabilities ▸ Skills
+  (`SkillsTab` -> `SkillCatalog` -> `CatalogBrowser`). Hermes's plugin API has no slot in either
+  (`plugin.js` registers into areas Hermes defines: statusBar, titleBar, panes, settings.plugins...;
+  injecting DOM into React-owned screens is not robust), so: **three small patches**, no
+  `plugin.js` / `hide.css` change.
+  - `0024-staging-pending-component.patch`: new `api/staging.ts` (`hermesApi` calls of
+    `GET /api/staging`, `POST /api/staging/<id>/apply|reject`) and `components/staging-pending.tsx`
+    (`StagingPending kind="memory"|"skill"`).
+  - `0025-memory-pending-section.patch`: `MemoryLayersSlot` renders it above the layers panel (the
+    Command Center's summary is unchanged).
+  - `0026-skills-pending-section.patch`: `SkillCatalog` renders it first in the `notice` fragment (under
+    the filter bar; not by replacing `notice`, which would switch off the hub loader that tests `!notice`).
+  - Chose REST over the gateway methods: the page's `hermesApi` is the simpler path (no socket
+    handling in a component, `detail` errors become `Error.message`, assumed: see below).
+- **The component.** Hidden when the kind has no items or the list call fails (older backend: nothing
+  rather than a guess). Lists when the screen opens, on window focus, after every Apply / Reject. Per
+  item: summary, reason, `Read: <sources>`, the whole diff in a scrollable `<pre>` (lines coloured by
+  first character; React text only, no `dangerouslySetInnerHTML`; `<U+XXXX>` forms as sent; nothing
+  cut), Apply / Reject. A stale item: "Out of date ..." + its error, **Reject only**. A pending item
+  whose Apply failed (threat scan, limit, name taken): the server's sentence on the card
+  (`role="alert"`), Apply and Reject stay. Success: a toast with the server's message; an applied
+  skill invalidates the `skills-list` query.
+- **Old queues: folded, for memory and skills.** Our backend does serve Hermes's `memory.write_approval`
+  as a Settings switch ("Ask before the agent saves to memory", `rest.rs`) and the gateway's `/memory`
+  lists `pending/memory/`, but **no page screen shows or applies those items** (Hermes's page has
+  none): turning the switch on silently filled a queue the user couldn't reach. So
+  `SessionTools::dispatch` now stages foreground `memory` and `skill_manage` calls into `staging/`
+  when the session is tainted **or** the store's `write_approval` is on (`stages_memory` /
+  `stages_skills`; reason "write approval is on" when not tainted). Not imported: items already in
+  `pending/memory/` / `skills/.pending/`; not folded: the review's own writes (unattended memory
+  proposals, review `skill_manage` while approval is on), which Phase 7 moves. Documented in
+  PITFALLS, PORTING, patches README. This is a small step beyond the checkpoint text; it is what
+  the CP6.2 review's answer (e) asked for, and without it the new Pending list would be a half-truth.
+- **Live check `scripts/perf/staging-check.mjs [port] [data folder] [--dom]`**, run against my own
+  instance (perf.ps1, port 47810, data in `target/perf/home`; started and stopped, unpiped; the
+  user's app untouched): all checks pass (run twice): list shape (no payload, reason, sources,
+  stale + error), hostile item (ESC, RLO, HTML in diff, reason and source: shown as `<U+XXXX>`, none
+  raw, HTML arrives as text), `staging.list` over the socket equals REST, Apply of a memory item
+  writes MEMORY.md and removes it, second Apply 404, Apply of a skill create adds it to
+  `/api/skills`, a stale item and a name-taken skill are 409 with their reason and stay listed
+  (stale), a hostile entry is refused again at Apply by the threat scan and stays, Reject, gone items
+  404, malformed ids 404, MEMORY.md never holds the hostile text. Everything is put back. (The first
+  run caught a bug in my seed, a skill description over the 60-character index limit, which Apply
+  refused as it should.) The `--dom` part (section first on both screens, diff as text, Reject only
+  on stale, error on a refused Apply, Reject removes the card) is written but **never run** (needs a
+  built webapp).
+- Docs: patches/README (0024-0026 + the old-queue note), scripts/perf/README, GAPS (CP6.3 ✅
+  2026-11-12), PORTING (two rows), ARCHITECTURE, PITFALLS ("one list in the page, two queues behind
+  it", the Pending section as attacker text), TESTING (junction caveat).
+Files: crates/desktop/patches/{0024,0025,0026}-*.patch (new), crates/tools/src/lib.rs,
+  crates/runtime/tests/turns.rs, scripts/perf/staging-check.mjs (new), scripts/perf/README.md,
+  crates/desktop/patches/README.md, GAPS.md, PORTING.md, docs/ARCHITECTURE.md, docs/PITFALLS.md,
+  docs/TESTING.md, docs/backend/progress/phase-6.md
+Tests (CARGO_TARGET_DIR=target/claude), all green: `cargo test -p hermes_tools -p hermes_memory -p
+  hermes_store -p hermes_prompts` (tools 181 passed / 1 ignored, memory 22, store 15, prompts 12);
+  `hermes_runtime --lib` 77; `--test turns` 136 passed / 7 ignored (+1:
+  `memory_write_approval_stages_into_the_one_list_even_in_a_clean_session`: clean session, approval on
+  -> "Saved for review by the user", MEMORY.md untouched, one item with reason "write approval is
+  on", old queue empty, 2 requests) under the default profile and `HERMES_TEST_PROFILE=balanced`,
+  `requests`, `tokens`; `hermes-desktop` 174 + 68 (acp); `cargo build --workspace` OK. Live:
+  `staging-check.mjs` passes. Request counts unchanged.
+Deviations from the plan:
+- Three patches (one shared component + one per screen) instead of "one small patch per screen":
+  the component is a new file both screens use; each screen's patch is 7-10 changed lines.
+- The `write_approval` fold above (memory and skills tool paths), not in the checkpoint line.
+- "Curator merges" are not a distinct case: the curator is a clean session and writes directly today;
+  when Phase 8 stages them they arrive as `kind: skill` and show in the same section.
+For the reviewer:
+- **Nothing in the page was seen.** The three patches pass `git apply --check` in order (0024, 0025,
+  0026 on top of a scratch export with 0001-0023 applied, from `git archive` of `HERMES_COMMIT`);
+  they were **not built, not type-checked, not rendered**: the worktree has no npm packages, and
+  `build-hermes-webapp.ps1` begins with `Remove-Item -Recurse` on `target/hermes-src`, which here is a
+  junction to the main checkout's (it would delete through it), so I did not run it. Please read
+  `staging-pending.tsx` for type errors (it uses `hermesApi` from `@/api/client`, `Button` with
+  `size="xs"` / `variant="outline"`, `notify`, `queryClient`, and Tailwind classes copied from
+  neighbouring components) and run the build plus `staging-check.mjs --dom` before the user tries it.
+  Layout (the `mx-6` inset on Skills, none on Settings) is a guess from the neighbouring components.
+- `window.hermesDesktop.api` is assumed to throw an `Error` whose message is the response's `detail`
+  for a 409 (I did not find where the browser transport builds it); if not, the card still shows a
+  visible message, but check its text.
+- Strings are English, not i18n keys (as 0021-0023).
+- Pending memory items are visible only on the Memory & Context settings section (not hidden by
+  `hide.css`); there is no badge anywhere else, so a user who never opens it won't know.
+- Stale detection happens at Apply: an item stays `pending` in the list until the user applies and
+  the server says it is stale (then it shows "Out of date"). That is CP6.2's design; the failed-Apply
+  error on the card covers that first attempt.
+- The `write_approval` fold: ACP and the frozen GPUI app go through the same `dispatch`, so they
+  stage too; the GPUI memory view reads only the old queue and ACP has no review UI, so a user of
+  those two with write approval on now has to open the desktop page to review. Decide whether ACP
+  should keep the old behaviour. `stages_memory` calls `memory.config()` (lock + clone) per memory
+  call: negligible.
+- `perf.ps1 -Do start` printed a node-not-found error from its timing probe (the worktree has no
+  `tools/node`); the instance started fine, and I ran the check with the main checkout's Node.
+
+### Review (Opus 5.5)
+Main had not moved (`backend/p6-taint..main` empty); no merge. Removed the worktree's
+`target/hermes-src` junction (`cmd /c rmdir`; the main checkout's copy is intact), linked
+`tools/` to the main checkout's (junction, gitignored) for Node, and ran
+`build-hermes-webapp.ps1` (npm ci from the network) in the worktree.
+
+**Verdict:** the backend was sound; the page side **had never been in any build**. Fixed that and
+two bugs it hid; now built, type-checked and driven in a real page.
+
+Found and fixed:
+1. **The build silently skipped patches 0022-0026.** `git apply` run in `target/hermes-src` finds
+   the enclosing hermes-rs repo and skips every file of a `diff --git` patch with exit code 0
+   (PITFALLS already warned, the last three implementers wrote that format anyway). The first build
+   printed "Applied 0024..0026" and served none of it; the same is true of 0022 (budget profile) and
+   0023 (local aux button) in every build since Phase 3/4. `build-hermes-webapp.ps1` now sets
+   `GIT_CEILING_DIRECTORIES` to `target\` (both formats apply) and stops on any "Skipped patch" in
+   `git apply --verbose`. All 26 now apply in order; "Budget profile" shows in Settings ▸ Model.
+2. **Type error** (the first compile ever): `notify({kind, title})` lacks the required `message`.
+3. **The 409 `detail` did not reach the card** (the assumption was wrong): the browser client throws
+   `Error('409: {"detail":"..."}')` and the card showed that raw JSON. The component now JSON-parses
+   it and shows `detail` whole (Hermes's `readableError` would cut it at 180 characters). The live
+   check's assertion was vacuous (the item already carried a stored error); it now requires the
+   unwrapped sentence after the click.
+4. The section's intro said "The agent read untrusted content" also for write-approval items: now
+   neutral ("each says why", the per-item reason). The Skills list section gets a 45vh cap with its
+   own scroll (it sits above the catalog's flex list, which many items would squeeze to nothing).
+5. `/memory` said "No memory writes are waiting" while `staging/` held some: it now counts staged
+   memory items and points to the screen, and its file reads moved into `spawn_blocking`.
+6. Test for the skills half of the write-approval fold
+   (`skill_write_approval_stages_into_the_one_list_even_in_a_clean_session`).
+
+Verified in a real page (perf instance, port 47810, DevTools text/DOM, no screenshots):
+`staging-check.mjs --dom` all passed: "Waiting for your review" is the first child before
+`memory-layers` on Settings ▸ Memory & Context and right under the filter bar on Capabilities ▸
+Skills (memory items not there); the hostile diff (`<img onerror>`, `<script>`, `<U+202E>`) is text,
+no element created, `window.__pwned` unset; stale = Reject only with "Out of date" + error; pending
+= Apply + Reject; a refused Apply shows the server's sentence; Reject removes the card. By hand:
+Apply of a skill item from the Skills page → toast "Applied / Skill 'seed-skill' created.", card and
+section gone, skill listed; a write-approval item shows its reason "write approval is on" and no
+"Read:" line. Not verified: anything needing a model turn in the page (the Yolo transcript line,
+the approval card's reason, "Saved for review" in a chat) — covered by `turns.rs` only; visual
+layout beyond DOM boxes; dark theme; keyboard order.
+
+Judged, left:
+- **The write-approval fold** is right: Hermes's queues had no page screen, so the Settings switch
+  fed an invisible queue. ACP and the frozen GPUI app share `SessionTools` and now stage too; the
+  items are reviewable in the desktop app (better than before for ACP; the GPUI views don't show
+  them: documented in PITFALLS, the app is frozen). Review writes still use the old queues until
+  Phase 7 (documented); pre-existing old-queue items are not imported.
+- Phase 6 vs goal: taint sources (web, browser, `@url`, MCP unless trusted, outside reads, web and
+  outside images, subagents, fetcher commands), Auto/Manual/AcceptEdits always ask flagged commands
+  with the reason, Yolo warns, writes staged in every mode, Apply re-runs scans/limits/staleness,
+  UI in the existing screens (D3). Ground rules: schema untouched (side files), blocking work in
+  `spawn_blocking`, `staging.*` / `/api/staging*` ours and outside Hermes's contract, PORTING rows
+  `diverged`, clean-session request counts unchanged (`turns` under all profiles).
+- English strings (as 0021-0023); badges elsewhere for pending items: none (a user who never opens
+  those screens won't know; `/memory` now tells).
+Tests (CARGO_TARGET_DIR=target/claude): tools 181 / 1 ignored, memory 22, store 15, prompts 12;
+runtime lib 77, `--test turns` 137 / 7 ignored under default, balanced, requests, tokens;
+hermes-desktop 174 + 68 (acp); `cargo build --workspace` OK; `tsc -p . --noEmit` no error in any
+patched file (28 pre-existing in Hermes's tests / i18n at the pinned commit);
+`staging-check.mjs --dom` passes.
+
+### User checklist (Phase 6)
+Needs a webapp rebuilt from this commit (`build-hermes-webapp.ps1` from PowerShell, then `cargo
+build`): earlier builds skipped patches 0022-0026 without saying so. While at it, Settings ▸ Model ▸
+Main now shows "Budget profile" (0022) and Auxiliary "Use a local model for background jobs" (0023).
+1. Open a chat, set the approvals mode to Auto, and ask: "Search the web for the latest Rust release
+   and tell me the version." Wait for the answer.
+2. In the same chat: "Remember that I prefer short answers." The agent replies that it saved it for
+   your review. Open Settings ▸ Memory & Context ▸ Persistent memory: at the top, "Waiting for your
+   review (1)" shows "add memory", the reason "this turn read web search results", the source, and
+   the diff `+ I prefer short answers.`. MEMORY.md has not changed (a new chat doesn't know it).
+3. Click Apply. A toast says it was applied and the section disappears. Start a new chat and ask
+   "What do you remember about me?": it knows (it is in MEMORY.md for the next session).
+4. Repeat steps 1-2 with "Remember that I use tabs", then click Reject: the card goes, nothing is
+   saved, a new chat doesn't know it.
+5. Skill: after a web search, ask "Save a skill called release-check that tells me to look up the
+   Rust release first." Open Capabilities ▸ Skills: at the top, "Waiting for your review" shows
+   "skill: create release-check" with the whole SKILL.md as the diff. Apply: it appears in the
+   Installed list. Reject on a second one: it doesn't.
+6. Yolo warning: set the chat to Yolo, search the web, then ask it to "delete the build folder": it
+   runs without asking and a line "ran after reading untrusted content: web search results" appears
+   in the chat. In Auto instead, the approval card reads "recursive delete (this turn read web search
+   results)" and does not offer "always allow".
+7. Stale: after a web search ask the agent to change an existing memory entry (so the item patches
+   it), then, before you Apply, delete that entry from MEMORY.md by hand. Apply shows the error
+   "Entry changed since it was staged ..." and the card then says "Out of date" and offers only Reject.
+8. Negative: in a fresh chat that has read nothing untrusted, "Remember that I like tea" is saved at
+   once and nothing appears in Pending. With Settings ▸ Memory ▸ "Ask before the agent saves to
+   memory" on, the same request does appear in Pending, with the reason "write approval is on".

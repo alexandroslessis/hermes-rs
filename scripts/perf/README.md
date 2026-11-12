@@ -136,6 +136,17 @@ model, a `/compress` whose summary comes from the local server (zero `compress` 
 provider), the same with the local server stopped (the main model writes it), 400 and nothing changed when
 no server answers, reset, endpoint removed.
 
+`staging-check.mjs [port] [data folder] [--dom]` checks the staging area (`GET /api/staging`,
+`POST /api/staging/<id>/apply|reject`, `staging.list`; patches 0024-0026): it seeds items in the instance's
+`staging/` (a memory add, a skill create, a stale memory patch, a skill whose name was taken, a hostile entry with
+an escape, a right-to-left override and HTML), then checks the list's shape (reason, sources, stale + error, no
+payload), hidden characters as `<U+XXXX>` and never raw, Apply writing MEMORY.md / the skill and removing the item,
+a second Apply 404, a stale / refused / threat-scanned Apply a 409 that keeps the item with its error, Reject, bad ids.
+It puts everything back (MEMORY.md, the skills it made). `--dom` also drives the page over DevTools: the section
+first on Settings ▸ Memory and at the top of Capabilities ▸ Skills, the diff as text (the HTML is not run), Reject only
+on a stale item, the 409's `detail` sentence (unwrapped) on a refused Apply, Reject removing the card; it needs a
+webapp built with the patches (passing 2026-11-12).
+
 `keyboard-nav-check.mjs` checks arrow-key navigation through the page (DevTools, patches/0018 and
 0019): the file tree's ↑/↓ move the visible selection and ←/→ fold the selected folder, and the
 Settings rail's rows walk with ↑/↓ (wrap-around; arrows only move focus, the hash never changes).

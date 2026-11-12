@@ -45,7 +45,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 3 | Budget profiles and the knobs they set — ✅ 2026-11-12 | M | 2 | Sonnet | A |
 | 4 | Side jobs off the main quota — ✅ 2026-11-12 | S–M | 3 | Sonnet | A |
 | 5 | Local index (FTS5) and per-turn pre-injection — ✅ 2026-11-12 | M | 3 | Sonnet | A |
-| 6 | Taint tracking and the staging area | M | 1 | Sonnet | B |
+| 6 | Taint tracking and the staging area — ✅ 2026-11-12 | M | 1 | Sonnet | B |
 | 7 | Review rewrite: signals, evidence packet, one shot | M–L | 5, 6 | **Opus** | C |
 | 8 | Skills v2: outcomes, provenance, project skills, curator v2 | M–L | 7 | Sonnet | B |
 | 9 | Memory v2: tiers, structured entries, links | L | 5, 7 | Sonnet (CP9.1 **Opus**) | B |

@@ -503,9 +503,10 @@ impl SessionTools {
             "terminal" => shell::terminal(self, args, live).await,
             "process_manage" => process::process_manage(self, args).await,
             "todo_list" => todo::todo_list(self, args),
-            // A tainted session's memory and skill writes wait for the user (`staging.rs`).
-            "memory" if self.taint().is_tainted() => self.stage_memory(&args).await,
-            "skill_manage" if self.taint().is_tainted() => {
+            // A tainted session's memory and skill writes wait for the user (`staging.rs`), and so
+            // do all of them while `write_approval` is on (one list for the user: Phase 6, CP6.3).
+            "memory" if self.stages_memory() => self.stage_memory(&args).await,
+            "skill_manage" if self.stages_skills() => {
                 self.stage_skills(&args, WriteOrigin::Foreground).await
             }
             "memory" => self.memory_tool(&args),
@@ -924,12 +925,33 @@ impl SessionTools {
         }
     }
 
+    /// Whether this session's `memory` writes wait for the user: it read untrusted content, or
+    /// `memory.write_approval` is on.
+    fn stages_memory(&self) -> bool {
+        self.taint().is_tainted()
+            || self
+                .memory
+                .as_ref()
+                .is_some_and(|memory| memory.config().write_approval)
+    }
+
+    /// The same for `skill_manage` and `skills.write_approval`.
+    fn stages_skills(&self) -> bool {
+        self.taint().is_tainted()
+            || self
+                .skills
+                .as_ref()
+                .is_some_and(|skills| skills.config().write_approval)
+    }
+
     /// Who is staging, and why the write waits.
     fn staging_meta(&self) -> staging::Meta {
         let taint = self.taint();
         staging::Meta {
             session_id: self.session_id.clone(),
-            reason: taint.reason().unwrap_or_default(),
+            reason: taint
+                .reason()
+                .unwrap_or_else(|| "write approval is on".to_string()),
             sources: taint.sources,
         }
     }

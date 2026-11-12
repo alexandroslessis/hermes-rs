@@ -140,6 +140,17 @@ text/DOM through DevTools:
 - `tools/node/node.exe scripts/perf/hover.mjs "<selector|aria-label|text>" [click]` — hover or
   click and get the boxes of popovers/tooltips that appear (positioning bugs).
 - The page routes by hash: navigate with `location.hash = '#/…'`, not `pushState`.
+- **A patch is checked by building it, not by `git apply --check` alone.** In a worktree:
+  `target/hermes-src` may be a junction to the main checkout's (gitignored) and
+  `build-hermes-webapp.ps1` starts by deleting that folder, so first remove the junction with
+  `cmd /c rmdir <worktree>\target\hermes-src` (never a recursive delete through it); `tools/` is
+  gitignored too, so link Node in with `cmd /c mklink /J <worktree>\tools <main>\tools` (remove it
+  the same way afterwards). Then run the script (its `npm ci` needs the network the first time) and
+  type-check: `node <src>\.build\webapp-workspace\node_modules\typescript\bin\tsc -p . --noEmit` in
+  `<src>\.build\webapp-workspace\apps\desktop` (Hermes's own test files have ~28 errors at the
+  pinned commit; look for the files your patch touches). To rebuild after editing one patch
+  without a fresh export: re-apply it in `target/hermes-src` (with `GIT_CEILING_DIRECTORIES` set to
+  `target\`, see PITFALLS) and run `node scripts/build-webapp.mjs` in its `apps\desktop`.
 - After editing a patch, `hide.css` or `plugin.js`: rebuild the webapp (patches), then always
   the exe (`cargo build`: it recopies the webapp next to the exe, and `hide.css` / `plugin.js`
   are `include_str!`'d), then restart the instance.

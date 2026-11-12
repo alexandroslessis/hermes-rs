@@ -5430,6 +5430,64 @@ async fn a_clean_session_writes_memory_directly() {
     assert_eq!(h.requests.lock().len(), 2);
 }
 
+/// `memory.write_approval` (a Settings switch) used to fill a separate queue the page can't show;
+/// it now stages into the one list the Memory screen reads, with its own reason.
+#[tokio::test]
+async fn memory_write_approval_stages_into_the_one_list_even_in_a_clean_session() {
+    use hermes_tools::approval::ApprovalChoice;
+    let (h, _asked) = taint_harness(
+        vec![memory_add_call(TASTE), text_reply("Noted.")],
+        ApprovalChoice::Deny,
+        false,
+    )
+    .await;
+    let mut config = h.runtime.memory().config();
+    config.write_approval = true;
+    h.runtime.memory().set_config(config);
+    let session = session_in(&h);
+    run_turn(&h, &session, "remember my taste").await;
+    assert!(tool_result_in(&h, 1).contains("Saved for review by the user"));
+    assert_eq!(memory_file(&h), None);
+    let items = h.runtime.staging().list();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].reason, "write approval is on");
+    assert!(items[0].sources.is_empty());
+    assert!(h.runtime.memory().pending().is_empty(), "the old queue is not used");
+    assert_eq!(h.requests.lock().len(), 2);
+}
+
+/// The same for `skills.write_approval`: the Skills screen's list, not the old `.pending` queue.
+#[tokio::test]
+async fn skill_write_approval_stages_into_the_one_list_even_in_a_clean_session() {
+    use hermes_tools::approval::ApprovalChoice;
+    let (h, _asked) = taint_harness(
+        vec![
+            skill_call(
+                "s1",
+                json!([{"action": "create", "name": "deploy", "content": DEPLOY}]),
+            ),
+            text_reply("Saved."),
+        ],
+        ApprovalChoice::Deny,
+        false,
+    )
+    .await;
+    let skills = h.runtime.skills();
+    let mut config = skills.config();
+    config.write_approval = true;
+    skills.set_config(config);
+    let session = session_in(&h);
+    run_turn(&h, &session, "save a deploy skill").await;
+    assert!(tool_result_in(&h, 1).contains("Saved for review by the user"));
+    assert!(skills.find("deploy").is_none());
+    let items = h.runtime.staging().list();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].kind, hermes_tools::staging::Kind::Skill);
+    assert_eq!(items[0].reason, "write approval is on");
+    assert!(skills.pending().is_empty(), "the old queue is not used");
+    assert_eq!(h.requests.lock().len(), 2);
+}
+
 #[tokio::test]
 async fn a_tainted_sessions_skill_writes_are_staged_not_saved() {
     use hermes_tools::approval::ApprovalChoice;

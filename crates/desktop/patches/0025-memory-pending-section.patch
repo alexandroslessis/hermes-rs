@@ -1,0 +1,27 @@
+diff --git a/apps/desktop/src/app/settings/memory/memory-layers.tsx b/apps/desktop/src/app/settings/memory/memory-layers.tsx
+index 3785bf8..e0ff36c 100644
+--- a/apps/desktop/src/app/settings/memory/memory-layers.tsx
++++ b/apps/desktop/src/app/settings/memory/memory-layers.tsx
+@@ -1,6 +1,7 @@
+ import { useStore } from '@nanostores/react'
+ import { useEffect, useState } from 'react'
+ 
++import { StagingPending } from '@/components/staging-pending'
+ import { Button } from '@/components/ui/button'
+ import { getMemoryStatus } from '@/hermes'
+ import { useI18n } from '@/i18n'
+@@ -172,7 +173,13 @@ export function MemoryLayersSlot({ sectionId, subpage, ...panel }: MemoryLayersS
+     return null
+   }
+ 
+-  return <MemoryLayersPanel {...panel} />
++  // hermes-rs: writes the agent made after reading untrusted content wait here for review
++  return (
++    <>
++      <StagingPending kind="memory" />
++      <MemoryLayersPanel {...panel} />
++    </>
++  )
+ }
+ 
+ /** `provider` is the page's live `memory.provider` draft; the active provider
