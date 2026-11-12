@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use hermes_agent::events::AgentEvent;
+use hermes_runtime::budget::{BudgetKnobs, BudgetProfile, for_profile};
 use hermes_runtime::{
     ClarifyOutcome, ClarifyRequest, ProcessNotice, ProviderConfig, Runtime, RuntimeConfig,
     RuntimeEvent, TurnOptions, TurnStatus,
@@ -184,6 +185,35 @@ async fn harness_for_data(
     replies: impl FnOnce(&Path) -> Vec<String>,
     bridge: Arc<dyn UserBridge>,
 ) -> Harness {
+    harness_budget(replies, bridge, test_budget(None)).await
+}
+
+/// A profile's knobs, with the iteration budget the suite has always used.
+fn test_budget(profile: Option<BudgetProfile>) -> BudgetKnobs {
+    // `HERMES_TEST_PROFILE=requests|balanced|tokens` runs the whole suite under that profile
+    // (a test whose counts depend on a profile's caps names its profile and does not read this).
+    let profile = profile
+        .or_else(|| {
+            std::env::var("HERMES_TEST_PROFILE")
+                .ok()
+                .and_then(|name| BudgetProfile::parse(&name))
+        })
+        .unwrap_or(BudgetProfile::Balanced);
+    BudgetKnobs {
+        max_iterations: 20,
+        ..for_profile(profile)
+    }
+}
+
+async fn harness_profile(replies: Vec<String>, profile: BudgetProfile) -> Harness {
+    harness_budget(|_| replies, Arc::new(Bridge), test_budget(Some(profile))).await
+}
+
+async fn harness_budget(
+    replies: impl FnOnce(&Path) -> Vec<String>,
+    bridge: Arc<dyn UserBridge>,
+    budget: BudgetKnobs,
+) -> Harness {
     let data = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
     let replies = replies(data.path());
@@ -199,7 +229,7 @@ async fn harness_for_data(
         })
         .mount(&server)
         .await;
-    let runtime = runtime_with(data.path(), bridge);
+    let runtime = runtime_with_budget(data.path(), bridge, budget);
     let provider = ProviderConfig {
         id: "mock".into(),
         base_url: format!("{}/v1", server.uri()),
@@ -221,11 +251,19 @@ fn runtime_in(data_dir: &Path) -> Runtime {
 }
 
 fn runtime_with(data_dir: &Path, bridge: Arc<dyn UserBridge>) -> Runtime {
+    runtime_with_budget(data_dir, bridge, test_budget(None))
+}
+
+fn runtime_with_budget(
+    data_dir: &Path,
+    bridge: Arc<dyn UserBridge>,
+    budget: BudgetKnobs,
+) -> Runtime {
     Runtime::new(
         RuntimeConfig {
             data_dir: data_dir.to_path_buf(),
             shell: detect_shell(),
-            max_iterations: 20,
+            budget,
             memory: Default::default(),
             skills: Default::default(),
         },
@@ -807,12 +845,16 @@ async fn misspelled_tool_names_are_repaired() {
 #[tokio::test]
 async fn three_batches_of_invented_tools_end_the_turn() {
     let invented = || tool_reply(&[("call_x", "browser_navigate", json!({"url": "x"}))]);
-    let h = harness(vec![
-        invented(),
-        invented(),
-        invented(),
-        text_reply("never sent"),
-    ])
+    // Three strikes is `balanced`'s `invalid_tool_retries`; `requests` stops at two.
+    let h = harness_profile(
+        vec![
+            invented(),
+            invented(),
+            invented(),
+            text_reply("never sent"),
+        ],
+        BudgetProfile::Balanced,
+    )
     .await;
     let session = session_in(&h);
     let events = run_turn(&h, &session, "browse").await;
@@ -1805,15 +1847,19 @@ async fn a_request_past_the_threshold_is_compressed_before_the_next_call() {
         supports_vision: false,
         aux: Default::default(),
     };
-    let h = harness(vec![
-        text_reply("one"),
-        text_reply(&long_two()),
-        text_reply("three"),
-        // 35k tokens: past 75% of the 40k window.
-        text_reply_with_prompt_tokens("four", 35_000),
-        text_reply("## Goal\nauto summary"),
-        text_reply("five"),
-    ])
+    // `balanced` compresses at 75% of a small window (`requests` waits for 90%).
+    let h = harness_profile(
+        vec![
+            text_reply("one"),
+            text_reply(&long_two()),
+            text_reply("three"),
+            // 35k tokens: past 75% of the 40k window.
+            text_reply_with_prompt_tokens("four", 35_000),
+            text_reply("## Goal\nauto summary"),
+            text_reply("five"),
+        ],
+        BudgetProfile::Balanced,
+    )
     .await;
     let session = session_in(&h);
     let run = |text: &'static str| {
@@ -3252,9 +3298,8 @@ async fn a_rewind_waits_for_no_other_windows_turn() {
 // ---------------------------------------------------------------------------------------------
 
 /// S1: read three files, edit one. Four tool rounds, then the answer.
-#[tokio::test]
-async fn baseline_s1_read_three_files_edit_one() {
-    let h = harness(vec![
+async fn s1_read_three_files_edit_one(profile: BudgetProfile) {
+    let h = harness_profile(vec![
         tool_reply(&[("r1", "read_file", json!({"path": "a.txt"}))]),
         tool_reply(&[("r2", "read_file", json!({"path": "b.txt"}))]),
         tool_reply(&[("r3", "read_file", json!({"path": "c.txt"}))]),
@@ -3264,7 +3309,7 @@ async fn baseline_s1_read_three_files_edit_one() {
             json!({"path": "b.txt", "content": "edited"}),
         )]),
         text_reply("Edited b.txt."),
-    ])
+    ], profile)
     .await;
     for name in ["a.txt", "b.txt", "c.txt"] {
         std::fs::write(h.work.path().join(name), format!("contents of {name}")).unwrap();
@@ -3283,9 +3328,8 @@ async fn baseline_s1_read_three_files_edit_one() {
 /// S2: after a tool round the model answers with nothing; `EmptyResponseRecovery` nudges it once,
 /// then it answers. (An empty reply with no tool call before it never reaches that op: the
 /// inference step retries it itself, see `baseline_s2b_empty_first_reply_is_retried`.)
-#[tokio::test]
-async fn baseline_s2_empty_reply_then_answer() {
-    let h = harness(vec![
+async fn s2_empty_reply_then_answer(profile: BudgetProfile) {
+    let h = harness_profile(vec![
         tool_reply(&[(
             "call_1",
             "write_file",
@@ -3293,7 +3337,7 @@ async fn baseline_s2_empty_reply_then_answer() {
         )]),
         finished_text_reply("", "stop"),
         text_reply("Here is the answer."),
-    ])
+    ], profile)
     .await;
     let session = session_in(&h);
     let events = run_turn(&h, &session, "question").await;
@@ -3314,12 +3358,11 @@ async fn baseline_s2_empty_reply_then_answer() {
 
 /// S2b: the first reply is empty; the inference step's own empty-response retry resends the same
 /// request, then the model answers.
-#[tokio::test]
-async fn baseline_s2b_empty_first_reply_is_retried() {
-    let h = harness(vec![
+async fn s2b_empty_first_reply_is_retried(profile: BudgetProfile) {
+    let h = harness_profile(vec![
         finished_text_reply("", "stop"),
         text_reply("Here is the answer."),
-    ])
+    ], profile)
     .await;
     let session = session_in(&h);
     let events = run_turn(&h, &session, "question").await;
@@ -3330,9 +3373,8 @@ async fn baseline_s2b_empty_first_reply_is_retried() {
 }
 
 /// S3: a tool call cut off by the output limit, retried, then the answer.
-#[tokio::test]
-async fn baseline_s3_truncated_tool_call() {
-    let h = harness(vec![
+async fn s3_truncated_tool_call(profile: BudgetProfile) {
+    let h = harness_profile(vec![
         raw_tool_reply(
             "write_file",
             r#"{"path": "big.txt", "content": "abc"#,
@@ -3344,7 +3386,7 @@ async fn baseline_s3_truncated_tool_call() {
             json!({"path": "big.txt", "content": "abc"}),
         )]),
         text_reply("written"),
-    ])
+    ], profile)
     .await;
     let session = session_in(&h);
     let events = run_turn(&h, &session, "write a big file").await;
@@ -3355,13 +3397,12 @@ async fn baseline_s3_truncated_tool_call() {
 
 /// S4: ten one-reply turns; the tenth makes the memory (and skill) counters due, so a background
 /// review runs on top of the ten main requests.
-#[tokio::test]
-async fn baseline_s4_ten_turn_session_with_review() {
+async fn s4_ten_turn_session_with_review(profile: BudgetProfile) {
     let mut replies: Vec<String> = (0..10)
         .map(|i| text_reply(&format!("answer {i}")))
         .collect();
     replies.push(text_reply("Nothing to save."));
-    let h = harness(replies).await;
+    let h = harness_profile(replies, profile).await;
     let session = session_in(&h);
     for i in 0..10 {
         let events = run_turn(&h, &session, &format!("question {i}")).await;
@@ -3387,9 +3428,8 @@ async fn baseline_s4_ten_turn_session_with_review() {
 }
 
 /// S5: the parent delegates two children, then answers.
-#[tokio::test]
-async fn baseline_s5_delegate_two_children() {
-    let h = harness(vec![
+async fn s5_delegate_two_children(profile: BudgetProfile) {
+    let h = harness_profile(vec![
         tool_reply(&[(
             "d1",
             "delegate_task",
@@ -3398,7 +3438,7 @@ async fn baseline_s5_delegate_two_children() {
         text_reply("- 3 files"),
         text_reply("- 1 file"),
         text_reply("Both children reported."),
-    ])
+    ], profile)
     .await;
     let session = session_in(&h);
     let events = run_turn(&h, &session, "delegate two counts").await;
@@ -3726,4 +3766,170 @@ async fn a_daily_limit_429_teaches_the_ledger_the_providers_limit() {
     // Every attempt the provider refused is counted as a 429 as well as a request.
     assert_eq!(usage.rate_limited as usize, requests.lock().len());
     assert_eq!(usage.used as usize, requests.lock().len());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Budget profiles (Phase 3). The baseline scenarios above run under every profile: at this
+// checkpoint the profiles only move caps (retries, limits, thresholds), so none of these happy
+// paths changes its request count; the request-lowering knobs arrive with the phases they wait
+// for (see `budget.rs`). The tests after them show the caps that do differ.
+// ---------------------------------------------------------------------------------------------
+
+/// Today's counts hold under `requests`, `balanced` and `tokens` alike.
+#[tokio::test]
+async fn baseline_s1_read_three_files_edit_one() {
+    for profile in BudgetProfile::ALL {
+        s1_read_three_files_edit_one(profile).await;
+    }
+}
+
+#[tokio::test]
+async fn baseline_s2_empty_reply_then_answer() {
+    for profile in BudgetProfile::ALL {
+        s2_empty_reply_then_answer(profile).await;
+    }
+}
+
+#[tokio::test]
+async fn baseline_s2b_empty_first_reply_is_retried() {
+    for profile in BudgetProfile::ALL {
+        s2b_empty_first_reply_is_retried(profile).await;
+    }
+}
+
+#[tokio::test]
+async fn baseline_s3_truncated_tool_call() {
+    for profile in BudgetProfile::ALL {
+        s3_truncated_tool_call(profile).await;
+    }
+}
+
+#[tokio::test]
+async fn baseline_s4_ten_turn_session_with_review() {
+    for profile in BudgetProfile::ALL {
+        s4_ten_turn_session_with_review(profile).await;
+    }
+}
+
+#[tokio::test]
+async fn baseline_s5_delegate_two_children() {
+    for profile in BudgetProfile::ALL {
+        s5_delegate_two_children(profile).await;
+    }
+}
+
+/// Two empty replies in a row: `balanced` retries up to three times (the third request answers),
+/// while `requests` retries once, so the second empty reply ends the turn with the terminal
+/// notice.
+#[tokio::test]
+async fn empty_reply_retries_follow_the_profile() {
+    let replies = || {
+        vec![
+            finished_text_reply("", "stop"),
+            finished_text_reply("", "stop"),
+            text_reply("Here is the answer."),
+        ]
+    };
+    let h = harness_profile(replies(), BudgetProfile::Balanced).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "question").await;
+    assert_requests(&h, Purpose::Main, 3..=3);
+    assert_eq!(last_text(&h, &session), "Here is the answer.");
+
+    let h = harness_profile(replies(), BudgetProfile::Requests).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "question").await;
+    assert_requests(&h, Purpose::Main, 2..=2);
+    assert_eq!(
+        last_text(&h, &session),
+        hermes_runtime::EMPTY_TERMINAL_MESSAGE
+    );
+}
+
+/// A text answer cut off by the output limit: `balanced` continues three times and stitches at
+/// the fourth cut, `requests` stitches at the second.
+#[tokio::test]
+async fn length_continuations_follow_the_profile() {
+    let cut = |n: usize| finished_text_reply(&format!("part {n} "), "length");
+    for (profile, requests) in [
+        (BudgetProfile::Balanced, 4),
+        (BudgetProfile::Tokens, 4),
+        (BudgetProfile::Requests, 2),
+    ] {
+        let h = harness_profile((1..=6).map(cut).collect(), profile).await;
+        let session = session_in(&h);
+        let events = run_turn(&h, &session, "long answer").await;
+        assert_eq!(finished_status(&events), TurnStatus::Completed);
+        assert_requests(&h, Purpose::Main, requests..=requests);
+        assert!(
+            last_text(&h, &session).starts_with("part 1 "),
+            "{profile:?}: {}",
+            last_text(&h, &session)
+        );
+    }
+}
+
+/// A tool call cut off by the output limit, again and again: `balanced` re-asks four times,
+/// `requests` twice, then both stop with the truncation notice.
+#[tokio::test]
+async fn truncated_tool_call_retries_follow_the_profile() {
+    let cut = || {
+        raw_tool_reply(
+            "write_file",
+            r#"{"path": "big.txt", "content": "abc"#,
+            "length",
+        )
+    };
+    for (profile, requests) in [
+        (BudgetProfile::Balanced, 5),
+        (BudgetProfile::Tokens, 5),
+        (BudgetProfile::Requests, 3),
+    ] {
+        let h = harness_profile((0..6).map(|_| cut()).collect(), profile).await;
+        let session = session_in(&h);
+        run_turn(&h, &session, "write a big file").await;
+        assert_requests(&h, Purpose::Main, requests..=requests);
+        assert_eq!(
+            last_text(&h, &session),
+            hermes_runtime::TRUNCATED_MESSAGE,
+            "{profile:?}"
+        );
+    }
+}
+
+/// Four subagents in one call: `balanced` allows ten at once, `requests` three.
+#[tokio::test]
+async fn delegation_width_follows_the_profile() {
+    let tasks = json!({"tasks": [
+        {"goal": "one"}, {"goal": "two"}, {"goal": "three"}, {"goal": "four"},
+    ]});
+    let h = harness_profile(
+        vec![
+            tool_reply(&[("d1", "delegate_task", tasks.clone())]),
+            text_reply("- a"),
+            text_reply("- b"),
+            text_reply("- c"),
+            text_reply("- d"),
+            text_reply("done"),
+        ],
+        BudgetProfile::Balanced,
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "four tasks").await;
+    assert_requests(&h, Purpose::Delegate, 4..=4);
+
+    let h = harness_profile(
+        vec![
+            tool_reply(&[("d1", "delegate_task", tasks)]),
+            text_reply("I'll do it myself."),
+        ],
+        BudgetProfile::Requests,
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "four tasks").await;
+    assert_requests(&h, Purpose::Delegate, 0..=0);
+    let second = h.requests.lock()[1].to_string();
+    assert!(second.contains("at most 3 subagents"), "{second}");
 }

@@ -34,10 +34,9 @@ use crate::compress;
 use crate::ops;
 use crate::session::{HermesEffect, OpenSession, TurnRuntime, TurnSession};
 
-/// `delegation.max_concurrent_children`.
-pub const MAX_CONCURRENT_CHILDREN: usize = 10;
-/// `delegation.max_iterations`: each child's own budget.
-const CHILD_MAX_ITERATIONS: u32 = 250;
+/// `delegation.max_concurrent_children` under the `balanced` profile (the page is told this
+/// number; a turn enforces its own profile's `delegate_max_children`).
+pub const MAX_CONCURRENT_CHILDREN: usize = crate::budget::BudgetKnobs::BALANCED.delegate_max_children;
 /// `DEFAULT_MAX_SUMMARY_CHARS`.
 const MAX_SUMMARY_CHARS: usize = 24_000;
 /// `DELEGATE_BLOCKED_TOOLS` that exist here.
@@ -89,6 +88,8 @@ pub struct Delegator {
     /// The quota governor and the provider the children call: delegation stops when the daily
     /// request quota is nearly gone.
     pub quota: Option<(crate::governor::Governor, String)>,
+    /// The turn's budget knobs: how many children, their iteration budget, retry caps.
+    pub budget: crate::budget::BudgetKnobs,
 }
 
 /// The parent's tools plus `delegate_task`.
@@ -384,10 +385,11 @@ impl Delegator {
                 "{why} Do the work yourself instead of delegating it."
             )});
         }
-        if tasks.len() > MAX_CONCURRENT_CHILDREN {
+        if tasks.len() > self.budget.delegate_max_children {
             return json!({"success": false, "error": format!(
-                "Too many tasks ({}): at most {MAX_CONCURRENT_CHILDREN} subagents run in parallel. Split the work into smaller batches.",
-                tasks.len()
+                "Too many tasks ({}): at most {} subagents run in parallel. Split the work into smaller batches.",
+                tasks.len(),
+                self.budget.delegate_max_children
             )});
         }
         let mut specs = Vec::new();
@@ -491,6 +493,7 @@ impl Delegator {
         ));
         tools.begin_turn();
         tools.set_vision(self.supports_vision);
+        tools.set_limits(crate::tool_limits(&self.budget));
         // The thread's mode holds for its subagents: Plan and Manual must not be escaped by
         // delegating (a child can't ask, so what would ask is refused), YOLO carries over.
         tools.set_mode(self.parent.tools.mode());
@@ -575,7 +578,7 @@ impl Delegator {
             }),
             scratch_dir: scratch.clone(),
             state: state.clone(),
-            result_limit: ops::result_size_limit(self.context_length),
+            result_limit: ops::result_size_limit(self.context_length, &self.budget),
             disabled: self.disabled.clone(),
         });
         let mut model_config = ModelConfig::new(&self.model)
@@ -589,12 +592,13 @@ impl Delegator {
             Step::Operation(Arc::new(ops::FrozenPrompt)),
             Step::Operation(Arc::new(ops::IterationBudget {
                 state: state.clone(),
-                max_iterations: CHILD_MAX_ITERATIONS,
+                max_iterations: self.budget.delegate_child_iterations,
             })),
-            Step::Operation(Arc::new(ops::ValidateToolCalls {
-                state: state.clone(),
-                tool_names: tool_names.clone(),
-            })),
+            Step::Operation(Arc::new(ops::ValidateToolCalls::new(
+                state.clone(),
+                tool_names.clone(),
+                &self.budget,
+            ))),
             Step::Operation(Arc::new(ToolOperation::new().with_provider(provider))),
             Step::Operation(Arc::new(ops::UnhandledToolCalls {
                 tool_names,
@@ -604,9 +608,10 @@ impl Delegator {
             Step::Operation(Arc::new(ops::DeliverSteer {
                 state: state.clone(),
             })),
-            Step::Operation(Arc::new(ops::LengthContinuation {
-                state: state.clone(),
-            })),
+            Step::Operation(Arc::new(ops::LengthContinuation::new(
+                state.clone(),
+                &self.budget,
+            ))),
             Step::Operation(Arc::new(ops::EmptyResponseRecovery {
                 state: state.clone(),
             })),
@@ -616,10 +621,10 @@ impl Delegator {
                 summarizer: self.summarizer.clone(),
                 rebuild_prompt: Arc::new(move || Ok(child_prompt.clone())),
             })),
-            Step::Inference(Arc::new(InferenceRunner::new(
-                self.llm.clone(),
-                model_config,
-            ))),
+            Step::Inference(Arc::new(
+                InferenceRunner::new(self.llm.clone(), model_config)
+                    .with_empty_response_retries(self.budget.empty_response_retries),
+            )),
         ];
         let machine = StateMachine::new(steps, cancel.clone());
         let session_id = child.record.lock().id.clone();

@@ -1,6 +1,7 @@
 //! The agent runtime the desktop app talks to: create and open sessions, start a turn and
 //! receive its events, cancel it, list a provider's models.
 
+pub mod budget;
 pub mod changes;
 mod commands;
 pub mod compress;
@@ -74,12 +75,17 @@ impl ProviderConfig {
             .with_provider_id(self.id.clone()))
     }
 
+    /// A provider with the default retry count (side jobs; turns use [`Self::provider_with`]).
     fn provider(&self) -> Result<Arc<dyn Provider>> {
-        Ok(Arc::new(OpenAiCompatibleProvider::new(
-            self.id.clone(),
-            self.client()?,
-            String::new(),
-        )))
+        self.provider_with(budget::BudgetKnobs::BALANCED.http_retries)
+    }
+
+    /// A provider that retries a failed HTTP request `http_retries` times (the budget knob).
+    fn provider_with(&self, http_retries: usize) -> Result<Arc<dyn Provider>> {
+        Ok(Arc::new(
+            OpenAiCompatibleProvider::new(self.id.clone(), self.client()?, String::new())
+                .with_max_retries(http_retries),
+        ))
     }
 
     /// Every model the endpoint serves, with context length, pricing and capabilities when known.
@@ -208,14 +214,16 @@ fn summarizer_for(
     llm: &Arc<dyn Provider>,
     model: &str,
     context_length: Option<usize>,
+    budget: &budget::BudgetKnobs,
 ) -> Result<compress::Summarizer> {
     Ok(match &aux.compression {
         Some(aux) => compress::Summarizer {
-            llm: aux.provider.provider()?,
+            llm: aux.provider.provider_with(budget.http_retries)?,
             model: aux.model.clone(),
             context_length: aux.context_length,
             window: context_length,
             request_params: aux_effort_params(aux),
+            compress_at: budget.compress_at,
         },
         None => compress::Summarizer {
             llm: llm.clone(),
@@ -223,8 +231,17 @@ fn summarizer_for(
             context_length,
             window: context_length,
             request_params: None,
+            compress_at: budget.compress_at,
         },
     })
+}
+
+/// The tools' share of the budget knobs (`hermes_tools` doesn't know the profiles).
+fn tool_limits(budget: &budget::BudgetKnobs) -> hermes_tools::ToolLimits {
+    hermes_tools::ToolLimits {
+        read_file_max_lines: budget.read_file_max_lines,
+        search_context_factor: budget.search_context_factor,
+    }
 }
 
 /// A side job's request fields for its chosen effort, if it has one.
@@ -308,9 +325,10 @@ pub struct RuntimeConfig {
     /// `%APPDATA%\hermes-rs`: sessions.db, SOUL.md, scratch/.
     pub data_dir: PathBuf,
     pub shell: ShellKind,
-    /// Model calls allowed per user message (Hermes's iteration budget); when they run out the
-    /// model gets one more call, without tools, to summarize.
-    pub max_iterations: u32,
+    /// The budget knobs (iteration budget, retries, compression thresholds, limits; see
+    /// [`budget`]). Every turn copies them once as it starts. `for_current_user` keeps `balanced`,
+    /// today's behaviour, until the profile setting arrives.
+    pub budget: budget::BudgetKnobs,
     /// `MEMORY.md` / `USER.md` limits and the write-approval gate.
     pub memory: MemoryConfig,
     /// Skill write approval and extra skill folders.
@@ -330,7 +348,7 @@ impl RuntimeConfig {
         Ok(Self {
             data_dir,
             shell: hermes_tools::detect_shell(),
-            max_iterations: 500,
+            budget: budget::BudgetKnobs::BALANCED,
             memory: MemoryConfig::default(),
             skills: SkillsConfig::default(),
         })
@@ -965,11 +983,13 @@ impl Runtime {
         // Another process may have added to the conversation since it was loaded.
         self.reload_if_stale(&open, session_id);
         let model = open.record.lock().model.clone();
-        let models = provider.provider().and_then(|llm| {
-            let summarizer = summarizer_for(&aux, &llm, &model, context_length)?;
+        // The budget knobs, read once: everything this turn builds takes them from this copy.
+        let budget = self.config.budget;
+        let models = provider.provider_with(budget.http_retries).and_then(|llm| {
+            let summarizer = summarizer_for(&aux, &llm, &model, context_length, &budget)?;
             let review = match &aux.review {
                 Some(aux) => (
-                    aux.provider.provider()?,
+                    aux.provider.provider_with(budget.http_retries)?,
                     aux.model.clone(),
                     aux.context_length,
                     aux_effort_params(aux),
@@ -994,6 +1014,7 @@ impl Runtime {
         *open.turn_state.lock() = Some(state.clone());
         open.tools.begin_turn();
         open.tools.set_vision(supports_vision);
+        open.tools.set_limits(tool_limits(&budget));
         let governor = self.governor();
         // Smart approvals judge with the approval model, else the turn's.
         let guard: Option<Arc<dyn hermes_tools::approval::ApprovalGuard>> = match &aux.approval {
@@ -1046,6 +1067,7 @@ impl Runtime {
             enabled: self.background_review.clone(),
             ledger: self.ledger.clone(),
             provider_id: review_provider_id,
+            budget,
         };
         // A message with `@url:` references or images is added once its pages are fetched and
         // its images prepared, in the turn's task (that can take seconds).
@@ -1095,6 +1117,7 @@ impl Runtime {
             effort_params.clone(),
             supports_vision,
             summarizer.clone(),
+            budget,
         );
         let self_mcp = self.mcp.clone();
         // The tools switched off as this turn starts (a switch applies from the next turn).
@@ -1109,7 +1132,6 @@ impl Runtime {
         if let Some(text) = quota_notice {
             let _ = events_tx.send(RuntimeEvent::Notice(text));
         }
-        let max_iterations = self.config.max_iterations;
         let session_id = session_id.to_string();
         let turn_cancel = cancel.clone();
         // A turn that panics (a bug in a tool, say) must still end: otherwise the session stays
@@ -1184,7 +1206,7 @@ impl Runtime {
                 }),
                 scratch_dir: runtime.session.tools.scratch_dir().to_path_buf(),
                 state: state.clone(),
-                result_limit: ops::result_size_limit(context_length),
+                result_limit: ops::result_size_limit(context_length, &budget),
                 disabled: disabled.clone(),
             });
             let mut model_config = ModelConfig::new(&model)
@@ -1197,12 +1219,13 @@ impl Runtime {
                 Step::Operation(Arc::new(ops::FrozenPrompt)),
                 Step::Operation(Arc::new(ops::IterationBudget {
                     state: state.clone(),
-                    max_iterations,
+                    max_iterations: budget.max_iterations,
                 })),
-                Step::Operation(Arc::new(ops::ValidateToolCalls {
-                    state: state.clone(),
-                    tool_names: tool_names.clone(),
-                })),
+                Step::Operation(Arc::new(ops::ValidateToolCalls::new(
+                    state.clone(),
+                    tool_names.clone(),
+                    &budget,
+                ))),
                 Step::Operation(Arc::new(ToolOperation::new().with_provider(tools))),
                 Step::Operation(Arc::new(ops::UnhandledToolCalls {
                     tool_names,
@@ -1211,9 +1234,10 @@ impl Runtime {
                 Step::Operation(Arc::new(ops::DeliverSteer {
                     state: state.clone(),
                 })),
-                Step::Operation(Arc::new(ops::LengthContinuation {
-                    state: state.clone(),
-                })),
+                Step::Operation(Arc::new(ops::LengthContinuation::new(
+                    state.clone(),
+                    &budget,
+                ))),
                 Step::Operation(Arc::new(ops::EmptyResponseRecovery {
                     state: state.clone(),
                 })),
@@ -1223,7 +1247,10 @@ impl Runtime {
                     summarizer: summarizer.clone(),
                     rebuild_prompt,
                 })),
-                Step::Inference(Arc::new(InferenceRunner::new(llm, model_config))),
+                Step::Inference(Arc::new(
+                    InferenceRunner::new(llm, model_config)
+                        .with_empty_response_retries(budget.empty_response_retries),
+                )),
             ];
             let machine = StateMachine::new(steps, turn_cancel.clone());
             let result = machine.run(&runtime, &session_id, &emit).await;
@@ -1299,15 +1326,17 @@ impl Runtime {
             !open.conversation.lock().messages().is_empty(),
             "Nothing to refine yet — send a message first."
         );
+        // The budget knobs, read once for this review.
+        let budget = self.config.budget;
         let (llm, model, context_length, effort_params) = match &options.aux.review {
             Some(aux) => (
-                aux.provider.provider()?,
+                aux.provider.provider_with(budget.http_retries)?,
                 aux.model.clone(),
                 aux.context_length,
                 aux_effort_params(aux),
             ),
             None => (
-                provider.provider()?,
+                provider.provider_with(budget.http_retries)?,
                 open.record.lock().model.clone(),
                 options.context_length,
                 options
@@ -1330,6 +1359,7 @@ impl Runtime {
                 .review
                 .as_ref()
                 .map_or_else(|| provider.id.clone(), |aux| aux.provider.id.clone()),
+            budget,
         };
         let skills = SessionTools::tool_names().contains(&"skill_manage");
         setup.start(&open, true, skills, focus, true);
@@ -1358,7 +1388,9 @@ impl Runtime {
             *running = Some(session::RunGuard::new(cancel.clone(), Some(lock)));
         }
         self.reload_if_stale(&open, session_id);
-        let llm = match provider.provider() {
+        // The budget knobs, read once for this compression.
+        let budget = self.config.budget;
+        let llm = match provider.provider_with(budget.http_retries) {
             Ok(llm) => llm,
             Err(error) => {
                 *open.running.lock() = None;
@@ -1367,7 +1399,7 @@ impl Runtime {
         };
         let rebuild_prompt = self.prompt_rebuild(&open, options.context_length);
         let model = open.record.lock().model.clone();
-        let summarizer = match summarizer_for(&options.aux, &llm, &model, options.context_length) {
+        let summarizer = match summarizer_for(&options.aux, &llm, &model, options.context_length, &budget) {
             Ok(summarizer) => summarizer,
             Err(error) => {
                 *open.running.lock() = None;
@@ -1760,6 +1792,7 @@ impl Runtime {
         effort_params: Option<HashMap<String, serde_json::Value>>,
         supports_vision: bool,
         summarizer: compress::Summarizer,
+        budget: budget::BudgetKnobs,
     ) -> Arc<delegate::Delegator> {
         Arc::new(delegate::Delegator {
             parent: open.clone(),
@@ -1776,6 +1809,7 @@ impl Runtime {
             subagents: self.subagents.clone(),
             disabled: Arc::new(self.disabled_tools.lock().clone()),
             quota: Some((self.governor(), provider_id.to_string())),
+            budget,
         })
     }
 
@@ -1795,9 +1829,12 @@ impl Runtime {
             anyhow::bail!("{why}");
         }
         let open = self.open(session_id)?;
-        let llm = provider.provider()?;
+        // The budget knobs, read once for the whole task.
+        let budget = self.config.budget;
+        let llm = provider.provider_with(budget.http_retries)?;
         let model = open.record.lock().model.clone();
-        let summarizer = summarizer_for(&options.aux, &llm, &model, options.context_length)?;
+        let summarizer =
+            summarizer_for(&options.aux, &llm, &model, options.context_length, &budget)?;
         let effort_params = options
             .effort
             .as_deref()
@@ -1811,6 +1848,7 @@ impl Runtime {
             effort_params,
             options.supports_vision,
             summarizer,
+            budget,
         );
         let task_id = format!("bg_{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
         let (events_tx, events) = mpsc::unbounded_channel();
@@ -2224,6 +2262,8 @@ struct ReviewSetup {
     ledger: ledger::Ledger,
     /// The provider the review model is on.
     provider_id: String,
+    /// The turn's budget knobs (the review loop's limits).
+    budget: budget::BudgetKnobs,
 }
 
 impl ReviewSetup {
@@ -2294,6 +2334,7 @@ impl ReviewSetup {
             skills,
             focus,
             requested,
+            budget: self.budget,
             cancel,
         })));
     }

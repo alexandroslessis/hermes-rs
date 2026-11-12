@@ -54,6 +54,25 @@ pub use skill_manage::{PendingSkillWrite, SkillOp, WriteOrigin};
 pub use skills::{SkillCommit, SkillEntry, SkillStore, SkillsConfig};
 pub use todo::{TodoItem, TodoStatus};
 
+/// The tool limits a budget profile sets (`hermes_runtime::budget`); one copy per turn. The
+/// default is today's behaviour (the `balanced` profile).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolLimits {
+    /// `read_file`: lines per read, both the default when the call gives no `limit` and the cap.
+    pub read_file_max_lines: usize,
+    /// `search_files`: a requested `context` is multiplied by this (the cap of 10 with it).
+    pub search_context_factor: usize,
+}
+
+impl Default for ToolLimits {
+    fn default() -> Self {
+        Self {
+            read_file_max_lines: 2000,
+            search_context_factor: 1,
+        }
+    }
+}
+
 /// What the tools need from the app: answers to `clarify`, and somewhere to deliver
 /// background-process completion notices.
 #[async_trait]
@@ -149,6 +168,8 @@ pub struct SessionTools {
     guard: parking_lot::Mutex<Option<Arc<dyn approval::ApprovalGuard>>>,
     /// Whether the session's model accepts images (set per turn; `vision_analyze` needs it).
     vision: std::sync::atomic::AtomicBool,
+    /// The budget profile's limits for this turn (set as the turn starts).
+    limits: parking_lot::Mutex<ToolLimits>,
 }
 
 impl SessionTools {
@@ -173,6 +194,7 @@ impl SessionTools {
             web: config.web,
             turn_checkpoints: Default::default(),
             vision: Default::default(),
+            limits: Default::default(),
             mode: Default::default(),
             guard: Default::default(),
             session_approved: Default::default(),
@@ -244,6 +266,15 @@ impl SessionTools {
     /// The reviewer smart approvals use (set per turn, for its model).
     pub fn set_guard(&self, guard: Option<Arc<dyn approval::ApprovalGuard>>) {
         *self.guard.lock() = guard;
+    }
+
+    /// The budget profile's limits for the coming turn.
+    pub fn set_limits(&self, limits: ToolLimits) {
+        *self.limits.lock() = limits;
+    }
+
+    pub(crate) fn limits(&self) -> ToolLimits {
+        *self.limits.lock()
     }
 
     /// Whether the model of the coming turn accepts images.

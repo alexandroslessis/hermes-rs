@@ -28,10 +28,6 @@ use tokio_util::sync::CancellationToken;
 use crate::session::{HermesEffect, OpenSession, TurnRuntime, TurnSession};
 use crate::{ProviderConfig, Runtime, TurnOptions, effort_request_params, ops};
 
-/// Model calls one consolidation pass may make (Hermes allows many: umbrella-building over a
-/// large library takes 50-100).
-const CURATOR_MAX_ITERATIONS: u32 = 200;
-
 /// The model the consolidation pass runs on.
 pub struct CuratorModel {
     pub provider: ProviderConfig,
@@ -141,6 +137,8 @@ impl Runtime {
     /// The consolidation pass: a fresh agent with only the skill tools works through the
     /// candidates. Returns its final message.
     async fn consolidate(&self, model: &CuratorModel, candidates: &str) -> Result<String> {
+        // The budget knobs, read once per pass.
+        let budget = self.config.budget;
         let skills_root = self.skills.root().to_path_buf();
         let scratch = self.config.data_dir.join("scratch").join("curator");
         let tools = Arc::new(SessionTools::new(SessionToolsConfig {
@@ -209,7 +207,7 @@ impl Runtime {
             inner: Arc::new(ReviewTools::curator(tools.clone())),
             scratch_dir: scratch,
             state: state.clone(),
-            result_limit: ops::result_size_limit(model.options.context_length),
+            result_limit: ops::result_size_limit(model.options.context_length, &budget),
             disabled: Default::default(),
         });
         let mut model_config =
@@ -224,28 +222,33 @@ impl Runtime {
             Step::Operation(Arc::new(ops::FrozenPrompt)),
             Step::Operation(Arc::new(ops::IterationBudget {
                 state: state.clone(),
-                max_iterations: CURATOR_MAX_ITERATIONS,
+                max_iterations: budget.curator_max_iterations,
             })),
-            Step::Operation(Arc::new(ops::ValidateToolCalls {
-                state: state.clone(),
-                tool_names: tool_names.clone(),
-            })),
+            Step::Operation(Arc::new(ops::ValidateToolCalls::new(
+                state.clone(),
+                tool_names.clone(),
+                &budget,
+            ))),
             Step::Operation(Arc::new(ToolOperation::new().with_provider(provider_tools))),
             Step::Operation(Arc::new(ops::UnhandledToolCalls {
                 tool_names,
                 disabled: Default::default(),
             })),
-            Step::Operation(Arc::new(ops::LengthContinuation {
-                state: state.clone(),
-            })),
+            Step::Operation(Arc::new(ops::LengthContinuation::new(
+                state.clone(),
+                &budget,
+            ))),
             Step::Operation(Arc::new(ops::EmptyResponseRecovery {
                 state: state.clone(),
             })),
             Step::Operation(Arc::new(ops::ExitOnError)),
-            Step::Inference(Arc::new(InferenceRunner::new(
-                model.provider.provider()?,
-                model_config,
-            ))),
+            Step::Inference(Arc::new(
+                InferenceRunner::new(
+                    model.provider.provider_with(budget.http_retries)?,
+                    model_config,
+                )
+                .with_empty_response_retries(budget.empty_response_retries),
+            )),
         ];
         let machine = StateMachine::new(steps, cancel);
         let result = machine.run(&runtime, "curator", &emit).await;

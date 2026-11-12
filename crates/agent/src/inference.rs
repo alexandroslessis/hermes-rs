@@ -75,7 +75,8 @@ pub trait InferenceEffect: From<Message> + MaybeSend + 'static {
 
 pub const EMPTY_RESPONSE_MESSAGE: &str =
     "The model returned an empty response. Please resend your message to continue.";
-const MAX_EMPTY_RESPONSE_RETRIES: usize = 3;
+/// Retries of an empty reply when the caller sets none (the `balanced` budget profile's value).
+pub const DEFAULT_EMPTY_RESPONSE_RETRIES: usize = 3;
 const EMPTY_RESPONSE_NOTE_SCOPE: &str = "inference";
 const EMPTY_RESPONSE_NOTE: &str = "empty_response";
 
@@ -251,6 +252,7 @@ pub struct InferenceRunner<'a, S, E> {
     model_config: ModelConfig,
     request_preparer: Arc<dyn InferenceRequestPreparer<S> + 'a>,
     output: Mutex<InferenceOutput>,
+    empty_response_retries: usize,
     effect: std::marker::PhantomData<fn() -> E>,
 }
 
@@ -365,8 +367,15 @@ impl<'a, S: MaybeSync, E: InferenceEffect> InferenceRunner<'a, S, E> {
             model_config,
             request_preparer: Arc::new(IdentityInferenceRequestPreparer),
             output: Mutex::new(InferenceOutput::default()),
+            empty_response_retries: DEFAULT_EMPTY_RESPONSE_RETRIES,
             effect: std::marker::PhantomData,
         }
+    }
+
+    /// How often an empty reply is requested again before the empty-response marker is given.
+    pub fn with_empty_response_retries(mut self, retries: usize) -> Self {
+        self.empty_response_retries = retries;
+        self
     }
 
     pub fn with_request_preparer(
@@ -585,10 +594,11 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
                 break empty_output;
             }
             self.output().accumulator.clear();
-            if empty_responses < MAX_EMPTY_RESPONSE_RETRIES {
+            if empty_responses < self.empty_response_retries {
                 empty_responses += 1;
                 tracing::warn!(
-                    "Provider returned an empty response; retrying ({empty_responses}/{MAX_EMPTY_RESPONSE_RETRIES})"
+                    "Provider returned an empty response; retrying ({empty_responses}/{})",
+                    self.empty_response_retries
                 );
                 continue;
             }

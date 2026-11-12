@@ -110,6 +110,8 @@ pub struct ReviewJob {
     /// reported even when nothing changed.
     pub requested: bool,
     pub cancel: CancellationToken,
+    /// The budget knobs of the turn that started the review.
+    pub budget: crate::budget::BudgetKnobs,
 }
 
 /// Runs a review and reports what it changed to the app.
@@ -146,6 +148,7 @@ async fn review(job: ReviewJob) -> Result<Vec<String>> {
         focus,
         requested,
         cancel,
+        budget,
         ..
     } = job;
     // The conversation as it is now, plus the review prompt; the copy never touches the session.
@@ -189,7 +192,7 @@ async fn review(job: ReviewJob) -> Result<Vec<String>> {
         inner: Arc::new(ReviewTools::new(session.tools.clone(), memory, requested)),
         scratch_dir: session.tools.scratch_dir().to_path_buf(),
         state: state.clone(),
-        result_limit: ops::result_size_limit(context_length),
+        result_limit: ops::result_size_limit(context_length, &budget),
         disabled: Default::default(),
     });
     let mut model_config = ModelConfig::new(&model).with_context_limit(context_length);
@@ -202,23 +205,25 @@ async fn review(job: ReviewJob) -> Result<Vec<String>> {
             state: state.clone(),
             max_iterations: REVIEW_MAX_ITERATIONS,
         })),
-        Step::Operation(Arc::new(ops::ValidateToolCalls {
-            state: state.clone(),
-            tool_names: tool_names.clone(),
-        })),
+        Step::Operation(Arc::new(ops::ValidateToolCalls::new(
+            state.clone(),
+            tool_names.clone(),
+            &budget,
+        ))),
         Step::Operation(Arc::new(ToolOperation::new().with_provider(tools))),
         Step::Operation(Arc::new(ops::UnhandledToolCalls {
             tool_names,
             disabled: Default::default(),
         })),
-        Step::Operation(Arc::new(ops::LengthContinuation {
-            state: state.clone(),
-        })),
+        Step::Operation(Arc::new(ops::LengthContinuation::new(state.clone(), &budget))),
         Step::Operation(Arc::new(ops::EmptyResponseRecovery {
             state: state.clone(),
         })),
         Step::Operation(Arc::new(ops::ExitOnError)),
-        Step::Inference(Arc::new(InferenceRunner::new(llm, model_config))),
+        Step::Inference(Arc::new(
+            InferenceRunner::new(llm, model_config)
+                .with_empty_response_retries(budget.empty_response_retries),
+        )),
     ];
     let machine = StateMachine::new(steps, cancel.clone());
     let result = machine.run(&runtime, &session_id, &emit).await;

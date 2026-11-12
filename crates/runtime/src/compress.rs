@@ -23,6 +23,7 @@ use hermes_tools::redact::{Source, redact};
 use rmcp::model::{CallToolResult, ContentBlock, Role};
 use serde_json::Value;
 
+use crate::budget::{BudgetKnobs, CompressAt};
 use crate::ops::SharedTurnState;
 use crate::session::{HermesEffect, TurnSession};
 
@@ -31,7 +32,7 @@ use crate::session::{HermesEffect, TurnSession};
 /// `CHARS_PER_TOKEN` of Hermes's rough estimator.
 const CHARS_PER_TOKEN: usize = 4;
 /// Windows below `_SMALL_CTX_WINDOW_LIMIT` compress at 75% (`_SMALL_CTX_THRESHOLD_PERCENT`),
-/// larger ones at the 50% default.
+/// larger ones at the 50% default (the `balanced` fractions; the budget profile sets them).
 const SMALL_WINDOW: usize = 512_000;
 const LEAN_TAIL_FLOOR_TOKENS: usize = 10_000;
 const LEAN_TAIL_CAP_TOKENS: usize = 25_000;
@@ -72,14 +73,20 @@ pub struct Budget {
 }
 
 impl Budget {
+    /// The `balanced` thresholds (Hermes's); a turn uses [`Budget::with_compress_at`].
     pub fn new(context_length: Option<usize>) -> Self {
+        Self::with_compress_at(context_length, BudgetKnobs::BALANCED.compress_at)
+    }
+
+    /// Budget for a window, compressing at the profile's fractions of it.
+    pub fn with_compress_at(context_length: Option<usize>, compress_at: CompressAt) -> Self {
         let context_length = context_length
             .filter(|&n| n > 0)
             .unwrap_or(DEFAULT_CONTEXT_LENGTH);
         let percent = if context_length < SMALL_WINDOW {
-            0.75
+            compress_at.small_window
         } else {
-            0.50
+            compress_at.large_window
         };
         let threshold = (context_length as f64 * percent) as usize;
         // `lean_tail_budget`: 2.5% of the window within the floor and cap, at most half the trigger.
@@ -745,6 +752,8 @@ pub struct Summarizer {
     pub window: Option<usize>,
     /// Extra request fields (the compression model's reasoning effort).
     pub request_params: Option<std::collections::HashMap<String, Value>>,
+    /// Where compression starts (the turn's budget profile).
+    pub compress_at: CompressAt,
 }
 
 pub struct Compacted {
@@ -761,7 +770,7 @@ pub async fn compact(
     focus: Option<&str>,
     notice_at: Option<usize>,
 ) -> Result<Option<Compacted>> {
-    let budget = Budget::new(summarizer.window);
+    let budget = Budget::with_compress_at(summarizer.window, summarizer.compress_at);
     let messages = conversation.messages();
     let Some(plan) = plan(messages, &budget) else {
         return Ok(None);
@@ -1006,7 +1015,7 @@ impl Operation<TurnSession, HermesEffect> for AutoCompress {
                 return not_applicable();
             }
         }
-        let budget = Budget::new(self.summarizer.window);
+        let budget = Budget::with_compress_at(self.summarizer.window, self.summarizer.compress_at);
         let fixed = estimate_text(&session.system_prompt) + tool_definition_tokens();
         let tokens = session.context_tokens(conversation, fixed);
         if tokens < budget.threshold {
@@ -1072,6 +1081,21 @@ mod tests {
         assert_eq!(large.tail, 25_000);
         assert_eq!(large.summary(1_000), MIN_SUMMARY_TOKENS);
         assert_eq!(large.summary(1_000_000), SUMMARY_TOKENS_CEILING);
+    }
+
+    #[test]
+    fn compression_thresholds_follow_the_profile() {
+        use crate::budget::{BudgetProfile, for_profile};
+        let at = |profile, window| {
+            Budget::with_compress_at(Some(window), for_profile(profile).compress_at).threshold
+        };
+        // Balanced is `Budget::new`.
+        assert_eq!(at(BudgetProfile::Balanced, 200_000), Budget::new(Some(200_000)).threshold);
+        assert_eq!(at(BudgetProfile::Balanced, 1_000_000), Budget::new(Some(1_000_000)).threshold);
+        assert_eq!(at(BudgetProfile::Requests, 200_000), 180_000);
+        assert_eq!(at(BudgetProfile::Requests, 1_000_000), 850_000);
+        assert_eq!(at(BudgetProfile::Tokens, 200_000), 120_000);
+        assert_eq!(at(BudgetProfile::Tokens, 1_000_000), 400_000);
     }
 
     #[test]

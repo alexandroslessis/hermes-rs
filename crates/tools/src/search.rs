@@ -90,6 +90,7 @@ pub async fn search_files(tools: &SessionTools, args: Value) -> ToolOutput {
     }
     let limit = args.limit.unwrap_or(50).clamp(1, 1000);
     let offset = args.offset.unwrap_or(0);
+    let context_factor = tools.limits().search_context_factor.max(1);
     let task = tokio::task::spawn_blocking(move || match args.target.as_str() {
         "files" => search_names(
             &root,
@@ -105,7 +106,7 @@ pub async fn search_files(tools: &SessionTools, args: Value) -> ToolOutput {
             &args.pattern,
             args.file_glob.as_deref(),
             args.output_mode.as_deref().unwrap_or("content"),
-            args.context.unwrap_or(0).min(10),
+            args.context.unwrap_or(0).min(10) * context_factor,
             offset,
             limit,
         ),
@@ -310,6 +311,25 @@ mod tests {
         std::fs::write(root.join("target/main.rs"), "fn main() {}\n").unwrap();
         std::fs::create_dir(root.join(".git")).unwrap();
         (dir, tools)
+    }
+
+
+    #[tokio::test]
+    async fn requested_context_is_multiplied_by_the_budget_factor() {
+        let (dir, tools) = tools_in();
+        let body: String = (1..=30).map(|n| format!("row {n}\n")).collect();
+        std::fs::write(dir.path().join("rows.txt"), body).unwrap();
+        let args = json!({"pattern": "row 15$", "context": 2});
+        let out = search_files(&tools, args.clone()).await;
+        let lines = |out: &ToolOutput| {
+            out.value["matches"][0]["context"].as_str().unwrap().lines().count()
+        };
+        assert_eq!(lines(&out), 5);
+        tools.set_limits(crate::ToolLimits {
+            search_context_factor: 2,
+            ..Default::default()
+        });
+        assert_eq!(lines(&search_files(&tools, args).await), 9);
     }
 
     #[tokio::test]

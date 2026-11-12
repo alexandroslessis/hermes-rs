@@ -15,7 +15,7 @@ use tokio_util::io::StreamReader;
 
 use super::api_client::ApiClient;
 use super::base::{stream_from_single_message, MessageStream, Provider};
-use super::retry::ProviderRetry;
+use super::retry::{ProviderRetry, RetryConfig};
 use crate::conversation::message::Message;
 use crate::errors::ProviderError;
 use crate::formats::openai::{
@@ -34,6 +34,8 @@ pub struct OpenAiCompatibleProvider {
     /// Path prefix prepended to `chat/completions` (e.g. `"deployments/{name}/"` for Azure).
     completions_prefix: String,
     supports_streaming: bool,
+    /// Retries of a failed request; `None` keeps [`RetryConfig`]'s default.
+    max_retries: Option<usize>,
 }
 
 impl OpenAiCompatibleProvider {
@@ -43,11 +45,19 @@ impl OpenAiCompatibleProvider {
             api_client,
             completions_prefix,
             supports_streaming: true,
+            max_retries: None,
         }
     }
 
     pub fn with_supports_streaming(mut self, supports_streaming: bool) -> Self {
         self.supports_streaming = supports_streaming;
+        self
+    }
+
+    /// How many times a failed request is retried (transient errors and rate limits; a daily
+    /// usage limit is never retried).
+    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = Some(max_retries);
         self
     }
 
@@ -178,6 +188,14 @@ impl Provider for OpenAiCompatibleProvider {
         &self.name
     }
 
+    fn retry_config(&self) -> RetryConfig {
+        let mut config = RetryConfig::default();
+        if let Some(max_retries) = self.max_retries {
+            config.max_retries = max_retries;
+        }
+        config
+    }
+
     async fn refresh_credentials(&self) -> Result<(), ProviderError> {
         self.api_client
             .refresh_credentials()
@@ -291,6 +309,23 @@ mod tests {
     use crate::model::ModelConfig;
     use serde_json::json;
     use test_case::test_case;
+
+    #[test]
+    fn max_retries_is_the_default_until_set() {
+        let client = ApiClient::new_with_tls(
+            "http://localhost:1/v1".to_string(),
+            crate::api_client::AuthMethod::NoAuth,
+            None,
+        )
+        .unwrap();
+        let provider = OpenAiCompatibleProvider::new("p".into(), client, String::new());
+        assert_eq!(
+            Provider::retry_config(&provider).max_retries,
+            crate::retry::DEFAULT_MAX_RETRIES
+        );
+        let provider = provider.with_max_retries(1);
+        assert_eq!(Provider::retry_config(&provider).max_retries, 1);
+    }
 
     #[test]
     fn stream_errors_carry_request_id_once() {

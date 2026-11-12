@@ -11,7 +11,6 @@ use serde_json::{Value, json};
 
 use crate::{SessionTools, ToolOutput, display_path, parse_args};
 
-const MAX_LINES: usize = 2000;
 const READ_CHAR_BUDGET: usize = 100_000;
 const MAX_LINE_CHARS: usize = 2000;
 const BINARY_SNIFF_BYTES: usize = 8000;
@@ -181,7 +180,8 @@ pub async fn read_file(tools: &SessionTools, args: Value) -> ToolOutput {
     let lines: Vec<&str> = text.split_inclusive('\n').map(split_line_ending).collect();
     let total_lines = lines.len();
     let offset = args.offset.unwrap_or(1).max(1);
-    let limit = args.limit.unwrap_or(MAX_LINES).clamp(1, MAX_LINES);
+    let max_lines = tools.limits().read_file_max_lines.max(1);
+    let limit = args.limit.unwrap_or(max_lines).clamp(1, max_lines);
 
     if offset > total_lines.max(1) {
         return ToolOutput::ok(json!({
@@ -613,6 +613,25 @@ mod tests {
         assert_eq!(text(&out)["content"], "2|line 2\n3|line 3");
         assert_eq!(text(&out)["total_lines"], 5);
         assert_eq!(text(&out)["next_offset"], 4);
+    }
+
+
+    #[tokio::test]
+    async fn read_default_lines_follow_the_budget_limits() {
+        let (dir, tools) = tools_in();
+        let body: String = (1..=3000).map(|n| format!("l{n}\n")).collect();
+        std::fs::write(dir.path().join("big.txt"), body).unwrap();
+        // Balanced (the default): 2000 lines, then a next offset.
+        let out = read_file(&tools, json!({"path": "big.txt"})).await;
+        assert_eq!(text(&out)["next_offset"], 2001);
+        // Requests: the whole file (up to 4000 lines).
+        tools.set_limits(crate::ToolLimits {
+            read_file_max_lines: 4000,
+            ..Default::default()
+        });
+        let out = read_file(&tools, json!({"path": "big.txt"})).await;
+        assert!(text(&out).get("next_offset").is_none(), "{:?}", out.value);
+        assert!(text(&out)["content"].as_str().unwrap().ends_with("3000|l3000"));
     }
 
     #[tokio::test]

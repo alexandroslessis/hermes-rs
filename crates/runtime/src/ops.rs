@@ -24,6 +24,7 @@ use parking_lot::Mutex;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Role, Tool};
 use serde_json::Value;
 
+use crate::budget::BudgetKnobs;
 use crate::guards::{ToolGuardrails, classify_failure, is_repetition_dominated, repair_tool_name};
 use crate::session::{HermesEffect, TurnSession};
 
@@ -55,10 +56,7 @@ const THINKING_ONLY_NUDGE: &str = "[System: Your previous response contained onl
 /// Shown when every empty-response recovery ran out (Hermes's `(empty)` terminal).
 pub const EMPTY_TERMINAL_MESSAGE: &str = "The model returned no visible response, even after being asked to continue. Use Retry, or try a different model.";
 
-const MAX_INVALID_TOOL_RETRIES: u32 = 3;
 const MAX_INVALID_JSON_RETRIES: u32 = 3;
-const MAX_TRUNCATED_TOOL_RETRIES: u32 = 4;
-const MAX_LENGTH_CONTINUATIONS: u32 = 4;
 const MAX_THINKING_PREFILLS: u32 = 2;
 /// Tools whose call next to a text reply doesn't make that reply mid-task narration.
 const HOUSEKEEPING_TOOLS: &[&str] = &["todo_list"];
@@ -271,6 +269,21 @@ impl Operation<TurnSession, HermesEffect> for IterationBudget {
 pub struct ValidateToolCalls {
     pub state: SharedTurnState,
     pub tool_names: Vec<String>,
+    /// All-invalid batches tolerated (`budget.invalid_tool_retries`).
+    pub invalid_tool_retries: u32,
+    /// Re-asks of a cut-off tool call (`budget.truncated_tool_retries`).
+    pub truncated_tool_retries: u32,
+}
+
+impl ValidateToolCalls {
+    pub fn new(state: SharedTurnState, tool_names: Vec<String>, budget: &BudgetKnobs) -> Self {
+        Self {
+            state,
+            tool_names,
+            invalid_tool_retries: budget.invalid_tool_retries,
+            truncated_tool_retries: budget.truncated_tool_retries,
+        }
+    }
 }
 
 #[async_trait]
@@ -298,11 +311,11 @@ impl Operation<TurnSession, HermesEffect> for ValidateToolCalls {
 
         // A response cut off by the output limit: re-ask with a bigger cap (4×), then refuse.
         if last.metadata.output_token_limit_reached {
-            if state.truncated_tool_retries < MAX_TRUNCATED_TOOL_RETRIES {
+            if state.truncated_tool_retries < self.truncated_tool_retries {
                 state.truncated_tool_retries += 1;
                 let n = state.truncated_tool_retries;
                 state.max_tokens = Some(boosted_output_cap(state.max_tokens, n));
-                tracing::warn!("truncated tool call — retrying ({n}/{MAX_TRUNCATED_TOOL_RETRIES})");
+                tracing::warn!("truncated tool call — retrying ({n}/{})", self.truncated_tool_retries);
                 return applied([hidden(last)]);
             }
             state.truncated_tool_retries = 0;
@@ -369,7 +382,7 @@ impl Operation<TurnSession, HermesEffect> for ValidateToolCalls {
         if !invalid_names.is_empty() && !any_valid {
             // Strikes only advance when a batch has no valid call at all.
             state.invalid_tool_retries += 1;
-            if state.invalid_tool_retries >= MAX_INVALID_TOOL_RETRIES {
+            if state.invalid_tool_retries >= self.invalid_tool_retries {
                 state.invalid_tool_retries = 0;
                 let mut answers = Message::user();
                 for request in tool_requests(&repaired) {
@@ -573,13 +586,15 @@ impl Operation<TurnSession, HermesEffect> for DeliverSteer {
 
 /// Hermes's per-result size cap (`tools/budget_config.py`): 100K characters, scaled down to 15%
 /// of a smaller model's context window (never below 8K).
-pub fn result_size_limit(context_length: Option<usize>) -> usize {
+/// The budget profile scales the result (`result_size_pct`: 100 = as is, 400 = four times, 50 = half).
+pub fn result_size_limit(context_length: Option<usize>, budget: &BudgetKnobs) -> usize {
     const DEFAULT: usize = 100_000;
-    match context_length.filter(|&tokens| tokens > 0) {
+    let base = match context_length.filter(|&tokens| tokens > 0) {
         Some(tokens) => ((tokens * 4) as f64 * 0.15) as usize,
         None => DEFAULT,
     }
-    .clamp(8_000, DEFAULT)
+    .clamp(8_000, DEFAULT);
+    base * budget.result_size_pct as usize / 100
 }
 
 /// `maybe_persist_tool_result`: an oversized result goes to a file in the session's scratch
@@ -772,6 +787,17 @@ impl ToolProvider<TurnSession> for GuardedTools {
 /// stitched into one answer and the trail is dropped.
 pub struct LengthContinuation {
     pub state: SharedTurnState,
+    /// Nudges before the fragments are stitched (`budget.length_continuations`).
+    pub max_continuations: u32,
+}
+
+impl LengthContinuation {
+    pub fn new(state: SharedTurnState, budget: &BudgetKnobs) -> Self {
+        Self {
+            state,
+            max_continuations: budget.length_continuations,
+        }
+    }
 }
 
 #[async_trait]
@@ -817,8 +843,8 @@ impl Operation<TurnSession, HermesEffect> for LengthContinuation {
         state.length_trail.push(id);
         state.length_continuations += 1;
         let n = state.length_continuations;
-        if n < MAX_LENGTH_CONTINUATIONS {
-            tracing::info!("requesting continuation ({n}/{MAX_LENGTH_CONTINUATIONS})");
+        if n < self.max_continuations {
+            tracing::info!("requesting continuation ({n}/{})", self.max_continuations);
             let message = Message::user()
                 .with_text(LENGTH_CONTINUATION_NUDGE)
                 .with_visibility(false, true)
@@ -982,10 +1008,22 @@ mod tests {
 
     #[test]
     fn result_limit_scales_with_small_context_windows() {
-        assert_eq!(result_size_limit(None), 100_000);
-        assert_eq!(result_size_limit(Some(1_000_000)), 100_000);
-        assert_eq!(result_size_limit(Some(65_536)), 39_321);
-        assert_eq!(result_size_limit(Some(4_096)), 8_000);
+        let balanced = BudgetKnobs::BALANCED;
+        assert_eq!(result_size_limit(None, &balanced), 100_000);
+        assert_eq!(result_size_limit(Some(1_000_000), &balanced), 100_000);
+        assert_eq!(result_size_limit(Some(65_536), &balanced), 39_321);
+        assert_eq!(result_size_limit(Some(4_096), &balanced), 8_000);
+    }
+
+    #[test]
+    fn result_limit_follows_the_profile() {
+        use crate::budget::{BudgetProfile, for_profile};
+        let requests = for_profile(BudgetProfile::Requests);
+        let tokens = for_profile(BudgetProfile::Tokens);
+        assert_eq!(result_size_limit(None, &requests), 400_000);
+        assert_eq!(result_size_limit(Some(65_536), &requests), 157_284);
+        assert_eq!(result_size_limit(None, &tokens), 50_000);
+        assert_eq!(result_size_limit(Some(4_096), &tokens), 4_000);
     }
 
     #[test]
