@@ -3499,3 +3499,34 @@ async fn a_terminal_command_naming_the_app_data_folder_asks_and_is_blocked_when_
         "{\"keep\": true}"
     );
 }
+
+#[tokio::test]
+async fn the_ledger_counts_every_model_call_of_a_turn_as_main_and_writes_requests_json() {
+    let h = harness(vec![
+        tool_reply(&[("r1", "todo_list", json!({}))]),
+        tool_reply(&[("r2", "todo_list", json!({}))]),
+        text_reply("Done."),
+    ])
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "check the list twice").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_requests(&h, Purpose::Main, 3..=3);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let today = h.runtime.ledger().snapshot().await.today("mock", now);
+    // The ledger saw exactly the requests the mock served, all under the provider's id.
+    assert_eq!(today.by_purpose.get("main"), Some(&3), "{today:?}");
+    assert_eq!(today.total() as usize, h.requests.lock().len());
+
+    // And it is on disk (a side file: the store schema is untouched).
+    h.runtime.ledger().flush_blocking();
+    let file: Value =
+        serde_json::from_slice(&std::fs::read(h.data.path().join("requests.json")).unwrap())
+            .unwrap();
+    assert_eq!(file["version"], 1);
+    assert_eq!(file["providers"]["mock"]["days"].as_object().unwrap().len(), 1);
+}

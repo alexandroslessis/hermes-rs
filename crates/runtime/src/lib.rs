@@ -7,6 +7,7 @@ pub mod compress;
 mod curator;
 mod delegate;
 mod guards;
+pub mod ledger;
 pub mod mcp;
 mod ops;
 mod review;
@@ -67,7 +68,8 @@ impl ProviderConfig {
             Some(key) if !key.is_empty() => AuthMethod::BearerToken(key.clone()),
             _ => AuthMethod::NoAuth,
         };
-        ApiClient::new_with_tls(self.base_url.trim_end_matches('/').to_string(), auth, None)
+        Ok(ApiClient::new_with_tls(self.base_url.trim_end_matches('/').to_string(), auth, None)?
+            .with_provider_id(self.id.clone()))
     }
 
     fn provider(&self) -> Result<Arc<dyn Provider>> {
@@ -376,6 +378,8 @@ pub struct Runtime {
     checkpoints: Arc<hermes_tools::checkpoints::Checkpoints>,
     /// The web tools every session shares.
     web: Arc<hermes_tools::web::Web>,
+    /// Counts every model request per provider and purpose (`requests.json`).
+    ledger: ledger::Ledger,
     /// The configured MCP servers (Settings), shared by every session.
     mcp: Arc<mcp::McpManager>,
     config: RuntimeConfig,
@@ -408,6 +412,7 @@ impl Runtime {
             config.data_dir.join("checkpoints"),
             false,
         ));
+        let ledger = ledger::Ledger::open(config.data_dir.join("requests.json"));
         Ok(Self {
             store: Arc::new(store),
             memory: Arc::new(memory),
@@ -419,6 +424,7 @@ impl Runtime {
                 &config.data_dir,
             ))),
             windows_version: windows_version(),
+            ledger,
             config,
             bridge,
             sessions: Mutex::new(HashMap::new()),
@@ -432,6 +438,11 @@ impl Runtime {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// The request ledger: today's model requests per provider and purpose.
+    pub fn ledger(&self) -> &ledger::Ledger {
+        &self.ledger
     }
 
     /// The skills folder every session shares (the Skills screen edits it too).
@@ -1064,7 +1075,10 @@ impl Runtime {
         // "running", Stop finds nothing to stop, and every new prompt waits behind it forever.
         let guard_session = runtime.session.clone();
         let guard_events = events_tx.clone();
-        let turn = tokio::spawn(async move {
+        // Every model call of the turn is a `main` request in the ledger (the context is a
+        // task-local, so it is set around this task; tasks the turn spawns need their own).
+        let request_context = self.ledger.context(hermes_llm::observer::Purpose::Main, Some(&session_id));
+        let turn = tokio::spawn(hermes_llm::observer::scope(request_context, async move {
             if let Some((text, images)) = deferred {
                 let session = runtime.session.clone();
                 let attachments =
@@ -1190,7 +1204,7 @@ impl Runtime {
             let finished = status == TurnStatus::Completed;
             let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
             review_setup.after_turn(&runtime.session, turn_start, review_memory, finished);
-        });
+        }));
         tokio::spawn(async move {
             if let Err(error) = turn.await
                 && error.is_panic()

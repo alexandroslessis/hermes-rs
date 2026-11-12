@@ -32,6 +32,8 @@ pub struct ApiClient {
     tls_config: Option<TlsConfig>,
     request_builder: Option<RequestBuilderDecorator>,
     transport_policy: TransportPolicy,
+    /// The provider's id in Settings, reported to the request observer ([`crate::observer`]).
+    provider_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -294,7 +296,14 @@ impl ApiClient {
             tls_config,
             request_builder: None,
             transport_policy: TransportPolicy::Default,
+            provider_id: None,
         })
+    }
+
+    /// Names the provider this client talks to, for the request ledger.
+    pub fn with_provider_id(mut self, id: impl Into<String>) -> Self {
+        self.provider_id = Some(id.into());
+        self
     }
 
     pub fn host(&self) -> &str {
@@ -577,14 +586,27 @@ impl<'a> ApiRequestBuilder<'a> {
         }
     }
 
+    /// One POST, one HTTP attempt: the request observer (if the task has a context, see
+    /// [`crate::observer`]) hears about it, retries included since each try calls this again.
     pub async fn response_post(self, payload: &Value) -> Result<Response> {
         let request = self.send_request(|url, client| client.post(url)).await?;
-        self.send_bounded(request.json(payload)).await
+        let observation = crate::observer::begin(
+            self.client.provider_id.as_deref(),
+            payload.get("model").and_then(Value::as_str),
+            self.streaming,
+        );
+        let result = self.send_bounded(request.json(payload)).await;
+        finish_observation(observation, &result);
+        result
     }
 
     pub async fn multipart_post(self, form: reqwest::multipart::Form) -> Result<Response> {
         let request = self.send_request(|url, client| client.post(url)).await?;
-        Ok(request.multipart(form).send().await?)
+        let observation =
+            crate::observer::begin(self.client.provider_id.as_deref(), None, self.streaming);
+        let result = request.multipart(form).send().await.map_err(Into::into);
+        finish_observation(observation, &result);
+        result
     }
 
     pub async fn api_get(self) -> Result<ApiResponse> {
@@ -627,6 +649,15 @@ impl<'a> ApiRequestBuilder<'a> {
         };
 
         Ok(request)
+    }
+}
+
+fn finish_observation(observation: Option<crate::observer::Observation>, result: &Result<Response>) {
+    if let Some(observation) = observation {
+        observation.finish(match result {
+            Ok(response) => crate::observer::Outcome::Status(response.status().as_u16()),
+            Err(_) => crate::observer::Outcome::TransportError,
+        });
     }
 }
 

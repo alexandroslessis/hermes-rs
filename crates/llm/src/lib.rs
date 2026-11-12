@@ -15,6 +15,7 @@ pub mod json;
 pub mod maybe_send;
 pub(crate) mod mcp_utils;
 pub mod model;
+pub mod observer;
 pub mod openai_compatible;
 pub mod permission;
 pub mod request_log;

@@ -44,6 +44,7 @@ flate2 = "1.1.9"
 http.workspace = true
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 reqwest = { workspace = true, features = ["gzip"] }
+parking_lot.workspace = true
 tempfile = "3.10.1"
 test-case = "3"
 tokio = { workspace = true, features = ["test-util", "net"] }
