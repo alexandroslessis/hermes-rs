@@ -5,6 +5,12 @@
 //! Both files enter the system prompt as a snapshot taken when a session starts; writes during a
 //! session hit disk but never change that session's prompt (the provider's prompt cache stays
 //! valid).
+//!
+//! Since Backend v2 Phase 9 (CP9.1) the entries live in `memory.db` and the two files are its
+//! exported view (`db.rs`, `sync.rs`; diverged from Hermes). The public API and its answers are
+//! unchanged: the entries are always exactly what the file parses to, so the prompt blocks are
+//! byte for byte what they were. (One exception: a file that can't be read after its migration is
+//! answered from the database instead of as empty; writes are still refused then.)
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -13,7 +19,13 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::db::{self, MemoryDb};
+use crate::sync::{Abort, Failpoint, Inner, View, read_file};
 use crate::threats::{Scope, first_threat_message, scan_for_threats};
+
+/// How many times a write starts again when the file changed under it (a writer that doesn't
+/// take the database's lock: an editor, an older build), or after the database failed.
+const WRITE_ATTEMPTS: usize = 3;
 
 pub const ENTRY_DELIMITER: &str = "\n§\n";
 /// Failed consolidation attempts allowed per turn before a terminal "stop retrying" result.
@@ -39,6 +51,14 @@ impl Target {
     pub fn name(self) -> &'static str {
         match self {
             Target::Memory => "memory",
+            Target::User => "user",
+        }
+    }
+
+    /// The `kind` column of its entries in `memory.db`.
+    pub(crate) fn kind(self) -> &'static str {
+        match self {
+            Target::Memory => "fact",
             Target::User => "user",
         }
     }
@@ -113,11 +133,17 @@ pub struct MemorySnapshot {
 
 pub struct MemoryStore {
     dir: PathBuf,
+    /// `memory.db`; `None`: the files alone (as before Phase 9).
+    db_path: Option<PathBuf>,
     config: Mutex<MemoryConfig>,
-    /// Serializes read-modify-write of the files (Hermes uses a lock file across processes).
-    lock: Mutex<()>,
+    /// Serializes this process's reads and writes and holds the database connection. Other
+    /// processes are serialized by the database's write lock (`sync.rs`).
+    inner: Mutex<Inner>,
     /// Run after every successful write: keeps the local index fresh (`hermes_tools::index`).
     on_change: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    /// A test's simulated crash point (`sync::Failpoint`).
+    #[cfg(test)]
+    pub(crate) failpoint: Mutex<Option<Failpoint>>,
 }
 
 /// Per-turn count of failed consolidation attempts (lives with the session, reset each turn).
@@ -267,7 +293,7 @@ fn stale_entry_message(entry: &str) -> String {
     )
 }
 
-fn parse_entries(raw: &str) -> Vec<String> {
+pub(crate) fn parse_entries(raw: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     raw.split(ENTRY_DELIMITER)
         .map(str::trim)
@@ -279,19 +305,69 @@ fn parse_entries(raw: &str) -> Vec<String> {
 
 /// What a closure passed to `mutate` decided.
 enum Mutation {
-    /// New entries, a message, and extra fields for the success payload.
-    Write(Vec<String>, String, Value),
+    /// New entries, a message, extra fields for the success payload, and what happens to the
+    /// entries that leave (`memory.db`).
+    Write(Vec<String>, String, Value, Leaving),
     /// Returned as-is; nothing is written.
     Reply(Value),
 }
 
+/// What `memory.db` does with the entries a write removes or rewrites.
+enum Leaving {
+    /// The agent's write: kept as removed rows; each rewritten one points at its replacement
+    /// (old text, new text).
+    Mark(Vec<(String, String)>),
+    /// The user's own edit (the Star map): erased, with their older versions.
+    Purge,
+}
+
 impl MemoryStore {
+    /// A store on the files in `dir`, with its database beside them (`<dir>/memory.db`).
+    /// The app uses [`Self::open`] (the database in the data folder); this is for tests and
+    /// tools that own their folder.
     pub fn new(dir: impl Into<PathBuf>, config: MemoryConfig) -> Self {
+        let dir = dir.into();
+        let db = dir.join("memory.db");
+        Self::build(dir, Some(db), config)
+    }
+
+    /// A store on the files in `dir` backed by the database at `db_path`
+    /// (`<data>/memory.db`). Nothing is opened or migrated until the first use.
+    pub fn open(dir: impl Into<PathBuf>, db_path: impl Into<PathBuf>, config: MemoryConfig) -> Self {
+        Self::build(dir.into(), Some(db_path.into()), config)
+    }
+
+    /// A store on the files alone, without a database (how it worked before Phase 9).
+    pub fn file_only(dir: impl Into<PathBuf>, config: MemoryConfig) -> Self {
+        Self::build(dir.into(), None, config)
+    }
+
+    fn build(dir: PathBuf, db_path: Option<PathBuf>, config: MemoryConfig) -> Self {
         Self {
-            dir: dir.into(),
+            dir,
+            db_path,
             config: Mutex::new(config),
-            lock: Mutex::new(()),
+            inner: Mutex::new(Inner::default()),
             on_change: Mutex::new(None),
+            #[cfg(test)]
+            failpoint: Mutex::new(None),
+        }
+    }
+
+    /// `memory.db`, when this store has one.
+    pub fn db_path(&self) -> Option<&Path> {
+        self.db_path.as_deref()
+    }
+
+    pub(crate) fn lock_inner(&self) -> parking_lot::MutexGuard<'_, Inner> {
+        self.inner.lock()
+    }
+
+    /// Runs the change hook (outside the store's lock).
+    pub(crate) fn changed(&self) {
+        let hook = self.on_change.lock().clone();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -332,29 +408,26 @@ impl MemoryStore {
         }
     }
 
-    /// `(raw, read_ok)`: `read_ok` is false only when the file exists but can't be read (saving
-    /// from an assumed-empty view would wipe it). A Notepad BOM is stripped.
-    fn read_raw(&self, target: Target) -> (String, bool) {
-        let path = self.path(target);
-        if !path.exists() {
-            return (String::new(), true);
+    /// The entries now (`sync.rs`: a changed file is taken into the database first).
+    fn load(&self, target: Target) -> View {
+        let (view, changed) = self.view(target);
+        if changed {
+            self.changed();
         }
-        match std::fs::read(&path).map(String::from_utf8) {
-            Ok(Ok(text)) => (text.trim_start_matches('\u{feff}').to_string(), true),
-            _ => (String::new(), false),
-        }
+        view
     }
 
     /// The live entries (the Memory screen and the tool's error payloads show these).
     pub fn entries(&self, target: Target) -> Vec<String> {
-        parse_entries(&self.read_raw(target).0)
+        self.load(target).entries
     }
 
-    /// The live entries, or `None` when the file exists but can't be read right now (where
-    /// [`Self::entries`] would answer "empty"). The local index uses this.
+    /// The live entries, or `None` when the file exists but can't be read right now and the
+    /// database has nothing for it (where [`Self::entries`] would answer "empty"). The local
+    /// index uses this.
     pub fn readable_entries(&self, target: Target) -> Option<Vec<String>> {
-        let (raw, ok) = self.read_raw(target);
-        ok.then(|| parse_entries(&raw))
+        let view = self.load(target);
+        view.trusted.then_some(view.entries)
     }
 
     fn chars(entries: &[String]) -> usize {
@@ -425,16 +498,6 @@ impl MemoryStore {
         }
     }
 
-    fn write_file(&self, target: Target, entries: &[String]) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
-        let path = self.path(target);
-        let tmp = self
-            .dir
-            .join(format!(".mem_{}.tmp", uuid::Uuid::new_v4().simple()));
-        std::fs::write(&tmp, entries.join(ENTRY_DELIMITER))?;
-        std::fs::rename(&tmp, &path)
-    }
-
     /// A `.bak.<ts>` snapshot taken before a drift refusal.
     fn drift_backup(&self, target: Target, raw: &str) -> String {
         let path = self.path(target);
@@ -486,48 +549,171 @@ impl MemoryStore {
     /// Lock, re-read from disk, run `mutate`, then persist and return the success response.
     /// Refuses to rewrite an unreadable file, and (unless `skip_drift`) a write that adds text
     /// while an entry is over the whole-file limit (it may be free text a rewrite would lose).
+    ///
+    /// With a database the whole step runs under its write lock (`sync.rs`); `mutate` may run
+    /// again when the file changed under it, so it must not have side effects that a second run
+    /// would repeat (it only decides; failures are counted on its `Reply` paths, which end the
+    /// step).
     fn mutate(
         &self,
         target: Target,
         skip_drift: bool,
-        mutate: impl FnOnce(&[String], usize) -> Mutation,
+        mut mutate: impl FnMut(&[String], usize) -> Mutation,
     ) -> Value {
-        let _guard = self.lock.lock();
-        let (raw, ok) = self.read_raw(target);
-        if !ok {
-            return error(format!(
-                "Refusing to write {}: the file exists on disk but could not be read right now (locked by another program, a permission change, or invalid text encoding). Treating an unreadable file as empty and saving would wipe existing memory, so the write is refused. Nothing was changed — retry in a moment.",
-                target.file_name()
-            ));
+        let mut inner = self.lock_inner();
+        let crash_after_create = self.crash_at(Failpoint::AfterDbCreate);
+        let mut use_db = inner.db(self.db_path(), crash_after_create).is_some();
+        let mut busy = false;
+        for _ in 0..WRITE_ATTEMPTS {
+            let db = if use_db {
+                inner.db(self.db_path(), false)
+            } else {
+                None
+            };
+            match self.mutate_once(db, target, skip_drift, &mut mutate) {
+                Ok((value, changed, purged)) => {
+                    if purged {
+                        if let Some(db) = inner.db(self.db_path(), false) {
+                            db.checkpoint();
+                        }
+                    }
+                    drop(inner);
+                    if changed {
+                        self.changed();
+                    }
+                    return value;
+                }
+                Err(Abort::Conflict) => continue,
+                Err(Abort::Busy(problem)) => {
+                    tracing::warn!("memory.db: busy ({problem}); trying again");
+                    busy = true;
+                }
+                Err(Abort::Crash) => return error("simulated crash (test failpoint)"),
+                Err(Abort::Refused(problem)) => {
+                    tracing::warn!("memory: write refused: {problem}");
+                    return error(format!(
+                        "Refusing to write {}: {problem}. Nothing was changed — retry in a moment.",
+                        target.file_name()
+                    ));
+                }
+                Err(Abort::Db(problem)) => {
+                    tracing::warn!(
+                        "memory.db: writing {} failed ({problem}); writing the file alone",
+                        target.file_name()
+                    );
+                    use_db = false;
+                }
+            }
         }
+        let why = if busy {
+            "another app process kept memory.db locked"
+        } else {
+            "it kept changing on disk while this write was being saved (another program is writing it)"
+        };
+        error(format!(
+            "Refusing to write {}: {why}. Nothing was changed — retry in a moment.",
+            target.file_name()
+        ))
+    }
+
+    /// One attempt of [`Self::mutate`]: `(response, whether memory changed, whether rows were
+    /// purged)`.
+    fn mutate_once(
+        &self,
+        db: Option<&mut MemoryDb>,
+        target: Target,
+        skip_drift: bool,
+        mutate: &mut impl FnMut(&[String], usize) -> Mutation,
+    ) -> Result<(Value, bool, bool), Abort> {
+        let tx = match db {
+            Some(db) => Some(db.begin()?),
+            None => None,
+        };
+        let file = read_file(&self.path(target));
+        let Some(seen) = file.hash().map(str::to_string) else {
+            return Ok((
+                error(format!(
+                    "Refusing to write {}: the file exists on disk but could not be read right now (locked by another program, a permission change, or invalid text encoding). Treating an unreadable file as empty and saving would wipe existing memory, so the write is refused. Nothing was changed — retry in a moment.",
+                    target.file_name()
+                )),
+                false,
+                false,
+            ));
+        };
+        let (before, imported, mut purged) = match &tx {
+            Some(tx) => {
+                let synced = self.sync_in(tx, target, &file)?;
+                (
+                    synced.entries.unwrap_or_default(),
+                    synced.changed,
+                    synced.purged,
+                )
+            }
+            None => (parse_entries(file.raw()), false, false),
+        };
+        let commit = |tx: Option<rusqlite::Transaction<'_>>| {
+            if let Some(Err(error)) = tx.map(rusqlite::Transaction::commit) {
+                // After a file write the file holds it, and the next access takes it over.
+                tracing::warn!("memory.db: commit failed ({error})");
+            }
+        };
+        let raw = file.raw();
         let limit = self.limit(target);
-        let before = parse_entries(&raw);
         let oversized = !skip_drift && before.iter().any(|e| e.chars().count() > limit);
         match mutate(&before, limit) {
             Mutation::Reply(value) => {
+                // Keep a re-import the sync made; nothing else was written.
+                commit(tx);
                 if oversized && value["over_budget"] == json!(true) {
-                    return self.drift_error(target, &raw);
+                    return Ok((self.drift_error(target, raw), imported, purged));
                 }
                 if let Value::Object(mut map) = value {
                     map.remove("over_budget");
-                    return Value::Object(map);
+                    return Ok((Value::Object(map), imported, purged));
                 }
-                value
+                Ok((value, imported, purged))
             }
-            Mutation::Write(entries, message, extra) => {
+            Mutation::Write(entries, message, extra, leaving) => {
                 if oversized && !entries.iter().all(|e| before.contains(e)) {
-                    return self.drift_error(target, &raw);
+                    commit(tx);
+                    return Ok((self.drift_error(target, raw), imported, purged));
                 }
-                if let Err(e) = self.write_file(target, &entries) {
-                    return error(format!(
-                        "Failed to write memory file {}: {e}",
-                        self.path(target).display()
+                let content = entries.join(ENTRY_DELIMITER);
+                // What a read of the file will give, so database and file agree entry by entry
+                // (a patch can make two entries equal, or put a `§` line in one).
+                let texts = parse_entries(&content);
+                if let Some(tx) = &tx {
+                    let now = chrono::Utc::now().timestamp();
+                    let (removal, supersedes) = match &leaving {
+                        Leaving::Mark(supersedes) => (db::Removal::Mark("store"), &supersedes[..]),
+                        Leaving::Purge => (db::Removal::Purge, &[][..]),
+                    };
+                    let changes =
+                        db::set_core(tx, target.kind(), &texts, removal, supersedes, now, false)?;
+                    purged |= changes.purged;
+                    db::set_meta(
+                        tx,
+                        &db::meta_synced(target.kind()),
+                        &crate::sync::hash(content.as_bytes()),
+                    )?;
+                }
+                // The file on disk may hold only what this write decided from (`before`) or
+                // writes (`texts`), or what the database knows: nothing else may vanish.
+                let allowed: Vec<String> = texts.iter().chain(&before).cloned().collect();
+                if let Err(e) =
+                    self.replace_file(tx.as_deref(), target, &seen, &content, &allowed)?
+                {
+                    // Dropping `tx` rolls the database back with the file.
+                    return Ok((
+                        error(format!(
+                            "Failed to write memory file {}: {e}",
+                            self.path(target).display()
+                        )),
+                        false,
+                        false,
                     ));
                 }
-                let hook = self.on_change.lock().clone();
-                if let Some(hook) = hook {
-                    hook();
-                }
+                commit(tx);
                 let mut response = json!({
                     "success": true,
                     "done": true,
@@ -543,7 +729,7 @@ impl MemoryStore {
                 }
                 response["note"] =
                     json!("Write saved. This update is complete — do not repeat it.");
-                response
+                Ok((response, true, purged))
             }
         }
     }
@@ -563,7 +749,8 @@ impl MemoryStore {
     /// The user's own edit of one entry (the Star map; Hermes's `learning_mutations`): `entry`,
     /// matched by its text under the lock, is replaced by `replacement`, or removed (`None`).
     /// A replacement may not put the file over its limit; a removal always may (it's how a file
-    /// over its limit gets back under).
+    /// over its limit gets back under). The old text is erased from `memory.db` too, with its
+    /// older versions (`db::Removal::Purge`): the user asked for it to be gone.
     pub fn edit_entry(&self, target: Target, entry: &str, replacement: Option<&str>) -> Value {
         let entry = entry.trim().to_string();
         let replacement = replacement.map(|r| r.trim().to_string());
@@ -591,7 +778,8 @@ impl MemoryStore {
                     format!("deleted memory from {file}")
                 }
             };
-            Mutation::Write(next, message, json!({}))
+            // The user's own delete or rewrite: the old text is erased from `memory.db` too.
+            Mutation::Write(next, message, json!({}), Leaving::Purge)
         })
     }
 
@@ -775,7 +963,26 @@ impl MemoryStore {
                     .map(|(k, v)| (k.to_string(), json!(v)))
                     .collect::<serde_json::Map<_, _>>());
             }
-            Mutation::Write(working, format!("Applied {} operation(s).", ops.len()), extra)
+            let supersedes: Vec<(String, String)> = ops
+                .iter()
+                .zip(&matched)
+                .enumerate()
+                .filter_map(|(i, (op, previous))| {
+                    let previous = previous.clone()?;
+                    let next = match op.action.as_str() {
+                        "patch" => produced.get(&(i + 1))?.clone(),
+                        "replace" => op.content.as_deref()?.trim().to_string(),
+                        _ => return None,
+                    };
+                    Some((previous, next))
+                })
+                .collect();
+            Mutation::Write(
+                working,
+                format!("Applied {} operation(s).", ops.len()),
+                extra,
+                Leaving::Mark(supersedes),
+            )
         });
         if outcome["success"] == json!(true) && commit {
             failures.0 = 0;

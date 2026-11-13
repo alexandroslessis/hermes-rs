@@ -1,7 +1,11 @@
 //! Persistent curated memory with Hermes's semantics: `MEMORY.md` (the agent's notes) and
 //! `USER.md` (the user profile), the `memory` tool, the threat scan and write approvals.
 
+mod db;
 mod store;
+mod sync;
+#[cfg(test)]
+mod sync_tests;
 pub mod threats;
 mod tool;
 

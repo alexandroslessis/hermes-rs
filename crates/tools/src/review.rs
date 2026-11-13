@@ -196,18 +196,14 @@ impl ReviewTools {
                 output
             }
             "memory" if !self.attended => {
-                let Some(memory) = &self.tools.memory else {
+                if self.tools.memory.is_none() {
                     return self.tools.dispatch(name, args, None).await;
-                };
+                }
                 if self.tools.taint().is_tainted() {
                     return self.tools.stage_memory(&args).await;
                 }
-                let result = memory.unattended_tool(&args, &mut self.tools.memory_failures.lock());
-                let failed = result.get("success") == Some(&Value::Bool(false));
-                ToolOutput {
-                    value: result,
-                    is_error: failed,
-                }
+                // Off the async workers, like the foreground tool.
+                self.tools.run_memory_tool(&args, true).await
             }
             _ => self.tools.dispatch(name, args, None).await,
         }

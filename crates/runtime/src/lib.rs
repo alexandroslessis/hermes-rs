@@ -484,8 +484,11 @@ impl Drop for Runtime {
 impl Runtime {
     pub fn new(config: RuntimeConfig, bridge: Arc<dyn UserBridge>) -> Result<Self> {
         let store = Store::open(&config.data_dir.join("sessions.db"))?;
-        let memory = Arc::new(MemoryStore::new(
+        // MEMORY.md / USER.md are the exported view of `memory.db` (Phase 9); the first use
+        // migrates them (after a backup copy), nothing happens here.
+        let memory = Arc::new(MemoryStore::open(
             config.data_dir.join("memories"),
+            config.data_dir.join("memory.db"),
             config.memory.clone(),
         ));
         let skills = Arc::new(SkillStore::new(

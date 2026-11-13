@@ -517,7 +517,7 @@ impl SessionTools {
             "skill_manage" if self.stages_skills() => {
                 self.stage_skills(&args, WriteOrigin::Foreground).await
             }
-            "memory" => self.memory_tool(&args),
+            "memory" => self.memory_tool(&args).await,
             "session_search" => self.session_search(&args),
             "skills_list" | "skill_view" | "skill_manage" => self.skills_tool(name, &args).await,
             "clarify" => clarify::clarify(self, args).await,
@@ -1059,13 +1059,48 @@ impl SessionTools {
         }
     }
 
-    fn memory_tool(&self, args: &Value) -> ToolOutput {
-        let Some(memory) = &self.memory else {
+    /// The `memory` tool. Its store reads files and `memory.db` (and may wait for another
+    /// process's write lock), so it runs off the async workers.
+    async fn memory_tool(&self, args: &Value) -> ToolOutput {
+        self.run_memory_tool(args, false).await
+    }
+
+    /// The `memory` tool, as the store's `tool` or (`unattended`: the agentic background
+    /// review) `unattended_tool`, in `spawn_blocking`.
+    pub(crate) async fn run_memory_tool(&self, args: &Value, unattended: bool) -> ToolOutput {
+        let Some(memory) = self.memory.clone() else {
             return ToolOutput::error(
                 "Memory is not available. It may be disabled in config or this environment.",
             );
         };
-        let result = memory.tool(args, &mut self.memory_failures.lock());
+        // The turn's failure count rides along as a copy and comes back as a change.
+        let before = self.memory_failures.lock().0;
+        let mut failures = hermes_memory::TurnFailures(before);
+        let args = args.clone();
+        let (result, failures) = tokio::task::spawn_blocking(move || {
+            let result = if unattended {
+                memory.unattended_tool(&args, &mut failures)
+            } else {
+                memory.tool(&args, &mut failures)
+            };
+            (result, failures)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            (
+                json!({"success": false, "error": format!("The memory write did not finish: {e}.")}),
+                hermes_memory::TurnFailures(before),
+            )
+        });
+        {
+            // Another memory call of the same turn may have counted meanwhile: apply this
+            // call's change (a success resets the count, a failure adds one).
+            let mut count = self.memory_failures.lock();
+            count.0 = match failures.0.checked_sub(before) {
+                Some(added) => count.0 + added,
+                None => failures.0,
+            };
+        }
         let failed = result.get("success") == Some(&Value::Bool(false));
         ToolOutput {
             value: result,

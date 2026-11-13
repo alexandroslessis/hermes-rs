@@ -719,3 +719,44 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   the schedule's `last_run_at` is saved before the first request.
 - **The ledger counts a moment late.** A run that crosses 20% left stops before the *next* job only
   once the ledger thread has applied the previous request; tests assert a range for that case.
+
+## Memory in `memory.db` (Phase 9 CP9.1, `crates/memory/src/{db,sync}.rs`)
+
+- **The files are a view, but the file wins a disagreement.** Every access compares MEMORY.md /
+  USER.md with `memory.db` (the hash recorded at our last export *and* the parsed entries); when
+  they differ the file is taken over. That is what makes a hand edit, an older build's write and a
+  crash between our rename and our commit all come out right, and it keeps the system prompt
+  byte for byte what the file says. Don't "fix" a mismatch by exporting the database over the file.
+- **A read never writes a `.md` file.** Migration and re-import only read them. Tests that write a
+  file and then read through the store see the new content (it is re-imported), as before.
+- **What is kept and what is erased.** The *agent's* removals and rewrites (the tool, a review, an
+  approved staged write) keep their row (`removed`, `removed_why = store`; a patched entry's old row
+  points at the new one, `superseded_by`; a text that comes back gets its old row and id), as does
+  `repair`. Later queries must filter `removed IS NULL`. The *user's* removals erase the text from
+  `memory.db` (rows, older versions, FTS index; `secure_delete` on, WAL checkpointed): Settings ▸
+  Memory ▸ reset (`MemoryStore::reset`; never delete the files directly any more, the next access
+  would treat that as an accident), a delete or rewrite on the Star map (`edit_entry`), and an
+  entry removed from the file by hand. So "ask the agent to forget X" keeps X as a removed row
+  until a reset; the GPUI app's Memory screen goes through `apply` too (frozen, not changed).
+- **A file left with no entries outside the app** (deleted, emptied) is taken over only after its
+  entries were copied to `<file>.bak.dropped.<time>` (rename it back to restore); no copy, no
+  take-over: reads answer from the file alone and writes are refused until the copy can be made.
+  A hand edit that keeps at least one entry makes no copy (it may be the user removing a secret).
+- **Backups hold old text.** `<file>.bak.pre-memory-db.<time>` (made before the first migration)
+  and `<file>.bak.dropped.<time>` are plain copies in `memories/`; we never delete them, and reset
+  does not either. Someone who wants a secret gone everywhere deletes those copies by hand (and the
+  `*.md.bak.<time>` drift snapshots, which predate Phase 9).
+- **The cross-process lock is the database's write lock** (`BEGIN IMMEDIATE`, busy timeout 5 s;
+  a write tries 3 times, so a memory call waits 15 s at most, then refuses). A writer that doesn't
+  take it (an editor, a store whose database is off) is caught by the re-read just before the
+  rename (a conflict, the write starts again, 3 tries), not prevented; the window is the time
+  between that read and the rename. The rename itself is retried for ~300 ms (a scanner holding
+  the file). A database still busy 5 s into its first open is tried again at the next use.
+- **Database trouble = the files alone**, as before Phase 9, logged (`MemoryStore::database_problem`).
+  A newer schema version or a damaged file that can't be moved aside switches it off for the life of
+  the process; the next start tries again.
+- **`MemoryStore::new(dir)` puts `memory.db` in `dir`** (tests, tools); the app uses
+  `MemoryStore::open(<data>/memories, <data>/memory.db)`. `file_only` is the old behaviour (the
+  reference in the round-trip tests).
+- **Failpoints are `#[cfg(test)]`** (`sync::Failpoint`, `MemoryStore::arm`): a "crash" returns
+  early without cleanup and the test drops the store, as a dead process would.

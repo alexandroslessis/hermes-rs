@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use hermes_memory::{MemoryStore, Target};
 use hermes_runtime::budget::CuratorMode;
 use hermes_runtime::{CuratorModel, Runtime, TurnOptions};
 use hermes_tools::SkillStore;
@@ -199,8 +200,10 @@ pub fn memory_status(data_dir: &Path) -> Value {
     json!({"active": "", "providers": [], "builtin_files": files})
 }
 
-/// `POST /api/memory/reset` `{target: all|memory|user}`: deletes the files.
-pub fn reset_memory(data_dir: &Path, body: &Value) -> (u16, Value) {
+/// `POST /api/memory/reset` `{target: all|memory|user}`: deletes the files and erases their
+/// entries from `memory.db` (`MemoryStore::reset`; since Phase 9 deleting the files alone would
+/// leave the text in the database). Blocking: call it off the async workers.
+pub fn reset_memory(memory: &MemoryStore, body: &Value) -> (u16, Value) {
     let target = body["target"]
         .as_str()
         .unwrap_or("all")
@@ -212,18 +215,15 @@ pub fn reset_memory(data_dir: &Path, body: &Value) -> (u16, Value) {
             json!({"detail": "target must be all, memory, or user"}),
         );
     }
-    let folder = data_dir.join("memories");
     let mut deleted = Vec::new();
-    for (file, key) in MEMORY_FILES {
-        let path = folder.join(file);
-        if (target == "all" || target == key) && path.exists() {
-            if let Err(error) = std::fs::remove_file(&path) {
-                return (
-                    500,
-                    json!({"detail": format!("Could not delete {file}: {error}")}),
-                );
-            }
-            deleted.push(file);
+    for (which, key) in [(Target::Memory, "memory"), (Target::User, "user")] {
+        if target != "all" && target != key {
+            continue;
+        }
+        match memory.reset(which) {
+            Ok(true) => deleted.push(which.file_name()),
+            Ok(false) => {}
+            Err(detail) => return (500, json!({"detail": detail})),
         }
     }
     (200, json!({"ok": true, "deleted": deleted}))
@@ -258,10 +258,23 @@ mod tests {
             memory_status(dir.path())["builtin_files"],
             json!({"memory": 3, "user": 1})
         );
-        assert_eq!(reset_memory(dir.path(), &json!({"target": "nope"})).0, 400);
-        let (status, body) = reset_memory(dir.path(), &json!({"target": "user"}));
+        let memory = MemoryStore::open(&folder, dir.path().join("memory.db"), Default::default());
+        assert_eq!(memory.entries(Target::User), ["x"]);
+        assert_eq!(reset_memory(&memory, &json!({"target": "nope"})).0, 400);
+        let (status, body) = reset_memory(&memory, &json!({"target": "user"}));
         assert_eq!((status, body["deleted"].clone()), (200, json!(["USER.md"])));
         assert!(folder.join("MEMORY.md").exists());
+        assert!(!folder.join("USER.md").exists());
+        // Erased, not just hidden: no copy is left for a later access to restore.
+        assert!(memory.entries(Target::User).is_empty());
+        let (_, body) = reset_memory(&memory, &json!({"target": "all"}));
+        assert_eq!(body["deleted"], json!(["MEMORY.md"]));
+        let left: Vec<String> = std::fs::read_dir(&folder)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".bak.dropped."))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]

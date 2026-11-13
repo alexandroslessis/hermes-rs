@@ -3641,7 +3641,18 @@ impl Gateway {
             }
             ("POST", "/api/memory/reset") => {
                 let body: Value = serde_json::from_slice(body).unwrap_or_default();
-                return Some(crate::maintenance::reset_memory(&self.data_dir, &body));
+                // Files and memory.db (which may wait for another process's lock): off the
+                // async workers.
+                let memory = self.runtime.memory();
+                return Some(
+                    tokio::task::spawn_blocking(move || {
+                        crate::maintenance::reset_memory(&memory, &body)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        (500, json!({"detail": format!("The reset did not finish: {e}")}))
+                    }),
+                );
             }
             _ => {}
         }

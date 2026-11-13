@@ -44,7 +44,7 @@ it calls into. Everything runs in one process.
 | `crates/agent` | `hermes_agent` | The agent state machine (from Goose): stream a reply, run tool calls, repeat | `events.rs` has `AgentEvent` |
 | `crates/llm` | `hermes_llm` | Messages, the OpenAI-compatible provider, retries (from Goose) | `conversation::message::{Message, MessageContent}`; `observer.rs` is where every model POST is reported (purpose, session, provider) to the request ledger |
 | `crates/tools` | `hermes_tools` | Every agent tool + `SessionTools` (the per-session tool set) | One module per tool family; `paths.rs` resolves paths; `path_policy.rs` classifies where file edits and terminal commands may go (workspace, app data, skills/memory, persistence places, outside); `approval.rs` the dangerous-command check; `taint.rs` what the session has read that the user didn't write (see Taint in PITFALLS.md); `staging.rs` the writes a tainted session's `memory` / `skill_manage` calls leave for the user (`staging/<id>.json`, applied through the stores' own write paths); `index.rs` the local FTS5 index (`index.db`) over skills and memory, kept fresh by write hooks on `SkillStore` / `MemoryStore` |
-| `crates/memory` | `hermes_memory` | The memory store and tool (`§`-separated entries, char limits, drift guard) | |
+| `crates/memory` | `hermes_memory` | The memory store and tool (`§`-separated entries, char limits, drift guard) | `store.rs` (the API every caller uses), `tool.rs`, `threats.rs`; since Phase 9: `db.rs` (`memory.db`: entries with tier/scope/kind/links; the agent's removals kept as marked rows, the user's erased) and `sync.rs` (the files as the exported view of the database: migration with a backup copy, re-import of manual edits, the write step under the database's lock, fallback to the files alone) |
 | `crates/store` | `hermes_store` | SQLite: sessions, messages, usage, projects | **Schema frozen** (shared with GPUI) |
 | `crates/prompts` | `hermes_prompts` | Builds the system prompt; tool schemas; coding-command and side-question prompts | Text comes from `prompts/` |
 | `crates/app` | — | The frozen GPUI app | Keep it compiling |
@@ -276,7 +276,8 @@ Data folder (`%APPDATA%\hermes-rs`, or `HERMES_RS_HOME`):
 | `archived-sessions.json` | `archive.rs` (archived sessions, last auto-archive sweep) |
 | `hermes-imports.json` | `hermes_import.rs` (imported Hermes session ids) |
 | `requests.json` | `hermes_runtime::ledger` (model requests per provider, day and purpose; the provider's learned limit) |
-| `memories/MEMORY.md`, `memories/USER.md` | `hermes_memory` |
+| `memory.db` (+ `-wal`, `-shm`) | `hermes_memory` (`db.rs`, `sync.rs`): the memory entries since Phase 9 (CP9.1), own schema version; a damaged one is moved aside to `memory.db.corrupt-<time>` |
+| `memories/MEMORY.md`, `memories/USER.md` | `hermes_memory`: the exported view of `memory.db`'s `core` entries, re-imported when edited by hand; `*.bak.pre-memory-db.<time>` are the copies made before the first migration (never deleted by us) |
 | `skills/` (+ `.usage.json`, `.archive/`) | `hermes_tools::skills`, curator |
 | `checkpoints/` | `hermes_tools::checkpoints` |
 | `images/`, `uploads/` | attachments |
