@@ -484,9 +484,25 @@ impl StagingStore {
         meta: &Meta,
         source: Option<&crate::provenance::SourceNote>,
     ) -> Value {
+        self.stage_skill_call_in(skills, None, args, origin, meta, source)
+    }
+
+    /// [`Self::stage_skill_call_from`] for a session in the repository at `project`: the call's
+    /// ops find that repository's skills too (and carry its root, so applying them later looks in
+    /// the same place).
+    pub fn stage_skill_call_in(
+        &self,
+        skills: &SkillStore,
+        project: Option<&std::path::Path>,
+        args: &Value,
+        origin: WriteOrigin,
+        meta: &Meta,
+        source: Option<&crate::provenance::SourceNote>,
+    ) -> Value {
         match skills.parse_call(args) {
             Ok(mut ops) => {
                 crate::skill_manage::attach_source(&mut ops, source);
+                crate::skill_manage::attach_project(&mut ops, project);
                 self.stage_skill_ops(skills, ops, origin, meta)
             }
             Err(refusal) => refusal,

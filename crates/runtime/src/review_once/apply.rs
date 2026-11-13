@@ -24,7 +24,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hermes_memory::{MemoryStore, Operation, Target, TurnFailures};
-use hermes_tools::skill_manage::{FileBase, SkillOp, StagedSkillError, WriteOrigin, fingerprint};
+use hermes_tools::skill_manage::{
+    FileBase, SkillOp, SkillScope, StagedSkillError, WriteOrigin, fingerprint,
+};
 use hermes_tools::skills::SkillStore;
 use hermes_tools::staging::{Meta, StagingStore};
 use serde_json::{Value, json};
@@ -50,6 +52,11 @@ pub struct ApplyContext {
     pub hold: Option<Hold>,
     /// The skills the packet showed (filled in from the packet).
     pub shown: BTreeMap<String, ShownSkill>,
+    /// The root of the repository the session works in: its skills are the ones a patch may name
+    /// (with the user's own), and where a `scope: project` create goes. `None`: no repository.
+    pub project: Option<std::path::PathBuf>,
+    /// Where a create goes when the reply doesn't say (`review_once::evidence_scope`).
+    pub default_scope: SkillScope,
 }
 
 /// What became of one operation.
@@ -220,7 +227,21 @@ fn plan_skill(ctx: &ApplyContext, change: &SkillChange) -> Result<(SkillOp, File
     let name = &change.name;
     match change.action {
         SkillAction::Create => {
-            if let Some(existing) = ctx.skills.find_any(name) {
+            let scope = change.scope.unwrap_or(ctx.default_scope);
+            if scope == SkillScope::Project && ctx.project.is_none() {
+                return Err(
+                    "scope \"project\" needs a session inside a git repository; this one is not in one"
+                        .into(),
+                );
+            }
+            // A project create may take the name of a read-only copy from another tool's folder
+            // (that is how it is customized); the store makes the call (`clash_for_create`).
+            let project = ctx.project.as_deref();
+            if let Some(existing) = ctx
+                .skills
+                .find_any_for(project, name)
+                .filter(|e| !(scope == SkillScope::Project && e.is_project() && e.external))
+            {
                 return Err(format!(
                     "a skill named '{name}' already exists ({}); patch it instead",
                     existing.dir.display()
@@ -237,12 +258,15 @@ fn plan_skill(ctx: &ApplyContext, change: &SkillChange) -> Result<(SkillOp, File
                 name: name.clone(),
                 content: Some(body),
                 source: Some(source_note(ctx, change)),
+                scope,
+                project: ctx.project.clone(),
                 ..Default::default()
             };
             let base = FileBase {
                 skill: name.clone(),
                 file: "SKILL.md".into(),
                 fingerprint: None,
+                project: ctx.project.clone(),
             };
             Ok((op, base))
         }
@@ -252,9 +276,14 @@ fn plan_skill(ctx: &ApplyContext, change: &SkillChange) -> Result<(SkillOp, File
                     "skill '{name}' was not in the evidence packet; only a skill shown there may be patched"
                 ));
             };
-            let Some(entry) = ctx.skills.find_any(name) else {
+            let Some(entry) = ctx.skills.find_any_for(ctx.project.as_deref(), name) else {
                 return Err(format!("skill '{name}' no longer exists"));
             };
+            if entry.is_project() && entry.external {
+                return Err(format!(
+                    "skill '{name}' is in a read-only project folder; create it again with scope \"project\" to customize it"
+                ));
+            }
             let bytes = std::fs::read(entry.skill_md())
                 .map_err(|e| format!("could not read {name}/SKILL.md: {e}"))?;
             let now = fingerprint(&bytes);
@@ -283,12 +312,14 @@ fn plan_skill(ctx: &ApplyContext, change: &SkillChange) -> Result<(SkillOp, File
                 name: name.clone(),
                 content: Some(updated),
                 source: Some(source_note(ctx, change)),
+                project: ctx.project.clone(),
                 ..Default::default()
             };
             let base = FileBase {
                 skill: name.clone(),
                 file: "SKILL.md".into(),
                 fingerprint: Some(now),
+                project: ctx.project.clone(),
             };
             Ok((op, base))
         }

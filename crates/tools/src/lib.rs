@@ -17,6 +17,7 @@ pub mod lint;
 mod path_policy;
 mod paths;
 mod process;
+pub mod project_skills;
 pub mod provenance;
 mod recall;
 pub mod redact;
@@ -178,6 +179,10 @@ pub struct SessionTools {
     limits: parking_lot::Mutex<ToolLimits>,
     /// What the session has read that isn't the user's (see [`taint`]).
     taint: parking_lot::Mutex<TaintCell>,
+    /// The repository the session works in (its root): whose project skills it sees. Fixed when
+    /// the tools are made, from the folder the session was started in ([`project_skills`]); a
+    /// later `cd` in the shell doesn't change it.
+    project: parking_lot::Mutex<Option<PathBuf>>,
 }
 
 /// The session's [`taint::Taint`] with what goes along with it.
@@ -203,7 +208,9 @@ impl SessionTools {
             persist: true,
             warnings: Vec::new(),
         };
+        let project = project_skills::find_root(&config.cwd);
         Self {
+            project: parking_lot::Mutex::new(project),
             hints: parking_lot::Mutex::new(hints::HintTracker::new(&config.cwd, &config.home)),
             shell: shell::ShellSession::new(config.shell, config.cwd, config.scratch_dir.clone()),
             processes: process::ProcessRegistry::default(),
@@ -512,7 +519,7 @@ impl SessionTools {
             }
             "memory" => self.memory_tool(&args),
             "session_search" => self.session_search(&args),
-            "skills_list" | "skill_view" | "skill_manage" => self.skills_tool(name, &args),
+            "skills_list" | "skill_view" | "skill_manage" => self.skills_tool(name, &args).await,
             "clarify" => clarify::clarify(self, args).await,
             "web_search" | "web_extract" => self.web_tool(name, &args).await,
             "delegate_task" => ToolOutput::error("delegate_task is not available here."),
@@ -668,19 +675,49 @@ impl SessionTools {
         }
     }
 
-    fn skills_tool(&self, name: &str, args: &Value) -> ToolOutput {
-        let Some(skills) = &self.skills else {
+    /// The repository this session works in: whose project skills it sees (and whose
+    /// `.agents/skills` it may write). `None` when its folder isn't inside a git repository.
+    pub fn project_root(&self) -> Option<PathBuf> {
+        self.project.lock().clone()
+    }
+
+    /// For tools that work on the user's own library and have no repository (the curator, whose
+    /// working folder is the skills folder): no project skills.
+    pub fn without_project(&self) {
+        *self.project.lock() = None;
+    }
+
+    /// A subagent works in its parent's project, wherever its shell has been `cd`'d to.
+    pub fn inherit_project(&self, parent: &SessionTools) {
+        *self.project.lock() = parent.project_root();
+    }
+
+    async fn skills_tool(&self, name: &str, args: &Value) -> ToolOutput {
+        let Some(skills) = self.skills.clone() else {
             return ToolOutput::error("Skills are not available in this session.");
         };
-        let result = match name {
-            "skills_list" => skills.list_tool(args),
-            "skill_view" => skills.view_tool(args),
-            _ => skills.manage_with_source(
-                args,
+        let project = self.project_root();
+        let source = (name == "skill_manage").then(|| self.skill_source(WriteOrigin::Foreground));
+        let (tool, args) = (name.to_string(), args.clone());
+        // Reading a repository's skills is file-system work.
+        let result = tokio::task::spawn_blocking(move || match tool.as_str() {
+            "skills_list" => skills.list_tool_for(project.as_deref(), &args),
+            "skill_view" => skills.view_tool_for(project.as_deref(), &args),
+            _ => skills.manage_in(
+                project.as_deref(),
+                &args,
                 WriteOrigin::Foreground,
-                Some(&self.skill_source(WriteOrigin::Foreground)),
+                source.as_ref(),
             ),
-        };
+        })
+        .await
+        .unwrap_or_else(|e| json!({"success": false, "error": format!("The skill tool stopped: {e}")}));
+        // A repository's skill is text its author wrote, not the user: once the model has been
+        // shown one the session is careful (see `project_skills.rs`).
+        if result.get("scope") == Some(&json!("project")) {
+            let shown = result.get("name").and_then(Value::as_str).unwrap_or("a skill");
+            self.mark_tainted(taint::project_skill_source(shown)).await;
+        }
         let failed = result.get("success") == Some(&Value::Bool(false));
         ToolOutput {
             value: result,
@@ -698,7 +735,8 @@ impl SessionTools {
             self.scratch_dir.clone(),
             self.data_dir.clone(),
             self.home.clone(),
-        );
+        )
+        .with_project(self.project_root());
         let skills_root = self.data_dir.join("skills");
         let command = command.to_string();
         tokio::task::spawn_blocking(move || {
@@ -997,8 +1035,16 @@ impl SessionTools {
         let store = staging::StagingStore::new(&self.data_dir);
         let (args, meta) = (args.clone(), self.staging_meta());
         let source = (origin != WriteOrigin::Curator).then(|| self.skill_source(origin));
+        let project = self.project_root();
         let result = tokio::task::spawn_blocking(move || {
-            store.stage_skill_call_from(&skills, &args, origin, &meta, source.as_ref())
+            store.stage_skill_call_in(
+                &skills,
+                project.as_deref(),
+                &args,
+                origin,
+                &meta,
+                source.as_ref(),
+            )
         })
         .await
         .unwrap_or_else(|e| json!({"success": false, "error": e.to_string()}));
@@ -1375,6 +1421,162 @@ pub(crate) mod tests {
         let (_dir, tools) = guarded(AskBridge::new(approval::ApprovalChoice::Deny));
         tools.set_mode(ApprovalMode::AcceptEdits);
         assert!(tools.check_command(command).await.is_err());
+    }
+
+    // ---- project skills (Phase 8, CP8.2) ----------------------------------------------------
+
+    /// Tools whose working folder is `cwd`, with a skills store and the approval policy.
+    fn project_tools(
+        dir: &Path,
+        cwd: &Path,
+        bridge: Arc<dyn UserBridge>,
+    ) -> (Arc<SkillStore>, SessionTools) {
+        let skills = Arc::new(SkillStore::new(dir.join(".data").join("skills"), Default::default()));
+        let tools = SessionTools::new(SessionToolsConfig {
+            session_id: "ses_test".into(),
+            cwd: cwd.to_path_buf(),
+            home: dir.join("home"),
+            data_dir: dir.join(".data"),
+            scratch_dir: dir.join(".data").join("scratch"),
+            shell: detect_shell(),
+            bridge,
+            todos: Vec::new(),
+            memory: None,
+            history: None,
+            skills: Some(skills.clone()),
+            approvals: Some(Arc::new(approval::ApprovalStore::new(&dir.join(".data")))),
+            checkpoints: None,
+            web: None,
+        });
+        (skills, tools)
+    }
+
+    fn project(dir: &Path, name: &str, skill: &str) -> PathBuf {
+        let root = dir.join(name);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let skill_dir = root.join(".agents/skills").join(skill);
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {skill}\ndescription: Does {skill}.\n---\n# {skill}\nRun scripts/run.sh.\n"),
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("scripts/run.sh"), "echo hi\n").unwrap();
+        project_skills::canonical(&root).unwrap()
+    }
+
+    #[tokio::test]
+    async fn viewing_a_project_skill_taints_the_session_but_listing_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "repo", "build-it");
+        let (_skills, tools) = project_tools(dir.path(), &root, Arc::new(TestBridge::default()));
+        assert_eq!(tools.project_root(), Some(root.clone()));
+        let listed = tools.dispatch("skills_list", json!({}), None).await;
+        assert!(listed.value.to_string().contains("build-it"));
+        assert!(!tools.taint().is_tainted(), "names and descriptions only");
+        let viewed = tools.dispatch("skill_view", json!({"name": "build-it"}), None).await;
+        assert_eq!(viewed.value["success"], true, "{}", viewed.value);
+        assert!(tools.taint().is_tainted());
+        assert!(tools.taint().sources[0].contains("project skill (build-it)"));
+        // A failed view (no such skill) is not a read.
+        let other_data = tempfile::tempdir().unwrap();
+        let (_skills, fresh) = project_tools(other_data.path(), &root, Arc::new(TestBridge::default()));
+        fresh.dispatch("skill_view", json!({"name": "nope"}), None).await;
+        assert!(!fresh.taint().is_tainted());
+    }
+
+    #[tokio::test]
+    async fn the_scope_is_fixed_at_the_start_and_a_child_takes_its_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = project(dir.path(), "repo-a", "skill-in-a");
+        let b = project(dir.path(), "repo-b", "skill-in-b");
+        let (_skills, parent) = project_tools(dir.path(), &a, Arc::new(TestBridge::default()));
+        // The shell goes into repository B: the session's skills don't change.
+        parent
+            .dispatch("terminal", json!({"command": format!("cd '{}'", b.display().to_string().replace('\\', "/"))}), None)
+            .await;
+        assert_eq!(project_skills::canonical(&parent.cwd()), Some(b.clone()), "the shell moved");
+        assert_eq!(parent.project_root(), Some(a.clone()));
+        let seen = parent.dispatch("skills_list", json!({}), None).await.value.to_string();
+        assert!(seen.contains("skill-in-a") && !seen.contains("skill-in-b"), "{seen}");
+        // A child made where the parent's shell is now still works in the parent's repository.
+        let (_skills, child) = project_tools(dir.path(), &parent.cwd(), Arc::new(TestBridge::default()));
+        assert_eq!(child.project_root(), Some(b.clone()));
+        child.inherit_project(&parent);
+        let seen = child.dispatch("skills_list", json!({}), None).await.value.to_string();
+        assert!(seen.contains("skill-in-a") && !seen.contains("skill-in-b"), "{seen}");
+        // No repository: nothing, and a folder outside one stays that way.
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let (_skills, none) = project_tools(dir.path(), &plain, Arc::new(TestBridge::default()));
+        assert_eq!(none.project_root(), None);
+        let seen = none.dispatch("skills_list", json!({}), None).await.value.to_string();
+        assert!(!seen.contains("skill-in-"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn a_project_skills_script_asks_like_a_script_the_agent_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "repo", "build-it");
+        let bridge = AskBridge::new(approval::ApprovalChoice::Once);
+        let (_skills, tools) = project_tools(dir.path(), &root, bridge.clone());
+        tools.set_mode(ApprovalMode::AcceptEdits);
+        let command = "bash .agents/skills/build-it/scripts/run.sh";
+        assert!(tools.check_command(command).await.is_ok());
+        assert_eq!(bridge.asked.lock().len(), 1);
+        assert!(bridge.asked.lock()[0].contains("project skill"), "{:?}", bridge.asked.lock());
+        // Other files of the repository, and its skill's SKILL.md, are ordinary.
+        assert!(tools.check_command("cat .agents/skills/build-it/SKILL.md").await.is_ok());
+        assert!(tools.check_command("cat src/main.rs").await.is_ok());
+        assert_eq!(bridge.asked.lock().len(), 1);
+        // Yolo runs it (warn-only, decision D2), without asking.
+        let bridge = AskBridge::new(approval::ApprovalChoice::Deny);
+        let (_skills, yolo) = project_tools(dir.path(), &root, bridge.clone());
+        yolo.set_mode(ApprovalMode::Yolo);
+        assert!(yolo.check_command(command).await.is_ok());
+        assert!(bridge.asked.lock().is_empty());
+        // A session in another repository has no project skill folders to protect.
+        let other = project(dir.path(), "other", "x");
+        let bridge = AskBridge::new(approval::ApprovalChoice::Deny);
+        let (_skills, elsewhere) = project_tools(dir.path(), &other, bridge.clone());
+        elsewhere.set_mode(ApprovalMode::AcceptEdits);
+        assert!(elsewhere.check_command("bash ./scripts/none.sh").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_tainted_sessions_skill_write_is_staged_with_the_projects_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path(), "repo", "build-it");
+        let (skills, tools) = project_tools(dir.path(), &root, Arc::new(TestBridge::default()));
+        tools.mark_tainted("a web page".into()).await;
+        // The model patches the repository's skill by name; the write waits for the user.
+        let staged = tools
+            .dispatch(
+                "skill_manage",
+                json!({"operations": [{"action": "patch", "name": "build-it", "old_string": "scripts/run.sh", "new_string": "scripts/build.sh"}]}),
+                None,
+            )
+            .await;
+        assert_eq!(staged.value["staged"], true, "{}", staged.value);
+        let text = std::fs::read_to_string(root.join(".agents/skills/build-it/SKILL.md")).unwrap();
+        assert!(text.contains("scripts/run.sh"), "not written yet");
+        let store = staging::StagingStore::new(&dir.path().join(".data"));
+        let items = store.list();
+        assert_eq!(items.len(), 1);
+        let memory = hermes_memory::MemoryStore::new(dir.path().join(".data/memories"), Default::default());
+        let applied = store.apply(&items[0].id, &memory, &skills);
+        assert!(matches!(applied, staging::Applied::Done(_)), "{applied:?}");
+        assert!(std::fs::read_to_string(root.join(".agents/skills/build-it/SKILL.md")).unwrap().contains("scripts/build.sh"));
+        // A repository's skill the session can't see is not patchable from here.
+        let other = project(dir.path(), "other", "other-skill");
+        let missing = skills.manage_in(
+            Some(&root),
+            &json!({"operations": [{"action": "delete", "name": "other-skill"}]}),
+            WriteOrigin::Foreground,
+            None,
+        );
+        assert_eq!(missing["success"], false);
+        assert!(other.join(".agents/skills/other-skill/SKILL.md").exists());
     }
 
     #[tokio::test]

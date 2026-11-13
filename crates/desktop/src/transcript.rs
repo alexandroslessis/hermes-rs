@@ -421,6 +421,7 @@ mod tests {
             text: "<context>\n<relevant-skills>\nsecret steps\n</relevant-skills>\n</context>".into(),
             skills: vec!["deploy".into()],
             memory: vec![],
+            project_skills: vec![],
         };
         let mut user = Message::user().with_text(format!("{}\n\nship it", block.text));
         block.note(&mut user);

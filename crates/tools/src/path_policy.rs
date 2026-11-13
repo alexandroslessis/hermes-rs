@@ -56,6 +56,10 @@ pub struct PolicyContext {
     /// The roaming AppData folder (can be redirected); the user's Startup folder lives in it.
     /// `~/AppData/Roaming` is checked as well.
     pub roaming: Option<PathBuf>,
+    /// The root of the repository the session works in, when it has project skills to protect
+    /// (`project_skills.rs`): a script inside one of its skill folders is flagged like the scripts
+    /// of a skill the agent wrote, whoever wrote it.
+    pub project: Option<PathBuf>,
 }
 
 impl PolicyContext {
@@ -71,8 +75,32 @@ impl PolicyContext {
             windows_dir: env("SystemRoot").or_else(|| env("windir")),
             documents: dirs::document_dir(),
             roaming: dirs::config_dir(),
+            project: None,
         }
     }
+
+    /// The same context for a session in the repository at `project`.
+    pub fn with_project(mut self, project: Option<PathBuf>) -> Self {
+        self.project = project;
+        self
+    }
+}
+
+/// Whether `path` is a script (below a `scripts` folder) of one of the project's skill folders.
+fn is_project_skill_script(path: &Path, ctx: &PolicyContext) -> bool {
+    let Some(root) = &ctx.project else {
+        return false;
+    };
+    let target = key(&canonical(path));
+    std::iter::once(crate::project_skills::WRITE_DIR)
+        .chain(crate::project_skills::READ_ONLY_DIRS)
+        .any(|rel| {
+            let dir = key(&canonical(&root.join(rel)));
+            within(&target, &dir)
+                && target[dir.len()..]
+                    .split('/')
+                    .any(|part| part == "scripts")
+        })
 }
 
 /// Classifies `path` (already resolved against the working folder, as `SessionTools::resolve`
@@ -263,6 +291,8 @@ pub const DESC_APP_DATA: &str = "touches the app's own data folder (settings, hi
 pub const DESC_SELF_IMPROVE: &str =
     "touches the skills or memory folder (use skill_manage / memory instead)";
 pub const DESC_SKILL_SCRIPT: &str = "runs a script the agent wrote into a skill";
+pub const DESC_PROJECT_SKILL_SCRIPT: &str =
+    "runs a script from a project skill (a file of this repository, not checked by the app)";
 
 /// Looks for protected paths in the text of a terminal command and says why it should be flagged.
 ///
@@ -301,7 +331,13 @@ pub fn command_flag(
                     (DESC_SELF_IMPROVE, false)
                 }
             }
-            PathClass::Workspace | PathClass::Outside => continue,
+            PathClass::Workspace | PathClass::Outside => {
+                if is_project_skill_script(&path, ctx) {
+                    (DESC_PROJECT_SKILL_SCRIPT, false)
+                } else {
+                    continue;
+                }
+            }
         };
         if persistence {
             return Some(CommandFlag {
@@ -446,6 +482,7 @@ mod tests {
                 windows_dir: Some(base.join("windows")),
                 documents: Some(base.join("onedrive").join("Documents")),
                 roaming: Some(base.join("roaming")),
+                project: None,
             };
             for dir in [&ctx.cwd, &ctx.scratch, &ctx.home] {
                 std::fs::create_dir_all(dir).unwrap();

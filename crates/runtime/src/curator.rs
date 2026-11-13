@@ -157,12 +157,14 @@ impl Runtime {
             checkpoints: None,
             web: None,
         }));
-        let system_prompt = self.system_prompt_with(
+        // The curator tends the user's library: whatever repository its folder is in (the data
+        // folder may be inside one) has no say, and its skills are not the curator's to see.
+        tools.without_project();
+        let system_prompt = self.curator_system_prompt(
             &model.provider.id,
             &model.model,
             model.options.context_length,
             &skills_root,
-            false,
         )?;
         let message = Message::user()
             .with_text(hermes_prompts::review::curator_message(candidates))

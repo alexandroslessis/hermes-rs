@@ -515,6 +515,8 @@ impl Delegator {
             &scratch,
         ));
         tools.begin_turn();
+        // The child sees the skills of its parent's repository, wherever its shell goes.
+        tools.inherit_project(&self.parent.tools);
         tools.set_vision(self.supports_vision);
         tools.set_limits(crate::tool_limits(&self.budget));
         // The thread's mode holds for its subagents: Plan and Manual must not be escaped by

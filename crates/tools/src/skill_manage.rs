@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::files::replace_in;
+use crate::project_skills;
 use crate::provenance::{self, SourceNote};
 use crate::skills::{
-    MAX_DESCRIPTION_LENGTH, SKILL_PROMPT_DESC_LIMIT, SUPPORT_DIRS, SkillStore,
+    MAX_DESCRIPTION_LENGTH, SKILL_PROMPT_DESC_LIMIT, SUPPORT_DIRS, SkillEntry, SkillStore,
     find_frontmatter_end, normalize_description, parse_frontmatter,
 };
 
@@ -26,6 +27,23 @@ const PATCH_NEEDS_OLD_STRING: &str = "old_string is required for 'patch' and mus
 const PATCH_NEEDS_NEW_STRING: &str =
     "new_string is required for 'patch'. Use an empty string to delete matched text.";
 const PATCH_EITHER_OR: &str = "Pass EITHER content (full SKILL.md rewrite) OR old_string/new_string (targeted replacement), not both.";
+
+/// Where a `create` puts the skill.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillScope {
+    /// The user's own library (`<data>/skills`).
+    #[default]
+    Global,
+    /// The session's repository: `<git root>/.agents/skills` (`project_skills.rs`).
+    Project,
+}
+
+impl SkillScope {
+    fn is_global(&self) -> bool {
+        *self == Self::Global
+    }
+}
 
 /// One operation of a `skill_manage` call.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -59,6 +77,22 @@ pub struct SkillOp {
     /// rewrite can't drop the skill's provenance. Never read from the model's call.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub own_hand: bool,
+    /// The repository root of the session this write comes from (project skills are looked up
+    /// there, together with the user's own). Set by the code that knows the session, never read
+    /// from the model's call ([`SkillStore::parse_call`] clears it); `None` outside a repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<PathBuf>,
+    /// For `create`: the user's library or the project's `.agents/skills`. Set by the evidence
+    /// review (which chooses), never read from the model's tool call.
+    #[serde(default, skip_serializing_if = "SkillScope::is_global")]
+    pub scope: SkillScope,
+}
+
+/// Gives every op the repository its session is in (see [`SkillOp::project`]).
+pub fn attach_project(ops: &mut [SkillOp], project: Option<&Path>) {
+    for op in ops {
+        op.project = project.map(Path::to_path_buf);
+    }
 }
 
 /// Gives the ops that write a SKILL.md the session they come from.
@@ -320,11 +354,17 @@ fn write_text(path: &Path, content: &str) -> Result<(), String> {
     std::fs::write(path, content).map_err(|e| format!("Could not write {}: {e}", path.display()))
 }
 
+/// Copies a folder's plain files and folders. Links (symlinks, junctions) are skipped, never
+/// followed: a project skill's `references/key -> ~/.ssh/id_ed25519` must not come back from a
+/// batch rollback as a real copy inside the repository (or fail the snapshot as a junction would).
 pub(crate) fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let target = to.join(entry.file_name());
+        if project_skills::is_reparse(&entry.metadata()?) {
+            continue;
+        }
         if entry.file_type()?.is_dir() {
             copy_dir(&entry.path(), &target)?;
         } else {
@@ -336,12 +376,16 @@ pub(crate) fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// A threat scan of everything a skill holds (it re-enters prompts when loaded).
 pub(crate) fn scan_skill(dir: &Path) -> Option<String> {
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
+    // (folder, depth): a link back up the tree must not loop (junctions in a project skill).
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((current, depth)) = stack.pop() {
         for entry in std::fs::read_dir(&current).ok()?.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                stack.push(path);
+                let link = entry.metadata().is_ok_and(|m| project_skills::is_reparse(&m));
+                if depth < 12 && !link {
+                    stack.push((path, depth + 1));
+                }
             } else if let Ok(text) = std::fs::read_to_string(&path) {
                 let scope = hermes_memory::threats::Scope::All;
                 if let Some(threat) = hermes_memory::threats::first_threat_message(&text, scope) {
@@ -457,11 +501,25 @@ impl SkillStore {
         origin: WriteOrigin,
         source: Option<&SourceNote>,
     ) -> Value {
+        self.manage_in(None, args, origin, source)
+    }
+
+    /// [`Self::manage_with_source`] for a session in the repository at `project`: the ops find
+    /// that repository's skills (and the user's own) by name, and may change the ones in its
+    /// `.agents/skills` folder.
+    pub fn manage_in(
+        &self,
+        project: Option<&Path>,
+        args: &Value,
+        origin: WriteOrigin,
+        source: Option<&SourceNote>,
+    ) -> Value {
         let mut ops = match self.parse_call(args) {
             Ok(ops) => ops,
             Err(refusal) => return refusal,
         };
         attach_source(&mut ops, source);
+        attach_project(&mut ops, project);
         if self.config().write_approval {
             return self.stage(ops, origin);
         }
@@ -483,6 +541,7 @@ impl SkillStore {
                                 op.name = default_name.to_string();
                             }
                             (op.source, op.own_hand) = (None, false);
+                            (op.project, op.scope) = (None, SkillScope::Global);
                             ops.push(op);
                         }
                         Err(e) => {
@@ -498,6 +557,7 @@ impl SkillStore {
             None => match serde_json::from_value::<SkillOp>(args.clone()) {
                 Ok(mut op) if !op.action.is_empty() => {
                     (op.source, op.own_hand) = (None, false);
+                    (op.project, op.scope) = (None, SkillScope::Global);
                     vec![op]
                 }
                 _ => {
@@ -602,16 +662,34 @@ impl SkillStore {
         else {
             return err("Could not create a temporary folder for the batch snapshot.");
         };
+        // The ops that change a project skill, by skill name, decided before anything changes.
+        let project_ops: Vec<String> = ops
+            .iter()
+            .filter(|op| self.is_project_op(op))
+            .map(|op| op.name.clone())
+            .collect();
         // (skill dir, snapshot or None when it didn't exist)
         let mut snapshots: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
         let mut results = Vec::new();
         for (i, op) in ops.iter().enumerate() {
             let dir = match op.action.as_str() {
+                "create" if op.scope == SkillScope::Project => op
+                    .project
+                    .as_deref()
+                    .map(|root| {
+                        root.join(project_skills::WRITE_DIR)
+                            .join(op.category.as_deref().map(str::trim).unwrap_or_default())
+                            .join(&op.name)
+                    })
+                    .unwrap_or_default(),
                 "create" => self
                     .root()
                     .join(op.category.as_deref().map(str::trim).unwrap_or_default())
                     .join(&op.name),
-                _ => self.find_any(&op.name).map(|s| s.dir).unwrap_or_default(),
+                _ => self
+                    .find_any_for(op.project.as_deref(), &op.name)
+                    .map(|s| s.dir)
+                    .unwrap_or_default(),
             };
             if !dir.as_os_str().is_empty() && !snapshots.iter().any(|(d, _)| *d == dir) {
                 let snapshot = dir.exists().then(|| backup.path().join(i.to_string()));
@@ -644,14 +722,21 @@ impl SkillStore {
             }
             results.push(result);
         }
-        for op in ops {
+        // A project skill is the repository's file: it is not in the user's usage file, and not in
+        // the skills history (the user commits it to the repository themselves).
+        let user_ops: Vec<&SkillOp> = ops.iter().filter(|op| !project_ops.contains(&op.name) ).collect();
+        for op in &user_ops {
             self.record_write(op, origin);
         }
-        let summary: Vec<String> = ops
-            .iter()
-            .map(|op| format!("{} {}", op.action, op.name))
-            .collect();
-        self.commit(&format!("skill_manage: {}", summary.join(", ")));
+        if user_ops.is_empty() {
+            self.changed();
+        } else {
+            let summary: Vec<String> = user_ops
+                .iter()
+                .map(|op| format!("{} {}", op.action, op.name))
+                .collect();
+            self.commit(&format!("skill_manage: {}", summary.join(", ")));
+        }
         if results.len() == 1 {
             return results.remove(0);
         }
@@ -660,6 +745,41 @@ impl SkillStore {
             "message": format!("Applied {} operations.", results.len()),
             "results": results,
         })
+    }
+
+    /// Whether `op` changes a project skill (it is created there, or names one of the repository's
+    /// and no skill of the user's own). Decided before the write: a delete removes the skill it
+    /// would be looked up by.
+    fn is_project_op(&self, op: &SkillOp) -> bool {
+        if op.action == "create" {
+            return op.scope == SkillScope::Project;
+        }
+        op.project.is_some() && self.find_any_for(None, &op.name).is_none()
+    }
+
+    /// The skill `name` an op targets: the user's own, or its session's repository's.
+    fn entry_for(&self, op: &SkillOp, name: &str) -> Option<SkillEntry> {
+        self.find_any_for(op.project.as_deref(), name)
+    }
+
+    /// Refuses a change to a skill that isn't ours to write (a read-only project folder).
+    fn writable(&self, skill: &SkillEntry) -> Result<(), Value> {
+        if skill.is_project() && skill.external {
+            return Err(err(format!(
+                "Skill '{}' is in a read-only project folder ({}); it is not changed. To customize it, create a skill with the same name in the project's .agents/skills folder.",
+                skill.name,
+                skill.dir.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuses a write that a link inside a project skill's folder would carry elsewhere.
+    fn inside(skill: &SkillEntry, target: &Path) -> Result<(), Value> {
+        if skill.is_project() {
+            project_skills::ensure_inside(&skill.dir, target).map_err(err)?;
+        }
+        Ok(())
     }
 
     fn apply_op(&self, op: &SkillOp, origin: WriteOrigin) -> Value {
@@ -723,7 +843,7 @@ impl SkillStore {
         {
             return err(e);
         }
-        if let Some(existing) = self.find_any(&op.name) {
+        if let Some(existing) = self.clash_for_create(op) {
             return err(format!(
                 "A skill named '{}' already exists at {}.",
                 op.name,
@@ -735,10 +855,34 @@ impl SkillStore {
             .as_deref()
             .map(str::trim)
             .filter(|c| !c.is_empty());
-        let dir = self
-            .root()
-            .join(category.unwrap_or_default())
-            .join(&op.name);
+        let project = op.scope == SkillScope::Project;
+        // Where the skill goes, and the folders a refused write must not leave behind.
+        let (base, root_of_new) = if project {
+            let Some(root) = op.project.as_deref().filter(|r| project_skills::is_root(r)) else {
+                return err(
+                    "This session is not inside a git repository, so there is no project to keep a skill in. Create it in the user's library (scope global) instead.",
+                );
+            };
+            match project_skills::write_dir_usable(root) {
+                Ok(dir) => (dir, Some(root.to_path_buf())),
+                Err(e) => return err(e),
+            }
+        } else {
+            (self.root().to_path_buf(), None)
+        };
+        let dir = base.join(category.unwrap_or_default()).join(&op.name);
+        if project && let Err(e) = project_skills::ensure_inside(&base, &dir) {
+            return err(e);
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&dir)
+            && (!meta.is_dir() || project_skills::is_reparse(&meta))
+        {
+            return err(format!(
+                "Cannot create skill '{}': {} already exists and is not a folder. Choose another name.",
+                op.name,
+                dir.display()
+            ));
+        }
         if dir.exists() && std::fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_some()) {
             return err(format!(
                 "Cannot create skill '{}': {} already exists (not an empty directory). Choose another name, or move/remove that path and retry.",
@@ -750,18 +894,31 @@ impl SkillStore {
             Ok(content) => content,
             Err(e) => return err(e),
         };
+        let made_agents = root_of_new
+            .as_ref()
+            .is_some_and(|root| !root.join(".agents").exists());
+        let made_skills_dir = project && !base.exists();
         if let Err(e) = self.guarded_write(&dir, &dir.join("SKILL.md"), &content) {
             let _ = std::fs::remove_dir(&dir);
+            if let Some(category) = category {
+                let _ = std::fs::remove_dir(base.join(category));
+            }
+            if made_skills_dir {
+                let _ = std::fs::remove_dir(&base);
+            }
+            if let (true, Some(root)) = (made_agents, &root_of_new) {
+                let _ = std::fs::remove_dir(root.join(".agents"));
+            }
             return e;
         }
         let rel = dir
-            .strip_prefix(self.root())
+            .strip_prefix(root_of_new.as_deref().unwrap_or(self.root()))
             .unwrap_or(&dir)
             .to_string_lossy()
             .replace('\\', "/");
         let mut result = json!({
             "success": true,
-            "message": format!("Skill '{}' created.", op.name),
+            "message": format!("Skill '{}' created{}.", op.name, if project { " in the project's .agents/skills folder (not committed: the user commits it)" } else { "" }),
             "path": rel,
             "hint": format!("To add reference files, templates, or scripts, use skill_manage(action='write_file', name='{}', file_path='references/example.md', file_content='...')", op.name),
         });
@@ -771,6 +928,16 @@ impl SkillStore {
         result
     }
 
+    /// A skill that stops `op` creating its name: any skill the session sees, except that a
+    /// project skill may be created over a read-only project copy of the same name (that is how
+    /// it is customized: D5 puts `.agents/skills` first).
+    fn clash_for_create(&self, op: &SkillOp) -> Option<SkillEntry> {
+        let existing = self.entry_for(op, &op.name)?;
+        let shadowed_copy =
+            op.scope == SkillScope::Project && existing.is_project() && existing.external;
+        (!shadowed_copy).then_some(existing)
+    }
+
     fn rewrite(&self, op: &SkillOp, content: &str) -> Value {
         let name = op.name.as_str();
         if let Some(e) =
@@ -778,9 +945,12 @@ impl SkillStore {
         {
             return err(e);
         }
-        let Some(skill) = self.find_any(name) else {
+        let Some(skill) = self.entry_for(op, name) else {
             return self.not_found(name, "");
         };
+        if let Err(e) = self.writable(&skill).and_then(|()| Self::inside(&skill, &skill.skill_md())) {
+            return e;
+        }
         let before = std::fs::read_to_string(skill.skill_md()).ok();
         let content = match finish_skill_md(op, before.as_deref(), content.to_string()) {
             Ok(content) => content,
@@ -793,9 +963,12 @@ impl SkillStore {
     }
 
     fn patch(&self, op: &SkillOp) -> Value {
-        let Some(skill) = self.find_any(&op.name) else {
+        let Some(skill) = self.entry_for(op, &op.name) else {
             return self.not_found(&op.name, "");
         };
+        if let Err(e) = self.writable(&skill) {
+            return e;
+        }
         let label = op.file_path.clone().unwrap_or_else(|| "SKILL.md".into());
         let target = match op.file_path.as_deref() {
             Some(file_path) => {
@@ -806,6 +979,9 @@ impl SkillStore {
             }
             None => skill.skill_md(),
         };
+        if let Err(e) = Self::inside(&skill, &target) {
+            return e;
+        }
         let Ok(content) = std::fs::read_to_string(&target) else {
             return err(format!("File not found: {label}"));
         };
@@ -815,7 +991,13 @@ impl SkillStore {
             Ok(done) => done,
             Err(e) => {
                 let preview: String = content.chars().take(500).collect();
-                return json!({"success": false, "error": e, "file_preview": preview});
+                let mut result = json!({"success": false, "error": e, "file_preview": preview});
+                // The preview is the repository's text: the session counts as having read it.
+                if skill.is_project() {
+                    result["name"] = json!(skill.name);
+                    result["scope"] = json!("project");
+                }
+                return result;
             }
         };
         if let Some(e) = validate_content_size(&updated, &label) {
@@ -857,10 +1039,13 @@ impl SkillStore {
         if let Some(e) = validate_content_size(content, file_path) {
             return err(e);
         }
-        let Some(skill) = self.find_any(&op.name) else {
+        let Some(skill) = self.entry_for(op, &op.name) else {
             return self.not_found(&op.name, " Create it first with action='create'.");
         };
         let target = skill.dir.join(file_path);
+        if let Err(e) = self.writable(&skill).and_then(|()| Self::inside(&skill, &target)) {
+            return e;
+        }
         let content = if file_path == "SKILL.md" {
             let before = std::fs::read_to_string(&target).ok();
             match finish_skill_md(op, before.as_deref(), content.to_string()) {
@@ -881,10 +1066,13 @@ impl SkillStore {
         if let Some(e) = validate_file_path(file_path) {
             return err(e);
         }
-        let Some(skill) = self.find_any(&op.name) else {
+        let Some(skill) = self.entry_for(op, &op.name) else {
             return self.not_found(&op.name, "");
         };
         let target = skill.dir.join(file_path);
+        if let Err(e) = self.writable(&skill).and_then(|()| Self::inside(&skill, &target)) {
+            return e;
+        }
         if !target.is_file() {
             let available: Vec<String> = SkillStore::linked_files(&skill.dir)
                 .into_values()
@@ -902,9 +1090,12 @@ impl SkillStore {
     }
 
     fn delete(&self, op: &SkillOp) -> Value {
-        let Some(skill) = self.find_any(&op.name) else {
+        let Some(skill) = self.entry_for(op, &op.name) else {
             return self.not_found(&op.name, "");
         };
+        if let Err(e) = self.writable(&skill) {
+            return e;
+        }
         let absorbed = op
             .absorbed_into
             .as_deref()
@@ -916,11 +1107,40 @@ impl SkillStore {
                     "absorbed_into='{absorbed}' cannot equal the skill being deleted."
                 ));
             }
-            if self.find_any(absorbed).is_none() {
+            if self.entry_for(op, absorbed).is_none() {
                 return err(format!(
                     "absorbed_into='{absorbed}' does not exist. Create or patch the umbrella skill first, then retry the delete."
                 ));
             }
+        }
+        if let (Some(root), true) = (skill.project.as_deref(), skill.is_project()) {
+            // A project skill goes only from the project's own `.agents/skills`, and a link
+            // standing in for its folder is not followed.
+            let write_dir = root.join(project_skills::WRITE_DIR);
+            let plain = std::fs::symlink_metadata(&skill.dir)
+                .is_ok_and(|m| m.is_dir() && !project_skills::is_reparse(&m));
+            if !plain
+                || skill.dir == write_dir
+                || !project_skills::within(&skill.dir, &write_dir)
+                || project_skills::ensure_inside(&write_dir, &skill.dir).is_err()
+            {
+                return err(format!(
+                    "Refusing to delete {}: it is not a plain folder inside the project's .agents/skills.",
+                    skill.dir.display()
+                ));
+            }
+            if let Err(e) = std::fs::remove_dir_all(&skill.dir) {
+                return err(e.to_string());
+            }
+            if let Some(parent) = skill.dir.parent().filter(|p| *p != write_dir) {
+                let _ = std::fs::remove_dir(parent);
+            }
+            let note = if absorbed.is_empty() {
+                String::new()
+            } else {
+                format!(" Content absorbed into '{absorbed}'.")
+            };
+            return json!({"success": true, "message": format!("Skill '{}' deleted.{note}", op.name)});
         }
         if !skill.dir.starts_with(self.root()) || skill.dir == self.root() {
             return err(format!(
@@ -956,6 +1176,9 @@ pub struct FileBase {
     pub file: String,
     /// [`fingerprint`] of the file then; `None`: it did not exist (for `SKILL.md`: the skill didn't).
     pub fingerprint: Option<String>,
+    /// The repository the skill is looked up in (see [`SkillOp::project`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<PathBuf>,
 }
 
 /// What staging a skill write needs: the diff the user reviews and the bases it was made against.
@@ -1017,6 +1240,8 @@ struct Planner<'a> {
     created: std::collections::HashSet<String>,
     bases: Vec<FileBase>,
     diff: String,
+    /// The repository of the op being planned (see [`SkillOp::project`]).
+    project: Option<PathBuf>,
 }
 
 impl Planner<'_> {
@@ -1032,11 +1257,16 @@ impl Planner<'_> {
             self.files.insert(key, None);
             return Ok(None);
         }
-        let Some(entry) = self.store.find_any(skill) else {
+        let Some(entry) = self.store.find_any_for(self.project.as_deref(), skill) else {
             return Err(format!(
                 "Skill '{skill}' not found. Use skills_list to see the available skills."
             ));
         };
+        if entry.is_project() && entry.external {
+            return Err(format!(
+                "Skill '{skill}' is in a read-only project folder; it is not changed. Create a skill with the same name in the project's .agents/skills folder to customize it."
+            ));
+        }
         // Pinned on the bytes, as `check_bases` reads them (a file that isn't UTF-8 is still a
         // file: it must not look absent and be shown as new).
         let bytes = std::fs::read(entry.dir.join(file)).ok();
@@ -1047,6 +1277,7 @@ impl Planner<'_> {
             skill: skill.to_string(),
             file: file.to_string(),
             fingerprint: bytes.as_deref().map(fingerprint),
+            project: self.project.clone(),
         });
         self.files.insert(key, text.clone());
         Ok(text)
@@ -1081,6 +1312,7 @@ impl Planner<'_> {
     }
 
     fn step(&mut self, op: &SkillOp) -> Result<(), String> {
+        self.project = op.project.clone();
         let content = op.content.as_deref().unwrap_or_default();
         match op.action.as_str() {
             "create" => {
@@ -1091,8 +1323,13 @@ impl Planner<'_> {
                 {
                     return Err(e);
                 }
-                if self.store.find_any(&op.name).is_some() {
+                if self.store.clash_for_create(op).is_some() {
                     return Err(format!("A skill named '{}' already exists.", op.name));
+                }
+                if op.scope == SkillScope::Project
+                    && !op.project.as_deref().is_some_and(project_skills::is_root)
+                {
+                    return Err("This session is not inside a git repository, so there is no project to keep a skill in.".into());
                 }
                 if let Some(e) = description_budget_error(content, None) {
                     return Err(e);
@@ -1105,6 +1342,7 @@ impl Planner<'_> {
                     skill: op.name.clone(),
                     file: "SKILL.md".into(),
                     fingerprint: None,
+                    project: op.project.clone(),
                 });
                 let place = match op
                     .category
@@ -1114,6 +1352,11 @@ impl Planner<'_> {
                 {
                     Some(category) => format!("{category}/{}", op.name),
                     None => op.name.clone(),
+                };
+                let place = if op.scope == SkillScope::Project {
+                    format!("{} (project skill, in .agents/skills)", place)
+                } else {
+                    place
                 };
                 self.diff.push_str(&format!("# new skill {place}\n"));
                 self.created.insert(op.name.clone());
@@ -1199,7 +1442,11 @@ impl Planner<'_> {
                 };
                 let absorbed = op.absorbed_into.as_deref().map(str::trim).unwrap_or("");
                 if !absorbed.is_empty()
-                    && (absorbed == op.name || self.store.find_any(absorbed).is_none())
+                    && (absorbed == op.name
+                        || self
+                            .store
+                            .find_any_for(self.project.as_deref(), absorbed)
+                            .is_none())
                 {
                     return Err(format!(
                         "absorbed_into='{absorbed}' must be another skill that exists."
@@ -1231,6 +1478,7 @@ impl SkillStore {
             created: Default::default(),
             bases: Vec::new(),
             diff: String::new(),
+            project: None,
         };
         for (i, op) in ops.iter().enumerate() {
             planner.step(op).map_err(|e| {
@@ -1250,7 +1498,7 @@ impl SkillStore {
     fn check_bases(&self, bases: &[FileBase]) -> Result<(), StagedSkillError> {
         let stale = |message: String| Err(StagedSkillError::Stale(message));
         for base in bases {
-            let entry = self.find_any(&base.skill);
+            let entry = self.find_any_for(base.project.as_deref(), &base.skill);
             if base.file == "SKILL.md" && base.fingerprint.is_none() {
                 if entry.is_some() {
                     return stale(format!(

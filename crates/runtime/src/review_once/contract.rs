@@ -29,7 +29,7 @@ pub const MAX_PATCH: usize = hermes_tools::skill_manage::MAX_SKILL_CONTENT_CHARS
 pub const MAX_REPLY_BYTES: usize = 512 * 1024;
 
 const MEMORY_FIELDS: [&str; 5] = ["op", "target", "old", "text", "why"];
-const SKILL_FIELDS: [&str; 4] = ["op", "name", "patch", "why"];
+const SKILL_FIELDS: [&str; 5] = ["op", "name", "patch", "scope", "why"];
 
 /// A memory operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +85,9 @@ pub struct SkillChange {
     pub name: String,
     /// A unified diff or a whole SKILL.md.
     pub patch: String,
+    /// Where a `create` puts the skill (the reply's `scope`); `None`: the reply didn't say, and
+    /// the review picks by the evidence (`review_once::evidence_scope`). Always `None` for a patch.
+    pub scope: Option<hermes_tools::skill_manage::SkillScope>,
     pub why: String,
 }
 
@@ -148,6 +151,7 @@ pub fn schema() -> Value {
                         "op": {"type": "string", "enum": ["create", "patch", "none"]},
                         "name": nullable,
                         "patch": nullable,
+                        "scope": {"type": ["string", "null"], "enum": ["global", "project", null]},
                         "why": {"type": "string"}
                     }
                 }
@@ -367,11 +371,20 @@ fn skill_change(index: usize, item: &Value) -> Result<Option<SkillChange>, Strin
     }
     let patch = text_field(object, "patch", MAX_PATCH)?.ok_or("'patch' is missing")?;
     let why = text_field(object, "why", MAX_WHY)?.unwrap_or_default();
+    // A reply from before `scope` existed has none (null is "decide for me"). Only a create has
+    // a place to choose: on a patch the field is ignored.
+    let scope = match (text_field(object, "scope", 20)?.as_deref(), action) {
+        (_, SkillAction::Patch) | (None, _) => None,
+        (Some("global"), _) => Some(hermes_tools::skill_manage::SkillScope::Global),
+        (Some("project"), _) => Some(hermes_tools::skill_manage::SkillScope::Project),
+        (Some(other), _) => return Err(format!("unknown scope '{}'", cut(other, 20))),
+    };
     Ok(Some(SkillChange {
         index,
         action,
         name,
         patch,
+        scope,
         why,
     }))
 }
@@ -469,6 +482,33 @@ mod tests {
         let why = "w".repeat(MAX_WHY + 1);
         let parsed = parse(&json!({"memory": [{"op": "add", "target": "memory", "old": null, "text": "x", "why": why}]}).to_string()).unwrap();
         assert!(parsed.memory.is_empty() && parsed.rejected.len() == 1);
+    }
+
+    #[test]
+    fn a_skills_scope_is_global_project_or_left_to_the_review() {
+        use hermes_tools::skill_manage::SkillScope;
+        let item = |op: &str, scope: Value| {
+            json!({"op": op, "name": "deploy", "patch": "body", "scope": scope, "why": ""})
+        };
+        let reply = |items: Vec<Value>| json!({"memory": [], "skills": items}).to_string();
+        let one = |op: &str, scope: Value| {
+            let parsed = parse(&reply(vec![item(op, scope)])).unwrap();
+            assert!(parsed.rejected.is_empty(), "{:?}", parsed.rejected);
+            parsed.skills[0].scope
+        };
+        assert_eq!(one("create", json!("project")), Some(SkillScope::Project));
+        assert_eq!(one("create", json!("global")), Some(SkillScope::Global));
+        assert_eq!(one("create", Value::Null), None);
+        // A patch has no place to choose: the field is ignored.
+        assert_eq!(one("patch", json!("project")), None);
+        // Replies from before the field existed still read.
+        let old = json!({"memory": [], "skills": [{"op": "create", "name": "deploy", "patch": "b", "why": ""}]});
+        assert_eq!(parse(&old.to_string()).unwrap().skills[0].scope, None);
+        // Anything else is refused alone.
+        for bad in [json!("everywhere"), json!(3), json!("PROJECT")] {
+            let parsed = parse(&reply(vec![item("create", bad)])).unwrap();
+            assert!(parsed.skills.is_empty() && parsed.rejected.len() == 1, "{parsed:?}");
+        }
     }
 
     #[test]

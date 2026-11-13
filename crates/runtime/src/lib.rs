@@ -728,6 +728,19 @@ impl Runtime {
             .build(provider, model, context_length, cwd, with_memory)
     }
 
+    /// The curator's prompt: no memory, and no repository's skills (see `curator.rs`).
+    fn curator_system_prompt(
+        &self,
+        provider: &str,
+        model: &str,
+        context_length: Option<usize>,
+        cwd: &Path,
+    ) -> Result<String> {
+        let mut source = self.prompt_source(self.budget());
+        source.project_skills = false;
+        source.build(provider, model, context_length, cwd, false)
+    }
+
     /// Builds a throwaway system prompt on a background thread, so what's set up on first use
     /// (the threat-scan patterns, the skills index) is ready before the first new session.
     pub fn warm_up(&self) {
@@ -749,6 +762,7 @@ impl Runtime {
             store: self.store.clone(),
             memory: self.memory.clone(),
             skills: self.skills.clone(),
+            project_skills: true,
             budget,
         }
     }
@@ -1393,6 +1407,9 @@ impl Runtime {
                                         conversation.messages(),
                                     ),
                                     project: hermes_tools::index::project_name(&cwd),
+                                    // This session's repository: its skills join the user's
+                                    // own in the search, no other repository's.
+                                    project_root: session.tools.project_root(),
                                 },
                                 preinject::already_attached(conversation.messages()),
                             )
@@ -1402,10 +1419,20 @@ impl Runtime {
                             budget.skills_preload as usize,
                             budget.memory_preload as usize,
                         );
-                        tokio::select! {
+                        let block = tokio::select! {
                             block = preinject::retrieve(index, query, limits, attached) => block,
                             _ = turn_cancel.cancelled() => None,
+                        };
+                        // A repository's skill put in front of the model is text its author
+                        // wrote: the session turns careful (`project_skills.rs`).
+                        if let Some(name) = block.as_ref().and_then(|b| b.project_skills.first()) {
+                            runtime
+                                .session
+                                .tools
+                                .mark_tainted(hermes_tools::taint::project_skill_source(name))
+                                .await;
                         }
+                        block
                     }
                     None => None,
                 };
@@ -2554,6 +2581,8 @@ struct PromptSource {
     store: Arc<Store>,
     memory: Arc<MemoryStore>,
     skills: Arc<SkillStore>,
+    /// Whether the skills block includes the folder's repository's skills (not for the curator).
+    project_skills: bool,
     /// The knobs when this source was made: a new session's prompt takes its budget wording
     /// and skills block from them, and keeps them (the prompt is frozen).
     budget: budget::BudgetKnobs,
@@ -2571,11 +2600,21 @@ impl PromptSource {
         let home = dirs::home_dir().context("no home directory")?;
         let soul = std::fs::read_to_string(self.data_dir.join("SOUL.md")).ok();
         let tool_names = SessionTools::tool_names();
-        let skills_index = self.skills.index_prompt_with(match self.budget.skills_index {
-            budget::SkillsIndex::Full => hermes_tools::IndexStyle::Full,
-            budget::SkillsIndex::CategoriesAndRetrieval => hermes_tools::IndexStyle::Categories,
-            budget::SkillsIndex::NamesOnly => hermes_tools::IndexStyle::Names,
-        });
+        // The skills of the repository `cwd` is in (and only that one's) join the user's own;
+        // known when the prompt is made, kept by it (the prompt is frozen: a later change of the
+        // session's folder doesn't rewrite it, it changes what the tools and the index see).
+        let project = self
+            .project_skills
+            .then(|| hermes_tools::project_skills::find_root(cwd))
+            .flatten();
+        let skills_index = self.skills.index_prompt_for(
+            match self.budget.skills_index {
+                budget::SkillsIndex::Full => hermes_tools::IndexStyle::Full,
+                budget::SkillsIndex::CategoriesAndRetrieval => hermes_tools::IndexStyle::Categories,
+                budget::SkillsIndex::NamesOnly => hermes_tools::IndexStyle::Names,
+            },
+            project.as_deref(),
+        );
         // Memory as it is now; writes during the session don't change this prompt.
         let snapshot = self.memory.snapshot();
         let memory = [snapshot.memory, snapshot.user]

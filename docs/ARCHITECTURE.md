@@ -306,6 +306,40 @@ API keys are in Windows Credential Manager (`keyring`), never in a file.
 - Long work started from an RPC (a turn, a background job) is `tokio::spawn`ed; the RPC answers at
   once and progress arrives as events.
 
+## Project skills (Phase 8 CP8.2)
+
+`tools/src/project_skills.rs` has the rules (read its module doc); the wiring is:
+
+- **Which repository** (`find_root`): the real working folder, then the nearest folder above it with
+  `.git`; no repository (or the home folder) means no project skills. `SessionTools::new` takes it
+  from the session's folder once (`SessionTools::project_root`); the shell's `cd` doesn't change it,
+  a subagent copies its parent's (`inherit_project`, in `delegate.rs`), the curator has none
+  (`without_project`). The system prompt (`PromptSource::build`) is built for the folder the session
+  has then and is frozen as usual: a model switch or a compaction rebuilds it for the repository
+  the session is in then, a workspace move doesn't, and the tools and the index always follow the
+  session's *current* repository.
+- **What reads it, and only for its own repository**: `SkillStore::*_for(project, ..)` (catalog,
+  `find`, `find_any`, `skills_list`, `skill_view`, the index prompt) take the root; the plain
+  methods (the Skills screen, the curator, slash commands, bundles, the agentic review's tools) are
+  the user's library only. The local index tags rows with a scope and a query names its repository
+  (`IndexQuery::project_root`; preinject and the review's related-skills lookup both pass the
+  session's). Preinject re-reads a project skill's file through `project_skills::read_skill_md` and
+  labels it `scope="project"`.
+- **What writes it**: `SkillOp.project` (the session's root, set by `SessionTools` and the review
+  from the session, cleared from a model's call) says where names are looked up; `SkillOp.scope` is
+  `project` only from the evidence review (`review_once/apply.rs`), never from a model's
+  `skill_manage` call. `create` with scope project lands in `<root>/.agents/skills/[category/]name`
+  (`write_dir_usable` refuses a non-folder or a link in the path; a refused create removes the
+  folders it made); every other action on a project skill works on `.agents/skills` only and
+  re-checks that the target resolves inside the skill's folder. Not committed to any git history, not
+  in `.usage.json`. A tainted session's project writes stage like any other (the staged op carries
+  the root; `FileBase.project` too).
+- **Taint**: a project skill's text reaching the model (`skill_view`, `skills_list` does not count;
+  the index attaching it) marks the session tainted (`taint::project_skill_source`).
+- **The review's scope**: the reply's `scope` (`global` | `project` | null) is validated in
+  `contract.rs`; null means `review_once::evidence_scope` (project when the session's file tools
+  and terminal `workdir`s only touched that repository, global otherwise, scratch output ignored).
+
 ## Skill outcomes and provenance (Phase 8 CP8.1)
 
 - **Outcomes** (`runtime/src/skill_outcomes.rs`, `tools/src/curator.rs`). A skill's record in

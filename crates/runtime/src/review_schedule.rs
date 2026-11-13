@@ -151,6 +151,9 @@ struct View {
     model: String,
     cwd: PathBuf,
     taint: Taint,
+    /// The repository the session works in (its tools' project, or the one its stored folder is
+    /// in): whose skills the review may read and write besides the user's own.
+    project: Option<PathBuf>,
 }
 
 impl Env {
@@ -172,6 +175,7 @@ impl Env {
                 model,
                 cwd: open.tools.cwd(),
                 taint: open.tools.taint(),
+                project: open.tools.project_root(),
             });
         }
         // Closed (switched away, or after a restart): what the store and the taint file say.
@@ -192,10 +196,12 @@ impl Env {
                     sources,
                 })
                 .unwrap_or_default();
+            let cwd = PathBuf::from(record.cwd);
             Ok(View {
                 messages,
                 model: record.model,
-                cwd: PathBuf::from(record.cwd),
+                project: hermes_tools::project_skills::find_root(&cwd),
+                cwd,
                 taint,
             })
         })
@@ -257,14 +263,32 @@ impl Env {
             message: review_once::topic(&view.messages, &evidence),
             last_assistant: None,
             project: hermes_tools::index::project_name(&view.cwd),
+            project_root: view.project.clone(),
         };
         let (memory, skills, index) =
             (self.memory.clone(), self.skills.clone(), self.index.clone());
         let messages = view.messages;
-        let input = tokio::task::spawn_blocking(move || {
-            review_once::gather(&messages, &memory, &skills, index.as_deref(), query)
+        let (cwd, project, scratch) = (
+            view.cwd.clone(),
+            view.project.clone(),
+            self.data_dir.join("scratch"),
+        );
+        // Both resolve paths and read files: off the async workers.
+        let (input, default_scope) = tokio::task::spawn_blocking(move || {
+            let scope =
+                review_once::evidence_scope(&messages, &cwd, project.as_deref(), &scratch);
+            let input = review_once::gather(&messages, &memory, &skills, index.as_deref(), query);
+            (input, scope)
         })
         .await?;
+        // A project skill in the packet (loaded, or found by the related-skills lookup) is the
+        // repository's text going to a model that can write: held like a tainted session's.
+        let packet_project_skill = input
+            .loaded
+            .iter()
+            .chain(&input.related)
+            .find(|skill| skill.project)
+            .map(|skill| hermes_tools::taint::project_skill_source(&skill.name));
         // A session that read something the user didn't write may carry an injection into the
         // evidence: everything it would write waits for the user (Phase 6).
         let hold = if view.taint.is_tainted() {
@@ -274,6 +298,11 @@ impl Env {
                     .reason()
                     .unwrap_or_else(|| "this session read untrusted content".into()),
                 sources: view.taint.sources.clone(),
+            })
+        } else if let Some(source) = packet_project_skill {
+            Some(review_once::Hold {
+                reason: format!("the review read {source}"),
+                sources: vec![source],
             })
         } else if settings.require_approval {
             Some(review_once::Hold {
@@ -300,6 +329,8 @@ impl Env {
                 session_id: session_id.to_string(),
                 hold,
                 shown: Default::default(),
+                project: view.project.clone(),
+                default_scope,
             },
             store: self.store.clone(),
         };

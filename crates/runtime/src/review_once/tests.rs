@@ -53,6 +53,7 @@ fn skill_text(name: &str, text: &str) -> SkillText {
         name: name.into(),
         text: text.into(),
         fingerprint: hermes_tools::skill_manage::fingerprint(text.as_bytes()),
+        project: false,
     }
 }
 
@@ -72,6 +73,7 @@ fn golden_input() -> PacketInput {
         text: "BLOCKED: User denied this command.".into(),
     });
     PacketInput {
+        project: None,
         signals: vec![
             correction(1, 1.75, "No, use pnpm instead."),
             signal(
@@ -191,6 +193,7 @@ fn big_input() -> PacketInput {
             .collect()
     };
     PacketInput {
+        project: None,
         signals,
         loaded: skills("used", 4),
         related: skills("related", 3),
@@ -275,6 +278,7 @@ fn the_packet_never_exceeds_its_budget() {
 fn a_cut_or_masked_skill_is_not_whole_and_the_budget_follows_the_window() {
     let secret = format!("{DEPLOY}\nToken: ghp_abcdefghijklmnopqrstuvwxyz0123\n");
     let input = PacketInput {
+        project: None,
         signals: vec![correction(1, 2.0, "No, use pnpm instead.")],
         loaded: vec![skill_text("masked", &secret)],
         related: vec![skill_text(
@@ -319,6 +323,7 @@ fn the_estimate_is_pessimistic_for_code_and_non_latin_text() {
     // 0.75.
     let cjk = "不要用npm，以后都用pnpm。".repeat(25); // ~400 characters: an excerpt's cap
     let input = PacketInput {
+        project: None,
         signals: (1..=6u64).map(|seq| correction(seq, 1.5, &cjk)).collect(),
         loaded: vec![skill_text(
             "deploy",
@@ -394,6 +399,102 @@ fn used_skills_come_from_views_injection_and_invocations_in_order() {
     assert_eq!(used_skills(&messages), vec!["deploy", "arxiv", "github"]);
 }
 
+// ---- project scope -------------------------------------------------------------------------
+
+fn tool_call(name: &str, args: serde_json::Value) -> Message {
+    use hermes_llm::conversation::message::Message as M;
+    M::assistant().with_tool_request(
+        format!("call_{name}"),
+        Ok(rmcp::model::CallToolRequestParams::new(name.to_string())
+            .with_arguments(args.as_object().cloned().unwrap_or_default())),
+    )
+}
+
+#[test]
+fn the_default_scope_is_project_only_when_every_file_is_in_the_one_repository() {
+    use hermes_tools::skill_manage::SkillScope::{Global, Project};
+    let dir = tempfile::tempdir().unwrap();
+    let root = hermes_tools::project_skills::canonical(dir.path()).unwrap();
+    std::fs::create_dir_all(root.join("repo/.git")).unwrap();
+    std::fs::create_dir_all(root.join("repo/src")).unwrap();
+    std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+    let repo = root.join("repo");
+    let scratch = root.join("data/scratch");
+    let scope = |calls: Vec<Message>, project: Option<&std::path::Path>| {
+        evidence_scope(&calls, &repo, project, &scratch)
+    };
+    let inside = tool_call("read_file", json!({"path": "src/main.rs"}));
+    let inside_abs = tool_call("write_file", json!({"path": repo.join("src/new.rs").display().to_string()}));
+    let outside = tool_call("read_file", json!({"path": root.join("elsewhere/x.txt").display().to_string()}));
+    let escaping = tool_call("read_file", json!({"path": "../elsewhere/x.txt"}));
+    let home = tool_call("read_file", json!({"path": "~/.ssh/config"}));
+    let in_scratch = tool_call("read_file", json!({"path": scratch.join("s1/out.txt").display().to_string()}));
+    let workdir = tool_call("terminal", json!({"command": "make", "workdir": repo.join("src").display().to_string()}));
+    let plain_cmd = tool_call("terminal", json!({"command": "make"}));
+    let search = tool_call("search_files", json!({"pattern": "TODO"}));
+    let other_tool = tool_call("todo_list", json!({}));
+    assert_eq!(scope(vec![inside.clone()], Some(&repo)), Project);
+    assert_eq!(scope(vec![inside.clone(), inside_abs, workdir, search], Some(&repo)), Project);
+    // A file elsewhere (absolute, by `..`, or `~`), or none at all: the user's own library.
+    assert_eq!(scope(vec![inside.clone(), outside], Some(&repo)), Global);
+    assert_eq!(scope(vec![inside.clone(), escaping], Some(&repo)), Global);
+    assert_eq!(scope(vec![inside.clone(), home], Some(&repo)), Global);
+    assert_eq!(scope(vec![plain_cmd, other_tool], Some(&repo)), Global);
+    assert_eq!(scope(vec![], Some(&repo)), Global);
+    // Saved tool output isn't a file the session worked on.
+    assert_eq!(scope(vec![inside.clone(), in_scratch], Some(&repo)), Project);
+    // No repository: never project.
+    assert_eq!(scope(vec![inside], None), Global);
+}
+
+#[test]
+fn a_project_create_is_applied_staged_or_refused_by_the_session() {
+    use hermes_tools::skill_manage::SkillScope;
+    let mut s = stores();
+    let root = hermes_tools::project_skills::canonical(s._dir.path()).unwrap().join("proj");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    s.ctx.project = Some(root.clone());
+    let create = |name: &str, scope: serde_json::Value| {
+        parse(json!({"memory": [], "skills": [{"op": "create", "name": name, "scope": scope, "why": "signal 1",
+            "patch": format!("---\nname: {name}\ndescription: Use when testing {name}.\n---\n# {name}\n\nSteps.\n")}]}))
+    };
+    // Said project: written to the repository, not the library.
+    let reports = apply::apply_all(&s.ctx, &create("proj-skill", json!("project")));
+    assert!(matches!(reports[0].result, OpResult::Applied(_)), "{reports:?}");
+    assert!(root.join(".agents/skills/proj-skill/SKILL.md").is_file());
+    assert!(s.ctx.skills.find_any("proj-skill").is_none());
+    // Said global: the library, even inside a repository.
+    let reports = apply::apply_all(&s.ctx, &create("lib-skill", json!("global")));
+    assert!(matches!(reports[0].result, OpResult::Applied(_)), "{reports:?}");
+    assert!(s.ctx.skills.find_any("lib-skill").is_some());
+    assert!(!root.join(".agents/skills/lib-skill").exists());
+    // Left to the review: the evidence's default.
+    s.ctx.default_scope = SkillScope::Project;
+    apply::apply_all(&s.ctx, &create("default-project", serde_json::Value::Null));
+    assert!(root.join(".agents/skills/default-project/SKILL.md").is_file());
+    s.ctx.default_scope = SkillScope::Global;
+    apply::apply_all(&s.ctx, &create("default-global", serde_json::Value::Null));
+    assert!(s.ctx.skills.find_any("default-global").is_some());
+    // A name already taken (by the user's library, or a project skill) is refused either way.
+    for (name, scope) in [("deploy", "project"), ("proj-skill", "project"), ("proj-skill", "global")] {
+        let reports = apply::apply_all(&s.ctx, &create(name, json!(scope)));
+        assert!(matches!(&reports[0].result, OpResult::Rejected(r) if r.contains("already exists")), "{name} {scope}: {reports:?}");
+    }
+    // Held: staged with the project root in it, nothing written until it is applied.
+    s.ctx.hold = Some(Hold { reason: "read a web page".into(), sources: vec!["a web page".into()] });
+    let reports = apply::apply_all(&s.ctx, &create("held-skill", json!("project")));
+    assert!(matches!(reports[0].result, OpResult::Staged(_)), "{reports:?}");
+    assert!(!root.join(".agents/skills/held-skill").exists());
+    // No repository: project is refused, global still works.
+    s.ctx.hold = None;
+    s.ctx.project = None;
+    let reports = apply::apply_all(&s.ctx, &create("lost-skill", json!("project")));
+    assert!(matches!(&reports[0].result, OpResult::Rejected(r) if r.contains("not in one")), "{reports:?}");
+    s.ctx.default_scope = SkillScope::Project;
+    let reports = apply::apply_all(&s.ctx, &create("still-global", serde_json::Value::Null));
+    assert!(matches!(&reports[0].result, OpResult::Rejected(_)), "a default of project with no repository is refused: {reports:?}");
+}
+
 // ---- apply ---------------------------------------------------------------------------------
 
 struct Stores {
@@ -428,7 +529,9 @@ fn stores() -> Stores {
                 fingerprint: hermes_tools::skill_manage::fingerprint(DEPLOY.as_bytes()),
             },
         )]
-        .into(),
+.into(),
+        project: None,
+        default_scope: hermes_tools::skill_manage::SkillScope::Global,
     };
     Stores { _dir: dir, ctx }
 }

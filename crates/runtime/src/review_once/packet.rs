@@ -68,6 +68,8 @@ pub struct SkillText {
     /// `skill_manage::fingerprint` of the file's bytes when read: a patch is applied only while
     /// the file is still what the model saw.
     pub fingerprint: String,
+    /// A skill of the session's repository (not the user's own library).
+    pub project: bool,
 }
 
 /// One memory file as the packet shows it.
@@ -83,6 +85,9 @@ pub struct MemoryFile {
 /// What a packet is built from.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PacketInput {
+    /// The repository the session works in (its folder's name), when it is in one: the review may
+    /// then keep a new skill in that repository.
+    pub project: Option<String>,
     /// The unreviewed signals (`SessionSignals::evidence`).
     pub signals: Vec<Signal>,
     /// Skills used in the session, in the order first used.
@@ -201,6 +206,12 @@ pub fn build(input: &PacketInput, budget_tokens: usize) -> Packet {
     ));
     let (signals_shown, signals_left_out) =
         write_signals(&mut w, &input.signals, share(SIGNALS_SHARE));
+    if let Some(project) = &input.project {
+        w.push(&format!(
+            "## Project\n\nThis session works in the repository \"{}\": a new skill may be kept there (scope \"project\"). Skills marked \"project skill\" below are that repository's.\n\n",
+            one_line(project, 80)
+        ));
+    }
     let mut skills = BTreeMap::new();
     if !input.loaded.is_empty() {
         w.push("## Skills used in this session\n\n");
@@ -357,15 +368,16 @@ fn write_skills(
         }
         let shown_chars = body.chars().count();
         let whole = shown_chars == total_chars && masked == skill.text;
+        let kind = if skill.project { "project skill, " } else { "" };
         let heading = if shown_chars == total_chars {
             if whole {
-                format!("### Skill {name} (shown whole)\n")
+                format!("### Skill {name} ({kind}shown whole)\n")
             } else {
-                format!("### Skill {name} (secrets masked: patch it with a diff only)\n")
+                format!("### Skill {name} ({kind}secrets masked: patch it with a diff only)\n")
             }
         } else {
             format!(
-                "### Skill {name} (cut: first {shown_chars} of {total_chars} characters; patch it with a diff only)\n"
+                "### Skill {name} ({kind}cut: first {shown_chars} of {total_chars} characters; patch it with a diff only)\n"
             )
         };
         if w.push(&format!("{heading}{open}{body}{close}")) {

@@ -1251,6 +1251,7 @@ mod tests {
             text: format!("<context>\n{}\n</context>", "skill text ".repeat(3_000)),
             skills: vec!["deploy".into()],
             memory: vec![],
+            project_skills: vec![],
         };
         let user = block.attach(Message::user().with_text("ship the release"));
         assert_eq!(serialize(&[user]), ["[USER]: ship the release"]);

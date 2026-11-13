@@ -33,8 +33,23 @@
 //!   `OR`. A quoted token can't be an operator (`NEAR`, `AND`, `*`, `:`, `-`, `(`).
 //!
 //! Disabled skills are indexed but left out of the results; disabled memory targets likewise.
+//!
+//! **Scopes (Phase 8, CP8.2).** Every skill row has a `scope`: `global` (the user's library and its
+//! external folders) or `project:<root>` (the skills of one repository, `project_skills.rs`). A
+//! query names the repository its session works in ([`IndexQuery::project_root`]) and the SQL
+//! only ever selects `scope IN ('global', <that scope>)`: another repository's rows are never
+//! read, let alone ranked. A repository is indexed once a query names it (it is remembered for
+//! the life of the process, 32 at most) and its files are re-checked, by `stat` only, at the start
+//! of each such query, so an edit made outside the app is seen at once. A project skill that
+//! fails the threat scan (or whose name the skill rules refuse) is remembered as not indexed. A
+//! name served from the user's library is never served from a repository (D5: the library wins,
+//! then `.agents/skills`, `.hermes/skills`, `.claude/skills`), and two repositories' skills of
+//! one name don't shadow each other. The version of the file is 3: an older `index.db` is dropped
+//! and rebuilt like any other schema change.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,10 +60,16 @@ use hermes_memory::{MemoryStore, Target};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::project_skills;
 use crate::skills::{self, SkillStore};
 
+/// The scope of the user's own skills.
+const GLOBAL: &str = "global";
+
 /// Bump to throw the old file away (the schema or the way text is indexed changed).
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+/// Repositories whose skills the index keeps (the least recently asked about go first).
+const MAX_PROJECTS: usize = 32;
 /// A file modified this recently is re-read even when its stat is unchanged (see the module doc).
 const RACY_NANOS: i64 = 2_000_000_000;
 /// The stored mtime of a file read inside the racy window: never equal to a real one, so the
@@ -90,6 +111,9 @@ pub struct IndexQuery {
     pub message: String,
     pub last_assistant: Option<String>,
     pub project: Option<String>,
+    /// The root of the repository the session works in (`project_skills::find_root`): the
+    /// skills of that repository are searched with the user's own, and no other repository's.
+    pub project_root: Option<PathBuf>,
 }
 
 /// How many hits, and how good they must be (a score is `-bm25`: higher is better).
@@ -127,6 +151,8 @@ pub struct SkillHit {
     /// The skill's `SKILL.md`.
     pub path: PathBuf,
     pub score: f64,
+    /// A project skill: the root of the repository it is from (the query's own).
+    pub project: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -153,6 +179,9 @@ pub struct LocalIndex {
     dirty: AtomicBool,
     /// The background refresher thread is alive.
     worker: AtomicBool,
+    /// Repositories a query has named, least recently asked about first, and the last `stat`
+    /// signature of each one's skill files (see [`Self::sync_project`]).
+    projects: Mutex<Vec<(PathBuf, u64)>>,
 }
 
 impl LocalIndex {
@@ -185,6 +214,7 @@ impl LocalIndex {
             memory,
             dirty: AtomicBool::new(true),
             worker: AtomicBool::new(false),
+            projects: Mutex::new(Vec::new()),
         }))
     }
 
@@ -206,14 +236,15 @@ impl LocalIndex {
         conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS skill_doc USING fts5(
                  name, category, description, body,
-                 path UNINDEXED, mtime UNINDEXED, hash UNINDEXED,
+                 path UNINDEXED, mtime UNINDEXED, hash UNINDEXED, scope UNINDEXED,
                  tokenize = 'porter unicode61');
              CREATE VIRTUAL TABLE IF NOT EXISTS memory_doc USING fts5(
                  id UNINDEXED, tier UNINDEXED, scope UNINDEXED, text, tags,
                  tokenize = 'porter unicode61');
              CREATE TABLE IF NOT EXISTS skill_files(
                  path TEXT PRIMARY KEY, doc INTEGER, mtime INTEGER NOT NULL, size INTEGER NOT NULL,
-                 hash TEXT NOT NULL, name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 0);
+                 hash TEXT NOT NULL, name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 0,
+                 scope TEXT NOT NULL DEFAULT 'global');
              CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -306,11 +337,13 @@ impl LocalIndex {
             hash: String,
             name: String,
             active: bool,
+            scope: String,
         }
         let mut existing: HashMap<String, Row> = HashMap::new();
         {
-            let mut stmt =
-                tx.prepare("SELECT path, doc, mtime, size, hash, name, active FROM skill_files")?;
+            let mut stmt = tx.prepare(
+                "SELECT path, doc, mtime, size, hash, name, active, scope FROM skill_files",
+            )?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -321,6 +354,7 @@ impl LocalIndex {
                         hash: r.get(4)?,
                         name: r.get(5)?,
                         active: r.get::<_, i64>(6)? != 0,
+                        scope: r.get(7)?,
                     },
                 ))
             })?;
@@ -331,12 +365,27 @@ impl LocalIndex {
         }
         let mut report = RefreshReport::default();
         let now = nanos(SystemTime::now());
-        // (path, name) of every indexed file in catalog priority order, and the current `active`.
-        let mut order: Vec<(String, String)> = Vec::new();
+        // (path, name, scope) of every indexed file in catalog priority order (the user's folders
+        // first, then each repository's), and the current `active`.
+        let mut order: Vec<(String, String, String)> = Vec::new();
         let mut active_now: HashMap<String, bool> = HashMap::new();
         let mut seen: HashSet<String> = HashSet::new();
+        // Where skills are read from: `(root for categories, read-only, scope, files)`.
+        let mut sources: Vec<(PathBuf, bool, String, Vec<PathBuf>)> = Vec::new();
         for (root, external) in self.skills.catalog_roots() {
-            for skill_md in skills::skill_files(&root) {
+            let files = skills::skill_files(&root);
+            sources.push((root, external, GLOBAL.to_string(), files));
+        }
+        let projects: Vec<PathBuf> = self.projects.lock().iter().map(|(p, _)| p.clone()).collect();
+        for project in projects.iter().filter(|p| project_skills::is_root(p)) {
+            for dir in project_skills::skill_dirs(project) {
+                let files = project_skills::skill_files(&dir.path);
+                sources.push((dir.path, dir.read_only, project_skills::scope_key(project), files));
+            }
+        }
+        for (root, external, scope, files) in sources {
+            let is_project = scope != GLOBAL;
+            for skill_md in files {
                 let key = skill_md.to_string_lossy().to_string();
                 if !seen.insert(key.clone()) {
                     continue;
@@ -353,7 +402,7 @@ impl LocalIndex {
                 let stored_mtime = if racy { SMUDGED_MTIME } else { mtime };
                 if let Some(r) = row.filter(|r| r.mtime == mtime && r.size == size && !racy) {
                     if r.doc.is_some() {
-                        order.push((key.clone(), r.name.clone()));
+                        order.push((key.clone(), r.name.clone(), r.scope.clone()));
                     }
                     active_now.insert(key, r.active);
                     continue;
@@ -364,7 +413,7 @@ impl LocalIndex {
                     match row {
                         Some(r) => {
                             if r.doc.is_some() {
-                                order.push((key.clone(), r.name.clone()));
+                                order.push((key.clone(), r.name.clone(), r.scope.clone()));
                             }
                             active_now.insert(key, r.active);
                         }
@@ -382,7 +431,7 @@ impl LocalIndex {
                         params![stored_mtime, size, key],
                     )?;
                     if r.doc.is_some() {
-                        order.push((key.clone(), r.name.clone()));
+                        order.push((key.clone(), r.name.clone(), r.scope.clone()));
                     }
                     active_now.insert(key, r.active);
                     continue;
@@ -397,9 +446,18 @@ impl LocalIndex {
                     report.added += 1;
                 }
                 // The catalog skips a SKILL.md that isn't UTF-8 (`read_to_string`): so does the index.
-                let entry = std::str::from_utf8(&bytes).ok().and_then(|text| {
-                    Some((text, skills::skill_entry(&root, external, &skill_md, text)?))
-                });
+                // A repository's skill also has to pass what the catalog asks of it (the threat
+                // scan, size, a valid name), or it is remembered as not indexed.
+                let entry = std::str::from_utf8(&bytes)
+                    .ok()
+                    .filter(|text| !is_project || project_skills::accept(text).is_ok())
+                    .and_then(|text| {
+                        Some((text, skills::skill_entry(&root, external, &skill_md, text)?))
+                    })
+                    .filter(|(_, entry)| {
+                        !is_project
+                            || crate::skill_manage::validate_skill_name(&entry.name).is_none()
+                    });
                 let (doc, name) = match entry {
                     Some((text, entry)) => {
                         let body: String = skills::parse_frontmatter(text)
@@ -408,8 +466,8 @@ impl LocalIndex {
                             .take(MAX_BODY_CHARS)
                             .collect();
                         tx.execute(
-                            "INSERT INTO skill_doc(name, category, description, body, path, mtime, hash)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            "INSERT INTO skill_doc(name, category, description, body, path, mtime, hash, scope)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                             params![
                                 entry.name,
                                 // As is: `/` is a separator to the tokenizer, so each folder is a word.
@@ -418,21 +476,22 @@ impl LocalIndex {
                                 body,
                                 key,
                                 mtime,
-                                digest
+                                digest,
+                                scope
                             ],
                         )?;
-                        order.push((key.clone(), entry.name.clone()));
+                        order.push((key.clone(), entry.name.clone(), scope.clone()));
                         (Some(tx.last_insert_rowid()), entry.name)
                     }
                     // Not for Windows: remembered so it isn't re-read on every refresh.
                     None => (None, String::new()),
                 };
                 tx.execute(
-                    "INSERT INTO skill_files(path, doc, mtime, size, hash, name, active)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+                    "INSERT INTO skill_files(path, doc, mtime, size, hash, name, active, scope)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
                      ON CONFLICT(path) DO UPDATE SET doc = ?2, mtime = ?3, size = ?4, hash = ?5,
-                                                     name = ?6, active = 0",
-                    params![key, doc, stored_mtime, size, digest, name],
+                                                     name = ?6, active = 0, scope = ?7",
+                    params![key, doc, stored_mtime, size, digest, name, scope],
                 )?;
                 active_now.insert(key, false);
             }
@@ -447,10 +506,20 @@ impl LocalIndex {
                 report.removed += 1;
             }
         }
-        // The first copy of a name (catalog order) is the one served.
+        // The first copy of a name (catalog order) is the one served. The user's own skills are
+        // first, so a repository can't take a name from them; each repository has its own names.
         let mut names = HashSet::new();
-        for (path, name) in &order {
-            let want = names.insert(name.clone());
+        let mut project_names: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for (path, name, scope) in &order {
+            let want = if scope == GLOBAL {
+                names.insert(name.clone())
+            } else {
+                !names.contains(name)
+                    && project_names
+                        .entry(scope)
+                        .or_default()
+                        .insert(name.as_str())
+            };
             if active_now.get(path).copied() != Some(want) {
                 tx.execute(
                     "UPDATE skill_files SET active = ?1 WHERE path = ?2",
@@ -506,6 +575,15 @@ impl LocalIndex {
     /// Empty when the query has no usable words. A refresh that fails is logged and the query
     /// answers from the index as it is (better a stale hit than no context at all).
     pub fn query(&self, query: &IndexQuery, limits: &Limits) -> Result<Retrieval> {
+        let scope = query
+            .project_root
+            .as_deref()
+            .map(|root| {
+                self.sync_project(root);
+                project_skills::scope_key(root)
+            })
+            // Matches no row: a session outside a repository sees the user's skills only.
+            .unwrap_or_else(|| GLOBAL.to_string());
         if self.dirty.load(Ordering::SeqCst)
             && let Err(e) = self.refresh()
         {
@@ -523,23 +601,24 @@ impl LocalIndex {
             // weighs little: a word that only occurs in a long text is weak evidence.
             let mut stmt = conn.prepare_cached(
                 "SELECT name, category, description, path,
-                        -bm25(skill_doc, 10.0, 2.0, 6.0, 0.3, 0.0, 0.0, 0.0)
-                 FROM skill_doc WHERE skill_doc MATCH ?1
-                 ORDER BY bm25(skill_doc, 10.0, 2.0, 6.0, 0.3, 0.0, 0.0, 0.0) LIMIT ?2",
+                        -bm25(skill_doc, 10.0, 2.0, 6.0, 0.3, 0.0, 0.0, 0.0, 0.0), scope
+                 FROM skill_doc WHERE skill_doc MATCH ?1 AND scope IN ('global', ?3)
+                 ORDER BY bm25(skill_doc, 10.0, 2.0, 6.0, 0.3, 0.0, 0.0, 0.0, 0.0) LIMIT ?2",
             )?;
             let mut active =
                 conn.prepare_cached("SELECT active FROM skill_files WHERE path = ?1")?;
-            let rows = stmt.query_map(params![expr, (limits.skills * 4 + 8) as i64], |r| {
+            let rows = stmt.query_map(params![expr, (limits.skills * 4 + 8) as i64, scope], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, f64>(4)?,
+                    r.get::<_, String>(5)?,
                 ))
             })?;
             for row in rows {
-                let (name, category, description, path, score) = row?;
+                let (name, category, description, path, score, row_scope) = row?;
                 if score < limits.min_skill_score {
                     break;
                 }
@@ -567,6 +646,10 @@ impl LocalIndex {
                     description,
                     path: PathBuf::from(path),
                     score,
+                    // The scope filter above lets only this query's repository through.
+                    project: (row_scope != GLOBAL)
+                        .then(|| query.project_root.clone())
+                        .flatten(),
                 });
                 if out.skills.len() >= limits.skills {
                     break;
@@ -618,6 +701,41 @@ impl LocalIndex {
     ) -> Result<Retrieval> {
         let this = self.clone();
         tokio::task::spawn_blocking(move || this.query(&query, &limits)).await?
+    }
+
+    /// Remembers that a query named the repository at `root` and, when the `stat` signature of its
+    /// skill files is not the one seen last, marks the index dirty (the query refreshes). Bounded:
+    /// at most 3 folders, [`project_skills::skill_files`]'s caps.
+    fn sync_project(&self, root: &Path) {
+        let mut signature = DefaultHasher::new();
+        if project_skills::is_root(root) {
+            for dir in project_skills::skill_dirs(root) {
+                for file in project_skills::skill_files(&dir.path) {
+                    if let Ok(meta) = std::fs::metadata(&file) {
+                        (file, meta.len(), meta.modified().ok()).hash(&mut signature);
+                    }
+                }
+            }
+        }
+        let signature = signature.finish();
+        let mut projects = self.projects.lock();
+        match projects.iter().position(|(known, _)| known == root) {
+            Some(i) => {
+                let mut entry = projects.remove(i);
+                if entry.1 != signature {
+                    entry.1 = signature;
+                    self.dirty.store(true, Ordering::SeqCst);
+                }
+                projects.push(entry);
+            }
+            None => {
+                projects.push((root.to_path_buf(), signature));
+                if projects.len() > MAX_PROJECTS {
+                    projects.remove(0);
+                }
+                self.dirty.store(true, Ordering::SeqCst);
+            }
+        }
     }
 
     /// Indexed skills (one per file; a name shadowed by an earlier copy is counted too).
@@ -1642,6 +1760,7 @@ pub(super) mod tests {
                         message: "git".into(),
                         last_assistant: Some((*text).into()),
                         project: Some((*text).into()),
+                        ..Default::default()
                     },
                     &limits,
                 )
@@ -1699,6 +1818,7 @@ pub(super) mod tests {
             message: long.clone(),
             last_assistant: Some(long.clone()),
             project: Some(long),
+            ..Default::default()
         });
         assert!(tokens.len() <= MESSAGE_TOKENS + ASSISTANT_TOKENS + PROJECT_TOKENS);
         assert!(tokens.iter().all(|t| t.chars().count() <= MAX_TOKEN_CHARS));
@@ -1707,6 +1827,7 @@ pub(super) mod tests {
             message: "hello".into(),
             last_assistant: Some(format!("{} tailword", "x ".repeat(300))),
             project: None,
+            ..Default::default()
         });
         assert!(!tokens.contains(&"tailword".to_string()));
     }

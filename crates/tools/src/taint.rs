@@ -175,6 +175,15 @@ pub fn reference_source(pages: &crate::references::FetchedPages) -> Option<Strin
         .then(|| "a web page (@url reference)".to_string())
 }
 
+/// A skill from the session's repository that was put in front of the model (`skill_view`, or
+/// attached to a message by the local index). Its author is whoever wrote the repository, not
+/// necessarily the user (a cloned repository can carry anything), so the session turns careful.
+/// The name is a validated skill name; it is kept short all the same.
+pub fn project_skill_source(name: &str) -> String {
+    let name: String = name.chars().filter(|c| !c.is_control()).take(40).collect();
+    format!("a project skill ({name})")
+}
+
 /// What a parent learns from a subagent that read untrusted content.
 pub fn child_source(source: &str) -> String {
     format!("a subagent that read {source}")

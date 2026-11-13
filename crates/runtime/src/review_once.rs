@@ -45,6 +45,7 @@ mod udiff;
 mod tests;
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
 use hermes_llm::base::Provider;
@@ -482,16 +483,117 @@ pub fn topic(messages: &[Message], evidence: &[Signal]) -> String {
     parts.join("\n").chars().take(2_000).collect()
 }
 
-fn read_skill(skills: &SkillStore, name: &str) -> Option<SkillText> {
-    let entry = skills.find_any(name)?;
-    let bytes = std::fs::read(entry.skill_md()).ok()?;
+/// A skill the review may read: the user's own, or the session's repository's (`project`), and
+/// no other repository's. A repository's is read the way the catalog reads it (a plain file, the
+/// threat scan), since the packet goes to a model that can write.
+fn read_skill(skills: &SkillStore, project: Option<&Path>, name: &str) -> Option<SkillText> {
+    let entry = skills.find_any_for(project, name)?;
+    let bytes = if entry.is_project() {
+        hermes_tools::project_skills::read_skill_md(&entry.skill_md())
+            .ok()?
+            .into_bytes()
+    } else {
+        std::fs::read(entry.skill_md()).ok()?
+    };
     let fingerprint = hermes_tools::skill_manage::fingerprint(&bytes);
     let text = String::from_utf8(bytes).ok()?;
     Some(SkillText {
         name: entry.name,
         text,
         fingerprint,
+        project: entry.project.is_some(),
     })
+}
+
+/// Where a new skill goes when the review's reply doesn't say: the session's repository when the
+/// evidence only involves files of that one repository, the user's own library otherwise (no
+/// file at all, a file somewhere else, no repository). The files are the paths of the session's
+/// file tools (`read_file`, `write_file`, `patch`, `search_files`) and the working folder of its
+/// terminal commands; relative paths are the session's working folder `cwd`; the scratch folder
+/// (where long tool output is saved) doesn't count.
+pub fn evidence_scope(
+    messages: &[Message],
+    cwd: &Path,
+    project: Option<&Path>,
+    scratch_root: &Path,
+) -> hermes_tools::skill_manage::SkillScope {
+    use hermes_tools::project_skills as ps;
+    use hermes_tools::skill_manage::SkillScope;
+    let Some(root) = project else {
+        return SkillScope::Global;
+    };
+    let (mut inside, mut outside) = (0usize, 0usize);
+    for message in messages {
+        for request in message
+            .content
+            .iter()
+            .filter_map(MessageContent::as_tool_request)
+        {
+            let Ok(call) = &request.tool_call else {
+                continue;
+            };
+            let args = call.arguments.clone().unwrap_or_default();
+            let path = match call.name.as_ref() {
+                "read_file" | "write_file" | "patch" => args.get("path"),
+                "search_files" => Some(args.get("path").unwrap_or(&Value::Null)),
+                "terminal" => args.get("workdir"),
+                _ => continue,
+            };
+            let text = match path {
+                Some(Value::String(text)) if !text.trim().is_empty() => text.trim(),
+                Some(Value::Null) | None if call.name == "search_files" => ".",
+                _ => continue,
+            };
+            if text.starts_with('~') {
+                outside += 1;
+                continue;
+            }
+            let joined = {
+                let path = Path::new(text);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    cwd.join(path)
+                }
+            };
+            // The nearest part that exists, resolved, then the rest as written (`..` folded).
+            let mut probe = joined.clone();
+            let mut tail = Vec::new();
+            let real = loop {
+                if let Some(real) = ps::canonical(&probe) {
+                    break Some(real);
+                }
+                match probe.file_name().map(std::ffi::OsStr::to_owned) {
+                    Some(name) if probe.pop() => tail.push(name),
+                    _ => break None,
+                }
+            };
+            let Some(mut real) = real else {
+                outside += 1;
+                continue;
+            };
+            for part in tail.iter().rev() {
+                if part == ".." {
+                    real.pop();
+                } else if part != "." {
+                    real.push(part);
+                }
+            }
+            if ps::within(&real, scratch_root) {
+                continue;
+            }
+            if ps::within(&real, root) {
+                inside += 1;
+            } else {
+                outside += 1;
+            }
+        }
+    }
+    if inside > 0 && outside == 0 {
+        SkillScope::Project
+    } else {
+        SkillScope::Global
+    }
 }
 
 /// The packet's skills and memory, read from disk and the index. Blocking.
@@ -502,9 +604,12 @@ pub(crate) fn gather(
     index: Option<&LocalIndex>,
     query: IndexQuery,
 ) -> PacketInput {
+    // The skills in reach are the user's own and the session's repository's: the query carries
+    // that repository (`IndexQuery::project_root`), and so does every read below.
+    let project = query.project_root.clone();
     let loaded: Vec<SkillText> = used_skills(messages)
         .iter()
-        .filter_map(|name| read_skill(skills, name))
+        .filter_map(|name| read_skill(skills, project.as_deref(), name))
         .collect();
     let mut related = Vec::new();
     if let Some(index) = index {
@@ -519,7 +624,7 @@ pub(crate) fn gather(
                     .skills
                     .iter()
                     .filter(|hit| !loaded.iter().any(|s| s.name == hit.name))
-                    .filter_map(|hit| read_skill(skills, &hit.name))
+                    .filter_map(|hit| read_skill(skills, project.as_deref(), &hit.name))
                     .take(packet::RELATED_SKILLS)
                     .collect();
             }
@@ -536,6 +641,10 @@ pub(crate) fn gather(
         })
         .collect();
     PacketInput {
+        project: project.as_deref().and_then(|root| {
+            root.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        }),
         signals: Vec::new(),
         loaded,
         related,

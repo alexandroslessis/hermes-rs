@@ -228,7 +228,7 @@ pub fn review_message(memory: bool, skills: bool, focus: Option<&str>) -> String
 /// What the evidence review returns, as the JSON-in-text contract states it.
 const EVIDENCE_REVIEW_SHAPE: &str = "{\"memory\": [{\"op\": \"add|replace|remove\", \"target\": \
 \"memory|user\", \"old\": \"...\", \"text\": \"...\", \"why\": \"...\"}], \"skills\": [{\"op\": \
-\"create|patch|none\", \"name\": \"...\", \"patch\": \"...\", \"why\": \"...\"}]}";
+\"create|patch|none\", \"name\": \"...\", \"patch\": \"...\", \"scope\": \"global|project\", \"why\": \"...\"}]}";
 
 /// The evidence review's system prompt. `memory` / `user`: whether MEMORY.md / USER.md take
 /// writes; `json_schema`: the request carries a `response_format` schema (else the reply format
@@ -288,7 +288,14 @@ instead be the complete new SKILL.md. Prefer patching a skill in the packet over
 with a letter or digit; at most 64 characters; never a PR number, an error string or a one-off \
 task); `patch` is the complete SKILL.md, starting with front matter:\n\
 ---\nname: <name>\ndescription: <when to use it, one sentence>\n---\n  \
-• none: nothing to change (`name` and `patch` null).\n\n\
+• none: nothing to change (`name` and `patch` null).\n\
+`scope` (only for create; null otherwise) says where a new skill is kept: \"global\" is the user's \
+own library, used in every project; \"project\" is the repository the session works in (the \
+packet says which, and only then is it allowed), for conventions of that repository alone. Use \
+\"project\" when the lesson is about this repository's files, commands or conventions; \"global\" \
+when it would hold in another project. null lets the system choose. A skill marked \"project \
+skill\" in the packet is that repository's: patch it like any other (a read-only one can't be \
+patched; create the skill again with scope \"project\" to customize it).\n\n\
 Never put secrets, keys or tokens in memory or skills; masked values in the packet stay out.\n\n\
 Do NOT capture{DO_NOT_CAPTURE_BLOCK}\
 Every operation's `why` is one short sentence naming the signal it rests on (\"signal 3\").\n\n\

@@ -610,6 +610,44 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   same turn is recorded as a weak signal (1.0), not an explicit one, so it doesn't force a review
   that would only find the entry there.
 
+## Project skills (Phase 8 CP8.2)
+
+- **A repository's skills must never reach another repository's session.** Anything new that lists
+  or loads skills for a session goes through `SkillStore::*_for(session.project_root(), ..)` (or the
+  index with `IndexQuery::project_root`), never the plain `catalog()` / `find()` with a guess. The
+  plain methods are the user's library only, and that is right for the Skills screen, the curator
+  and slash commands; don't "fix" them to see projects.
+- **The scope is the session's, fixed at the start.** Don't derive a project from the shell's live
+  `cwd()` (the agent can `cd` into any repository, a cloned one included): use
+  `SessionTools::project_root()`. A child built from `Runtime::child_tools` must `inherit_project`.
+  The frozen system prompt keeps listing the project it was built for after a workspace move.
+- **Never follow a link inside a repository.** A project folder, skill folder or file that is a
+  symlink or junction is skipped (`is_reparse`, which also catches junctions, that `is_symlink`
+  misses on older Rust); reads and writes check the resolved path is inside the skill
+  (`ensure_inside`). Windows junctions need no privilege, so a cloned repository can carry one.
+- **A project skill is not trusted.** It passes the threat scan every time it is read (cached per
+  file stamp), and names that the skill rules refuse are skipped: a name is used as a path and in
+  XML attributes. Reading one into the model's context taints the session; the cost is that memory
+  and skill writes of such a session wait in Pending. To make project skills cheaper that way, don't
+  weaken the taint: trust has to come from something the repository's author can't forge.
+- **The library wins a name clash, then `.agents`, `.hermes`, `.claude`** (D5 fixes the order of the
+  project folders; the library first is ours, so a cloned repository can't replace a skill the user
+  relies on). A shadowed copy is invisible (not listed, not indexed). Creating a project skill over a
+  read-only copy of the same name is allowed on purpose.
+- **Project skills are not in `.usage.json` and not in the skills git history.** `bump`,
+  `record_write` and `commit` are skipped for them (a project skill's name in the user's file would
+  leak it to every session through the curator, the Star map and the Skills screen).
+- **Every path that puts a project skill's text in front of a model taints or holds.** `skill_view`
+  and a failed `skill_manage` patch's `file_preview` answer `"scope": "project"` (the tool layer
+  taints on that); pre-injection taints from `Block.project_skills`; the evidence review holds its
+  writes when its packet carries a project skill (loaded or related). A new delivery path needs
+  the same, or the repository's text rides into a clean session.
+- **`copy_dir` skips links** (the batch snapshot / rollback and the Hermes import): following a
+  file symlink would bring a copy of its target back into the repository on a rollback.
+- **`index.db` is version 3.** An older file is dropped and rebuilt like any schema change. A query
+  that names a repository checks its skill files' `stat` signature first, so an edit made outside
+  the app is seen; a repository nobody queries is not indexed.
+
 ## Skill outcomes and provenance (Phase 8 CP8.1)
 
 - **An outcome is provisional.** A `clean` use may turn `corrected` when the next message
