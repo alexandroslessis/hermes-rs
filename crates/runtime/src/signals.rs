@@ -618,7 +618,7 @@ pub fn analyze(base: &TurnBase, outcome: &TurnOutcome) -> Analysis {
         let signal = if signal.is_explicit() && saved_to_memory(&outcome.calls) {
             Signal::new(
                 SignalKind::Correction {
-                    phrases: vec!["remember (saved by the agent)".into()],
+                    phrases: vec![SAVED_REMEMBER_PHRASE.into()],
                 },
                 SAVED_REMEMBER_WEIGHT,
                 turn,
@@ -823,6 +823,10 @@ pub fn final_answer(messages: &[Message]) -> Option<String> {
         .then(|| last.as_concat_text())
         .filter(|text| !text.trim().is_empty())
 }
+
+/// The phrase of a "remember this" the agent already saved (a weak `Correction` that corrects
+/// nothing: `skill_outcomes` ignores it).
+pub const SAVED_REMEMBER_PHRASE: &str = "remember (saved by the agent)";
 
 /// The weight of a "remember this" the agent saved itself in the same turn.
 const SAVED_REMEMBER_WEIGHT: f32 = 1.0;

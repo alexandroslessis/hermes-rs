@@ -40,7 +40,7 @@ it calls into. Everything runs in one process.
 | Crate | Package | Role | Notes |
 |---|---|---|---|
 | `crates/desktop` | `hermes-desktop` | The app: Tauri window, axum server, the protocol layer | The main app. Most feature work lands here. |
-| `crates/runtime` | `hermes_runtime` | Sessions and turns over the agent: `Runtime` | `lib.rs` (API), `session.rs`, `ops.rs` (per-turn tool guards), `delegate.rs` + `subagents.rs`, `compress.rs`, `review.rs` (background review), `signals.rs` (learning signals: what each turn says is worth learning, scored locally into `signals/<id>.json`), `review_once.rs` (the evidence review: one request with a packet of signals, skills and memory; a JSON reply validated and applied or staged), `review_schedule.rs` (when it runs: per-session idle timers, switched-away/closed, one review at a time, back-off, hourly cap), `curator.rs`, `mcp.rs`, `commands.rs` (`/diff`, `/usage`…), `guards.rs`, `changes.rs` |
+| `crates/runtime` | `hermes_runtime` | Sessions and turns over the agent: `Runtime` | `lib.rs` (API), `session.rs`, `ops.rs` (per-turn tool guards), `delegate.rs` + `subagents.rs`, `compress.rs`, `review.rs` (background review), `signals.rs` (learning signals: what each turn says is worth learning, scored locally into `signals/<id>.json`), `skill_outcomes.rs` (how the turns a skill was used in went, into `.usage.json`), `review_once.rs` (the evidence review: one request with a packet of signals, skills and memory; a JSON reply validated and applied or staged), `review_schedule.rs` (when it runs: per-session idle timers, switched-away/closed, one review at a time, back-off, hourly cap), `curator.rs`, `mcp.rs`, `commands.rs` (`/diff`, `/usage`…), `guards.rs`, `changes.rs` |
 | `crates/agent` | `hermes_agent` | The agent state machine (from Goose): stream a reply, run tool calls, repeat | `events.rs` has `AgentEvent` |
 | `crates/llm` | `hermes_llm` | Messages, the OpenAI-compatible provider, retries (from Goose) | `conversation::message::{Message, MessageContent}`; `observer.rs` is where every model POST is reported (purpose, session, provider) to the request ledger |
 | `crates/tools` | `hermes_tools` | Every agent tool + `SessionTools` (the per-session tool set) | One module per tool family; `paths.rs` resolves paths; `path_policy.rs` classifies where file edits and terminal commands may go (workspace, app data, skills/memory, persistence places, outside); `approval.rs` the dangerous-command check; `taint.rs` what the session has read that the user didn't write (see Taint in PITFALLS.md); `staging.rs` the writes a tainted session's `memory` / `skill_manage` calls leave for the user (`staging/<id>.json`, applied through the stores' own write paths); `index.rs` the local FTS5 index (`index.db`) over skills and memory, kept fresh by write hooks on `SkillStore` / `MemoryStore` |
@@ -200,7 +200,10 @@ Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`
    (`title_session`, aux "titles" model), and the background review may run. Just before
    `TurnFinished` the runtime scores the turn's learning signals (`signals.rs`: corrections,
    denials, workarounds, long turns, explicit requests; no request) and hands them to the signal
-   store's writer thread; a rewind or `/undo` adds one too.
+   store's writer thread; a rewind or `/undo` adds one too. The same step writes the outcome of
+   every skill the turn used (attached by the index, or loaded with `skill_view`) into the skill's
+   record (`skill_outcomes.rs`, on a blocking thread), and a correction in the message makes the
+   previous turn's uses `corrected`.
    Under `budget.review_mode = idle_once` (the `requests` profile) the turn's end arms the
    session's idle timer (`review_schedule.rs`); a quiet session with signals at the threshold, or
    one the page switched away from, gets one evidence review. Under `nudges` the counters or the
@@ -302,3 +305,31 @@ API keys are in Windows Credential Manager (`keyring`), never in a file.
   an `.await`. Poisoned locks: `lock().unwrap_or_else(|e| e.into_inner())`.
 - Long work started from an RPC (a turn, a background job) is `tokio::spawn`ed; the RPC answers at
   once and progress arrives as events.
+
+## Skill outcomes and provenance (Phase 8 CP8.1)
+
+- **Outcomes** (`runtime/src/skill_outcomes.rs`, `tools/src/curator.rs`). A skill's record in
+  `skills/.usage.json` has `outcomes` (newest 50: `{session, turn, outcome, at}`) and `clean_rate`
+  (the share of them that are `clean`). `uses` / `last_used` stay what they were (a whole-skill
+  `skill_view` load); a skill the index attached is counted apart, in `attached` / `last_attached`,
+  which the curator counts as activity (so a skill attached every turn is not idle) and the Star
+  map doesn't (its "learned" filter is `uses > 0`). The rules, in the module doc: a use is
+  written `clean` when its turn ends (or `errored` / `corrected` by what the turn shows); a
+  `Correction` signal in turn `T` makes turn `T-1`'s uses `corrected`; a rewind of turns
+  `T..T+n` makes theirs `undone`; an outcome only gets worse; a cancelled turn is not judged.
+  Entries are keyed by (session, turn): the turn numbers are the signals' (renumbered by rewinds,
+  so a rewound turn's entries become `undone` before the number is reused).
+- **`.usage.json` round trip.** A record keeps fields this version doesn't know (`extra`,
+  flattened), an unknown outcome string stays as it is, entries that aren't records are kept, a field
+  of the wrong type (`"uses": "3"`, `null`, a BOM) is coerced or dropped alone, never the record;
+  an unparseable file is copied once to `.usage.json.corrupt` before the next save replaces it; a
+  file that exists but can't be read (locked) is not written at all. Writes go
+  through `usage_lock` and a temp file + rename; the runtime does them in `spawn_blocking`.
+- **Provenance** (`tools/src/provenance.rs`). `sources:` in the SKILL.md frontmatter, appended as
+  a text edit of that block only. `SkillOp.source` is set by our code (review apply, the session's
+  `skill_manage` via `SessionTools::skill_source`, staged ops keep it); the model's call can't set
+  it (`parse_call` clears it, as `own_hand`). Any write but the user's keeps `sources` as the file had it
+  (`keep_sources`: none for a new skill; whatever the writer put there in any form is replaced, and a
+  write where that can't be done safely is refused); the editor in the app (`user_write`) may change it.
+  A skill the module can't edit safely (no frontmatter, `sources` as a flow list or scalar, YAML
+  that doesn't parse) is written without the entry.

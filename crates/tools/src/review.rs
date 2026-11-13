@@ -163,7 +163,8 @@ impl ReviewTools {
                 if self.tools.taint().is_tainted() {
                     return self.tools.stage_skills(&args, self.origin()).await;
                 }
-                let result = skills.manage_with(&args, self.origin());
+                let source = (!self.curator).then(|| self.tools.skill_source(WriteOrigin::Review));
+                let result = skills.manage_with_source(&args, self.origin(), source.as_ref());
                 let failed = result.get("success") == Some(&Value::Bool(false));
                 ToolOutput {
                     value: result,

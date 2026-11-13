@@ -471,8 +471,24 @@ impl StagingStore {
         origin: WriteOrigin,
         meta: &Meta,
     ) -> Value {
+        self.stage_skill_call_from(skills, args, origin, meta, None)
+    }
+
+    /// [`Self::stage_skill_call`] for a write that comes from a session: `source` is appended to
+    /// the skill's `sources` when it is applied (the staged diff shows it).
+    pub fn stage_skill_call_from(
+        &self,
+        skills: &SkillStore,
+        args: &Value,
+        origin: WriteOrigin,
+        meta: &Meta,
+        source: Option<&crate::provenance::SourceNote>,
+    ) -> Value {
         match skills.parse_call(args) {
-            Ok(ops) => self.stage_skill_ops(skills, ops, origin, meta),
+            Ok(mut ops) => {
+                crate::skill_manage::attach_source(&mut ops, source);
+                self.stage_skill_ops(skills, ops, origin, meta)
+            }
             Err(refusal) => refusal,
         }
     }

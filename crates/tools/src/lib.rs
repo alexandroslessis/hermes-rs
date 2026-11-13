@@ -17,6 +17,7 @@ pub mod lint;
 mod path_policy;
 mod paths;
 mod process;
+pub mod provenance;
 mod recall;
 pub mod redact;
 pub mod references;
@@ -674,7 +675,11 @@ impl SessionTools {
         let result = match name {
             "skills_list" => skills.list_tool(args),
             "skill_view" => skills.view_tool(args),
-            _ => skills.manage_tool(args),
+            _ => skills.manage_with_source(
+                args,
+                WriteOrigin::Foreground,
+                Some(&self.skill_source(WriteOrigin::Foreground)),
+            ),
         };
         let failed = result.get("success") == Some(&Value::Bool(false));
         ToolOutput {
@@ -973,6 +978,16 @@ impl SessionTools {
         Self::staged_output(result)
     }
 
+    /// The provenance entry for a skill write this session's agent (or its review) makes
+    /// ([`provenance`]): the session and a fixed reason, since the agent gives none.
+    pub fn skill_source(&self, origin: WriteOrigin) -> provenance::SourceNote {
+        let why = match origin {
+            WriteOrigin::Review => "a background review of this session",
+            _ => "the agent changed it during this session",
+        };
+        provenance::SourceNote::new(&self.session_id, why)
+    }
+
     /// A `skill_manage` call from a tainted session (or a review of one): the same as
     /// [`Self::stage_memory`] for skills.
     pub(crate) async fn stage_skills(&self, args: &Value, origin: WriteOrigin) -> ToolOutput {
@@ -981,8 +996,9 @@ impl SessionTools {
         };
         let store = staging::StagingStore::new(&self.data_dir);
         let (args, meta) = (args.clone(), self.staging_meta());
+        let source = (origin != WriteOrigin::Curator).then(|| self.skill_source(origin));
         let result = tokio::task::spawn_blocking(move || {
-            store.stage_skill_call(&skills, &args, origin, &meta)
+            store.stage_skill_call_from(&skills, &args, origin, &meta, source.as_ref())
         })
         .await
         .unwrap_or_else(|e| json!({"success": false, "error": e.to_string()}));

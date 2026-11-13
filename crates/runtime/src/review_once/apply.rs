@@ -209,6 +209,12 @@ fn apply_memory(ctx: &ApplyContext, change: &MemoryChange) -> OpResult {
     }
 }
 
+/// The provenance entry of a review write: this session, today, and the review's own reason
+/// (model text: `SourceNote` cleans it and runs the threat scan).
+fn source_note(ctx: &ApplyContext, change: &SkillChange) -> hermes_tools::provenance::SourceNote {
+    hermes_tools::provenance::SourceNote::new(&ctx.session_id, &change.why)
+}
+
 /// The write a skill change makes, and the file state it must find: `Err` is why it is refused.
 fn plan_skill(ctx: &ApplyContext, change: &SkillChange) -> Result<(SkillOp, FileBase), String> {
     let name = &change.name;
@@ -230,6 +236,7 @@ fn plan_skill(ctx: &ApplyContext, change: &SkillChange) -> Result<(SkillOp, File
                 action: "create".into(),
                 name: name.clone(),
                 content: Some(body),
+                source: Some(source_note(ctx, change)),
                 ..Default::default()
             };
             let base = FileBase {
@@ -275,6 +282,7 @@ fn plan_skill(ctx: &ApplyContext, change: &SkillChange) -> Result<(SkillOp, File
                 action: "edit".into(),
                 name: name.clone(),
                 content: Some(updated),
+                source: Some(source_note(ctx, change)),
                 ..Default::default()
             };
             let base = FileBase {

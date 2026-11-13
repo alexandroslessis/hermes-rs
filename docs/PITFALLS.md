@@ -609,3 +609,30 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - A "remember this" the agent already saved with its `memory` tool (add/patch, not refused) in the
   same turn is recorded as a weak signal (1.0), not an explicit one, so it doesn't force a review
   that would only find the entry there.
+
+## Skill outcomes and provenance (Phase 8 CP8.1)
+
+- **An outcome is provisional.** A `clean` use may turn `corrected` when the next message
+  arrives, or `undone` after a rewind; `clean_rate` moves then. Only the turn right before a
+  correction is blamed: a skill used two turns earlier is not. Don't read the rate of a skill with
+  fewer than a handful of entries.
+- **`uses` means a whole-skill load, nothing else.** A `skill_view` bumps `uses` itself;
+  `record_skill_use(.., attached)` counts the skills the local index attached in `attached`, not
+  `uses` (the Star map shows any skill with `uses > 0` as learned: bundled skills the index
+  attaches would all appear). A new way to load a skill (the `/skill-name` invocation is one that
+  isn't counted yet) must pick one counter, not both.
+- **Never edit SKILL.md frontmatter through a YAML round trip.** `serde_yaml` drops comments and
+  reorders nothing it understands but rewrites quoting; user-written skills must stay byte for
+  byte. `provenance::append_source` edits lines and then checks the parsed result equals the
+  original minus the new entry; if you change it, keep that check.
+- **The model can't pick a provenance.** `SkillOp.source` and `own_hand` deserialize (staged ops
+  need them) but `SkillStore::parse_call` clears both for a model's call. A new entry point that
+  builds ops from model JSON must clear them too, or the model can forge `sources` and skip the
+  rewrite guard.
+- **A flow-style `sources: [..]` (or a scalar) is skipped, not fixed.** The write goes through
+  without the entry; that is deliberate. But a non-user write never decides `sources` itself:
+  whatever the model put there (any form, also on `create`) is replaced by the file's previous
+  list, and a write where that can't be done safely is refused.
+- **`file_path: "SKILL.md"` is the skill's SKILL.md.** `parse_call` normalises `./SKILL.md` and
+  friends to `SKILL.md`, and every SKILL.md path check compares with that; a check on
+  `file_path.is_none()` alone lets a patch through the provenance guard.

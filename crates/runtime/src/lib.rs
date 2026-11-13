@@ -18,6 +18,7 @@ pub mod review_once;
 pub mod review_schedule;
 mod session;
 pub mod signals;
+mod skill_outcomes;
 pub mod subagents;
 pub mod titles;
 mod turnlock;
@@ -967,6 +968,8 @@ impl Runtime {
             .replace_messages(session_id, conversation.messages())?;
         open.tools.reset_todos(restore_todos(&conversation));
         if let Some(signal) = signal {
+            // The skills used in the dropped turns didn't work out (`skill_outcomes.rs`).
+            skill_outcomes::apply_rewind(&self.skills, session_id, &signal);
             self.signals.record(
                 session_id,
                 signals::Analysis {
@@ -1338,8 +1341,11 @@ impl Runtime {
         // A daily-limit 429 that ends the turn teaches the ledger the provider's limit.
         let (learn_ledger, learn_provider) = (self.ledger.clone(), provider.id.clone());
         let signal_store = self.signals.clone();
+        let skill_store = self.skills.clone();
         let turn = tokio::spawn(hermes_llm::observer::scope(request_context, async move {
             let mut signal_message_id = signal_message_id;
+            // The skills the local index attached to this turn's message (a use, `skill_outcomes`).
+            let mut attached_skills: Vec<String> = Vec::new();
             if deferred.is_some() || held.is_some() {
                 let built: Result<Message> = match deferred {
                     Some((text, images)) => {
@@ -1412,6 +1418,9 @@ impl Runtime {
                 match added {
                     Ok(user) if !turn_cancel.is_cancelled() => {
                         signal_message_id = user.id.clone();
+                        if let Some(block) = &block {
+                            attached_skills = block.skills.clone();
+                        }
                         turn_start = runtime.session.conversation.lock().len();
                         let _ = events_tx.send(RuntimeEvent::Agent(AgentEvent::Message(user)));
                     }
@@ -1546,7 +1555,29 @@ impl Runtime {
                     answer: signal_answer,
                 }
             };
-            signal_store.record(&session_id, signals::analyze(&signal_base, &outcome));
+            let analysis = signals::analyze(&signal_base, &outcome);
+            // How the skills used in this turn did, and what this turn says about the one before
+            // (a correction): zero requests, the file work on a blocking thread, done before the
+            // page hears the turn is over.
+            let plan = skill_outcomes::plan(
+                &signal_base,
+                &analysis,
+                &outcome.calls,
+                &attached_skills,
+                match &status {
+                    TurnStatus::Completed => skill_outcomes::Ended::Completed,
+                    TurnStatus::Cancelled => skill_outcomes::Ended::Cancelled,
+                    TurnStatus::Failed(_) => skill_outcomes::Ended::Failed,
+                },
+            );
+            signal_store.record(&session_id, analysis);
+            if !plan.uses.is_empty() || !plan.worsen.is_empty() {
+                let session = session_id.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    skill_outcomes::apply(&skill_store, &session, &plan)
+                })
+                .await;
+            }
             let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
             if let Some(setup) =
                 review_setup.after_turn(&runtime.session, turn_start, review_memory, finished)

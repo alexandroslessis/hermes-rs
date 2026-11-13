@@ -6425,6 +6425,15 @@ async fn a_skill_the_session_loaded_is_patched_with_a_strict_diff() {
             .contains("2. Run `pnpm deploy` (never npm).")
     );
     assert_requests(&h, Purpose::Review, 2..=2);
+    // Provenance: the review's write names the session and its reason, in the frontmatter.
+    let sources = hermes_tools::provenance::sources_of(&std::fs::read_to_string(&skill_md).unwrap());
+    assert_eq!(sources.len(), 1, "{sources:?}");
+    assert_eq!((sources[0].session.as_str(), sources[0].why.as_str()), (session.as_str(), "signal 1"));
+    // Outcomes: turn 1 loaded the skill and turn 2 corrected it.
+    assert_eq!(
+        skill_outcomes(&h, "deploy-app"),
+        [(1, hermes_tools::curator::Outcome::Corrected)]
+    );
 }
 
 #[tokio::test]
@@ -6992,4 +7001,79 @@ async fn a_failing_nudge_review_is_not_restarted_every_turn() {
     assert_requests(&h, Purpose::Review, 1..=1);
     assert_requests(&h, Purpose::Main, 6..=6);
     assert!(h.runtime.signals(&session).await.triggered());
+}
+
+// ---- Phase 8 CP8.1: skill outcomes -----------------------------------------------------------
+
+fn skill_outcomes(h: &Harness, name: &str) -> Vec<(u64, hermes_tools::curator::Outcome)> {
+    h.runtime
+        .skills()
+        .record(name)
+        .outcomes
+        .into_iter()
+        .map(|e| (e.turn, e.outcome))
+        .collect()
+}
+
+#[tokio::test]
+async fn an_attached_skill_is_clean_until_the_user_corrects_the_next_turn() {
+    use hermes_tools::curator::Outcome;
+    let h = harness_profile(
+        vec![text_reply("Found 3 papers."), text_reply("Switched to pnpm.")],
+        BudgetProfile::Requests,
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, ARXIV_ASK).await;
+    // Used in turn 1, nothing wrong: clean, counted as attached, no extra request.
+    assert_eq!(skill_outcomes(&h, "arxiv"), [(1, Outcome::Clean)]);
+    let record = h.runtime.skills().record("arxiv");
+    assert_eq!((record.attached, record.clean_rate), (1, Some(1.0)));
+    assert!(record.last_attached.is_some());
+    // `uses` stays a whole-skill load: a bundled skill only attached isn't "learned".
+    assert_eq!((record.uses, record.last_used.as_deref()), (0, None));
+    assert_requests(&h, Purpose::Main, 1..=1);
+
+    run_turn(&h, &session, "No, that's wrong. Use pnpm instead.").await;
+    // The correction answers turn 1, so that turn's use is now corrected.
+    assert_eq!(skill_outcomes(&h, "arxiv"), [(1, Outcome::Corrected)]);
+    assert_eq!(h.runtime.skills().record("arxiv").clean_rate, Some(0.0));
+    // The correction is a learning signal as before; outcomes cost no request.
+    assert_eq!(h.runtime.signals(&session).await.signals.len(), 1);
+    assert_requests(&h, Purpose::Main, 2..=2);
+    assert_eq!(total_requests(&h), 2);
+}
+
+#[tokio::test]
+async fn a_loaded_skill_counts_once_and_an_undo_makes_it_undone() {
+    use hermes_tools::curator::Outcome;
+    let h = harness_profile(
+        vec![
+            tool_reply(&[("sv", "skill_view", json!({"name": "arxiv"}))]),
+            text_reply("Found 3 papers."),
+        ],
+        BudgetProfile::Balanced,
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, ARXIV_ASK).await;
+    let record = h.runtime.skills().record("arxiv");
+    // The view counted the use; the outcome history adds no second one.
+    assert_eq!((record.views, record.uses), (1, 1));
+    assert_eq!(skill_outcomes(&h, "arxiv"), [(1, Outcome::Clean)]);
+    assert_requests(&h, Purpose::Main, 2..=2);
+
+    h.runtime.undo(&session, "").unwrap();
+    assert_eq!(skill_outcomes(&h, "arxiv"), [(1, Outcome::Undone)]);
+    assert_eq!(h.runtime.skills().record("arxiv").clean_rate, Some(0.0));
+    assert_eq!(total_requests(&h), 2);
+}
+
+#[tokio::test]
+async fn a_turn_without_a_skill_leaves_no_outcome() {
+    let h = harness_profile(vec![text_reply("Hello.")], BudgetProfile::Requests).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "Hello there, how are you?").await;
+    assert!(skill_outcomes(&h, "arxiv").is_empty());
+    assert!(!h.data.path().join("skills").join(".usage.json").exists());
 }
