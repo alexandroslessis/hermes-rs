@@ -1,0 +1,24 @@
+{
+  "name": "run_script",
+  "description": "Run one PowerShell, Python or bash script and get only its output back: use it when a task needs several independent reads, searches or commands, so one call does the work of many (collect, filter and print just what you need). Each call is a fresh process in the session's working folder; nothing persists between calls (no variables, no cd).\n\nlanguage: powershell (Windows PowerShell), python (run through uv, standard library only unless already installed) or bash (Git Bash). If the chosen interpreter is not installed the call says so; switch language.\n\nThe whole script is shown to the user for approval when it deletes or overwrites things, names paths outside the working folder, or builds and runs text at run time (Invoke-Expression, & $variable, Start-Process, -EncodedCommand, eval, exec, subprocess, os.system, $(...), bash -c): prefer plain, readable commands and the user is asked less. Do not use it to hide what you run.\n\nUse read_file, search_files, patch and write_file for single reads and edits. Output is trimmed to its head and tail with the full text saved to a file whose path is in the result; print summaries, not whole files. Stderr comes back separately as stderr. The script is killed with everything it started when the timeout is reached; it cannot be left running in the background.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "language": {
+        "type": "string",
+        "enum": ["powershell", "python", "bash"],
+        "description": "The script's language."
+      },
+      "code": {
+        "type": "string",
+        "description": "The script (at most 64 KB)."
+      },
+      "timeout": {
+        "type": "integer",
+        "description": "Max seconds (default 60, max 600).",
+        "minimum": 1
+      }
+    },
+    "required": ["language", "code"]
+  }
+}

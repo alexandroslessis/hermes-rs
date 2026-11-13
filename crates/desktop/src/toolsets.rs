@@ -22,8 +22,8 @@ pub const TOOLSETS: [(&str, &str, &str, &[&str]); 10] = [
     (
         "terminal",
         "Terminal & Processes",
-        "terminal, process",
-        &["terminal", "process_manage"],
+        "terminal, run_script, process",
+        &["terminal", "run_script", "process_manage"],
     ),
     (
         "file",
@@ -163,7 +163,10 @@ mod tests {
     fn switching_off_and_on() {
         let off = switch(&[], "terminal", false).unwrap();
         assert_eq!(off, ["terminal"]);
-        assert_eq!(disabled_tools(&off), ["terminal", "process_manage"]);
+        assert_eq!(
+            disabled_tools(&off),
+            ["terminal", "run_script", "process_manage"]
+        );
         assert_eq!(list(&off)[1]["enabled"], false);
         assert_eq!(list(&off)[0]["enabled"], true);
         assert!(switch(&off, "terminal", true).unwrap().is_empty());

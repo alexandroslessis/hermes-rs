@@ -94,6 +94,16 @@ Read the existing tests near the area you change before writing a new one; the h
   skill boost, schema bump), `runtime/src/memory_hygiene.rs` and `review_once/tests.rs` (supersedes),
   `desktop/src/learning.rs` (link edges, dangling links, no project memory). The curator turns test
   backdates `memory.db` rows with `rusqlite` (a dev-dependency of the runtime only for that).
+- `run_script` tests (Phase 10 CP10.1): the analysis is unit-tested in `crates/tools/src/script_guard.rs`
+  (one list per smuggling construct and language, continuation joins, benign scripts that must pass);
+  approval and execution in `crates/tools/src/script.rs` (every mode, taint, Yolo warning, persistence,
+  outside paths, remembered approvals ignored; real PowerShell/uv/Git Bash runs that skip themselves
+  when the interpreter is missing: output, exit code, stderr, size limit, timeout kill, stopping the
+  turn, dropping the call, scratch cleanup, secret variables not inherited). `turns.rs` has a
+  `// ---- Phase 10, CP10.1` banner: `script_call(id, language, code)` builds the model's reply,
+  `tool_result_texts` reads the results back, and `one_run_script_call_does_the_work_of_three_tool_calls`
+  holds the request counts (4 main requests with three terminal calls, 2 with one script).
+  The tests use PowerShell (always present on Windows); no live check: the page calls nothing new.
 - Known flaky under heavy load: `an_exhausted_budget_ends_with_a_toolless_summary` (timing).
   Re-run it alone before suspecting your change.
 

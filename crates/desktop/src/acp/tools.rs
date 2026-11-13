@@ -20,7 +20,7 @@ pub fn kind(name: &str) -> &'static str {
         "read_file" | "skill_view" | "skills_list" | "vision_analyze" | "video_analyze" => "read",
         "write_file" | "patch" | "skill_manage" => "edit",
         "search_files" | "session_search" => "search",
-        "terminal" | "process_manage" => "execute",
+        "terminal" | "run_script" | "process_manage" => "execute",
         // Not "execute": Zed draws an execute card as a command and can't expand one that has
         // text instead of a terminal, so a delegation's log and result were out of reach.
         "delegate_task" => "other",
@@ -57,6 +57,15 @@ pub fn title(name: &str, args: &Value) -> String {
                 "Run a command".to_string()
             } else {
                 clip(first, 80)
+            }
+        }
+        "run_script" => {
+            let language = text_arg(args, &["language"]);
+            let first = text_arg(args, &["code"]).lines().find(|l| !l.trim().is_empty()).unwrap_or_default().trim();
+            if first.is_empty() {
+                "Run a script".to_string()
+            } else {
+                clip(&format!("Run {language} script: {first}"), 80)
             }
         }
         "read_file" => {
@@ -193,6 +202,14 @@ fn result_text(result: &Value, raw: &str) -> String {
         Value::Object(object) => match (object.get("output"), object.get("error")) {
             (Some(Value::String(output)), _) => {
                 let mut text = output.clone();
+                // `run_script` returns stderr as its own field.
+                if let Some(stderr) = object
+                    .get("stderr")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    text.push_str(&format!("\n[stderr]\n{stderr}"));
+                }
                 if let Some(code) = object
                     .get("exit_code")
                     .and_then(Value::as_i64)
@@ -321,7 +338,7 @@ pub fn complete_content(
             Some(summary) => vec![text_content(&summary)],
             None => vec![text_content(&result_text(result, raw))],
         },
-        "terminal" => {
+        "terminal" | "run_script" => {
             let text = result_text(result, raw);
             if text.trim().is_empty() {
                 vec![text_content("(no output)")]
@@ -403,6 +420,7 @@ mod tests {
             ("patch", "edit"),
             ("search_files", "search"),
             ("terminal", "execute"),
+            ("run_script", "execute"),
             ("process_manage", "execute"),
             ("delegate_task", "other"),
             ("web_search", "fetch"),
@@ -421,6 +439,18 @@ mod tests {
             title("terminal", &json!({"command": "cargo test -p foo\nls"})),
             "cargo test -p foo"
         );
+        assert_eq!(
+            title(
+                "run_script",
+                &json!({"language": "powershell", "code": "\nGet-ChildItem\nls"})
+            ),
+            "Run powershell script: Get-ChildItem"
+        );
+        assert_eq!(title("run_script", &json!({"language": "python"})), "Run a script");
+        let result = json!({"output": "out", "stderr": "warn", "exit_code": 2});
+        let content = complete_content("run_script", &json!({}), &result, "", "C:/w", None);
+        assert!(content[0].to_string().contains("[stderr]"), "{content:?}");
+        assert!(content[0].to_string().contains("exit code 2"), "{content:?}");
         assert_eq!(
             title("read_file", &json!({"path": "src/a.rs"})),
             "Read src/a.rs"

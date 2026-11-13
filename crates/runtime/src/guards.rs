@@ -221,6 +221,7 @@ const PROGRESS_RESET_TOOLS: &[&str] = &[
     "write_file",
     "patch",
     "terminal",
+    "run_script",
     "process_manage",
     "todo_list",
 ];
@@ -279,7 +280,7 @@ fn result_hash(result: &str) -> u64 {
 /// object fails on `success: false` or an `error` field; anything else on an error flag.
 pub fn classify_failure(tool: &str, result: &str, is_error: bool) -> bool {
     let parsed: Option<Value> = serde_json::from_str(result).ok();
-    if tool == "terminal" {
+    if tool == "terminal" || tool == "run_script" {
         return parsed
             .as_ref()
             .and_then(|v| v.get("exit_code"))

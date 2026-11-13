@@ -208,12 +208,16 @@ impl ProcessTree {
 }
 
 /// Kills the process tree unless disarmed, including when the owning future is dropped.
-struct KillOnDrop {
+pub(crate) struct KillOnDrop {
     tree: Option<ProcessTree>,
 }
 
 impl KillOnDrop {
-    fn disarm(&mut self) {
+    pub(crate) fn new(tree: ProcessTree) -> Self {
+        Self { tree: Some(tree) }
+    }
+
+    pub(crate) fn disarm(&mut self) {
         self.tree = None;
     }
 }
@@ -257,14 +261,14 @@ fn bash_quote(text: &str) -> String {
 
 /// The turn's cancel, or a future that never resolves (no turn to observe: the review path's
 /// and background spawns' runs are stopped by nothing but their timeout).
-async fn stopped(cancel: Option<&CancellationToken>) {
+pub(crate) async fn stopped(cancel: Option<&CancellationToken>) {
     match cancel {
         Some(token) => token.cancelled().await,
         None => std::future::pending().await,
     }
 }
 
-fn powershell_quote(text: &str) -> String {
+pub(crate) fn powershell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
@@ -660,7 +664,7 @@ impl ShellSession {
 
 /// The error text in what PowerShell wrote on stderr: plain text, or CLIXML (`#< CLIXML` then
 /// `<S S="Error">…</S>` pieces with `_x000D__x000A_` for line ends) when stderr is redirected.
-fn powershell_errors(bytes: &[u8]) -> String {
+pub(crate) fn powershell_errors(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     if !text.contains("#< CLIXML") {
         return text.trim().to_string();
@@ -697,7 +701,7 @@ pub(crate) fn encode_powershell(script: &str) -> String {
 }
 
 /// Keeps the head and tail of long output and saves the whole text to the scratch dir.
-fn limit_output(output: String, scratch_dir: &Path) -> (String, Option<PathBuf>) {
+pub(crate) fn limit_output(output: String, scratch_dir: &Path) -> (String, Option<PathBuf>) {
     let total = output.chars().count();
     if total <= MAX_OUTPUT_CHARS {
         return (output, None);

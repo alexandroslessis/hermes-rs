@@ -10,6 +10,10 @@ const SCHEMAS: &[(&str, &str)] = &[
         include_str!("../../../prompts/tools/terminal.json"),
     ),
     (
+        "run_script",
+        include_str!("../../../prompts/tools/run_script.json"),
+    ),
+    (
         "process_manage",
         include_str!("../../../prompts/tools/process_manage.json"),
     ),

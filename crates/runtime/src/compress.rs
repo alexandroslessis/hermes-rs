@@ -331,6 +331,16 @@ pub fn summarize_tool_result(
                 .map_or("?".to_string(), |code| code.to_string());
             format!("[terminal] ran `{command}` -> exit {exit}, {lines} lines output")
         }
+        "run_script" => {
+            let exit = json_object(content)
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .map_or("?".to_string(), |code| code.to_string());
+            format!(
+                "[run_script] ran a {} script -> exit {exit}, {lines} lines output",
+                str_arg(args, "language")
+            )
+        }
         "read_file" => format!(
             "[read_file] read {} from line {} ({len} chars){failed}",
             shown_arg(args, "path", "?"),

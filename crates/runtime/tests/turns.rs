@@ -8394,3 +8394,307 @@ async fn the_hygiene_pass_proposes_nothing_under_a_profile_that_never_retrieves_
         assert_eq!(total_requests(&h), 0);
     }
 }
+
+// ---- Phase 10, CP10.1: the `run_script` tool ----------------------------------------------------
+
+fn script_call(id: &str, language: &str, code: &str) -> String {
+    tool_reply(&[(id, "run_script", json!({"language": language, "code": code}))])
+}
+
+fn tool_result_texts(h: &Harness, session: &str) -> Vec<String> {
+    h.runtime
+        .messages(session)
+        .unwrap()
+        .iter()
+        .flat_map(|m| m.content.clone())
+        .filter_map(|c| c.as_tool_response_text())
+        .collect()
+}
+
+/// Files left under any `scripts` folder below `dir` (the scratch folder of `run_script`).
+fn script_leftovers(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                0
+            } else if path.file_name().is_some_and(|n| n == "scripts") {
+                std::fs::read_dir(&path).map(|e| e.count()).unwrap_or(0)
+            } else {
+                script_leftovers(&path)
+            }
+        })
+        .sum()
+}
+
+#[tokio::test]
+async fn one_run_script_call_does_the_work_of_three_tool_calls() {
+    // Three reads as three terminal calls: three tool round trips and the final answer.
+    let h3 = harness(vec![
+        tool_reply(&[("a", "terminal", json!({"command": "Get-Content a.txt"}))]),
+        tool_reply(&[("b", "terminal", json!({"command": "Get-Content b.txt"}))]),
+        tool_reply(&[("c", "terminal", json!({"command": "Get-Content c.txt"}))]),
+        text_reply("Done."),
+    ])
+    .await;
+    // The same three reads in one script: one tool round trip and the final answer.
+    let h1 = harness(vec![
+        script_call(
+            "s",
+            "powershell",
+            "foreach ($f in 'a.txt','b.txt','c.txt') { \"== $f\"; Get-Content $f }",
+        ),
+        text_reply("Done."),
+    ])
+    .await;
+    for h in [&h3, &h1] {
+        for name in ["a", "b", "c"] {
+            std::fs::write(
+                h.work.path().join(format!("{name}.txt")),
+                format!("contents of {name}"),
+            )
+            .unwrap();
+        }
+    }
+    let s3 = session_in(&h3);
+    let s1 = session_in(&h1);
+    assert_eq!(
+        finished_status(&run_turn(&h3, &s3, "read the three files").await),
+        TurnStatus::Completed
+    );
+    assert_eq!(
+        finished_status(&run_turn(&h1, &s1, "read the three files").await),
+        TurnStatus::Completed
+    );
+    assert_requests(&h3, Purpose::Main, 4..=4);
+    assert_requests(&h1, Purpose::Main, 2..=2);
+    let results = tool_result_texts(&h1, &s1);
+    assert_eq!(results.len(), 1);
+    for name in ["a", "b", "c"] {
+        assert!(
+            results[0].contains(&format!("contents of {name}")),
+            "{}",
+            results[0]
+        );
+    }
+    assert!(results[0].contains("\"exit_code\":0"), "{}", results[0]);
+    // The scratch folder holds no script afterwards.
+    assert_eq!(script_leftovers(&h1.data.path().join("scratch")), 0);
+}
+
+#[tokio::test]
+async fn run_script_is_offered_with_the_terminal_and_switched_off_with_it() {
+    let h = harness(vec![text_reply("ok")]).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "hello").await;
+    let offered: Vec<String> = h.requests.lock()[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(offered.contains(&"run_script".to_string()), "{offered:?}");
+    // Switched off with the terminal toolset: not offered, refused if called anyway.
+    let h = harness(vec![
+        script_call("s", "powershell", "Write-Output hi"),
+        text_reply("I couldn't."),
+    ])
+    .await;
+    h.runtime
+        .set_disabled_tools(["terminal", "run_script", "process_manage"].map(String::from));
+    let session = session_in(&h);
+    run_turn(&h, &session, "go").await;
+    let requests = h.requests.lock().clone();
+    let offered = requests[0]["tools"].to_string();
+    assert!(!offered.contains("run_script"), "{offered}");
+    assert!(requests[1].to_string().contains("turned off by the user"));
+}
+
+#[tokio::test]
+async fn an_approved_destructive_script_runs_with_a_note_and_a_denied_one_does_not() {
+    use hermes_tools::approval::ApprovalChoice;
+    for (choice, runs) in [(ApprovalChoice::Once, true), (ApprovalChoice::Deny, false)] {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let h = harness_with(
+            vec![
+                script_call(
+                    "s",
+                    "powershell",
+                    "Write-Output start\nRemove-Item -Recurse -Force build\nWrite-Output end",
+                ),
+                text_reply("Done."),
+            ],
+            Arc::new(ApproveBridge {
+                choice,
+                asked: asked.clone(),
+            }),
+        )
+        .await;
+        std::fs::create_dir_all(h.work.path().join("build")).unwrap();
+        let session = session_in(&h);
+        let events = run_turn(&h, &session, "clean up").await;
+        assert_eq!(finished_status(&events), TurnStatus::Completed);
+        let asked = asked.lock().clone();
+        assert_eq!(asked.len(), 1, "{choice:?}");
+        assert!(asked[0].contains("destructive delete"), "{asked:?}");
+        let result = tool_result_texts(&h, &session).remove(0);
+        if runs {
+            assert!(result.contains("was approved by the user"), "{result}");
+            assert!(result.contains("start") && result.contains("end"), "{result}");
+            assert!(!h.work.path().join("build").exists());
+        } else {
+            assert!(
+                result.contains("BLOCKED: User denied this command."),
+                "{result}"
+            );
+            assert!(result.contains("\"status\":\"blocked\""), "{result}");
+            assert!(h.work.path().join("build").exists(), "denied: not run");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_hardline_script_never_reaches_the_user() {
+    use hermes_tools::approval::ApprovalChoice;
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let h = harness_with(
+        vec![
+            script_call("s", "bash", "echo ok\nrm -rf /"),
+            text_reply("Done."),
+        ],
+        Arc::new(ApproveBridge {
+            choice: ApprovalChoice::Always,
+            asked: asked.clone(),
+        }),
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "go").await;
+    assert!(asked.lock().is_empty());
+    let result = tool_result_texts(&h, &session).remove(0);
+    assert!(result.contains("BLOCKED (hardline)"), "{result}");
+}
+
+#[tokio::test]
+async fn a_dynamic_script_asks_every_time_even_after_always_and_is_never_smart_approved() {
+    use hermes_tools::ApprovalMode;
+    use hermes_tools::approval::ApprovalChoice;
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let h = harness_with(
+        vec![
+            script_call("s1", "powershell", "$c = 'Write-Output ran'\nInvoke-Expression $c"),
+            script_call(
+                "s2",
+                "powershell",
+                "$c = 'Write-Output second'\nInvoke-Expression $c",
+            ),
+            text_reply("Done."),
+        ],
+        Arc::new(ApproveBridge {
+            choice: ApprovalChoice::Always,
+            asked: asked.clone(),
+        }),
+    )
+    .await;
+    let session = session_in(&h);
+    h.runtime
+        .set_approval_mode(&session, ApprovalMode::Auto)
+        .unwrap();
+    run_turn(&h, &session, "go").await;
+    // Both asked, in Auto: no reviewer request was made (the turn made exactly three requests).
+    assert_eq!(asked.lock().len(), 2, "{:?}", asked.lock());
+    assert!(asked.lock()[0].contains("Invoke-Expression"));
+    assert_eq!(h.requests.lock().len(), 3);
+    let results = tool_result_texts(&h, &session);
+    assert!(
+        results[0].contains("ran") && results[1].contains("second"),
+        "{results:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_flagged_script_after_untrusted_content_asks_in_auto_and_warns_in_yolo() {
+    use hermes_tools::ApprovalMode;
+    use hermes_tools::approval::ApprovalChoice;
+    let flagged = || script_call("s", "powershell", "Remove-Item -Recurse -Force build");
+    // Auto: asks, naming the source; the reviewer is not consulted.
+    let (h, asked) = taint_harness(
+        vec![add_call(), flagged(), text_reply("Done.")],
+        ApprovalChoice::Deny,
+        false,
+    )
+    .await;
+    let session = session_in(&h);
+    h.runtime
+        .set_approval_mode(&session, ApprovalMode::Auto)
+        .unwrap();
+    let events = run_turn(&h, &session, "add 2 and 3, then clean up").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let asked = asked.lock().clone();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(
+        asked[0].ends_with("(this turn read results from MCP server calc)"),
+        "{asked:?}"
+    );
+    assert!(h.work.path().join("build").exists(), "declined: not run");
+    assert_eq!(h.requests.lock().len(), 3);
+    // Yolo: runs, with the warning line in the transcript.
+    let (h, asked) = taint_harness(
+        vec![add_call(), flagged(), text_reply("Done.")],
+        ApprovalChoice::Deny,
+        false,
+    )
+    .await;
+    let session = session_in(&h);
+    h.runtime
+        .set_approval_mode(&session, ApprovalMode::Yolo)
+        .unwrap();
+    let events = run_turn(&h, &session, "add 2 and 3, then clean up").await;
+    assert!(asked.lock().is_empty(), "Yolo never blocks");
+    assert!(!h.work.path().join("build").exists(), "it ran");
+    assert_eq!(
+        taint_warnings(&events),
+        ["ran after reading untrusted content: results from MCP server calc"]
+    );
+}
+
+#[tokio::test]
+async fn a_script_that_fetches_from_the_network_taints_the_session() {
+    use hermes_tools::ApprovalMode;
+    let h = harness(vec![
+        // The host does not exist, which is irrelevant: the script *fetches*.
+        script_call(
+            "s",
+            "powershell",
+            "try { Invoke-WebRequest -UseBasicParsing http://hermes-rs-test.invalid/x -TimeoutSec 2 } catch { Write-Output 'offline' }",
+        ),
+        text_reply("Done."),
+    ])
+    .await;
+    let session = session_in(&h);
+    h.runtime
+        .set_approval_mode(&session, ApprovalMode::Yolo)
+        .unwrap();
+    run_turn(&h, &session, "fetch").await;
+    assert!(h.runtime.taint(&session).unwrap().is_tainted());
+}
+
+#[tokio::test]
+async fn a_bad_language_is_an_error_the_model_can_fix_in_one_more_call() {
+    let h = harness(vec![
+        script_call("s1", "ruby", "puts 1"),
+        script_call("s2", "powershell", "Write-Output fixed"),
+        text_reply("Done."),
+    ])
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "go").await;
+    let results = tool_result_texts(&h, &session);
+    assert!(results[0].contains("language must be one of"), "{results:?}");
+    assert!(results[1].contains("fixed"), "{results:?}");
+    assert_requests(&h, Purpose::Main, 3..=3);
+}

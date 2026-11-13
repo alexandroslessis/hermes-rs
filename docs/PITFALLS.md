@@ -893,3 +893,140 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   `memory:` links are edges. The archive is an additive list the page ignores; **project memory is
   never in the map** (no working folder to scope it by). A link whose end is gone is listed with
   `resolved: false` and drawn nowhere.
+
+## `run_script` (Phase 10 CP10.1, `crates/tools/src/{script,script_guard}.rs`)
+
+- **The approval is an aid, not a sandbox.** A script is many commands in a language that can build
+  more of them at run time, so no list of spellings proves one safe. `script_guard.rs` is
+  deliberately generous (comments and string literals are scanned like code; a pattern it cannot
+  evaluate counts as a match) and the boundary is the OS sandbox of Phase 15. What it does:
+  - **hardline** on any line (`rm -rf /`, `Stop-Computer`, `shutdown`...) blocks the script in
+    every mode, Yolo included, without asking;
+  - the terminal's **dangerous** patterns run over the whole text, every physical line and the text
+    with continuations undone (backtick-newline and every backtick in PowerShell, caret-newline,
+    backslash-newline), after NFKC folding, so `I`nvoke-Expression`, `r\` + newline + `m -rf` and
+    full-width look-alikes read as what they run, and an unbalanced quote on one line cannot blank
+    the next lines for the guard's search-command masking;
+  - **dynamic** constructs (a script that runs text it builds, fetches or decodes) are listed per
+    language (PowerShell: `Invoke-Expression`/`iex`, `& $x` / `& (...)` / dot-sourcing, `Start-Process`
+    and friends, `-EncodedCommand`, `FromBase64String`, `[scriptblock]`, `Add-Type`, reflection,
+    `.Invoke(`, COM/`Process.Start`, aliases, another shell launched, a script or executable file
+    written; Python: `eval`/`exec`/`compile`, `__import__`/`importlib`, `subprocess`/`os.system`/`popen`/
+    `exec*`, `ctypes`/win32/`winreg`, `getattr`/`globals`/`__builtins__`/dunder escapes, `pickle`/
+    `marshal`, `timeit`/`cProfile`/`pip`, base64/hex decoding, a script or executable file written,
+    `chmod`; bash: `eval`/`source`/`exec`/`xargs`/`trap`, `$(...)`/backticks/`${!x}`/`$'..'`/`<(...)`, a
+    variable as the command word, another shell started or piped into, `find -exec`, `awk system`,
+    `perl -e`, base64 decoding, `chmod`, an executable script written). A script with one **always
+    asks** (every mode but Yolo), is **never smart-approved** and **never remembered**: the card
+    offers only once/deny and the answers "for this session" / "always" are treated as "once";
+    remembered terminal approvals (session or allowlist) are not consulted for scripts at all.
+  - The approval card shows the **whole script** (`run_script (<language>)` + the code). A script
+    that needs a decision and is longer than 16,000 characters is refused ("split it"), so the user
+    never approves text they cannot see. A script with no flagged line and no decision to make
+    can be up to 64 KB and just runs.
+  - Path literals: persistence places, the app's data folder and the skill folders are found by
+    the terminal's `command_flag` over the whole text; an *obvious* path literal (drive path, UNC,
+    `~`, `/c/..`, `/etc`.., `..\`) that resolves outside the working folder flags the script (reads
+    count like writes). A URL, a regular expression or a bare relative name is not a path here.
+  - Tainted sessions: a flagged script always asks (never smart-approved), Yolo runs it and the
+    transcript gets the usual "ran after reading untrusted content" line. A script that fetches
+    from the network (`curl`, `Invoke-WebRequest`, Python `requests`/`urllib`...) or names an outside
+    path taints the session afterwards (`script::fetch_source`).
+- **Added by the CP10.1 review** (each with a test in `script_guard_corpus.rs` / `script.rs`):
+  - The terminal's command-position patterns also run on the commands *inside blocks*: each line is
+    split, quote-aware, at `{ } ( ) ; | &` and after `then`/`do`/`else`, so `if ($x) { shutdown /s }`,
+    `then rm -rf /` and `f() { rm -rf /; }` are hardline, and `if (1) { python -c ... }` is flagged
+    (before, a terminal-flagged command wrapped in a block was not: `run_script` was a way around the
+    terminal's approval).
+  - The scan folds en/em dashes to `-` and curly quotes to quotes (PowerShell honours them:
+    `Remove-Item x –Recurse –Force` deletes recursively) and treats `\v`, `\f`, NEL, U+2028/2029 as
+    line breaks; a raw control character (ESC, backspace...) flags the script, and the **approval card
+    shows every control, bidirectional and invisible character as `\u{XXXX}`**, so the script can't
+    reorder or overwrite the card that shows it.
+  - New rules: the `function:` drive (`Set-Item function:f -Value $text` runs text), `.Invoke*(`,
+    `[wmiclass]`/`Win32_Process`, `Import-Module`/`using module`, `ii`, Windows helper binaries
+    (`explorer`, `msbuild`, `installutil`, `regasm`, `cmstp`, `runas`...) and shells by any path or after
+    `env`/`command`/`nohup`; `Remove-Item` aliases with abbreviated `-r`/`-fo`, `| Remove-Item`,
+    `[IO.Directory]::Delete`; Python `rmtree`, bare `exec`/`eval` (`f = exec`), `o.execv(` on an alias,
+    `from os import *`, `nt`/`posix`, `_ctypes`; bash `alias`, `awk ... | "sh"`, `sed .../e`; registry
+    writes; `git -c alias.`/`core.pager`, `git config alias.`, `tar --to-command`, `rsync -e`,
+    `ProxyCommand`; `.env`. **Persistence and credentials named anywhere** (`$PROFILE`, `.bashrc`, the
+    startup folder, `.git/hooks`, `core.hooksPath`, `.ssh`, `authorized_keys`, `.aws`, `.npmrc`...) ask
+    **even in Yolo**, like the terminal's `Persistence` paths (`Analysis::persistence`).
+  - *Write, then run*: a PowerShell or bash script that writes a file (redirect, `Set-Content`, `cp`, a
+    download...) **and** runs a program by path (`./x`, `.\a.exe`) or an interpreter on a file
+    (`python x.dat`, `node x.mjs`) is dynamic. Split across two calls it still passes (residual 1).
+  - Patterns run on the linear-time `regex` engine wherever they have no look-around: on the
+    backtracking engine a 64 KB script hit the backtracking limit, which counts as a match, so every
+    big script asked. A padded line (60 KB of spaces, words or quotes around `rm -rf build`) is caught.
+  - The script file is written, then **held open read-only, sharing only reads**, until the run ends;
+    what is read back through that handle must equal what was checked, and a run folder or `scripts`
+    folder that is a junction is refused. A parallel script or a background command can't swap the
+    file between check and run, or append to it while bash reads it. Run folders older than an hour
+    (a crash's leftovers) are swept when the next script runs. All of it on `spawn_blocking`.
+  - PowerShell is started by its full path under `%SystemRoot%`; `uv.exe` is looked up only in absolute
+    PATH entries; bash runs without `BASH_ENV`, `ENV` and exported `BASH_FUNC_*` functions.
+  - `timeout` accepts an integer, a float or a numeric string; zero, negative or junk is the default.
+- **Residual risks** (what the guard does not and cannot see; each is why Phase 15 exists):
+  1. *Write, then run, across calls.* One script (or `write_file`) writes a file and a later script
+     runs it with `python x.dat` or `./x`: each call alone is unflagged. The terminal has the same
+     hole (`write_file` then `terminal`). Within one script the write-then-run rule asks.
+  2. *Programs that run programs.* Anything that runs what a file or argument says: `npm run`,
+     `cargo build` (a `build.rs`), `make`, `pytest` (`conftest.py`), a hook already in the
+     repository... The common option spellings (`git -c alias.`, `tar --to-command`, `rsync -e`,
+     `ProxyCommand`, `zip -TT`) ask; build tools run what the repository says, as in the terminal.
+  3. *Python is too dynamic.* The list is names, not semantics: a name not listed (a stdlib module
+     that evaluates strings, a third-party package that is installed) gets through, and string tricks
+     only matter once they reach one of the listed names.
+  4. *Exfiltration over the network is not an approval trigger* (a POST of project files with
+     `Invoke-RestMethod` or `requests.post`; credential files and `.env` named in the script do ask).
+     The session is tainted afterwards.
+  5. *Data in, code out.* A reviewer model in Auto mode sees the script text; comments after `#` are
+     stripped, but PowerShell block comments and Python docstrings are not, so an injected
+     "APPROVE" can reach it. It only judges scripts that are flagged for a dangerous pattern and
+     nothing else (never dynamic, tainted or persistence ones), the same exposure as a flagged
+     command.
+  6. *The scan is of text.* A Python script that imports a module from the working folder runs that
+     module's code (the model could have written it earlier); modules loaded by name from the
+     user's own module paths likewise.
+  7. *Scratch is not a sandbox.* The script runs with the user's rights, in the working folder; the
+     per-run scratch folder only holds the script file.
+  8. *Escaping the job object.* The process tree dies with the job, but a process started *through a
+     service* (WMI `Win32_Process.Create`, the Task Scheduler, a COM server such as
+     `Shell.Application`) is not in the job and outlives the script; those constructs are flagged.
+  9. *A false positive costs a click:* a script that only prints `rm -rf build` asks.
+- **Python goes through `uv`, never the `python` on PATH, and never a repository's venv.** The
+  interpreter is `uv python find --system --no-project --no-config --no-python-downloads` (run from
+  the scratch folder), then `<python> -X utf8 <file>` runs directly: `uv run` would have used a
+  `.venv\Scripts\python.exe` in the working folder (the repository's executable and its `.pth`
+  files), nothing is downloaded, and PEP 723 inline metadata (`# /// script`) is never read, so
+  nothing is installed. Python adds the script's own (scratch) folder to `sys.path`, not the working
+  folder. Only what is installed for that interpreter is importable (not the project's venv). No
+  `uv` (looked on PATH, `~/.local/bin`, `$CARGO_HOME/bin`) or no Python is a plain error; so is no Git
+  Bash for `language=bash`.
+- **PowerShell is wrapped, the script is not.** The script is a file with a UTF-8 byte-order mark
+  (Windows PowerShell reads a file without one as the ANSI code page); the command line is our own
+  driver (`-EncodedCommand` of a few lines holding only the random path) that sets UTF-8 output,
+  silences progress records (they come out on stderr as CLIXML) and returns the script's exit code
+  (`exit n`, else `$LASTEXITCODE`, else `$?`). A terminating error ends the whole run with exit
+  code 1. Output is CRLF-normalised; stderr comes back separately as `stderr`.
+- **Per-run scratch folder.** `<scratch>/scripts/<random>/script.<ext>`, removed after the run (with
+  retries while Windows still holds a killed process's handle), also when the turn is stopped or the
+  call future is dropped (a guard's `Drop` retries on a thread). A crash of the whole app can leave
+  one behind under `<data>/scratch/<session>/scripts/`; nothing sweeps it yet.
+- **One call, one process tree.** Timeout default 60 s, at most 600 s; the tree is killed on timeout,
+  on the turn being stopped, when the call future is dropped and when the script ends (a script
+  that starts a server loses it). There is no background mode and no live output relay (the
+  terminal's `tool.progress` is not ported).
+- **Checking cost.** The analysis (hundreds of regexes) runs on a blocking thread: about a second per
+  10 KB of script plus a few milliseconds per distinct line in a debug build, several times less in
+  release. A script at the 64 KB limit costs a few seconds in debug; it never blocks a worker.
+- **The tool list is part of the frozen prompt.** Adding `run_script` changes the cached prefix once
+  for existing sessions on upgrade (the first request after it is a cache miss; the system prompt's text
+  is unchanged, it only names the tools it needs). It is
+  offered where `terminal` is: it belongs to the `terminal` toolset, so switching that toolset off
+  removes `run_script` too; subagents get it like `terminal`; the background review and the curator
+  are whitelisted and never see it. Prompt guidance about batching with it is CP10.2.
+- **Failure bookkeeping treats it like the terminal** (`guards.rs`: a nonzero `exit_code` is a failure,
+  a success resets the no-progress counter; `compress.rs` summarises a pruned result as
+  `[run_script] ran a <language> script -> exit N, M lines output`).

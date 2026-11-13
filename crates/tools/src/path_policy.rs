@@ -370,6 +370,44 @@ pub fn command_paths(command: &str, ctx: &PolicyContext) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Whether a word of a script is *obviously* a path: a drive path (`C:\x`, `C:/x`), a UNC path, a
+/// `~` path, an MSYS drive path (`/c/x`), a path under a POSIX system folder (`/etc`, `/usr`...)
+/// or one that climbs out with `..`. Looser tests would flag every regular expression and URL in
+/// a script (CP10.1).
+fn obvious_path(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    let home = word == "~" || word.starts_with("~/") || word.starts_with("~\\");
+    let unc = word.starts_with("\\\\") && word.len() > 2;
+    let msys = word.starts_with('/')
+        && bytes.get(1).is_some_and(u8::is_ascii_alphabetic)
+        && (bytes.len() == 2 || bytes[2] == b'/');
+    let posix = [
+        "/etc", "/usr", "/var", "/root", "/home", "/dev", "/proc", "/mnt", "/opt", "/bin",
+        "/sbin", "/boot", "/lib",
+    ]
+    .iter()
+    .any(|root| word == *root || word.starts_with(&format!("{root}/")));
+    let climbs = word.contains("../") || word.contains("..\\");
+    drive || home || unc || msys || posix || climbs
+}
+
+/// The first obvious path literal in a script that resolves outside the working folder (class
+/// [`PathClass::Outside`]), for `run_script`'s approval. Reads count like writes: a script can't
+/// be told apart statically. Persistence, app-data and skill places are found by
+/// [`command_flag`] on the same text.
+pub fn script_outside_path(code: &str, ctx: &PolicyContext) -> Option<PathBuf> {
+    words(code)
+        .into_iter()
+        .map(|word| expand_variables(&word, ctx))
+        .filter(|word| obvious_path(word))
+        .map(|word| crate::paths::resolve(&word, &ctx.cwd, &ctx.home))
+        .find(|path| classify(path, ctx) == PathClass::Outside)
+}
+
 /// The words of a command line: split at whitespace and shell punctuation, except inside quotes,
 /// where a quoted string (spaces and all) is one word. An unquoted path with spaces in it is not
 /// recognised (best effort, see [`command_flag`]).

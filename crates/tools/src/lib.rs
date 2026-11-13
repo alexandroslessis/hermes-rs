@@ -23,6 +23,8 @@ mod recall;
 pub mod redact;
 pub mod references;
 mod review;
+mod script;
+mod script_guard;
 mod search;
 mod shell;
 pub mod skill_manage;
@@ -262,6 +264,21 @@ impl SessionTools {
                     checkpoints.ensure(
                         &cwd,
                         &format!("before terminal: {short}"),
+                        &self.home,
+                        &mut taken,
+                    );
+                }
+                None
+            }
+            "run_script" => {
+                let language = script_guard::Language::parse(args.get("language")?.as_str()?)?;
+                let code = args.get("code")?.as_str()?;
+                if script_guard::may_change_files(language, code) {
+                    let cwd = self.cwd();
+                    let short: String = code.lines().next().unwrap_or("").chars().take(60).collect();
+                    checkpoints.ensure(
+                        &cwd,
+                        &format!("before run_script: {short}"),
                         &self.home,
                         &mut taken,
                     );
@@ -509,6 +526,7 @@ impl SessionTools {
             "patch" => files::patch(self, args).await,
             "search_files" => search::search_files(self, args).await,
             "terminal" => shell::terminal(self, args, live).await,
+            "run_script" => script::run_script(self, args, live).await,
             "process_manage" => process::process_manage(self, args).await,
             "todo_list" => todo::todo_list(self, args),
             // A tainted session's memory and skill writes wait for the user (`staging.rs`), and so
@@ -598,6 +616,17 @@ impl SessionTools {
                 let command = args.get("command").and_then(Value::as_str).unwrap_or("");
                 if let Some(source) = taint::command_source(command) {
                     self.mark_tainted(source).await;
+                }
+                return;
+            }
+            "run_script" => {
+                let code = args.get("code").and_then(Value::as_str).unwrap_or("");
+                if let Some(source) = script::fetch_source(code) {
+                    self.mark_tainted(source).await;
+                }
+                if let Some(outside) = self.script_outside_path(code).await {
+                    self.mark_tainted(taint::outside_file_source(&self.shown(&outside)))
+                        .await;
                 }
                 return;
             }
@@ -1147,6 +1176,7 @@ fn is_within(path: &Path, dir: &Path) -> bool {
 }
 
 /// A tool result: JSON shown to the model, flagged as an error when the call failed.
+#[derive(Debug)]
 pub(crate) struct ToolOutput {
     value: Value,
     is_error: bool,
