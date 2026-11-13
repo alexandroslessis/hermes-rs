@@ -656,7 +656,8 @@ impl MemoryStore {
     }
 
     /// Settings ▸ Memory ▸ reset: erases `target`'s memory. Its file is deleted and, with a
-    /// database, every row of its kind (live or removed) and their FTS text are deleted with it,
+    /// database, every `core` row of its kind (live or removed) and their FTS text are deleted
+    /// with it (not the `project` / `archive` tiers: the page's confirmation names the file),
     /// in one step under the database's write lock (the file goes first, inside the transaction:
     /// stopped between the two, the next access finds the file gone and keeps a `.bak.dropped`
     /// copy rather than losing anything). The pre-migration backups are not touched (they are
@@ -675,6 +676,8 @@ impl MemoryStore {
                     format!("Could not reset {}: memory.db: {e}. Nothing was changed — retry in a moment.", target.file_name())
                 };
                 let tx = db.begin().map_err(failed)?;
+                // `core` only: the project and archive tiers are not in the file the page's
+                // confirmation names, so a reset doesn't erase them (PITFALLS.md).
                 let purged = db::purge_kind(&tx, target.kind()).map_err(failed)?;
                 db::set_meta(&tx, &db::meta_synced(target.kind()), ABSENT).map_err(failed)?;
                 let deleted = remove(&path)?;

@@ -128,6 +128,59 @@ pub fn scope_key(root: &Path) -> String {
     format!("project:{}", key(root))
 }
 
+/// A small text file read whole (a git pointer file); `None` if it is missing, a link or large.
+fn small_text(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > 4096 {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// For a linked worktree (`git worktree add`), the main checkout's root; `None` for anything
+/// else (an ordinary repository, a submodule, a bare repository's worktree, a broken link).
+///
+/// A worktree's `.git` is a file `gitdir: <repo>/.git/worktrees/<name>`; that folder's `commondir`
+/// names the shared `.git` and its `gitdir` names the worktree's `.git` back. The back-pointer is
+/// required: the `.git` file is in the (possibly foreign) checkout, so a folder could claim any
+/// repository's worktree folder; the pointer back is inside that repository's own `.git`, which
+/// the folder can't write. A submodule's `.git` file points at `.git/modules/<name>`, which has
+/// no `commondir`: it stays its own project.
+pub fn main_checkout(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    let pointer = small_text(&dot_git)?;
+    let gitdir = pointer.lines().next()?.strip_prefix("gitdir:")?.trim();
+    // `Path::join` keeps an absolute path as it is and resolves a relative one against the base.
+    let gitdir = canonical(&root.join(gitdir))?;
+    let back = small_text(&gitdir.join("gitdir"))?;
+    let back = canonical(&gitdir.join(back.trim()))?;
+    if key(&back) != key(&canonical(&dot_git)?) {
+        return None;
+    }
+    let common = small_text(&gitdir.join("commondir"))?;
+    let common = canonical(&gitdir.join(common.trim()))?;
+    if !common
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(".git"))
+    {
+        return None;
+    }
+    let main = common.parent()?.to_path_buf();
+    // The main checkout must be a repository root `find_root` would give (not the home folder).
+    find_root(&main)
+        .is_some_and(|found| key(&found) == key(&main))
+        .then_some(main)
+}
+
+/// The scope of a repository's **project memory** (Phase 9): [`scope_key`] of its root, except
+/// that a linked worktree shares its main checkout's (its notes are about the repository, and a
+/// worktree is usually short-lived: memory kept under its own path would be orphaned when it is
+/// removed). Project *skills* stay per checkout ([`scope_key`]): they are files in that checkout.
+/// File-system work (a few small reads): call it off the async workers.
+pub fn memory_scope_key(root: &Path) -> String {
+    scope_key(&main_checkout(root).unwrap_or_else(|| root.to_path_buf()))
+}
+
 /// The repository a working folder belongs to: see the module doc. `None` when there is none.
 pub fn find_root(cwd: &Path) -> Option<PathBuf> {
     let real = canonical(cwd)?;

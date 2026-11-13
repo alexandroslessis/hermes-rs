@@ -1817,8 +1817,9 @@ impl Runtime {
             _ => None,
         })
         .unwrap_or(0);
-        let snapshot = self.memory.snapshot();
-        let memory = [snapshot.memory, snapshot.user]
+        let scope = open.tools.memory_scope();
+        let snapshot = self.memory.snapshot_for(scope.as_deref());
+        let memory = [snapshot.memory, snapshot.user, snapshot.project]
             .into_iter()
             .flatten()
             .filter(|block| prompt.contains(block.as_str()))
@@ -2631,9 +2632,17 @@ impl PromptSource {
             },
             project.as_deref(),
         );
-        // Memory as it is now; writes during the session don't change this prompt.
-        let snapshot = self.memory.snapshot();
-        let memory = [snapshot.memory, snapshot.user]
+        // Memory as it is now; writes during the session don't change this prompt. A session in
+        // a git repository also gets that repository's project memory (and no other's): the
+        // same root the skills use (a linked worktree counts as its main checkout), known when
+        // the prompt is made and kept by it.
+        let snapshot = self.memory.snapshot_for(
+            project
+                .as_deref()
+                .map(hermes_tools::project_skills::memory_scope_key)
+                .as_deref(),
+        );
+        let memory = [snapshot.memory, snapshot.user, snapshot.project]
             .into_iter()
             .flatten()
             .reduce(|a, b| format!("{a}\n\n{b}"))

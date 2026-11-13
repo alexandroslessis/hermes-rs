@@ -199,3 +199,138 @@ lib 174 + `tests/acp.rs` 68; `cargo build --workspace` ok, no warnings. The work
 `target/hermes-src` was a junction to the main checkout's (removed by its `cargo clean`); the
 webapp was rebuilt into the worktree itself (`tools/node` junction to the main checkout's Node).
 Request counts unchanged.
+
+## CP9.2 — tiers and scopes, limits, notes, the memory tool's new fields
+Worktree: C:\Users\alexandros\repos\hermes-rs-p9   Branch: backend/p9-memory   Model: Sonnet 5.5 (subagent)
+Cut on top of CP9.1 (+ its review). Uncommitted.
+Done:
+- **Tiers.** `core` is untouched (the files, file wins, same limits and errors). `project` and
+  `archive` live in `memory.db` only (`tiers.rs`; no schema change: the columns existed). The agent's
+  batches in them go through the same planner as `core` (`store.rs` `batch`: matching, errors,
+  all-or-nothing, threat scan) and are recorded by `MemoryStore::mutate_tier` (one transaction under
+  the write lock; removed/rewritten rows are marked, never deleted; a patched row's successor takes
+  its tags, links, created, hits). One call writes one tier; `note_read` stands alone.
+- **Project scope** = `hermes_tools::project_skills::scope_key(find_root(cwd))` (Phase 8's root;
+  worktree = own project, nested repo = own, subfolder = parent's root, no repo = no project tier,
+  the call is refused, nothing falls back). The memory crate knows no paths: the tools crate passes
+  the key (`SessionTools::memory_scope`, `tool_in`, `unattended_tool_in`, `stage_memory_call_in`);
+  it is never read from model arguments and each staged operation carries it.
+- **Prompt.** `snapshot_for(scope)` adds a project block (`PROJECT MEMORY (notes for this
+  repository only) [..]`) read only for that scope; `PromptSource::build` appends it after the core
+  blocks when the session starts (frozen with the prompt). Without project entries the prompt is
+  byte-identical (turns test compares prompts before/after archive and other-repo writes).
+  `context_breakdown` counts it as memory.
+- **Limits.** `MemoryConfig::project_char_limit` (default 1500; `memory.project_char_limit` in
+  config, validated to 200-20000 else default, shown in Settings), per project, both kinds together.
+  Archive: no char limit; 1000 chars an entry, 5000 entries a target. Same error style (current
+  entries, how much to prune).
+- **Notes** (`notes.rs`): chosen design = `add`/`patch` take `note` (the body) and the new action
+  `note_read` (old_text + tier) reads it; no `note_write`. File `memories/notes/<slug>.md`, link
+  `file:notes/<slug>.md`; slug sanitising (`[a-z0-9-]`, 48 chars, device names, no empty), 20000-char
+  cap, atomic temp+rename, never overwritten, threat-scanned, reads only via valid slug + regular
+  file. Core has no notes. Model-supplied links into `notes/` are refused.
+- **Deletion.** Agent removal keeps row and note (history). User removal (`delete_tier_entry`, and
+  `reset`, which now erases every tier of its kind and their notes) purges rows, older versions,
+  FTS and the note files.
+- **Tool schema** (`prompts/tools/memory.json`): `tier`, `tags`, `links`, `note`, `note_read`, a
+  TIERS paragraph. Old-shape calls: identical results/errors/files (test compares against
+  `file_only` over 19 calls incl. errors). Tags (<=8, 32 chars) and links (<=8, kinds `skill:` `file:`
+  `session:` `memory:`, 300 chars) validated; `file:` links stay strings. Core entries may carry
+  tags/links (database only; a patch carries them over). Schema change = one cache miss (PITFALLS).
+- **Staging/review.** `PendingWrite.extras` and the taint staging payload carry tier/scope/tags/
+  links/note (absent for old shape, so old records serialize as before); the dry run applies limits
+  and scan; the diff shows tier, tags, links, note. Phase 7 review ops are unchanged (core).
+- `Operation` is unchanged (CP9.1 tests build it literally); extras are a parallel `Extras` list
+  (`apply_ext`, `resolve_ext`, `parse_call_in`; `parse_call` removed, its one caller updated).
+Files: `crates/memory/src/{tiers,tiers_tests,notes,db,store,tool,sync,lib}.rs`,
+`crates/tools/src/{lib,staging,project_skills/tests}.rs`, `crates/runtime/src/lib.rs`,
+`crates/runtime/tests/turns.rs`, `crates/desktop/src/{gateway,rest}.rs`, `prompts/tools/memory.json`,
+`PORTING.md`, `GAPS.md`, `docs/{ARCHITECTURE,PITFALLS}.md`, this note.
+Tests (`CARGO_TARGET_DIR=target/claude`): hermes_memory 78 (+1 ignored; CP9.1's 53 unmodified),
+hermes_tools 245, store 12, prompts 23, llm 468+5, runtime lib 169, `--test turns` 196 (7 ignored)
+under default/balanced/requests/tokens, hermes-desktop and `cargo build --workspace` (see final
+report). New: 27 memory tests (scope isolation, limits, bounds, notes slugs/escapes/limits/
+history, link validation, hard delete incl. bytes scan, reset, staging, unattended, old-shape
+identity), 1 tools test (worktree/subfolder/nested/no-repo roots), 1 staging test, 2 turns tests
+(core-only prompt byte-identical, project block only in its repo and frozen mid-session, 8 requests
+for 4 turns).
+Request counts: unchanged.
+Deviations: `Operation` not extended (parallel `Extras`); `reset` erases all tiers of the kind;
+`snapshot()` keeps its signature (new `snapshot_for`).
+For the reviewer:
+- A worktree is its own project (Phase 8's root): its memory is not shared with the main checkout.
+  Confirm, or map worktrees to the common git dir.
+- `reset` erasing project/archive entries and notes of that target: confirm it is what the user
+  expects from "reset memory".
+- Notes only for project/archive (core entries are in every prompt; a core note's link would be
+  invisible). Confirm.
+- Archive/project rows are not in `index.db` yet (global indexing would leak across repos); CP9.3
+  must index with scope.
+- `source_session` is not filled (the store doesn't know the session); CP9.3 if wanted.
+- An agent-removed project entry keeps its text (and note) on disk until the user removes it
+  through a path that purges; there is no page for non-core tiers yet (CP9.3 map).
+- A crash between writing a note and the commit leaves an unlinked note file.
+- Schema text grew ~700 chars: one cache miss on upgrade (PITFALLS).
+- Not verified live: no page call changed; no `*-check.mjs` written.
+
+### Review (Opus 5.5)
+`main` had not moved (cut at 3c182fa + CP9.1 6ef3bda); no merge. `/code-review` not run as a skill
+(subagent); manual pass over tiers.rs, notes.rs, tool.rs, store.rs, db.rs, sync.rs, the tools,
+runtime and desktop callers.
+
+**Old-shape calls (evidence).** A scratch workspace (outside the repo, same `target/claude`) built
+the CP9.1 crate (`git archive 6ef3bda crates/memory`, renamed) next to this one and ran 55 calls
+in sequence on both, in three modes (direct, `write_approval`, unattended review): add/patch/
+remove/replace (batch and legacy single-op, `new_text`), both targets, not found, ambiguous,
+missing/invalid/numeric target, `operations` as string/empty/number item/no action, unknown and
+mis-cased actions, null action, numeric content/old_text, empty and blank content, a 100k-char
+entry, unknown top-level and per-op fields, null/string/array args, duplicate add, threat text,
+unicode, `§`, newlines, a mixed batch, overflow to the consolidation-failure cap, removing the
+last entry. Compared: result JSON and error texts, MEMORY.md / USER.md bytes, snapshot blocks,
+staged records. **Identical**, except (a) `note_read` (the new action; it is a read, so it no
+longer counts as a failure) and (b) staged records of calls that use the new fields gain an
+`extras` field. One regression found and fixed: `"tags": "misc"` (a string; the old code ignored
+the field and wrote) was refused; `tags`/`links` given as a string are now read as a
+comma-separated list, an empty string as none. Schema: valid JSON Schema, `strict: false` (our
+provider), `additionalProperties: false` per item, enums only on strings; fine for llama.cpp
+grammars and OpenAI-compatible servers. Core-only prompt byte-identical (turns test).
+
+**Findings and fixes:**
+1. *Worktree scope (decision).* A linked worktree was its own project: memory written there was
+   invisible from the main checkout and orphaned when the worktree is removed (this project
+   works in worktrees). New `project_skills::main_checkout` / `memory_scope_key`: follows the
+   `.git` file's `gitdir:`, requires the pointer back (`<gitdir>/gitdir` = this `.git`, which a
+   foreign folder can't forge since it lives in the other repo's `.git`) and a `commondir` naming
+   a `.git` folder; absolute and relative pointers. Submodules (`.git/modules`, no `commondir`),
+   forged pointers, bare-repo worktrees and nested repos stay their own project. Project *skills*
+   keep `scope_key` per checkout. Used by `memory_scope`, the tool and staging paths (now computed
+   inside `spawn_blocking`) and `PromptSource::build`. Case/slash/`..`/junction/8.3/`\?\`
+   spellings already collapse via `canonical` + lowercase key. The scope comes only from the
+   session's project root (`take_extras` never reads a `scope` field; items reject extra fields).
+2. *Reset destroyed data the dialog doesn't name.* The page asks "Delete Agent memory
+   (MEMORY.md)? This cannot be undone."; CP9.2 made it also erase every repository's project and
+   archive entries of that kind and their notes. Now `reset` purges `core` rows only (live and
+   removed, FTS, checkpoint as in CP9.1); other tiers stay. PITFALLS, GAPS, PORTING updated.
+3. *A purge could delete a note a live entry still shows.* A patched entry's successor keeps its
+   predecessor's note link, and `purge_rows` also takes removed rows of the same text from any
+   tier; erasing an unrelated entry with the old text deleted the live successor's note file.
+   `db::unreferenced` keeps any note a remaining row links.
+4. *Notes folder as a junction/symlink* was followed by write/read/delete. Now refused (test
+   plants a real junction with `mklink /J`).
+
+Checked, no change: leaks — project rows only via `tier_rows(scope)`; errors list entries of the
+session's scope only (archive is global by design); no REST/Star map/index (`memory_doc`) path
+reads non-core tiers; children inherit the parent's root, the curator has none; Phase 7
+`review_once` ops are core. Every `Operation` consumer that stages or applies (`approve`, staging
+`apply_memory`, unattended, `write_approval`) passes `extras`; GPUI uses `approve`. Limits and
+boundaries tested (1000/1001 chars, 5000 rows, project 1500, 200-20000 clamp, chars not bytes);
+one tier per call, one `BEGIN IMMEDIATE` transaction, notes removed on a failed commit.
+Left: orphan note after a crash between note write and commit (not swept); no page to erase
+project/archive entries until CP9.3 (only `delete_tier_entry`, or a soft agent removal); an old
+build approving a staged non-core write would apply it to core (PITFALLS); `source_session`
+unfilled; no live check (no page shape changed).
+Tests (`CARGO_TARGET_DIR=target/claude`): hermes_memory 81 + 1 ignored (new: reset core-only,
+note kept for a surviving row, string tags/links, junction), hermes_tools 246 + 1 ignored (new:
+linked worktree), store 12, prompts 23, llm 468+5; runtime lib 169; `--test turns` 196 (7
+ignored) under default, balanced, requests, tokens; hermes-desktop 174 + acp 68;
+`cargo build --workspace` ok, no warnings. Request counts unchanged.

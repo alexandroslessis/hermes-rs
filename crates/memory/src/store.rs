@@ -11,6 +11,10 @@
 //! unchanged: the entries are always exactly what the file parses to, so the prompt blocks are
 //! byte for byte what they were. (One exception: a file that can't be read after its migration is
 //! answered from the database instead of as empty; writes are still refused then.)
+//!
+//! CP9.2 adds two tiers that live in `memory.db` only, `project` (per git root) and `archive`, with
+//! tags, links and notes (`tiers.rs`, `notes.rs`). Everything here that is about `core` is as it
+//! was; a batch whose operations carry no `tier` is a `core` batch and takes exactly the old path.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -22,6 +26,7 @@ use serde_json::{Value, json};
 use crate::db::{self, MemoryDb};
 use crate::sync::{Abort, Failpoint, Inner, View, read_file};
 use crate::threats::{Scope, first_threat_message, scan_for_threats};
+use crate::tiers::{self, Extras, Tier};
 
 /// How many times a write starts again when the file changed under it (a writer that doesn't
 /// take the database's lock: an editor, an older build), or after the database failed.
@@ -93,6 +98,9 @@ pub struct MemoryConfig {
     pub user_profile_enabled: bool,
     pub memory_char_limit: usize,
     pub user_char_limit: usize,
+    /// The most characters one project's entries may hold, per git root (`memory.project_char_limit`;
+    /// held to `tiers::PROJECT_LIMIT_MIN..=PROJECT_LIMIT_MAX`).
+    pub project_char_limit: usize,
     /// Stage writes for the user's approval instead of saving them (`memory.write_approval`).
     pub write_approval: bool,
 }
@@ -104,6 +112,7 @@ impl Default for MemoryConfig {
             user_profile_enabled: true,
             memory_char_limit: 2200,
             user_char_limit: 1375,
+            project_char_limit: tiers::PROJECT_LIMIT_DEFAULT,
             write_approval: false,
         }
     }
@@ -129,6 +138,9 @@ pub struct Operation {
 pub struct MemorySnapshot {
     pub memory: Option<String>,
     pub user: Option<String>,
+    /// The project tier's block for the session's repository (`MemoryStore::snapshot_for`);
+    /// `None` for no repository or no entries.
+    pub project: Option<String>,
 }
 
 pub struct MemoryStore {
@@ -189,7 +201,7 @@ fn substring_matches(entries: &[String], old_text: &str) -> Vec<usize> {
 }
 
 /// `(index, ambiguous)`: a whole-entry exact match wins; distinct substring matches are ambiguous.
-fn find_unique_match(entries: &[String], old_text: &str) -> (Option<usize>, bool) {
+pub(crate) fn find_unique_match(entries: &[String], old_text: &str) -> (Option<usize>, bool) {
     let exact: Vec<usize> = (0..entries.len())
         .filter(|&i| entries[i] == old_text)
         .collect();
@@ -304,16 +316,26 @@ pub(crate) fn parse_entries(raw: &str) -> Vec<String> {
 }
 
 /// What a closure passed to `mutate` decided.
-enum Mutation {
-    /// New entries, a message, extra fields for the success payload, and what happens to the
-    /// entries that leave (`memory.db`).
-    Write(Vec<String>, String, Value, Leaving),
+pub(crate) enum Mutation {
+    /// New entries, a message, extra fields for the success payload, what happens to the
+    /// entries that leave (`memory.db`), and the tags, links and notes the call attached to
+    /// entries it adds or patches (empty for an old-shape call).
+    Write(Vec<String>, String, Value, Leaving, Vec<RowMeta>),
     /// Returned as-is; nothing is written.
     Reply(Value),
 }
 
+/// What a call attached to one entry it writes (`text` is the entry as it will be).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RowMeta {
+    pub text: String,
+    pub tags: Option<Vec<String>>,
+    pub links: Option<Vec<String>>,
+    pub note: Option<String>,
+}
+
 /// What `memory.db` does with the entries a write removes or rewrites.
-enum Leaving {
+pub(crate) enum Leaving {
     /// The agent's write: kept as removed rows; each rewritten one points at its replacement
     /// (old text, new text).
     Mark(Vec<(String, String)>),
@@ -485,8 +507,15 @@ impl MemoryStore {
         ))
     }
 
-    /// The blocks a new session's system prompt carries.
+    /// The blocks a new session's system prompt carries (no repository: no project block).
     pub fn snapshot(&self) -> MemorySnapshot {
+        self.snapshot_for(None)
+    }
+
+    /// [`Self::snapshot`] for a session in the repository whose scope key is `project`
+    /// (`hermes_tools::project_skills::scope_key`): its project entries too, and no other
+    /// repository's. The core blocks are exactly the same as without a project.
+    pub fn snapshot_for(&self, project: Option<&str>) -> MemorySnapshot {
         let block = |target| {
             self.enabled(target)
                 .then(|| self.render_block(target, &self.entries(target)))
@@ -495,6 +524,7 @@ impl MemoryStore {
         MemorySnapshot {
             memory: block(Target::Memory),
             user: block(Target::User),
+            project: project.and_then(|scope| self.project_block(scope)),
         }
     }
 
@@ -673,7 +703,7 @@ impl MemoryStore {
                 }
                 Ok((value, imported, purged))
             }
-            Mutation::Write(entries, message, extra, leaving) => {
+            Mutation::Write(entries, message, extra, leaving, metas) => {
                 if oversized && !entries.iter().all(|e| before.contains(e)) {
                     commit(tx);
                     return Ok((self.drift_error(target, raw), imported, purged));
@@ -691,6 +721,23 @@ impl MemoryStore {
                     let changes =
                         db::set_core(tx, target.kind(), &texts, removal, supersedes, now, false)?;
                     purged |= changes.purged;
+                    // Tags and links the call set (or a patch carries over from the entry it
+                    // replaced) are kept for the map; the file doesn't show them.
+                    if !supersedes.is_empty() {
+                        db::inherit_core_meta(tx, target.kind())?;
+                    }
+                    for meta in &metas {
+                        let json = |list: &Option<Vec<String>>| {
+                            list.as_ref().and_then(|l| serde_json::to_string(l).ok())
+                        };
+                        db::set_core_meta(
+                            tx,
+                            target.kind(),
+                            &meta.text,
+                            json(&meta.tags).as_deref(),
+                            json(&meta.links).as_deref(),
+                        )?;
+                    }
                     db::set_meta(
                         tx,
                         &db::meta_synced(target.kind()),
@@ -779,25 +826,43 @@ impl MemoryStore {
                 }
             };
             // The user's own delete or rewrite: the old text is erased from `memory.db` too.
-            Mutation::Write(next, message, json!({}), Leaving::Purge)
+            Mutation::Write(next, message, json!({}), Leaving::Purge, Vec::new())
         })
     }
 
     /// Applies a batch atomically against the final budget: any failing op writes nothing.
     pub fn apply(&self, target: Target, ops: &[Operation], failures: &mut TurnFailures) -> Value {
-        self.batch(target, ops, failures, true)
+        self.apply_ext(target, ops, &[], failures)
+    }
+
+    /// [`Self::apply`] with the tier, tags, links and notes of each operation (`extras[i]` for
+    /// `ops[i]`; missing ones are default = a `core` operation as it always was).
+    pub fn apply_ext(
+        &self,
+        target: Target,
+        ops: &[Operation],
+        extras: &[Extras],
+        failures: &mut TurnFailures,
+    ) -> Value {
+        self.batch(target, ops, extras, failures, true)
     }
 
     /// Dry run of `apply`: on success `matched_entries` holds, per op, the full entry a
     /// patch/remove selects now (null for add). Staged writes pin these.
     pub fn resolve(&self, target: Target, ops: &[Operation]) -> Value {
-        self.batch(target, ops, &mut TurnFailures::default(), false)
+        self.resolve_ext(target, ops, &[])
+    }
+
+    /// [`Self::resolve`] with the operations' extras.
+    pub fn resolve_ext(&self, target: Target, ops: &[Operation], extras: &[Extras]) -> Value {
+        self.batch(target, ops, extras, &mut TurnFailures::default(), false)
     }
 
     fn batch(
         &self,
         target: Target,
         ops: &[Operation],
+        extras: &[Extras],
         failures: &mut TurnFailures,
         commit: bool,
     ) -> Value {
@@ -816,13 +881,35 @@ impl MemoryStore {
                 }
             }
         }
+        // The new fields: which store this writes, and whether they are valid. An old-shape call
+        // is `core` and never fails here.
+        let place = match tiers::check_extras(ops, extras) {
+            Ok(place) => place,
+            Err(message) => return error(message),
+        };
+        let tier = place.tier;
+        let core = tier == Tier::Core;
+        let noun = if core { "Memory" } else { "Project memory" };
+        let (entry_cap, row_cap) = match tier {
+            Tier::Core => (None, None),
+            Tier::Project => (None, Some(tiers::PROJECT_ROWS_MAX)),
+            Tier::Archive => (
+                Some(tiers::ARCHIVE_ENTRY_CHARS),
+                Some(tiers::ARCHIVE_ROWS_MAX),
+            ),
+        };
         let file = target.file_name();
-        let outcome = self.mutate(target, !commit, |entries, limit| {
+        let plan = |entries: &[String], limit: usize| {
+            let limit_text = if limit == usize::MAX {
+                "no limit".to_string()
+            } else {
+                limit.to_string()
+            };
             let batch_failure = |failures: &mut TurnFailures, message: String, closest: Option<Value>, over_budget: bool| {
                 let mut value = error(format!(
                     "{message} No operations were applied (batch is all-or-nothing)."
                 ));
-                value["usage"] = json!(format!("{}/{limit}", Self::chars(entries)));
+                value["usage"] = json!(format!("{}/{limit_text}", Self::chars(entries)));
                 if let Some(closest) = closest {
                     value["closest_entries"] = closest;
                 }
@@ -834,6 +921,20 @@ impl MemoryStore {
             let mut working: Vec<String> = entries.to_vec();
             let mut matched: Vec<Option<String>> = Vec::new();
             let mut produced: HashMap<usize, String> = HashMap::new();
+            let mut metas: Vec<RowMeta> = Vec::new();
+            let empty = Extras::default();
+            let meta_of = |i: usize, text: &str| {
+                let extra = extras.get(i).unwrap_or(&empty);
+                (extra.tags.is_some() || extra.links.is_some() || extra.note.is_some()).then(|| {
+                    RowMeta {
+                        text: text.to_string(),
+                        // Validated by `check_extras`; the cleaned lists are what is kept.
+                        tags: extra.tags.as_deref().and_then(|t| tiers::clean_tags(t).ok()),
+                        links: extra.links.as_deref().and_then(|l| tiers::clean_links(l).ok()),
+                        note: extra.note.as_ref().map(|n| n.trim().to_string()),
+                    }
+                })
+            };
             for (i, op) in ops.iter().enumerate() {
                 let act = op.action.as_str();
                 let pos = format!(
@@ -851,6 +952,7 @@ impl MemoryStore {
                     if content.is_empty() {
                         return batch_failure(failures, format!("{pos}: content is required."), None, false);
                     }
+                    metas.extend(meta_of(i, &content));
                     if !working.contains(&content) {
                         working.push(content);
                     }
@@ -905,6 +1007,7 @@ impl MemoryStore {
                     _ => match patch_entry(&previous, &old_text, &content) {
                         Ok(patched) => {
                             working[index] = patched.clone();
+                            metas.extend(meta_of(i, &patched));
                             produced.insert(i + 1, patched);
                         }
                         Err(message) => {
@@ -914,11 +1017,25 @@ impl MemoryStore {
                 }
                 matched.push(Some(previous));
             }
-            if !entries.is_empty()
+            if core
+                && !entries.is_empty()
                 && working.is_empty()
                 && !(ops.len() == 1 && ops[0].action == "remove")
             {
                 return batch_failure(failures, format!("Refusing to empty {file}: this batch would remove every entry from a previously non-empty store. Keep at least one entry — merge overlapping entries into a shorter one instead of removing the last one. To delete the final entry deliberately, remove it alone in a one-item batch."), None, false);
+            }
+            if let Some(cap) = entry_cap {
+                if let Some(long) = working
+                    .iter()
+                    .find(|w| !entries.contains(w) && w.chars().count() > cap)
+                {
+                    return batch_failure(failures, format!("An entry of {} characters is too long for the {} tier (at most {cap}): keep the entry a one-line summary and put the detail in a note.", long.chars().count(), tier.name()), None, false);
+                }
+            }
+            if let Some(cap) = row_cap {
+                if working.len() > cap && working.len() > entries.len() {
+                    return batch_failure(failures, format!("The {} tier holds at most {cap} entries per store; remove or merge some first.", tier.name()), None, false);
+                }
             }
             let new_total = Self::chars(&working);
             let grows = !(ops.iter().all(|op| op.action == "remove")
@@ -932,14 +1049,14 @@ impl MemoryStore {
                     let over = Self::chars(&with_new) - limit;
                     let value = json!({
                         "success": false,
-                        "error": format!("Memory at {}/{limit} chars; adding this entry ({} chars) would exceed the limit by {over} chars. Retry as ONE 'operations' batch that removes or shortens (patch) stale entries from current_entries below to free at least {over} chars AND adds this entry — the limit is checked only on the batch result.", Self::chars(entries), content.chars().count()),
+                        "error": format!("{noun} at {}/{limit} chars; adding this entry ({} chars) would exceed the limit by {over} chars. Retry as ONE 'operations' batch that removes or shortens (patch) stale entries from current_entries below to free at least {over} chars AND adds this entry — the limit is checked only on the batch result.{}", Self::chars(entries), content.chars().count(), if core { String::new() } else { format!(" Keep tier '{}' on every operation.", tier.name()) }),
                         "current_entries": entries,
                         "usage": format!("{}/{limit}", Self::chars(entries)),
                         "over_budget": true,
                     });
                     return Mutation::Reply(Self::consolidation_failure(failures, value));
                 }
-                return batch_failure(failures, format!("Applying all {} operations would put memory at {new_total}/{limit} chars: free at least {} chars more. Add removes or shortening patches of other stale entries to the same batch, then retry.", ops.len(), new_total - limit), None, true);
+                return batch_failure(failures, format!("Applying all {} operations would put {} at {new_total}/{limit} chars: free at least {} chars more. Add removes or shortening patches of other stale entries to the same batch, then retry.", ops.len(), if core { "memory" } else { tier.label() }, new_total - limit), None, true);
             }
             if !commit {
                 return Mutation::Reply(json!({"success": true, "matched_entries": matched}));
@@ -982,8 +1099,14 @@ impl MemoryStore {
                 format!("Applied {} operation(s).", ops.len()),
                 extra,
                 Leaving::Mark(supersedes),
+                metas,
             )
-        });
+        };
+        let outcome = if core {
+            self.mutate(target, !commit, plan)
+        } else {
+            self.mutate_tier(target, &place, plan)
+        };
         if outcome["success"] == json!(true) && commit {
             failures.0 = 0;
         }

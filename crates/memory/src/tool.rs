@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::store::{MemoryStore, Operation, Target, TurnFailures};
+use crate::tiers::{Extras, Tier};
 
 const REPLACE_REMOVED: &str = "'replace' is not available; use 'patch'. old_text is the exact span to change and content is its new text; the rest of the entry is kept. To rewrite a whole entry, set old_text to the whole entry. Nothing was written.";
 
@@ -17,22 +18,108 @@ pub struct PendingWrite {
     pub target: Target,
     pub summary: String,
     pub operations: Vec<Operation>,
+    /// The tier, tags, links and notes of `operations[i]` (empty: all `core`, as before CP9.2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extras: Vec<Extras>,
     pub created_at: i64,
+}
+
+/// A `memory` call read into what it does.
+#[derive(Clone, Debug)]
+pub struct Parsed {
+    pub target: Target,
+    pub ops: Vec<Operation>,
+    /// Parallel to `ops` (all default for an old-shape call).
+    pub extras: Vec<Extras>,
+    /// `Some` for a `note_read` call: a read, never staged, never counted as a write.
+    pub read: Option<ReadCall>,
+}
+
+/// A `note_read` call.
+#[derive(Clone, Debug)]
+pub struct ReadCall {
+    pub tier: Tier,
+    /// The session's project scope key (from the caller, never from the model).
+    pub scope: Option<String>,
+    pub old_text: String,
 }
 
 fn error(message: impl Into<String>) -> Value {
     json!({"success": false, "error": message.into()})
 }
 
-/// One line per op, as the approver sees it.
-fn op_line(op: &Operation) -> String {
+/// One line per op, as the approver sees it (a non-core tier is named).
+fn op_line(op: &Operation, extra: &Extras) -> String {
     let content = op.content.as_deref().unwrap_or_default();
     let old = op.old_text.as_deref().unwrap_or_default();
+    let tier = match extra.tier.as_deref() {
+        Some(tier) if tier != "core" => format!(" [{tier}]"),
+        _ => String::new(),
+    };
     match op.action.as_str() {
-        "remove" => format!("- remove: {old}"),
-        "patch" => format!("- patch span '{old}' -> '{content}' (rest of the entry is kept)"),
-        action => format!("- {action}: {content}"),
+        "remove" => format!("- remove{tier}: {old}"),
+        "patch" => {
+            format!("- patch{tier} span '{old}' -> '{content}' (rest of the entry is kept)")
+        }
+        action => format!("- {action}{tier}: {content}"),
     }
+}
+
+/// Reads the tier, tags, links and note of one operation (a batch item, or the top level of a
+/// legacy single-op call). `n` names the operation in a refusal; `default_tier` is a call-level
+/// `tier`. The project scope is the session's, never the model's.
+fn take_extras(
+    item: &Value,
+    n: usize,
+    default_tier: Option<&str>,
+    session_scope: Option<&str>,
+) -> Result<Extras, Value> {
+    let bad = |what: &str| error(format!("Operation {n}: {what} Nothing was written or staged."));
+    let tier = match item.get("tier") {
+        None | Some(Value::Null) => default_tier.map(str::to_string),
+        Some(Value::String(tier)) if tier.trim().is_empty() => default_tier.map(str::to_string),
+        Some(Value::String(tier)) => Some(tier.trim().to_ascii_lowercase()),
+        Some(_) => return Err(bad("tier must be 'core', 'project' or 'archive'.")),
+    };
+    let list = |key: &str| -> Result<Option<Vec<String>>, Value> {
+        match item.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            // Smaller models often send one label as a string, or a comma-separated string:
+            // read it as that list rather than failing a write the old schema would have taken
+            // (an unknown field was ignored before CP9.2). An empty string is no list.
+            Some(Value::String(text)) => {
+                let items: Vec<String> = text
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                Ok((!items.is_empty()).then_some(items))
+            }
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| v.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+                .map(Some)
+                .ok_or_else(|| bad(&format!("{key} must be a list of strings."))),
+            Some(_) => Err(bad(&format!("{key} must be a list of strings."))),
+        }
+    };
+    let note = match item.get("note") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(_) => return Err(bad("note must be a string (the long-form body).")),
+    };
+    let scope = (tier.as_deref() == Some("project"))
+        .then(|| session_scope.map(str::to_string))
+        .flatten();
+    Ok(Extras {
+        tier,
+        scope,
+        tags: list("tags")?,
+        links: list("links")?,
+        note,
+    })
 }
 
 impl MemoryStore {
@@ -57,10 +144,10 @@ impl MemoryStore {
         records
     }
 
-    fn stage(&self, target: Target, operations: Vec<Operation>) -> Value {
+    fn stage(&self, target: Target, operations: Vec<Operation>, extras: Vec<Extras>) -> Value {
         // Pin each patch/remove to the full entry it selects now, so approval applies to exactly
         // what the approver reviewed.
-        let resolved = self.resolve(target, &operations);
+        let resolved = self.resolve_ext(target, &operations, &extras);
         if resolved["success"] != json!(true) {
             return resolved;
         }
@@ -78,7 +165,12 @@ impl MemoryStore {
             })
             .collect();
         let id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
-        let lines: Vec<String> = operations.iter().map(op_line).collect();
+        let empty = Extras::default();
+        let lines: Vec<String> = operations
+            .iter()
+            .enumerate()
+            .map(|(i, op)| op_line(op, extras.get(i).unwrap_or(&empty)))
+            .collect();
         let record = PendingWrite {
             id: id.clone(),
             target,
@@ -89,6 +181,11 @@ impl MemoryStore {
                 lines.join("\n")
             ),
             operations,
+            extras: if extras.iter().all(Extras::is_empty) {
+                Vec::new()
+            } else {
+                extras
+            },
             created_at: chrono::Utc::now().timestamp_millis(),
         };
         let dir = self.pending_dir();
@@ -114,9 +211,10 @@ impl MemoryStore {
         let Some(record) = self.pending().into_iter().find(|r| r.id == id) else {
             return error(format!("No pending memory write {id}."));
         };
-        let result = self.apply(
+        let result = self.apply_ext(
             record.target,
             &record.operations,
+            &record.extras,
             &mut TurnFailures::default(),
         );
         if result["success"] == json!(true) {
@@ -132,23 +230,59 @@ impl MemoryStore {
     /// The `memory` tool. Accepts Hermes's batch shape (`target` + `operations`) and the legacy
     /// single-op shape (`action`, `content`/`new_text`, `old_text`).
     pub fn tool(&self, args: &Value, failures: &mut TurnFailures) -> Value {
-        self.tool_as(args, failures, false)
+        self.tool_as(args, failures, false, None)
+    }
+
+    /// [`Self::tool`] for a session in the repository whose scope key is `project` (it may use
+    /// tier `project`, for that repository only).
+    pub fn tool_in(
+        &self,
+        args: &Value,
+        failures: &mut TurnFailures,
+        project: Option<&str>,
+    ) -> Value {
+        self.tool_as(args, failures, false, project)
     }
 
     /// The `memory` tool for an unattended background review (Hermes's `_background_delete_gate`):
     /// adding stays available, but patches and removals are staged for the user's approval
     /// instead of applied, since nobody is watching.
     pub fn unattended_tool(&self, args: &Value, failures: &mut TurnFailures) -> Value {
-        self.tool_as(args, failures, true)
+        self.tool_as(args, failures, true, None)
     }
 
-    fn tool_as(&self, args: &Value, failures: &mut TurnFailures, unattended: bool) -> Value {
-        let (target, ops) = match self.parse_call(args) {
+    /// [`Self::unattended_tool`] for a session in the repository `project` (see [`Self::tool_in`]).
+    pub fn unattended_tool_in(
+        &self,
+        args: &Value,
+        failures: &mut TurnFailures,
+        project: Option<&str>,
+    ) -> Value {
+        self.tool_as(args, failures, true, project)
+    }
+
+    fn tool_as(
+        &self,
+        args: &Value,
+        failures: &mut TurnFailures,
+        unattended: bool,
+        project: Option<&str>,
+    ) -> Value {
+        let parsed = match self.parse_call_in(args, project) {
             Ok(parsed) => parsed,
             Err(refusal) => return refusal,
         };
+        if let Some(read) = &parsed.read {
+            return self.run_read(parsed.target, read);
+        }
+        let Parsed {
+            target,
+            ops,
+            extras,
+            ..
+        } = parsed;
         if unattended && ops.iter().any(|op| op.action != "add") {
-            let mut staged = self.stage(target, ops);
+            let mut staged = self.stage(target, ops, extras);
             if staged["success"] == json!(true) {
                 staged["proposal_staged"] = json!(true);
                 staged["message"] = json!(
@@ -158,16 +292,24 @@ impl MemoryStore {
             return staged;
         }
         if self.config().write_approval {
-            return self.stage(target, ops);
+            return self.stage(target, ops, extras);
         }
-        self.apply(target, &ops, failures)
+        self.apply_ext(target, &ops, &extras, failures)
+    }
+
+    /// A `note_read` call: the body of the note an entry links to (a read: nothing is staged).
+    pub fn run_read(&self, target: Target, read: &ReadCall) -> Value {
+        self.read_note(target, read.tier, read.scope.as_deref(), &read.old_text)
     }
 
     /// Reads a `memory` call into its store and operations, with every check the tool makes
     /// before it writes (shape, target, the store being enabled). `Err` is the tool's own refusal.
     /// The taint-driven staging area (`hermes_tools::staging`) reads a call through this too, so a
     /// staged write is the same write the tool would have made.
-    pub fn parse_call(&self, args: &Value) -> Result<(Target, Vec<Operation>), Value> {
+    ///
+    /// `project` is the session's project scope key (the repository it works in), or `None`
+    /// outside one; it is what tier `project` writes to, and only the caller supplies it.
+    pub fn parse_call_in(&self, args: &Value, project: Option<&str>) -> Result<Parsed, Value> {
         let text = |key: &str| {
             args.get(key)
                 .and_then(Value::as_str)
@@ -204,10 +346,13 @@ impl MemoryStore {
             );
         }
 
+        // A call-level `tier` is the default of every operation that names none.
+        let default_tier = text("tier");
+        let mut extras: Vec<Extras> = Vec::new();
         let ops: Vec<Operation> = match operations {
             Some(Value::Array(items)) if !items.is_empty() => {
                 let mut ops = Vec::new();
-                for item in items {
+                for (index, item) in items.iter().enumerate() {
                     let Ok(mut op) = serde_json::from_value::<Operation>(item.clone()) else {
                         return Err(error(
                             "operations must be a list of {action, content?, old_text?} objects.",
@@ -220,6 +365,7 @@ impl MemoryStore {
                             .map(str::to_string);
                     }
                     op.matched_entry = None;
+                    extras.push(take_extras(item, index + 1, default_tier.as_deref(), project)?);
                     ops.push(op);
                 }
                 if ops.iter().any(|op| op.action == "replace") {
@@ -241,7 +387,7 @@ impl MemoryStore {
                 if action == "replace" {
                     return Err(error(REPLACE_REMOVED));
                 }
-                if !matches!(action.as_str(), "add" | "patch" | "remove") {
+                if !matches!(action.as_str(), "add" | "patch" | "remove" | "note_read") {
                     return Err(error(format!(
                         "Unknown action '{action}'. Use: add, patch, remove"
                     )));
@@ -255,10 +401,46 @@ impl MemoryStore {
                 if let Some(invalid) = self.validate_single(target, &op) {
                     return Err(invalid);
                 }
+                extras.push(take_extras(args, 1, default_tier.as_deref(), project)?);
                 vec![op]
             }
         };
-        Ok((target, ops))
+        if ops.iter().any(|op| op.action == "note_read") {
+            if ops.len() != 1 {
+                return Err(error(
+                    "note_read must be the only operation in its call (it reads; it writes nothing). Nothing was written or staged.",
+                ));
+            }
+            let tier = match extras[0].tier.as_deref() {
+                None => Tier::Archive,
+                Some(name) => Tier::parse(name).ok_or_else(|| {
+                    error(format!(
+                        "Invalid tier '{name}'. Use 'project' or 'archive' for note_read."
+                    ))
+                })?,
+            };
+            let Some(old_text) = ops[0].old_text.clone() else {
+                return Err(error(
+                    "note_read needs old_text -- a short unique substring of the entry whose note to read.",
+                ));
+            };
+            return Ok(Parsed {
+                target,
+                ops: Vec::new(),
+                extras: Vec::new(),
+                read: Some(ReadCall {
+                    tier,
+                    scope: project.map(str::to_string),
+                    old_text,
+                }),
+            });
+        }
+        Ok(Parsed {
+            target,
+            ops,
+            extras,
+            read: None,
+        })
     }
 }
 

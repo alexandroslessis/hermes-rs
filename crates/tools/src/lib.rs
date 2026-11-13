@@ -681,6 +681,15 @@ impl SessionTools {
         self.project.lock().clone()
     }
 
+    /// The scope key of the project tier of memory for this session: its repository's
+    /// (`project_skills::memory_scope_key`: the root the skills use, a linked worktree mapped to
+    /// its main checkout); `None` outside one (no project memory), and for the curator and other
+    /// sessions that have no repository. Reads a few small files: not on an async worker.
+    pub fn memory_scope(&self) -> Option<String> {
+        self.project_root()
+            .map(|root| project_skills::memory_scope_key(&root))
+    }
+
     /// For tools that work on the user's own library and have no repository (the curator, whose
     /// working folder is the skills folder): no project skills.
     pub fn without_project(&self) {
@@ -1008,11 +1017,14 @@ impl SessionTools {
             );
         };
         let store = staging::StagingStore::new(&self.data_dir);
-        let (args, meta) = (args.clone(), self.staging_meta());
-        let result =
-            tokio::task::spawn_blocking(move || store.stage_memory_call(&memory, &args, &meta))
-                .await
-                .unwrap_or_else(|e| json!({"success": false, "error": e.to_string()}));
+        let (args, meta, root) = (args.clone(), self.staging_meta(), self.project_root());
+        let result = tokio::task::spawn_blocking(move || {
+            // Reads the worktree pointer files (if any): here, off the async workers.
+            let scope = root.as_deref().map(project_skills::memory_scope_key);
+            store.stage_memory_call_in(&memory, scope.as_deref(), &args, &meta)
+        })
+        .await
+        .unwrap_or_else(|e| json!({"success": false, "error": e.to_string()}));
         Self::staged_output(result)
     }
 
@@ -1077,11 +1089,14 @@ impl SessionTools {
         let before = self.memory_failures.lock().0;
         let mut failures = hermes_memory::TurnFailures(before);
         let args = args.clone();
+        let root = self.project_root();
         let (result, failures) = tokio::task::spawn_blocking(move || {
+            // Reads the worktree pointer files (if any): here, off the async workers.
+            let scope = root.as_deref().map(project_skills::memory_scope_key);
             let result = if unattended {
-                memory.unattended_tool(&args, &mut failures)
+                memory.unattended_tool_in(&args, &mut failures, scope.as_deref())
             } else {
-                memory.tool(&args, &mut failures)
+                memory.tool_in(&args, &mut failures, scope.as_deref())
             };
             (result, failures)
         })

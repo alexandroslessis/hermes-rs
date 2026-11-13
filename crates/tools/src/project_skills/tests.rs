@@ -666,3 +666,131 @@ mod scoped {
         assert!(files.iter().any(|f| f.ends_with("a-first/SKILL.md")), "{files:?}");
     }
 }
+
+/// Backend v2 Phase 9 CP9.2: the project tier of memory is keyed by this module's root, so what
+/// is a project here (a subfolder of a repository, a nested repository, no repository at all) is
+/// what is a project of memory; except that a linked worktree with valid pointers shares its main
+/// checkout's memory (review), and a `.git` file that merely claims to be one does not.
+#[test]
+fn project_memory_follows_the_same_root_as_project_skills() {
+    use hermes_memory::{MemoryStore, Target, TurnFailures};
+    let dir = tempfile::tempdir().unwrap();
+    let outer = repo(dir.path(), "outer");
+    std::fs::create_dir_all(outer.join("src/deep")).unwrap();
+    let inner = repo(&outer, "vendor-inner");
+    // A `.git` file with no pointer back from the repository: a forged (or broken) worktree.
+    let tree = outer.join("wt");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join(".git"), "gitdir: ../.git/worktrees/wt\n").unwrap();
+    let plain = dir.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let other = repo(dir.path(), "other");
+    let scope = |cwd: &Path| find_root(cwd).map(|root| memory_scope_key(&root));
+
+    let memory = MemoryStore::new(dir.path().join("data/mem"), Default::default());
+    let write = |cwd: &Path, text: &str| {
+        let result = memory.tool_in(
+            &serde_json::json!({"target": "memory", "operations": [{"action": "add", "tier": "project", "content": text}]}),
+            &mut TurnFailures::default(),
+            scope(cwd).as_deref(),
+        );
+        result["success"] == serde_json::json!(true)
+    };
+    let seen = |cwd: &Path| {
+        memory
+            .snapshot_for(scope(cwd).as_deref())
+            .project
+            .unwrap_or_default()
+    };
+    // From a subfolder, the memory belongs to the repository's root.
+    assert!(write(&outer.join("src/deep"), "outer uses cargo"));
+    for cwd in [&outer, &outer.join("src"), &outer.join("src/deep/../..")] {
+        assert!(seen(cwd).contains("outer uses cargo"), "{cwd:?}");
+    }
+    // A nested repository, a worktree and another repository are projects of their own.
+    for cwd in [&inner, &tree, &other] {
+        assert_eq!(seen(cwd), "", "{cwd:?}");
+    }
+    assert!(write(&tree, "worktree only"));
+    assert!(write(&inner, "inner only"));
+    assert!(seen(&tree).contains("worktree only") && !seen(&tree).contains("outer uses"));
+    assert!(seen(&inner).contains("inner only") && !seen(&inner).contains("worktree"));
+    assert!(!seen(&outer).contains("worktree only") && !seen(&outer).contains("inner only"));
+    // No repository: no project tier to write to or read from, and nothing of the others'.
+    assert_eq!(scope(&plain), None);
+    assert!(!write(&plain, "orphan"));
+    assert_eq!(seen(&plain), "");
+    assert_eq!(seen(&plain.join("missing")), "");
+    // The spelling of the path (case, slashes) is one project.
+    let shouty = PathBuf::from(outer.to_string_lossy().to_uppercase());
+    assert_eq!(scope(&outer), Some(scope_key(&shouty)));
+    assert_eq!(scope(&shouty), scope(&outer));
+    // Core memory is unaffected by all of it.
+    assert!(memory.entries(Target::Memory).is_empty());
+}
+
+/// Review (CP9.2): `git worktree add` checkouts share the main checkout's project memory (this
+/// project itself works in worktrees), with absolute or relative pointers; project skills stay
+/// per checkout. A submodule, a forged pointer and a bare repository's worktree stay their own.
+#[test]
+fn a_linked_worktree_shares_its_main_checkouts_memory_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = repo(dir.path(), "main");
+    let worktree = |name: &str, absolute: bool| {
+        let tree = dir.path().join(name);
+        std::fs::create_dir_all(&tree).unwrap();
+        let admin = main.join(".git/worktrees").join(name);
+        std::fs::create_dir_all(&admin).unwrap();
+        let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
+        if absolute {
+            std::fs::write(tree.join(".git"), format!("gitdir: {}\n", slash(&admin))).unwrap();
+            std::fs::write(admin.join("gitdir"), format!("{}\n", slash(&tree.join(".git")))).unwrap();
+        } else {
+            std::fs::write(tree.join(".git"), format!("gitdir: ../main/.git/worktrees/{name}\n")).unwrap();
+            std::fs::write(admin.join("gitdir"), format!("../../../../{name}/.git\n")).unwrap();
+        }
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        tree
+    };
+    let abs = worktree("wt-abs", true);
+    let rel = worktree("wt-rel", false);
+    let main_key = Some(memory_scope_key(&find_root(&main).unwrap()));
+    for tree in [&abs, &rel, &abs.join("sub/..")] {
+        let root = find_root(tree).unwrap();
+        // Skills: the worktree's own checkout. Memory: the repository's.
+        assert_ne!(scope_key(&root), scope_key(&find_root(&main).unwrap()), "{tree:?}");
+        assert_eq!(Some(memory_scope_key(&root)), main_key, "{tree:?}");
+    }
+    // A folder claiming another repository's worktree slot without the pointer back.
+    let forged = dir.path().join("forged");
+    std::fs::create_dir_all(&forged).unwrap();
+    std::fs::write(
+        forged.join(".git"),
+        format!("gitdir: {}\n", main.join(".git/worktrees/wt-abs").to_string_lossy().replace('\\', "/")),
+    )
+    .unwrap();
+    let root = find_root(&forged).unwrap();
+    assert_eq!(memory_scope_key(&root), scope_key(&root));
+    // A submodule: its `.git` file names `.git/modules/<name>`, which has no `commondir`.
+    let sub = main.join("vendor/sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::create_dir_all(main.join(".git/modules/sub")).unwrap();
+    std::fs::write(sub.join(".git"), "gitdir: ../../.git/modules/sub\n").unwrap();
+    let root = find_root(&sub).unwrap();
+    assert_eq!(memory_scope_key(&root), scope_key(&root));
+    // A worktree of a bare repository (no `.git` folder to name a main checkout by).
+    let bare = dir.path().join("bare.git");
+    let admin = bare.join("worktrees/wb");
+    std::fs::create_dir_all(&admin).unwrap();
+    let wb = dir.path().join("wb");
+    std::fs::create_dir_all(&wb).unwrap();
+    std::fs::write(wb.join(".git"), format!("gitdir: {}\n", admin.to_string_lossy().replace('\\', "/"))).unwrap();
+    std::fs::write(admin.join("gitdir"), format!("{}\n", wb.join(".git").to_string_lossy().replace('\\', "/"))).unwrap();
+    std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+    let root = find_root(&wb).unwrap();
+    assert_eq!(memory_scope_key(&root), scope_key(&root));
+    // An ordinary repository and garbage in a `.git` file change nothing.
+    assert_eq!(main_checkout(&find_root(&main).unwrap()), None);
+    std::fs::write(forged.join(".git"), "not a pointer").unwrap();
+    assert_eq!(main_checkout(&find_root(&forged).unwrap()), None);
+}

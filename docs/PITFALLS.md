@@ -760,3 +760,64 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   reference in the round-trip tests).
 - **Failpoints are `#[cfg(test)]`** (`sync::Failpoint`, `MemoryStore::arm`): a "crash" returns
   early without cleanup and the test drops the store, as a dead process would.
+
+## Memory tiers, scopes and notes (Phase 9 CP9.2, `crates/memory/src/{tiers,notes}.rs`)
+
+- **The `memory` tool's schema grew** (`tier`, `tags`, `links`, `note`, the action `note_read`, a
+  TIERS paragraph in the description). Tool definitions are part of the cached prefix, so every
+  session's cache misses **once** after this upgrade (as at Phase 3); a session that already
+  started keeps working (the runtime reads old and new shapes). Keep further additions small: the
+  schema rides in every request.
+- **`core` is the files; the other tiers are the database only.** `project` and `archive` rows
+  never reach MEMORY.md / USER.md and are not synced from them. A query for the core view must
+  keep `tier = 'core' AND scope = ''` (`db::LIVE_CORE`, `db::knows`); one for another tier must
+  filter `removed IS NULL`. A hand edit of the file, the Star map and the index (`memory_doc`) see
+  `core` only; `archive` and `project` are not indexed or retrieved until CP9.3 (indexing project
+  rows globally would leak one repository's memory into another's context).
+- **Project scope = Phase 8's git root, worktrees folded in.** `memory_scope()` of the session's
+  tools (`project_skills::memory_scope_key(find_root(cwd))`) is the only source of the scope; it
+  is never read from the model's arguments (`take_extras` sets it, a staged operation carries it,
+  so approving later writes the same repository). The path is canonical (`..`, junctions, 8.3
+  names, `\\?\` resolved) and compared lowercase, so spellings of one folder are one key. A
+  **linked worktree** (`git worktree add`) shares its main checkout's memory — `main_checkout`
+  follows the `.git` file's `gitdir:` and requires the pointer back (`<gitdir>/gitdir`) and a
+  `commondir` naming a `.git` folder; a forged `.git` file, a submodule (`.git/modules/...`, no
+  `commondir`) and a bare repository's worktree stay projects of their own. Project *skills* stay
+  per checkout (`scope_key`): they are files in it. Removing a worktree therefore loses no
+  memory. A session outside a repository has no project tier (the call is refused, nothing falls
+  back to global). Curator sessions have no repository. Computing the key reads two small files:
+  do it in `spawn_blocking`.
+- **The project block is built when the session starts and frozen with the prompt**
+  (`PromptSource::build`, `snapshot_for`). A project write this session reaches the next
+  session's prompt, not this one's (retrieval into a running session is CP9.3). `snapshot()`
+  (no repository) never reads the project tier, so a core-only user's prompt is unchanged byte for
+  byte; the `turns` test compares it.
+- **One call writes one tier**, and `note_read` stands alone. Mixed batches would make "all or
+  nothing" span a file and a database, so they are refused up front.
+- **Limits.** `core`: today's char limits, same errors. `project`: `memory.project_char_limit`
+  (default 1500, 200-20000) per project, both kinds together (the other kind's characters are
+  reserved when a target is checked). `archive`: none, but 1000 characters an entry and 5000 entries
+  a target; long text goes in a note (20000 characters, threat-scanned). Core has no notes.
+- **Notes.** The slug is built only by `notes::slug_for` and re-checked (`valid_slug`) wherever a
+  link is turned back into a path, so `..`, drives, separators and Windows device names can't come
+  out of a link. The model's own `file:notes/...` links are refused (the store's link is what
+  `note_read` trusts), and `file:` links are otherwise only strings, never opened. A note is never
+  overwritten: a rewrite is a new file, the old one stays linked to the replaced row (the agent's
+  history) until the user removes the entry, which deletes every file the row and its older
+  versions linked to (`delete_tier_entry`) — except a file a surviving row still links (a patch's
+  successor carries its predecessor's note links, and a purge also takes removed rows of the same
+  text from any tier: `db::unreferenced`). A crash between writing a note and committing leaves an
+  unlinked file (not cleaned up); a failed commit removes the files it wrote. A notes folder that
+  is a junction or symlink is never read, written or deleted through.
+- **Reset erases `core` only.** Settings ▸ Memory ▸ reset asks "Delete Agent memory (MEMORY.md)?
+  This cannot be undone." (page text, not ours), so `MemoryStore::reset(target)` purges that
+  kind's `core` rows and deletes the file, and leaves the `project` and `archive` tiers of every
+  repository and their notes alone: erasing data the confirmation doesn't name would be a
+  surprise that can't be undone. Until CP9.3's map shows those tiers, the user removes them one
+  by one only through `delete_tier_entry` (no page yet) or by asking the agent (a soft removal:
+  the row stays, marked). `edit_entry` (Star map) is core only until CP9.3.
+- **A staged write carries `extras`** (tier, scope, tags, links, note). A build older than CP9.2
+  (an old GPUI binary sharing the data folder) would read such a record without them and approve
+  it into `core`; approve staged writes with a current build.
+- **Tags and links of core entries live in the database only** (the file can't hold them); a patch
+  carries them over, a hand edit of the file does not (the changed text is a new row).

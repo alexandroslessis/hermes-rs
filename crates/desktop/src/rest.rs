@@ -108,6 +108,7 @@ fn config_defaults() -> Value {
             "user_profile_enabled": true,
             "memory_char_limit": 2200,
             "user_char_limit": 1375,
+            "project_char_limit": 1500,
             "write_approval": false,
         },
     })
@@ -330,6 +331,7 @@ fn config_schema() -> serde_json::Map<String, Value> {
             "memory.user_char_limit" => {
                 Some(json!({"description": "Largest size of USER.md, in characters"}))
             }
+            "memory.project_char_limit" => Some(json!({"description": "Largest size of one project's memory (entries the agent keeps for a git repository, given to chats in that repository only), in characters; 200 to 20000"})),
             "memory.write_approval" => {
                 Some(json!({"description": "Ask before the agent saves to memory"}))
             }

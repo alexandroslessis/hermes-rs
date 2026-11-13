@@ -7943,3 +7943,174 @@ async fn balanced_keeps_the_agent_loop_and_ignores_clusters() {
     assert_requests(&h, Purpose::Curator, 1..=1);
     assert_eq!(h.runtime.staging().list().len(), 1);
 }
+
+// ---- memory tiers (Phase 9 CP9.2) -----------------------------------------------------------
+
+/// What the memory tool answered in the tool message of the request that followed the call.
+fn tool_answer(request: &Value) -> Value {
+    let content = sent_messages(request)
+        .into_iter()
+        .rfind(|m| m["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    serde_json::from_str(&content).unwrap_or(Value::String(content))
+}
+
+/// The project scope key of the repository a session in `folder` belongs to (how the runtime
+/// finds it: the real path, without the `\\?\` form `canonicalize` gives).
+fn project_scope(folder: &Path) -> String {
+    let root = hermes_tools::project_skills::find_root(folder).expect("a repository");
+    hermes_tools::project_skills::scope_key(&root)
+}
+
+fn add_core(h: &Harness, target: hermes_memory::Target, text: &str) {
+    let op = hermes_memory::Operation {
+        action: "add".into(),
+        content: Some(text.into()),
+        old_text: None,
+        matched_entry: None,
+    };
+    let result = h
+        .runtime
+        .memory()
+        .apply(target, &[op], &mut hermes_memory::TurnFailures::default());
+    assert_eq!(result["success"], true, "{result}");
+}
+
+fn add_in(h: &Harness, scope: Option<&str>, tier: &str, text: &str) {
+    let result = h.runtime.memory().tool_in(
+        &json!({"target": "memory", "operations": [{"action": "add", "tier": tier, "content": text}]}),
+        &mut hermes_memory::TurnFailures::default(),
+        scope,
+    );
+    assert_eq!(result["success"], true, "{result}");
+}
+
+#[tokio::test]
+async fn project_memory_reaches_its_repositorys_new_sessions_only_and_core_prompts_do_not_change() {
+    let h = harness_budget_quiet(vec![text_reply("one"), text_reply("two")]).await;
+    add_core(&h, hermes_memory::Target::Memory, "The build uses cargo");
+    add_core(&h, hermes_memory::Target::User, "User's name is Alex");
+    let (a, b) = two_repos(&h);
+    let plain = h.work.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let (scope_a, scope_b) = (project_scope(&a), project_scope(&b));
+
+    // The prompts of a core-only user, in a repository of each kind and outside one.
+    let before = [
+        stored_prompt(&h, &session_at(&h, &a)),
+        stored_prompt(&h, &session_at(&h, &b)),
+        stored_prompt(&h, &session_at(&h, &plain)),
+    ];
+    assert!(before[0].contains("MEMORY (your personal notes) [") && before[0].contains("USER PROFILE"));
+    assert!(!before.iter().any(|p| p.contains("PROJECT MEMORY")));
+    // Archive memory and another repository's project memory change nobody's prompt: the same
+    // bytes as before for the sessions of repository A and for the folder outside any repository.
+    add_in(&h, None, "archive", "an archived fact about zebras");
+    add_in(&h, Some(&scope_b), "project", "B ships with make ship");
+    assert_eq!(stored_prompt(&h, &session_at(&h, &a)), before[0], "A's prompt is unchanged");
+    assert_eq!(stored_prompt(&h, &session_at(&h, &plain)), before[2]);
+    // B's sessions get B's project block, after the core blocks, and only that.
+    let b_now = stored_prompt(&h, &session_at(&h, &b));
+    let block_b = h.runtime.memory().snapshot_for(Some(&scope_b)).project.unwrap();
+    assert!(b_now.contains("B ships with make ship") && !b_now.contains("zebras"), "{b_now}");
+    assert_eq!(b_now.replace(&format!("\n\n{block_b}"), ""), before[1]);
+
+    // A's project memory: A's new sessions, not B's, not the plain folder's.
+    let running = session_at(&h, &a);
+    let running_prompt = stored_prompt(&h, &running);
+    add_in(&h, Some(&scope_a), "project", "A tests with cargo xtask test");
+    let a_now = stored_prompt(&h, &session_at(&h, &a));
+    assert!(a_now.contains("PROJECT MEMORY (notes for this repository only)"), "{a_now}");
+    assert!(a_now.contains("A tests with cargo xtask test") && !a_now.contains("make ship"));
+    let block_a = h.runtime.memory().snapshot_for(Some(&scope_a)).project.unwrap();
+    assert_eq!(a_now.replace(&format!("\n\n{block_a}"), ""), before[0]);
+    let b_after = stored_prompt(&h, &session_at(&h, &b));
+    assert!(!b_after.contains("cargo xtask test"));
+    assert_eq!(stored_prompt(&h, &session_at(&h, &plain)), before[2]);
+
+    // A running session's prompt is frozen: the write above didn't touch it, in the store or on
+    // the wire, and the turn costs the one request it always did.
+    assert_eq!(stored_prompt(&h, &running), running_prompt);
+    run_turn(&h, &running, "hello").await;
+    assert_eq!(system_of(&h.requests.lock()[0]), running_prompt);
+    assert!(!system_of(&h.requests.lock()[0]).contains("cargo xtask test"));
+    assert_requests(&h, Purpose::Main, 1..=1);
+    assert_eq!(total_requests(&h), 1);
+}
+
+#[tokio::test]
+async fn the_tool_writes_tiers_and_notes_in_a_turn_and_old_calls_cost_the_same() {
+    let h = harness_budget_quiet(vec![
+        // Session in repository A: a project entry with a note, then reading it back.
+        tool_reply(&[(
+            "c1",
+            "memory",
+            json!({"target": "memory", "operations": [{"action": "add", "tier": "project",
+                "content": "Release checklist", "note": "1. bump 2. tag 3. push", "tags": ["release"],
+                "links": ["skill:git-commit"]}]}),
+        )]),
+        text_reply("saved"),
+        tool_reply(&[(
+            "c2",
+            "memory",
+            json!({"target": "memory", "operations": [{"action": "note_read", "tier": "project", "old_text": "checklist"}]}),
+        )]),
+        text_reply("read"),
+        // Session outside any repository: project is refused, archive and the old shape work.
+        tool_reply(&[(
+            "c3",
+            "memory",
+            json!({"target": "memory", "operations": [{"action": "add", "tier": "project", "content": "orphan"}]}),
+        )]),
+        text_reply("refused"),
+        tool_reply(&[(
+            "c4",
+            "memory",
+            json!({"target": "user", "operations": [{"action": "add", "content": "User's name is Alex"}]}),
+        )]),
+        text_reply("old shape"),
+    ])
+    .await;
+    let (a, _b) = two_repos(&h);
+    let in_a = session_at(&h, &a);
+    let events = run_turn(&h, &in_a, "remember the release steps").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let saved = tool_answer(&h.requests.lock()[1]);
+    assert_eq!(saved["success"], true, "{saved}");
+    assert_eq!(saved["tier"], "project");
+    assert_eq!(saved["notes"][0]["file"], "file:notes/release-checklist.md");
+    run_turn(&h, &in_a, "what were they").await;
+    let read = tool_answer(&h.requests.lock()[3]);
+    assert_eq!(read["note"], "1. bump 2. tag 3. push", "{read}");
+    assert!(h.data.path().join("memories/notes/release-checklist.md").exists());
+    // The file view is core only: nothing was written to it.
+    assert!(!h.data.path().join("memories/MEMORY.md").exists());
+
+    let plain = h.work.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let outside = session_at(&h, &plain);
+    run_turn(&h, &outside, "remember orphan").await;
+    let refused = tool_answer(&h.requests.lock()[5]);
+    assert!(
+        refused["error"].as_str().unwrap().contains("needs a session inside a git repository"),
+        "{refused}"
+    );
+    run_turn(&h, &outside, "my name is Alex").await;
+    let old = tool_answer(&h.requests.lock()[7]);
+    assert_eq!(old["success"], true, "{old}");
+    assert_eq!(old["usage"], "1% — 19/1375 chars");
+    assert_eq!(old["message"], "Applied 1 operation(s).");
+    assert_eq!(
+        std::fs::read_to_string(h.data.path().join("memories/USER.md")).unwrap(),
+        "User's name is Alex"
+    );
+    // Two requests per turn (the tool call, the answer); the tiers added none.
+    assert_requests(&h, Purpose::Main, 8..=8);
+    assert_eq!(total_requests(&h), 8);
+    // A new session in A sees the project entry (the summary, not the note) in its prompt.
+    let next = stored_prompt(&h, &session_at(&h, &a));
+    assert!(next.contains("Release checklist") && !next.contains("1. bump"), "{next}");
+}

@@ -312,6 +312,16 @@ impl Gateway {
                 user_profile_enabled: flag("user_profile_enabled", defaults.user_profile_enabled),
                 memory_char_limit: size("memory_char_limit", defaults.memory_char_limit),
                 user_char_limit: size("user_char_limit", defaults.user_char_limit),
+                // Held to its bounds like a budget knob: anything outside (or not a whole
+                // number) is the default, so a typo can't make the project block huge or empty.
+                project_char_limit: memory["project_char_limit"]
+                    .as_u64()
+                    .map(|n| n as usize)
+                    .filter(|n| {
+                        (hermes_memory::PROJECT_LIMIT_MIN..=hermes_memory::PROJECT_LIMIT_MAX)
+                            .contains(n)
+                    })
+                    .unwrap_or(defaults.project_char_limit),
                 write_approval: flag("write_approval", defaults.write_approval),
             });
         // The tools switched off in Capabilities ▸ Tools.

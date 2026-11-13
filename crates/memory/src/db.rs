@@ -270,7 +270,10 @@ pub(crate) struct Changes {
 /// Deletes the rows `ids`, every removed row they superseded (recursively: the older versions
 /// of the text), and every removed row of `kind` with the same text, and merges the FTS index so
 /// their tokens leave it too.
-fn purge_rows(tx: &Connection, kind: &str, ids: &[i64]) -> rusqlite::Result<()> {
+///
+/// Returns the note files (`notes.rs` slugs) the deleted rows linked to: the caller deletes them
+/// once the transaction has committed.
+fn purge_rows(tx: &Connection, kind: &str, ids: &[i64]) -> rusqlite::Result<Vec<String>> {
     let mut doomed: HashSet<i64> = HashSet::new();
     let mut queue: Vec<i64> = ids.to_vec();
     while let Some(id) = queue.pop() {
@@ -290,20 +293,55 @@ fn purge_rows(tx: &Connection, kind: &str, ids: &[i64]) -> rusqlite::Result<()> 
             queue.push(older?);
         }
     }
+    let mut slugs = Vec::new();
     let mut delete = tx.prepare_cached("DELETE FROM entry WHERE id = ?1")?;
     for id in &doomed {
+        let links: Option<String> = tx
+            .prepare_cached("SELECT links FROM entry WHERE id = ?1")?
+            .query_row([id], |r| r.get(0))
+            .optional()?;
+        slugs.extend(note_slugs(links.as_deref().unwrap_or("[]")));
         delete.execute([id])?;
     }
     // The 'delete' rows the trigger wrote only mask the old tokens; merging the segments drops
     // them from the index's pages (which `secure_delete` then zeroes).
     tx.execute("INSERT INTO entry_fts(entry_fts) VALUES('optimize')", [])?;
-    Ok(())
+    slugs.sort();
+    slugs.dedup();
+    unreferenced(tx, slugs)
 }
 
-/// Settings ▸ Memory ▸ reset: deletes every row of `kind` (live or removed) and its FTS text.
-/// Whether anything was deleted.
+/// The note files a `links` column (a JSON array of strings) points at.
+pub(crate) fn note_slugs(links: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(links)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|link| crate::notes::slug_of_link(link))
+        .collect()
+}
+
+/// Of `slugs`, the notes no row still links to (live or removed): a patched entry's successor
+/// carries its predecessor's note links, so a purge of one version must not delete a note a
+/// surviving version still shows.
+fn unreferenced(tx: &Connection, slugs: Vec<String>) -> rusqlite::Result<Vec<String>> {
+    let mut used = tx.prepare_cached("SELECT 1 FROM entry WHERE instr(links, ?1) > 0 LIMIT 1")?;
+    let mut out = Vec::new();
+    for slug in slugs {
+        // The link as it is stored inside the JSON array, quotes included (slugs are [a-z0-9-]).
+        let needle = format!("\"{}\"", crate::notes::link_for(&slug));
+        if !used.exists([needle])? {
+            out.push(slug);
+        }
+    }
+    Ok(out)
+}
+
+/// Settings ▸ Memory ▸ reset: deletes every `core` row of `kind` (live or removed) and its FTS
+/// text: what the page's confirmation names (MEMORY.md / USER.md). The `project` and `archive`
+/// tiers are not in those files and are not touched (PITFALLS.md). Whether anything was
+/// deleted. (`core` rows never link notes.)
 pub(crate) fn purge_kind(tx: &Connection, kind: &str) -> rusqlite::Result<bool> {
-    let deleted = tx.execute("DELETE FROM entry WHERE kind = ?1", [kind])?;
+    let deleted = tx.execute("DELETE FROM entry WHERE tier = 'core' AND kind = ?1", [kind])?;
     if deleted > 0 {
         tx.execute("INSERT INTO entry_fts(entry_fts) VALUES('optimize')", [])?;
     }
@@ -338,9 +376,12 @@ pub(crate) fn live_texts(conn: &Connection, kind: &str) -> rusqlite::Result<Vec<
     Ok(live_rows(conn, kind)?.into_iter().map(|(_, t)| t).collect())
 }
 
-/// Whether any row of `kind`, live or removed, holds exactly `text`.
+/// Whether any `core` row of `kind`, live or removed, holds exactly `text` (the file is the view
+/// of `core` only: an entry of the same text in another tier doesn't make it known).
 pub(crate) fn knows(conn: &Connection, kind: &str, text: &str) -> rusqlite::Result<bool> {
-    conn.prepare_cached("SELECT 1 FROM entry WHERE kind = ?1 AND text = ?2 LIMIT 1")?
+    conn.prepare_cached(
+        "SELECT 1 FROM entry WHERE tier = 'core' AND kind = ?1 AND text = ?2 LIMIT 1",
+    )?
         .exists(params![kind, text])
 }
 
@@ -432,6 +473,7 @@ pub(crate) fn set_core(
         .execute(params![now, why, successor, id])?;
     }
     if !purge.is_empty() {
+        // `core` entries have no note files.
         purge_rows(tx, kind, &purge)?;
     }
     for (index, id) in assigned.iter().enumerate() {
@@ -444,6 +486,146 @@ pub(crate) fn set_core(
         changed,
         purged: !purge.is_empty(),
     })
+}
+
+/// A live row of the `project` or `archive` tier.
+#[derive(Clone, Debug)]
+pub(crate) struct TierRow {
+    pub id: i64,
+    pub kind: String,
+    pub text: String,
+    /// JSON array of strings.
+    pub tags: String,
+    /// JSON array of strings.
+    pub links: String,
+    pub created: i64,
+    pub hits: i64,
+}
+
+/// The live rows of `tier` in `scope` (`''` for `archive`), of one `kind` or of both (`None`:
+/// `fact` entries first), in their order.
+pub(crate) fn tier_rows(
+    conn: &Connection,
+    tier: &str,
+    scope: &str,
+    kind: Option<&str>,
+) -> rusqlite::Result<Vec<TierRow>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT id, kind, text, tags, links, created, hits FROM entry
+         WHERE tier = ?1 AND scope = ?2 AND removed IS NULL AND (?3 IS NULL OR kind = ?3)
+         ORDER BY kind, position, id",
+    )?;
+    let rows = statement.query_map(params![tier, scope, kind], |r| {
+        Ok(TierRow {
+            id: r.get(0)?,
+            kind: r.get(1)?,
+            text: r.get(2)?,
+            tags: r.get(3)?,
+            links: r.get(4)?,
+            created: r.get(5)?,
+            hits: r.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// A new row of a non-`core` tier; its id.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn insert_tier_row(
+    tx: &Connection,
+    tier: &str,
+    scope: &str,
+    kind: &str,
+    text: &str,
+    tags: &str,
+    links: &str,
+    created: i64,
+    hits: i64,
+    now: i64,
+    position: usize,
+) -> rusqlite::Result<i64> {
+    tx.prepare_cached(
+        "INSERT INTO entry(tier, scope, kind, text, tags, links, created, last_confirmed, hits, position)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?
+    .execute(params![
+        tier,
+        scope,
+        kind,
+        text,
+        tags,
+        links,
+        created,
+        now,
+        hits,
+        position as i64
+    ])?;
+    Ok(tx.last_insert_rowid())
+}
+
+pub(crate) fn set_position(tx: &Connection, id: i64, position: usize) -> rusqlite::Result<()> {
+    tx.prepare_cached("UPDATE entry SET position = ?1 WHERE id = ?2 AND position <> ?1")?
+        .execute(params![position as i64, id])?;
+    Ok(())
+}
+
+pub(crate) fn set_row_meta(tx: &Connection, id: i64, tags: &str, links: &str) -> rusqlite::Result<()> {
+    tx.prepare_cached("UPDATE entry SET tags = ?1, links = ?2 WHERE id = ?3")?
+        .execute(params![tags, links, id])?;
+    Ok(())
+}
+
+/// The agent removed (or rewrote) a row: it stays, marked, pointing at its replacement.
+pub(crate) fn mark_removed(
+    tx: &Connection,
+    id: i64,
+    now: i64,
+    why: &str,
+    successor: Option<i64>,
+) -> rusqlite::Result<()> {
+    tx.prepare_cached(
+        "UPDATE entry SET removed = ?1, removed_why = ?2, superseded_by = ?3 WHERE id = ?4",
+    )?
+    .execute(params![now, why, successor, id])?;
+    Ok(())
+}
+
+/// Deletes one live row of a non-`core` tier and its older versions: the user removed it. The
+/// note files they linked to are returned for the caller to delete after the commit.
+pub(crate) fn purge_entry(tx: &Connection, kind: &str, id: i64) -> rusqlite::Result<Vec<String>> {
+    purge_rows(tx, kind, &[id])
+}
+
+/// Sets the tags and links of the live `core` row holding `text` (what the agent's add or patch
+/// said; `None` leaves a column as it is).
+pub(crate) fn set_core_meta(
+    tx: &Connection,
+    kind: &str,
+    text: &str,
+    tags: Option<&str>,
+    links: Option<&str>,
+) -> rusqlite::Result<()> {
+    tx.prepare_cached(
+        "UPDATE entry SET tags = COALESCE(?3, tags), links = COALESCE(?4, links)
+         WHERE tier = 'core' AND scope = '' AND kind = ?1 AND text = ?2 AND removed IS NULL",
+    )?
+    .execute(params![kind, text, tags, links])?;
+    Ok(())
+}
+
+/// After a patch: a live `core` row that has no tags or links of its own takes those of the row
+/// it replaced.
+pub(crate) fn inherit_core_meta(tx: &Connection, kind: &str) -> rusqlite::Result<()> {
+    tx.prepare_cached(
+        "UPDATE entry SET
+           tags = (SELECT o.tags FROM entry o WHERE o.superseded_by = entry.id ORDER BY o.id DESC LIMIT 1),
+           links = (SELECT o.links FROM entry o WHERE o.superseded_by = entry.id ORDER BY o.id DESC LIMIT 1)
+         WHERE tier = 'core' AND scope = '' AND kind = ?1 AND removed IS NULL
+           AND tags = '[]' AND links = '[]'
+           AND EXISTS (SELECT 1 FROM entry o WHERE o.superseded_by = entry.id)",
+    )?
+    .execute([kind])?;
+    Ok(())
 }
 
 #[cfg(test)]
