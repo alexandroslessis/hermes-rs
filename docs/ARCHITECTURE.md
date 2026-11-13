@@ -40,7 +40,7 @@ it calls into. Everything runs in one process.
 | Crate | Package | Role | Notes |
 |---|---|---|---|
 | `crates/desktop` | `hermes-desktop` | The app: Tauri window, axum server, the protocol layer | The main app. Most feature work lands here. |
-| `crates/runtime` | `hermes_runtime` | Sessions and turns over the agent: `Runtime` | `lib.rs` (API), `session.rs`, `ops.rs` (per-turn tool guards), `delegate.rs` + `subagents.rs`, `compress.rs`, `review.rs` (background review), `signals.rs` (learning signals: what each turn says is worth learning, scored locally into `signals/<id>.json`), `skill_outcomes.rs` (how the turns a skill was used in went, into `.usage.json`), `review_once.rs` (the evidence review: one request with a packet of signals, skills and memory; a JSON reply validated and applied or staged), `review_schedule.rs` (when it runs: per-session idle timers, switched-away/closed, one review at a time, back-off, hourly cap), `curator.rs`, `mcp.rs`, `commands.rs` (`/diff`, `/usage`…), `guards.rs`, `changes.rs` |
+| `crates/runtime` | `hermes_runtime` | Sessions and turns over the agent: `Runtime` | `lib.rs` (API), `session.rs`, `ops.rs` (per-turn tool guards), `delegate.rs` + `subagents.rs`, `compress.rs`, `review.rs` (background review), `signals.rs` (learning signals: what each turn says is worth learning, scored locally into `signals/<id>.json`), `skill_outcomes.rs` (how the turns a skill was used in went, into `.usage.json`), `review_once.rs` (the evidence review: one request with a packet of signals, skills and memory; a JSON reply validated and applied or staged), `review_schedule.rs` (when it runs: per-session idle timers, switched-away/closed, one review at a time, back-off, hourly cap), `curator.rs` + `curator/` (the curator: the agent loop of `balanced`, and per-cluster proposals under `requests`), `mcp.rs`, `commands.rs` (`/diff`, `/usage`…), `guards.rs`, `changes.rs` |
 | `crates/agent` | `hermes_agent` | The agent state machine (from Goose): stream a reply, run tool calls, repeat | `events.rs` has `AgentEvent` |
 | `crates/llm` | `hermes_llm` | Messages, the OpenAI-compatible provider, retries (from Goose) | `conversation::message::{Message, MessageContent}`; `observer.rs` is where every model POST is reported (purpose, session, provider) to the request ledger |
 | `crates/tools` | `hermes_tools` | Every agent tool + `SessionTools` (the per-session tool set) | One module per tool family; `paths.rs` resolves paths; `path_policy.rs` classifies where file edits and terminal commands may go (workspace, app data, skills/memory, persistence places, outside); `approval.rs` the dangerous-command check; `taint.rs` what the session has read that the user didn't write (see Taint in PITFALLS.md); `staging.rs` the writes a tainted session's `memory` / `skill_manage` calls leave for the user (`staging/<id>.json`, applied through the stores' own write paths); `index.rs` the local FTS5 index (`index.db`) over skills and memory, kept fresh by write hooks on `SkillStore` / `MemoryStore` |
@@ -367,3 +367,34 @@ API keys are in Windows Credential Manager (`keyring`), never in a file.
   write where that can't be done safely is refused); the editor in the app (`user_write`) may change it.
   A skill the module can't edit safely (no frontmatter, `sources` as a flow list or scalar, YAML
   that doesn't parse) is written without the entry.
+
+## Curator v2 (Phase 8 CP8.3)
+
+`runtime/src/curator.rs` is two curators behind one `Runtime::run_curator(Option<CuratorModel>)`.
+Every run first does the deterministic pass (idle curator-managed skills go stale, then to the
+archive), then, with a model, one of:
+
+- **`budget.curator_mode = loop`** (`balanced`, `tokens`): today's agent loop over the agent-created
+  skills with the three skill tools (`consolidate`), unchanged.
+- **`per_cluster`** (`requests`; any profile can opt in with `budget.curator_mode`): `curator/`.
+  `propose.rs::library` is the user's own skills (not a repository's, an external folder's, a
+  bundled one, a pinned one); `select` finds the jobs (`cluster.rs`: Jaccard of 5-word shingles,
+  threshold 0.35, single linkage, at most 4 skills a cluster; `is_low_performer`: at least 5 judged
+  uses, under half clean, with evidence from `signals/<id>.json`); `per_cluster.rs` runs at most
+  `curator_max_requests` of them, one request each (text contract, `contract.rs`, one repair), with
+  the governor asked before every job and `gate.rs`'s hourly cap and back-off in front; `contract::judge`
+  turns a reply into `edit` + `archive` ops; `propose::deliver` stages them (one item, with a diff;
+  `session_id` `curator`) or, with `curator.auto_apply` and only skills the review created
+  (`created_by: agent`), applies them through `plan` + `apply_staged`; a skill whose SKILL.md changed
+  since the model read it refuses the proposal, and a skill with files besides SKILL.md is never
+  archived by a merge.
+  `seen.rs` (`curator-seen.json` in the data folder) remembers jobs already judged for 30 days, unless
+  their skills changed. Zero jobs means zero requests and no model needed.
+- **The desktop** passes the model (`maintenance::curator_model`: `aux_models.curator`, else the
+  review model, else the main one) only when the knob says `per_cluster`; otherwise `None` as before
+  (archiving only). The trigger is unchanged: the weekly schedule after two idle hours, or Run now.
+- **`SkillOp` `archive`** (tools): moves a library skill to `.archive/` after its text was merged into
+  `absorbed_into`; only valid after every other op of a batch, checked (not pinned, not bundled /
+  external / project, the absorber exists) for all archives before the first change; a failure after
+  an archive went through takes it back out of `.archive` (no duplicate). A model's
+  `skill_manage` call can't use it (`parse_call` refuses the action).

@@ -674,3 +674,48 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **`file_path: "SKILL.md"` is the skill's SKILL.md.** `parse_call` normalises `./SKILL.md` and
   friends to `SKILL.md`, and every SKILL.md path check compares with that; a check on
   `file_path.is_none()` alone lets a patch through the provenance guard.
+
+## Curator v2 (Phase 8 CP8.3)
+
+- **`requests` changed what the curator does.** Under `curator_mode = per_cluster` the agent loop
+  (`consolidate`, `curator_max_iterations`) never runs; tests of the loop pin `Balanced`. The loop's
+  candidates are agent-created skills only; the per-cluster curator looks at *all* of the user's own
+  library skills (a hand-written skill is a candidate for a merge, with the user's approval).
+  `curator.auto_apply` writes without a click only when every skill the proposal touches is
+  `created_by: agent` (`curator_managed`); anything else is staged even then. It has no Settings
+  switch (the page's Settings only shows the sections it knows): `desktop-config.json`, then restart.
+- **The model read the skills minutes before the answer is delivered.** `propose::deliver` compares
+  the plan's base fingerprint of every skill the ops touch with the one the job was read with; a
+  difference refuses the proposal (never "rebase" the model's text onto the user's edit). After
+  staging, the item's own bases make it stale instead.
+- **A skill with files besides SKILL.md is never archived by a merge**: the model saw only SKILL.md.
+  It may be the kept one (the message says so); two such skills in a cluster = no job.
+- **The threshold is 0.35, not "about half"**: Jaccard of shingle sets is `s / (2 - s)` for a shared
+  fraction `s`, so 60% shared text scores 0.43. Distinct skills (bundled, Hermes's 193) sit under 0.2.
+- **No model of its own means the main one.** `maintenance::curator_model` falls back to the review
+  model, then the main model on the main provider (counted as `curator`, held back by the governor
+  under 20%, at most 3 jobs a run, 2 runs an hour, weekly by schedule). Set `aux_models.curator` (no
+  Settings row) or a review model to keep it off the main model.
+- **Undo of an applied merge**: the absorbed skill is in `skills/.archive/<name>` byte for byte (no
+  restore button in this app; move the folder back), the kept skill's old text is in the skills
+  history. A hand-restored skill keeps its `archived` record, so the curator leaves it alone.
+- **"Uses" for the low-performer rule are `outcomes` entries, not the `uses` counter.** `uses`
+  counts whole-skill loads since the file began; `attached` counts index attachments; neither has a
+  verdict. `propose::judged_uses` counts the outcome entries this build understands (`Other(..)` is
+  not one). Don't switch the rule to `uses` or `clean_rate` alone (`clean_rate` is `None` at zero).
+- **A merge's `sources` is ours, so its op is `own_hand`.** `contract::merged_sources` strips whatever
+  `sources` the model wrote and appends the union of the cluster's; the op carries `own_hand` so the
+  store doesn't put the kept skill's old list back (`keep_sources`). Repairs are not `own_hand`.
+- **The `archive` op is not a model action.** `parse_call` refuses it and `validate_ops` requires it
+  after every other op; code that builds ops from model JSON must not pass an `archive` through.
+  The whole batch is staged as one item, so approving archives without the merge is not possible.
+- **A skill with a secret-like value is never sent**: masking would change its text, and the merged
+  text would then overwrite the real one. The cluster is skipped (`propose::skill_block`); same for a
+  skill that contains `</skill` and for a job over the model's window.
+- **Judged jobs are remembered for 30 days** (`curator-seen.json`), keyed by names and file hashes:
+  a rejected proposal isn't re-requested weekly, an edited skill is. Delete the file to ask again.
+- **The curator's hourly cap and back-off are per process** (`gate.rs`), like the review scheduler's.
+  A failed request ends the run and the next run waits an hour (doubling). A crash loop can't burst:
+  the schedule's `last_run_at` is saved before the first request.
+- **The ledger counts a moment late.** A run that crosses 20% left stops before the *next* job only
+  once the ledger thread has applied the previous request; tests assert a range for that case.

@@ -466,6 +466,11 @@ pub struct Runtime {
     /// starts.
     budget: Arc<Mutex<budget::BudgetKnobs>>,
     curator_running: AtomicBool,
+    /// `curator.auto_apply`: the curator's merge and repair proposals are applied at once (through
+    /// the same validated paths) instead of waiting in the staging area.
+    curator_auto_apply: AtomicBool,
+    /// The per-cluster curator's hourly cap and back-off (`curator/gate.rs`).
+    curator_gate: Mutex<curator::Gate>,
 }
 
 impl Drop for Runtime {
@@ -553,6 +558,8 @@ impl Runtime {
             disabled_tools: Mutex::new(Default::default()),
             budget,
             curator_running: AtomicBool::new(false),
+            curator_auto_apply: AtomicBool::new(false),
+            curator_gate: Mutex::new(Default::default()),
         })
     }
 
@@ -567,6 +574,12 @@ impl Runtime {
     /// session's prompt is frozen (prompt caching).
     pub fn set_budget(&self, knobs: budget::BudgetKnobs) {
         *self.budget.lock() = knobs;
+    }
+
+    /// `curator.auto_apply` (Settings): the curator's proposals are applied directly, through the
+    /// same validated paths as an approval, instead of waiting in the staging area.
+    pub fn set_curator_auto_apply(&self, on: bool) {
+        self.curator_auto_apply.store(on, Ordering::Relaxed);
     }
 
     pub fn store(&self) -> &Store {

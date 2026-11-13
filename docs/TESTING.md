@@ -76,6 +76,13 @@ Read the existing tests near the area you change before writing a new one; the h
   a `REFUSE_400` makes it keep retrying across the following turns. An app restart is a second
   `runtime_with_budget(h.data.path(), ..)` dropped mid-review (`an_exit_mid_review_...`,
   `reviews_cut_off_twice_...`).
+- Curator v2 tests (Phase 8 CP8.3, after the `// Phase 8, CP8.3` banner): `curator_harness(replies,
+  per_cluster_budget(n))` scripts the `curator` replies, `two_clusters` / `deploy_pair` make the library
+  (`procedure_skill` builds skills whose shared steps make them near-duplicates), `run_curator_now` runs
+  the curator with the mock as its model, and `h.runtime.staging().list()` is where proposals appear.
+  Clustering, the contract and `deliver` are unit tests in `runtime/src/curator/tests.rs`
+  (`bundled_skills_do_not_cluster` reads `assets/skills`; `hermes_full_skill_set_is_reported` reads
+  `../hermes-agent` when it is there and never fails). Tests of the agent-loop curator pin `Balanced`.
 - Known flaky under heavy load: `an_exhausted_budget_ends_with_a_toolless_summary` (timing).
   Re-run it alone before suspecting your change.
 

@@ -436,6 +436,12 @@ impl SkillStore {
         self.load_records().remove(name).unwrap_or_default()
     }
 
+    /// Every skill's record, by name (one read of `.usage.json`): what the curator selects
+    /// low performers from.
+    pub fn records(&self) -> HashMap<String, SkillRecord> {
+        self.load_records()
+    }
+
     /// Records that `name` was used in turn `turn` of `session` and how the turn went (Phase 8).
     ///
     /// `attached`: the local index attached it (counted in `attached`/`last_attached`, not in
@@ -648,7 +654,20 @@ impl SkillStore {
         self.archive_skill(name, false)
     }
 
-    fn archive_skill(&self, name: &str, curator: bool) -> Result<(), String> {
+    pub(crate) fn archive_skill(&self, name: &str, curator: bool) -> Result<(), String> {
+        let (skill, _) = self.move_to_archive(name, curator)?;
+        let who = if curator { "curator" } else { "user" };
+        self.commit(&format!("{who}: archive {skill}"));
+        Ok(())
+    }
+
+    /// [`Self::archive_skill`] without the history commit (a batch commits once, at its end, and
+    /// may still roll the move back): the skill's name and the folder it moved to.
+    pub(crate) fn move_to_archive(
+        &self,
+        name: &str,
+        curator: bool,
+    ) -> Result<(String, std::path::PathBuf), String> {
         let skill = self
             .find(name)
             .ok_or_else(|| format!("Skill '{name}' not found."))?;
@@ -690,9 +709,7 @@ impl SkillStore {
             record.archived_at = Some(now_string());
             record.archived_from = Some(from);
         });
-        let who = if curator { "curator" } else { "user" };
-        self.commit(&format!("{who}: archive {}", skill.name));
-        Ok(())
+        Ok((skill.name, dest))
     }
 
     /// Archived skills, newest first.

@@ -312,3 +312,238 @@ and the prompt's catalog walk run where the session is made (bounded, as the exi
 Tests: hermes_tools 241 (+3: huge support file + preview scope, rollback with a junction, folder
 cap), memory/store/prompts/llm green; hermes_runtime lib 142, turns 180 (7 ignored) under default,
 balanced, requests, tokens; hermes-desktop and `cargo build --workspace` green.
+
+## CP8.3 — curator v2: clusters, low performers, one request per job, proposals in staging
+Worktree: C:\Users\alexandros\repos\hermes-rs-p8   Branch: backend/p8-skills   Model: Sonnet 5.5 (subagent)
+Cut on top of CP8.2 (66080d0). Uncommitted. The phase's last checkpoint.
+Done:
+- **Two curators behind `Runtime::run_curator`.** The deterministic pass (stale / archive by age) is
+  unchanged. Then `budget.curator_mode` decides: `Loop` (`balanced`, `tokens`: today's agent loop, the
+  code and its summary untouched) or the new `PerCluster` (`requests`; any profile can opt in with
+  `budget.curator_mode: per_cluster`, or out with `loop`). New knob `curator_max_requests` (3; override
+  range 1-20). Module `crates/runtime/src/curator/` (`cluster.rs`, `contract.rs`, `propose.rs`,
+  `per_cluster.rs`, `gate.rs`, `seen.rs`); prompts in `crates/prompts/src/curator.rs`. Every module's
+  doc says what it does and why.
+- **Candidates**: the user's own library skills only (`propose::library`): not a repository's, an
+  external folder's, a bundled one (the seeding manifest lists its files; a copy the user made is
+  theirs), a pinned one, an archived or switched-off one. Not limited to agent-created skills (the
+  loop's rule): a hand-written skill may be merged, with the user's approval.
+- **Duplicate clusters** (`cluster.rs`): Jaccard of 5-word shingles of the body (front matter left out),
+  exact, deterministic, single linkage, threshold **0.5**, at most 4 skills a cluster, skills under 30
+  shingles never compared, at most 400 skills a run, pairs whose sizes can't reach the threshold skipped.
+  Measured: the 39 bundled skills (the plan's 37 plus two nested) top out at **0.128**
+  (`microsoft-office` / `pdf`), nothing clusters, and the test pins a 2x margin; Hermes's 193 skills
+  (`skills` + `optional-skills`, informational test) have exactly one pair over 0.5 (two vendored
+  library manuals, `pytorch-fsdp` / `unsloth`, 0.56). Why not BM25 from the index: it needs the index
+  and measures topic, not copied text.
+- **Low performers** (`propose::is_low_performer`): "uses" = the entries of `outcomes` this build
+  understands (CP8.1: last 50, a verdict each; not the `uses` counter, not `attached`); at least 5 of
+  them and fewer than half `clean` (recomputed, not the stored `clean_rate`). A repair also needs
+  **evidence**: excerpts of the signals (`signals/<session>.json`) of the turns that went wrong (turn
+  `T` and `T+1`), up to 6 uses; without any, the job is left out and no request is spent. A cluster's
+  skills are not also repaired in the same run.
+- **One request per job** (`propose.rs`, `per_cluster.rs`): the job's skills in full (secrets: a skill
+  whose text masking would change is not sent at all; a job over the model's window, `JOB_TOKENS` 16k or
+  half of what the window leaves, is not sent), no tools, text JSON contract (reply read as in
+  `review_once`: fence or sentence tolerated, anything else malformed, **exactly one repair request**,
+  then given up). At most `curator_max_requests` jobs a run; clusters first (best score), then repairs
+  (worst rate). The governor is asked before the run and before every job (`Purpose::Curator`: nothing
+  below 20% left, nor at the daily limit); a failed request ends the run and a daily-limit 429 teaches
+  the ledger; `gate.rs` has an hourly cap (2 runs that send) and a back-off after a failed run (1 h,
+  doubling to 24 h), in memory like the review scheduler's.
+- **The answer** (`contract.rs`): `{action: merge|repair|none, keep, content, archive[], why}`, each part
+  judged alone against the job: `keep` must be a listed skill and `content` a SKILL.md whose front
+  matter says `name: <keep>`, else the whole answer is refused; an `archive` entry outside the job, the
+  kept skill, a repeat, or any entry of a repair is dropped with its reason while the rest stands; a
+  merge that archives nothing is refused. Result: `edit` of the kept skill + `archive` of each absorbed
+  one. Merged `sources` = the union of the cluster's (the model's own `sources` is stripped) + this run's
+  entry (`curator`, date, why).
+- **Staging, not writing** (`propose::deliver`): `skills.plan` (validation, threat scan, size, description
+  budget, a pin, staleness bases) then one staged item (`session_id` `curator`, reason, full diff:
+  new text, and the absorbed skills' removal with "moves to the archive (restorable)"). Approving it goes
+  through `apply_staged` (re-checks, base fingerprints: a skill edited since is stale and nothing is
+  written). `curator.auto_apply` (config, default false; `Runtime::set_curator_auto_apply`, set from
+  `apply_settings`) applies through the same `plan` + `apply_staged` unless `skills.write_approval` is
+  on. Jobs judged (a proposal, "none", a refusal, an unreadable reply) are remembered 30 days in
+  `curator-seen.json` unless the skills change; a job a waiting proposal touches is left out.
+- **New skill-store op `archive`** (`tools/src/skill_manage.rs`): moves a library skill to `.archive/`
+  after its text was merged into `absorbed_into`. Needed because `delete` must be the sole op of a call
+  and `archive_for_curator` only takes curator-managed skills. Must come after every other op of a
+  batch; every archive is checked (not pinned, not bundled / external / project, the absorber exists)
+  before anything changes; a model's `skill_manage` call can't use it (`parse_call` refuses it).
+- **Desktop** (`maintenance.rs`): same trigger (weekly after 2 idle hours, or Run now). When the knob is
+  `per_cluster` it passes `CuratorModel` from `aux_models.curator`, else the review model, else the main
+  model (window from the provider's `context_length` setting, else unknown); other profiles pass `None`
+  as before (archiving only). `curator.auto_apply` is in the config defaults (Settings shows a switch).
+  `providers::AuxModels` reads `curator`.
+Files: `crates/runtime/src/{curator.rs,budget.rs,lib.rs,review_once.rs}`,
+`crates/runtime/src/curator/{cluster,contract,gate,per_cluster,propose,seen,tests}.rs`,
+`crates/runtime/src/review_once/contract.rs` (`extract` crate-visible), `crates/runtime/tests/turns.rs`,
+`crates/prompts/src/{curator.rs,lib.rs}`, `crates/tools/src/{skill_manage.rs,curator.rs}`,
+`crates/desktop/src/{maintenance.rs,gateway.rs,providers.rs,rest.rs}`, `PORTING.md`, `GAPS.md`,
+`docs/{ARCHITECTURE,PITFALLS,TESTING}.md`.
+Tests (all with `CARGO_TARGET_DIR=target/claude`): 
+- `cargo test -p hermes_tools -p hermes_memory -p hermes_store -p hermes_prompts -p hermes_llm`: green
+  (hermes_tools 242, +1: the `archive` op).
+- `cargo test -p hermes_runtime --lib`: 166 green (new: 23 in `curator/tests.rs` (clusters, bundled and
+  Hermes sets, low-performer rule, contract, staging, auto-apply, refusals, selection, message), 2 in
+  `gate.rs`, 1 budget knobs test).
+- `cargo test -p hermes_runtime --test turns`: 194 passed / 7 ignored under the default profile and under
+  `HERMES_TEST_PROFILE` balanced, requests and tokens (new: 14 curator tests after the `Phase 8, CP8.3`
+  banner; `the_curator_archives_an_absorbed_skill_and_reports` now pins `Balanced`).
+- `cargo test -p hermes-desktop`: 174 + 68 integration green. `cargo build --workspace`: green.
+  Bundled-set measurement: `cargo test -p hermes_runtime --lib curator::tests::bundled -- --nocapture`.
+Request counts: unchanged for every existing test. New (`requests`, `per_cluster_budget`): two
+clusters -> 2 `curator` requests (cap 3), cap 1 -> 1, no clusters or low performers -> 0 (and no model
+needed), unreadable reply -> 2 (one repair) then nothing on the next run, governor below 20% left -> 0
+(81 and 100 of 100; 79 of 100 -> 2), failed request -> 1 and the next run 0 (back-off), `balanced` with
+duplicate skills -> 0 (summary `skipped (no candidates)`, byte for byte), `balanced` opted in -> 1.
+Deviations from the plan: none in what it asks. Choices the plan leaves open: Jaccard of shingles
+(not BM25); a new `archive` skill op; text JSON contract only (no `response_format: json_schema`, so no
+schema-refusal fallback: at most 2 requests a job); the merged skill replaces an existing member (no new
+umbrella name); repairs need evidence; jobs judged are remembered 30 days.
+For the reviewer:
+- **`archive` is a new write path in `skill_manage.rs`.** Check `validate_ops` / `apply_ops_locked` /
+  `Planner`: archives last, all pre-checked before the first write, refused in `parse_call`. A failure
+  of an archive after another archive succeeded (an I/O error: the pre-check passed) leaves the first
+  archived and the batch's snapshot restore recreating the second's folder next to its `.archive` copy;
+  rare, restorable, not handled.
+- **`own_hand` on a merge op.** The merged text's `sources` is built by `contract::merged_sources` and
+  the op is `own_hand: true` so `keep_sources` doesn't revert it to the kept skill's old list. That is a
+  second use of a flag documented as "the user's editor". The text has been through `keep_sources(None,
+  ..)` (model-written `sources` stripped) first; staged ops keep the flag. Is that acceptable, or should
+  the union be a separate field?
+- **Who the curator may merge.** All the user's library skills, not only agent-created ones, because
+  the plan says "the user's library skills". With the approval gate that seemed right; with
+  `curator.auto_apply` a hand-written skill can be archived (restorable from `.archive`, and in the
+  skills git history) without a click. The default is off.
+- **The model's choice of `keep`** is any member (so a merge can keep the less-used name). The prompt
+  asks for the one a search would look for. No new umbrella names (they'd need clash and category
+  handling).
+- **Repairs need evidence from the signals files.** A session whose signals file is gone (deleted
+  session) or whose signals were all dropped gives none; the plan said "where available". I chose not
+  to spend a request on a repair with nothing to repair from. Also the evidence maps a use in turn `T`
+  to signals of turns `T` and `T+1`, but signal turns are renumbered by rewinds (informational per
+  the signals module), so evidence can occasionally belong to another turn.
+- **Desktop model fallback.** With no `aux_models.curator` and no review model, the curator uses the
+  main model on the main provider, counted as `curator` in the ledger and held back below 20% (the
+  governor's table is the only protection; Phase 4's "no side job on the main quota" applies to the
+  approval judge only). The window is the provider setting's `context_length`, else unknown (the 16k
+  job cap applies; a smaller real window would make the request fail and back the curator off).
+  The aux `curator` row has no Settings entry (hidden slot).
+- **The page**: `curator.auto_apply` shows as a switch under a new "curator" category from the config
+  schema; I did not open the page to see where it lands. Staged curator items show in Pending like the
+  others (kind `skill`, summary `skill: edit x, archive y`); not checked in the page (no live check:
+  nothing the page calls is new).
+- **Hermes's set**: one pair at 0.56 clusters over there (informational). If a threshold of 0.6 is
+  preferred, that costs a hand-copied-and-edited pair around 0.5-0.6.
+- **Not done**: the per-skill clean rate and the curator proposals have no UI beyond Pending; the
+  "Run now" action's summary lines are the places the numbers show (`/api/actions/curator-run`, and
+  `logs/curator/<run>/REPORT.md`, whose "Consolidation pass" section lists every job and refusal).
+- The ledger counts requests a moment late, so "stops before the next job once under 20%" is asserted
+  as a range (1 or 2).
+
+### Review (Opus 5.5)
+Main had not moved (nothing to merge). Read the whole diff and the new `curator/` module; no
+`/code-review` in a subagent, so a manual pass. Verdict: sound design (local selection, zero
+requests with nothing to do, every answer validated against its job, staging by default, the store's
+own checks on plan and on apply); fixed the data-loss paths below.
+Findings and fixes:
+- **Clobbering an edit made while the request ran** (the real data-loss path). The staged item's
+  bases were taken at *delivery*, after a request of up to minutes, so a user edit of the kept skill
+  in between was overwritten by the model's merge of the old text (silently under `auto_apply`; under
+  staging the diff showed it reverted). `propose::deliver` now takes the job and refuses a proposal
+  when a touched skill's SKILL.md fingerprint differs from the one the model read (test
+  `a_skill_edited_while_the_model_was_reading_it_refuses_the_proposal`, both modes). After staging,
+  the existing base check makes the item stale (confirmed by `an_approval_finds_a_skill_edited_...`).
+- **Archiving files the model never saw.** The model sees SKILL.md only, but `archive` moves the whole
+  folder, so a merge could archive `references/` / `scripts/` the merged text needs. Now a skill with
+  anything besides SKILL.md may be kept but never archived (`contract::judge` drops it; the message
+  tells the model which one to keep), and a cluster with two such skills is left to the user without
+  a request (`a_skill_with_its_own_files_may_be_kept_but_never_archived`). Hermes's one clustering
+  pair (pytorch-fsdp / unsloth, both with `references/`) is exactly this case.
+- **The implementer's doubt, batch rollback after an archive**: confirmed real (on Windows a rename
+  fails whenever a file in the folder is open) and worse than stated: the record stayed `archived`
+  and `archive_skill` had committed "user: archive x" mid-batch. The `archive` op now uses
+  `move_to_archive` (no commit); `apply_ops_locked` remembers each archive's destination and record
+  and, on a later failure, deletes the moved copy after the snapshot restores the folder and puts the
+  record back. The batch commits once (`skill_manage: edit a, archive b`). Test
+  `an_archive_that_fails_after_another_went_through_leaves_no_duplicate`; the archived copy is
+  checked byte for byte.
+- **`auto_apply` on hand-written skills**: now applies directly only when every touched skill is
+  `created_by: agent` (`curator_managed`, the loop curator's own rule); the user's and chats' skills
+  are staged even with it on. Reason: undoing an applied merge means moving the archived folder back
+  by hand (this app has no restore route; `restore_archived` exists in `hermes_tools` only) and
+  taking the kept skill's old text from the skills history.
+- **Threshold 0.5 -> 0.35.** Jaccard of shingle sets is about `s / (2 - s)` for a shared fraction `s`,
+  so the realistic duplicate (new title, same core steps, a few of its own each: 60% shared) scored
+  0.43 and did not cluster (new test `two_skills_sharing_about_sixty_percent_of_their_steps_cluster`).
+  Measured: the bundled 39 top out at 0.128 (the 2x margin test holds at 0.175); Hermes's 193 give
+  the same single pair at every threshold from 0.3 to 0.55 (at 0.2 a third, axolotl, joins).
+  Normalisation confirmed: front matter out, case folded, markdown/punctuation are separators, code
+  counts as words; deterministic (sorted, union-find, ties by name); 400 skills a run, 200 KB a file.
+- Docs: gate.rs said an unreadable reply backs off (it doesn't: it is remembered in `seen.rs`); it now
+  says why a crash loop can't burst (`last_run_at` saved before the first request; judged jobs on
+  disk). The checklist claimed a Settings switch for `curator.auto_apply`: the page's Settings only
+  shows sections it knows, so there is none; the config description and the checklist say so.
+
+Confirmed without change: zero requests when nothing to do (returns before the governor, no model
+needed); requests = jobs (+1 repair each), cap 1-20 with 0 refused; governor before the run and before
+every job, `Purpose::Curator`, a daily-limit 429 taught to the ledger; `seen.rs` corrupt file = empty
+(re-asks once, bounded by the caps, then rewritten atomically); `archive` unreachable from a model:
+`parse_call` refuses it (both call shapes), the review's `SkillAction` is create/patch only, staged
+payloads are our own serialized ops; pinned / bundled / external / project skills never selected and
+re-checked by `check_archive` at plan and apply; secrets: a skill whose masking would change is never
+sent, so the model can't echo one back; the threat scan runs at plan and at apply; `own_hand` only
+skips `keep_sources` (no taint or staging bypass), and the union is built from the files' own
+`sources` after stripping the model's, so it can't be forged; the curator has no session, so no taint
+applies: staging by default is the gate. `balanced` / `tokens`: the old loop test is pinned to
+`Balanced` and still runs; `balanced` with duplicates sends 0. Ground rules: no store schema change
+(side file `curator-seen.json`), file work in `spawn_blocking`, no prompt touched mid-session.
+
+**Decision for the user: model fallback.** With no `aux_models.curator` and no review model, the
+curator uses the main model on the main provider. Kept: it is bounded (the governor's 20% floor, 3
+jobs = at most 6 requests a run, 2 runs an hour, weekly by schedule, judged jobs not re-asked for 30
+days), and requiring an aux model would make the `requests` default do nothing for most users.
+Documented in PITFALLS; set a background review model to keep it off the main one.
+
+Left: no restore button for archived skills in this app (pre-existing; a folder move by hand); no UI
+switch for `curator.auto_apply` (config file); evidence turn mapping across rewinds (informational).
+Tests (`CARGO_TARGET_DIR=target/claude`): hermes_tools 243 (+1) and memory/store/prompts/llm green;
+hermes_runtime lib 169 (+3); turns 194 passed / 7 ignored under default, balanced, requests and
+tokens; hermes-desktop green; `cargo build --workspace` green.
+
+### User checklist (Phase 8, all three checkpoints)
+Build the webapp once if you haven't (`scripts/build-hermes-webapp.ps1`), start the app, and keep the
+budget profile at **Requests** (the default; Settings > Model > Main > Budget profile).
+1. **Duplicate skills -> one proposal.** In Capabilities > Skills create a skill with a dozen lines
+   of steps, then a second one: copy the text, change the `name`, the title and a step or two (at
+   least half of the text the same). Have a model set in Settings > Model > Main (optionally a
+   "Background review" model in Settings > Model > Auxiliary: the curator then uses that one
+   instead). Open Command Center > Maintenance and press **Run now** next to *Skill curator*. Within
+   seconds the output box there says "per-cluster: 1 job(s) asked (1 request(s)): 1 proposal(s)
+   staged". Open Capabilities > Skills: at the top, "Waiting for your review" shows one item "skill:
+   edit A, archive B" with a diff (the merged text, and B moving to the archive).
+2. **Apply it.** Press Apply: B disappears from the list, A holds the merged text, and A's front
+   matter (open it in the skill editor) ends its `sources:` list with an entry from `curator`.
+   B's folder is now in `%APPDATA%\hermes-rs\skills\.archive\B`, unchanged; to undo, move that folder
+   back into `%APPDATA%\hermes-rs\skills\` (there is no restore button yet).
+3. **Reject instead.** Repeat 1 with two new duplicates and press Reject: nothing changes, and Run
+   now again lists that pair as "asked about in the last 30 days", with no request.
+4. **Nothing to do, no request.** Run now on a library without duplicates: "nothing to merge or
+   repair; no request"; the status bar's request count doesn't move.
+5. **Pinned skills are left alone.** Pin one of two duplicates and Run now: no proposal.
+6. **Auto-apply leaves your own skills alone.** Close the app, add `"curator": {"auto_apply": true}`
+   to `%APPDATA%\hermes-rs\desktop-config.json` (there is no switch in Settings), start it, make a
+   new duplicate pair by hand and Run now: the proposal still waits in "Waiting for your review"
+   (only skills the background review created are merged without asking). Set it back to `false`.
+7. **A skill that goes wrong gets repaired.** Use one of your own skills in chats and correct the
+   agent about it ("no, ...") on 5 or more uses. Run now: a "repair" job asks once, and the proposal
+   shows the corrected text. (Takes real use; the automated tests cover it.)
+8. **Project skills stay out.** In a git repository put a copy of one of your skills in
+   `.agents/skills/<name>/SKILL.md` and Run now: the repository's copy is never proposed or archived.
+9. **Provenance and outcomes.** A merged or review-written skill's `sources:` list says which session
+   or curator run each change came from; outcomes are in `%APPDATA%\hermes-rs\skills\.usage.json`
+   (`outcomes`, `clean_rate`); the Skills screen does not show the rate yet.
+10. **Other profiles unchanged.** Switch the budget profile to Balanced and Run now: idle skills are
+    archived as before, and no request is sent.

@@ -93,6 +93,10 @@ fn config_defaults() -> Value {
         "budget": {"profile": "requests", "review_mode": ""},
         // On by default (Hermes's is opt-in): a coding harness keeps a way back from the agent's
         // edits, as Claude Code does. Settings ▸ Safety ▸ Checkpoints switches it.
+        // The skills curator (backend v2 Phase 8): `auto_apply` applies its merge and repair
+        // proposals at once, through the same checks as an approval; off, they wait in Capabilities
+        // ▸ Skills ▸ Pending.
+        "curator": {"auto_apply": false},
         "checkpoints": {"enabled": true},
         "stt": {"enabled": false},
         // Settings ▸ Sessions: hide sessions idle this many days (`archive.rs`); off by default.
@@ -329,6 +333,7 @@ fn config_schema() -> serde_json::Map<String, Value> {
             "memory.write_approval" => {
                 Some(json!({"description": "Ask before the agent saves to memory"}))
             }
+            "curator.auto_apply" => Some(json!({"description": "Apply the skills curator's proposals (merging near-duplicate skills, repairing skills that often go wrong) without asking, for skills the background review created; a change to a skill you or a chat wrote still waits for you. Off: every proposal waits in Capabilities, Skills, Pending for your approval. Applies to the Requests profile's curator."})),
             _ => None,
         };
         if let (Some(field), Some(overrides)) = (field.as_object_mut(), overrides) {

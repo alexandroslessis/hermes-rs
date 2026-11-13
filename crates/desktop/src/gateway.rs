@@ -151,7 +151,11 @@ impl Gateway {
         // The runtime keeps the approval policy in memory: Settings' choice applies from the start.
         gateway.apply_settings();
         if background {
-            crate::maintenance::schedule_curator(gateway.runtime.clone(), gateway.actions.clone());
+            crate::maintenance::schedule_curator(
+                gateway.runtime.clone(),
+                gateway.actions.clone(),
+                gateway.data_dir.clone(),
+            );
         }
         // So are the skills switched off in Capabilities ▸ Skills.
         crate::skills::apply_config(&gateway.runtime.skills(), &gateway.rest);
@@ -282,6 +286,11 @@ impl Gateway {
             .set_budget(hermes_runtime::budget::from_config(
                 &self.rest.config_value("budget"),
             ));
+        // Backend v2 Phase 8: the curator's merge and repair proposals apply at once instead of
+        // waiting in Pending (off by default).
+        self.runtime.set_curator_auto_apply(
+            self.rest.config_value("curator.auto_apply") == true,
+        );
         // File checkpoints (`/rollback`), before the turn's first write.
         self.runtime
             .checkpoints()
@@ -3616,7 +3625,11 @@ impl Gateway {
             }
             ("POST", "/api/curator/run") => {
                 let started =
-                    crate::maintenance::run_curator(self.runtime.clone(), self.actions.clone());
+                    crate::maintenance::run_curator(
+                        self.runtime.clone(),
+                        self.actions.clone(),
+                        self.data_dir.clone(),
+                    );
                 return Some((
                     200,
                     json!({"ok": true, "pid": 0, "name": crate::maintenance::CURATOR_RUN,

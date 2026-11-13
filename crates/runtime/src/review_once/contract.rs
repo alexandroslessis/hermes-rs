@@ -171,7 +171,7 @@ pub fn response_format() -> Value {
 
 /// The JSON object in a reply: the whole text, or inside one code fence, or from its first `{`
 /// to its last `}` (a sentence around it). `Err` says why there is none.
-fn extract(text: &str) -> Result<Value, String> {
+pub(crate) fn extract(text: &str) -> Result<Value, String> {
     if text.len() > MAX_REPLY_BYTES {
         return Err(format!(
             "the reply is {} KB, more than the {} KB read",

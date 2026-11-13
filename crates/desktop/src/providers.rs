@@ -70,6 +70,11 @@ pub struct AuxModels {
     pub approval: Option<ModelChoice>,
     #[serde(default)]
     pub titles: Option<ModelChoice>,
+    /// The curator's model (the GPUI app's `curator`; backend v2 Phase 8 reads it for the
+    /// per-cluster curator, `maintenance::curator_model`). No Settings row: it follows the review
+    /// model, then the main one.
+    #[serde(default)]
+    pub curator: Option<ModelChoice>,
 }
 
 impl AuxModels {
@@ -80,6 +85,7 @@ impl AuxModels {
             "review" => self.review.as_ref(),
             "approval" => self.approval.as_ref(),
             "titles" => self.titles.as_ref(),
+            "curator" => self.curator.as_ref(),
             _ => None,
         }
     }

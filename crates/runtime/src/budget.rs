@@ -13,7 +13,7 @@
 //! from the next *session* (prompt caching, ground rule 8); a compaction or a model switch, which
 //! rebuild the prompt anyway, take the profile the session runs under then.
 //!
-//! A knob whose `requests` or `tokens` value needs a later phase (per-cluster curator, deferred
+//! A knob whose `requests` or `tokens` value needs a later phase (deferred
 //! tool schemas) holds its `balanced`
 //! value until that phase lands: the enum has the variant, [`for_profile`] says which phase flips
 //! it in a comment, and nothing consumes the later variant yet.
@@ -94,12 +94,14 @@ impl ReviewMode {
     }
 }
 
-/// How the curator consolidates. Phase 8 adds one-shot-per-cluster as the `requests` value.
+/// How the curator consolidates (`curator.rs`): the agent loop of today, or (Phase 8) one request
+/// per cluster of near-duplicate skills and per low performer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CuratorMode {
     /// One agent loop over all candidates, up to `curator_max_iterations` calls (today).
     Loop,
-    /// One request per cluster of related skills (Phase 8).
+    /// One request per cluster of near-duplicate skills or low-performing skill, the answer a
+    /// proposal in the staging area (`curator/`). The `requests` value.
     PerCluster,
 }
 
@@ -184,6 +186,9 @@ pub struct BudgetKnobs {
     /// Model calls one curator pass may make (when `curator_mode` is `Loop`).
     pub curator_max_iterations: u32,
     pub curator_mode: CuratorMode,
+    /// `curator_mode` `PerCluster`: clusters and repairs one run may send a request for (each
+    /// may take one more request to repair an unreadable reply).
+    pub curator_max_requests: u32,
     pub skills_index: SkillsIndex,
     /// Skills attached to the user's message by the local index (Phase 5): the top k, 0 = none.
     pub skills_preload: u32,
@@ -225,6 +230,7 @@ impl BudgetKnobs {
         review_per_hour: 6,
         curator_max_iterations: 200,
         curator_mode: CuratorMode::Loop,
+        curator_max_requests: 3,
         skills_index: SkillsIndex::Full,
         skills_preload: 0,
         memory_preload: 0,
@@ -274,9 +280,10 @@ pub fn for_profile(profile: BudgetProfile) -> BudgetKnobs {
             review_threshold: balanced.review_threshold,
             review_idle_minutes: balanced.review_idle_minutes,
             review_per_hour: balanced.review_per_hour,
-            // Phase 8: CuratorMode::PerCluster.
+            // Phase 8: one request per cluster or repair, up to 3 a run.
             curator_max_iterations: balanced.curator_max_iterations,
-            curator_mode: balanced.curator_mode,
+            curator_mode: CuratorMode::PerCluster,
+            curator_max_requests: 3,
             // Phase 5: the system prompt lists categories; the top 3 skills and top 3 memory
             // entries for each message ride on it (the local index).
             skills_index: SkillsIndex::CategoriesAndRetrieval,
@@ -305,7 +312,7 @@ pub fn for_profile(profile: BudgetProfile) -> BudgetKnobs {
 
 /// What `budget.*` in the config can set: the profile, and each of these numbers on top of it
 /// (`budget.max_iterations: 100`). Names are the knob's field names.
-pub const OVERRIDE_KEYS: [&str; 20] = [
+pub const OVERRIDE_KEYS: [&str; 22] = [
     "skills_preload",
     "memory_preload",
     "max_iterations",
@@ -322,6 +329,8 @@ pub const OVERRIDE_KEYS: [&str; 20] = [
     "delegate_max_children",
     "delegate_child_iterations",
     "curator_max_iterations",
+    "curator_mode",
+    "curator_max_requests",
     "review_mode",
     "review_threshold",
     "review_idle_minutes",
@@ -378,6 +387,16 @@ pub fn apply_override(
         "curator_max_iterations" => {
             knobs.curator_max_iterations = count(key, value, 1, 10_000)? as u32
         }
+        // "" is the profile's own (no override).
+        "curator_mode" if value.as_str().is_some_and(|v| v.trim().is_empty()) => {}
+        "curator_mode" => {
+            knobs.curator_mode = match value.as_str().map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+                Some("loop") => CuratorMode::Loop,
+                Some("per_cluster") => CuratorMode::PerCluster,
+                _ => return Err("budget.curator_mode must be loop or per_cluster".to_string()),
+            }
+        }
+        "curator_max_requests" => knobs.curator_max_requests = count(key, value, 1, 20)? as u32,
         // "" is the Settings select's "the profile's own" (no override).
         "review_mode" if value.as_str().is_some_and(|v| v.trim().is_empty()) => {}
         "review_mode" => {
@@ -473,6 +492,7 @@ mod tests {
         assert_eq!(k.review_per_hour, 6);
         assert_eq!(k.curator_max_iterations, 200); // curator.rs CURATOR_MAX_ITERATIONS
         assert_eq!(k.curator_mode, CuratorMode::Loop);
+        assert_eq!(k.curator_max_requests, 3); // only read by `PerCluster`
         assert_eq!(k.skills_index, SkillsIndex::Full);
         assert_eq!(k.skills_preload, 0);
         assert_eq!(k.memory_preload, 0);
@@ -543,9 +563,11 @@ mod tests {
         assert_eq!((r.skills_preload, r.memory_preload), (3, 3));
         // Phase 7: the evidence review at idle.
         assert_eq!(r.review_mode, ReviewMode::IdleOnce);
+        // Phase 8: the curator asks once per cluster or repair, 3 a run at most.
+        assert_eq!((r.curator_mode, r.curator_max_requests), (CuratorMode::PerCluster, 3));
         // Later phases: still balanced.
         let b = BudgetKnobs::BALANCED;
-        assert_eq!((r.curator_mode, r.tool_schemas), (b.curator_mode, b.tool_schemas));
+        assert_eq!(r.tool_schemas, b.tool_schemas);
 
         let t = for_profile(BudgetProfile::Tokens);
         assert_eq!(
@@ -619,6 +641,33 @@ mod tests {
     }
 
     #[test]
+    fn the_curator_knobs_are_validated_and_can_opt_a_profile_in_or_out() {
+        use serde_json::json;
+        for mode in ["loop", "per_cluster", " Loop ", ""] {
+            assert!(check_config_value("curator_mode", &json!(mode)).is_ok(), "{mode}");
+        }
+        assert!(check_config_value("curator_mode", &json!("agentic")).is_err());
+        assert!(check_config_value("curator_mode", &json!(1)).is_err());
+        assert!(check_config_value("curator_max_requests", &json!(0)).is_err());
+        assert!(check_config_value("curator_max_requests", &json!(21)).is_err());
+        assert!(check_config_value("curator_max_requests", &json!(5)).is_ok());
+        // balanced and tokens keep the agent loop unless the user opts in; requests can opt out.
+        for profile in ["balanced", "tokens"] {
+            assert_eq!(from_config(&json!({"profile": profile})).curator_mode, CuratorMode::Loop);
+            let knobs = from_config(&json!({
+                "profile": profile, "curator_mode": "per_cluster", "curator_max_requests": 2
+            }));
+            assert_eq!((knobs.curator_mode, knobs.curator_max_requests), (CuratorMode::PerCluster, 2));
+        }
+        let knobs = from_config(&json!({"profile": "requests", "curator_mode": "loop"}));
+        assert_eq!(knobs.curator_mode, CuratorMode::Loop);
+        assert_eq!(
+            from_config(&json!({"profile": "requests", "curator_mode": ""})).curator_mode,
+            CuratorMode::PerCluster
+        );
+    }
+
+    #[test]
     fn a_config_without_the_key_gets_requests() {
         use serde_json::json;
         for config in [
@@ -670,6 +719,7 @@ mod tests {
             "delegate_max_children",
             "delegate_child_iterations",
             "curator_max_iterations",
+            "curator_max_requests",
         ] {
             assert!(check_config_value(key, &json!(0)).is_err(), "{key}");
             // And from a hand-edited file: ignored, the profile value stays.

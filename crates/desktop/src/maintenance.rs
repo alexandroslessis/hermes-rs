@@ -6,11 +6,13 @@
 //! (`maybe_run_curator`: the schedule).
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use hermes_runtime::Runtime;
+use hermes_runtime::budget::CuratorMode;
+use hermes_runtime::{CuratorModel, Runtime, TurnOptions};
 use hermes_tools::SkillStore;
+use crate::providers::Settings;
 use hermes_tools::curator::{ARCHIVE_AFTER_DAYS, INTERVAL_HOURS, MIN_IDLE_HOURS, STALE_AFTER_DAYS};
 use serde_json::{Value, json};
 
@@ -104,13 +106,52 @@ pub fn set_curator_paused(skills: &SkillStore, paused: bool) -> Value {
     json!({"ok": true, "paused": paused})
 }
 
+/// The model the per-cluster curator (backend v2 Phase 8) asks, when the knobs say it runs
+/// (`budget.curator_mode`: the `requests` profile's): the curator's own model if one is set in
+/// `config.json` (`aux_models.curator`), else the background review's (Settings ▸ Model ▸
+/// Auxiliary), else the main model. Its requests count as `curator` in the ledger and the governor
+/// holds them back below 20% of the day's quota. `None` under the other profiles: today's curator
+/// runs without a model here (the deterministic archive pass only).
+pub fn curator_model(runtime: &Runtime, data_dir: &Path) -> Option<CuratorModel> {
+    if runtime.budget().curator_mode != CuratorMode::PerCluster {
+        return None;
+    }
+    let settings = Settings::load(data_dir);
+    let chosen = settings
+        .aux_models
+        .curator
+        .as_ref()
+        .or(settings.aux_models.review.as_ref())
+        .and_then(|choice| {
+            let provider = settings.provider(&choice.provider)?;
+            Some((provider, choice.model.clone(), choice.effort.clone()))
+        });
+    let (provider, model, effort) = match chosen {
+        Some(chosen) => chosen,
+        None => (settings.active()?, settings.model.clone()?, None),
+    };
+    if !provider.ready() || model.trim().is_empty() {
+        return None;
+    }
+    Some(CuratorModel {
+        provider: provider.runtime(),
+        model,
+        options: TurnOptions {
+            context_length: provider.context_length,
+            effort,
+            ..Default::default()
+        },
+    })
+}
+
 /// Runs the curator in the background under the `curator-run` action; `false` when one runs.
-pub fn run_curator(runtime: Arc<Runtime>, actions: Arc<Actions>) -> bool {
+pub fn run_curator(runtime: Arc<Runtime>, actions: Arc<Actions>, data_dir: PathBuf) -> bool {
     if !actions.start(CURATOR_RUN) {
         return false;
     }
     tokio::spawn(async move {
-        match runtime.run_curator(None).await {
+        let model = curator_model(&runtime, &data_dir);
+        match runtime.run_curator(model).await {
             Ok(outcome) => {
                 let mut lines: Vec<String> = outcome.summary.lines().map(str::to_string).collect();
                 if let Some(report) = outcome.report {
@@ -125,9 +166,10 @@ pub fn run_curator(runtime: Arc<Runtime>, actions: Arc<Actions>) -> bool {
 }
 
 /// The scheduled curator (Hermes's `maybe_run_curator`): checked every ten minutes, it runs when
-/// a week has passed, it isn't paused, and nothing has been used for two hours. Archiving idle
-/// skills only (consolidating them with a model is a separate, opt-in pass).
-pub fn schedule_curator(runtime: Arc<Runtime>, actions: Arc<Actions>) {
+/// a week has passed, it isn't paused, and nothing has been used for two hours. It archives idle
+/// skills; under the `requests` profile it also asks the model once per duplicate cluster or low
+/// performer and stages what it proposes (`curator_model`); the other profiles keep archiving only.
+pub fn schedule_curator(runtime: Arc<Runtime>, actions: Arc<Actions>, data_dir: PathBuf) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
@@ -136,7 +178,7 @@ pub fn schedule_curator(runtime: Arc<Runtime>, actions: Arc<Actions>) {
         loop {
             tick.tick().await;
             if runtime.curator_due() {
-                run_curator(runtime.clone(), actions.clone());
+                run_curator(runtime.clone(), actions.clone(), data_dir.clone());
             }
         }
     });

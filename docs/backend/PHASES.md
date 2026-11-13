@@ -47,7 +47,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 5 | Local index (FTS5) and per-turn pre-injection — ✅ 2026-11-12 | M | 3 | Sonnet | A |
 | 6 | Taint tracking and the staging area — ✅ 2026-11-12 | M | 1 | Sonnet | B |
 | 7 | Review rewrite: signals, evidence packet, one shot — ✅ 2026-11-13 | M–L | 5, 6 | **Opus** | C |
-| 8 | Skills v2: outcomes, provenance, project skills, curator v2 | M–L | 7 | Sonnet | B |
+| 8 | Skills v2: outcomes, provenance, project skills, curator v2 — ✅ 2026-11-13 | M–L | 7 | Sonnet | B |
 | 9 | Memory v2: tiers, structured entries, links | L | 5, 7 | Sonnet (CP9.1 **Opus**) | B |
 | 10 | Fewer round trips: script tool, first-turn context, batching | M | 3 | Sonnet | A |
 | 11 | Token mode: deferred tool schemas | S–M | 3 | Sonnet | A |
@@ -1026,6 +1026,12 @@ signals: 0, idle or switched away from. An evidence review is 1 request (2 with 
 most 3); at most `review_per_hour` (6) start per hour. S1-S3, S5, S6 unchanged. `balanced` /
 `tokens` (`nudges`): S1-S6 unchanged (S4 still 11, the counter review); a session whose signals
 reach the threshold gets the agentic review at that turn's end instead of waiting for the counters.
+
+After 8 (`requests`, 2026-11-13): S1-S6 unchanged (no scenario runs the curator). The curator, which
+under `requests` sent nothing before (archiving only): one `curator` request per duplicate cluster
+or low performer (two with its one repair), at most `curator_max_requests` (3) jobs a run, **0**
+when there is nothing to merge or repair, below 20% of the day's quota, or while its back-off holds
+(`turns.rs`, after the `Phase 8, CP8.3` banner). `balanced` / `tokens`: unchanged (the agent loop).
 
 Since Phase 2 the mock also splits them by purpose (the `x-hermes-rs-purpose` header): S1-S3 are
 all `main`; S4 is 10 `main` + 1 `review`; S5 is 2 `main` + 2 `delegate`. The totals above are

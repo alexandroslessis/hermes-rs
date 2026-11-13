@@ -22,6 +22,10 @@ const MAX_NAME_LENGTH: usize = 64;
 pub const MAX_SKILL_CONTENT_CHARS: usize = 100_000;
 const MAX_SKILL_FILE_BYTES: usize = 1_048_576;
 const MAX_BATCH_OPS: usize = 20;
+/// The op that moves a skill into the archive after its content was merged into another one
+/// (the curator's merge proposals, Phase 8). Not an action a model's `skill_manage` call may
+/// use ([`SkillStore::parse_call`] refuses it); only code that builds ops itself does.
+pub const ARCHIVE_ACTION: &str = "archive";
 const NAME_RULE: &str = "Use lowercase letters, numbers, hyphens, dots, and underscores.";
 const PATCH_NEEDS_OLD_STRING: &str = "old_string is required for 'patch' and must be the EXACT text currently in the file. Read the target file first (skill_view, or skill_view with file_path) and copy the snippet verbatim, then retry 'patch'. Do NOT fall back to action='write_file' — that rewrites the entire file and destroys unrelated content.";
 const PATCH_NEEDS_NEW_STRING: &str =
@@ -578,6 +582,14 @@ impl SkillStore {
                 op.file_path = Some("SKILL.md".into());
             }
         }
+        // `archive` is the curator's merge proposal's (`runtime/src/curator`): built by code,
+        // never by a model's call, so it is not an action of the tool.
+        if let Some(op) = ops.iter().find(|op| op.action == ARCHIVE_ACTION) {
+            return Err(err(format!(
+                "operations: unknown action '{}'. Use: create, patch, write_file, remove_file, delete",
+                op.action
+            )));
+        }
         if let Some(error) = self.validate_ops(&ops) {
             return Err(err(error));
         }
@@ -614,11 +626,22 @@ impl SkillStore {
                 "remove_file",
                 "delete",
                 "edit",
+                ARCHIVE_ACTION,
             ];
             if !known.contains(&op.action.as_str()) {
                 return Some(format!(
                     "operations[{i}]: unknown action '{}'. Use: create, patch, write_file, remove_file, delete",
                     op.action
+                ));
+            }
+            // Archives come last, so everything that can fail has failed before the first
+            // skill moves.
+            if i > 0
+                && ops[i - 1].action == ARCHIVE_ACTION
+                && op.action != ARCHIVE_ACTION
+            {
+                return Some(format!(
+                    "operations[{i}]: archive operations must come after every other operation."
                 ));
             }
             if op.name.is_empty() {
@@ -663,6 +686,16 @@ impl SkillStore {
             return err("Could not create a temporary folder for the batch snapshot.");
         };
         // The ops that change a project skill, by skill name, decided before anything changes.
+        // Every archive is checked before anything changes: they run last, and one that can't
+        // (a pin set meanwhile) must not leave the batch half done.
+        for op in ops.iter().filter(|op| op.action == ARCHIVE_ACTION) {
+            if let Err(error) = self.check_archive(op) {
+                return err(format!(
+                    "operations ({} on '{}'): {error} No changes were applied (the batch is all-or-nothing).",
+                    op.action, op.name
+                ));
+            }
+        }
         let project_ops: Vec<String> = ops
             .iter()
             .filter(|op| self.is_project_op(op))
@@ -670,6 +703,9 @@ impl SkillStore {
             .collect();
         // (skill dir, snapshot or None when it didn't exist)
         let mut snapshots: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+        // Archives done so far: (skill, the folder it moved to, its record before), so a later
+        // failure can take them back out of `.archive` (the snapshot restores the folder itself).
+        let mut archived: Vec<(String, PathBuf, crate::curator::SkillRecord)> = Vec::new();
         let mut results = Vec::new();
         for (i, op) in ops.iter().enumerate() {
             let dir = match op.action.as_str() {
@@ -700,13 +736,24 @@ impl SkillStore {
                 }
                 snapshots.push((dir, snapshot));
             }
+            let before = (op.action == ARCHIVE_ACTION).then(|| self.record(&op.name));
             let result = self.apply_op(op, origin);
+            if let (Some(before), Some(to)) = (before, result["archived_to"].as_str()) {
+                archived.push((op.name.clone(), PathBuf::from(to), before));
+            }
             if result["success"] != json!(true) {
                 for (dir, snapshot) in snapshots.iter().rev() {
                     let _ = std::fs::remove_dir_all(dir);
                     if let Some(snapshot) = snapshot {
                         let _ = copy_dir(snapshot, dir);
                     }
+                }
+                // An archive that went through before this failure: its folder is back from the
+                // snapshot, so the moved copy goes (no duplicate in `.archive`) and its record is
+                // what it was.
+                for (name, moved, record) in archived.iter().rev() {
+                    let _ = std::fs::remove_dir_all(moved);
+                    self.update_record(name, |r| *r = record.clone());
                 }
                 let error = result["error"].as_str().unwrap_or("failed").to_string();
                 let mut failure = result.clone();
@@ -799,6 +846,7 @@ impl SkillStore {
             },
             "write_file" => self.write_file(op),
             "remove_file" => self.remove_file(op),
+            ARCHIVE_ACTION => self.archive_merged(op),
             "delete" if origin == WriteOrigin::Curator => self.archive_for_curator(op),
             "delete" => self.delete(op),
             other => err(format!("Unknown action '{other}'.")),
@@ -1087,6 +1135,57 @@ impl SkillStore {
             let _ = std::fs::remove_dir(parent);
         }
         json!({"success": true, "message": format!("File '{file_path}' removed from skill '{}'.", op.name)})
+    }
+
+    /// Whether the `archive` op may move its skill: one of the user's own library (not a
+    /// project's, an external folder's or a bundled one), not pinned, and its content absorbed
+    /// into another skill that exists. `Err` says why not.
+    pub(crate) fn check_archive(&self, op: &SkillOp) -> Result<(), String> {
+        let absorbed = op
+            .absorbed_into
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default();
+        if absorbed.is_empty() || absorbed == op.name {
+            return Err("archive needs absorbed_into, another skill.".into());
+        }
+        if self.find(absorbed).is_none() {
+            return Err(format!("absorbed_into='{absorbed}' does not exist."));
+        }
+        let Some(skill) = self.find(&op.name) else {
+            return Err(format!("Skill '{}' not found.", op.name));
+        };
+        if skill.external || skill.is_project() || self.is_bundled(&skill.dir) {
+            return Err(format!(
+                "'{}' is not a skill of the user's own library (external, project or bundled).",
+                op.name
+            ));
+        }
+        if self.record(&skill.name).pinned {
+            return Err(format!("'{}' is pinned.", op.name));
+        }
+        Ok(())
+    }
+
+    /// `archive`: the skill's folder goes to `.archive/` (restorable), its content having been
+    /// merged into `absorbed_into`.
+    fn archive_merged(&self, op: &SkillOp) -> Value {
+        if let Err(error) = self.check_archive(op) {
+            return err(error);
+        }
+        // No commit of its own: the batch commits once at its end, or rolls the move back.
+        match self.move_to_archive(&op.name, false) {
+            Ok((_, moved)) => json!({
+                "success": true,
+                "message": format!(
+                    "Skill '{}' archived. Content absorbed into '{}'.",
+                    op.name,
+                    op.absorbed_into.as_deref().unwrap_or_default().trim()
+                ),
+                "archived_to": moved.to_string_lossy(),
+            }),
+            Err(error) => err(error),
+        }
     }
 
     fn delete(&self, op: &SkillOp) -> Value {
@@ -1434,6 +1533,19 @@ impl Planner<'_> {
                     return Err(format!("File '{file}' not found in skill '{}'.", op.name));
                 };
                 self.set(&op.name, file, Some(&old), None);
+                Ok(())
+            }
+            ARCHIVE_ACTION => {
+                self.store.check_archive(op)?;
+                let Some(old) = self.current(&op.name, "SKILL.md")? else {
+                    return Err(format!("Skill '{}' not found.", op.name));
+                };
+                self.set(&op.name, "SKILL.md", Some(&old), None);
+                self.diff.push_str(&format!(
+                    "# the skill '{}' moves to the archive (restorable); its content is merged into '{}'\n",
+                    op.name,
+                    op.absorbed_into.as_deref().unwrap_or_default().trim()
+                ));
                 Ok(())
             }
             "delete" => {
@@ -1876,5 +1988,111 @@ no frontmatter
             "file_path": format!("{}", outside.display()), "file_content": SKILL}]}));
         assert_eq!(escaped["success"], false, "{escaped}");
         assert!(!outside.exists());
+    }
+
+    #[test]
+    fn the_archive_op_moves_an_absorbed_skill_last_and_refuses_the_unsafe_ones_before_anything_changes() {
+        let (dir, store) = store();
+        let other = SKILL.replace("name: deploy", "name: ship").replace("Deploy", "Ship");
+        for (name, text) in [("deploy", SKILL.to_string()), ("ship", other), ("kept", SKILL.replace("name: deploy", "name: kept"))] {
+            let created = store.manage_tool(&json!({"operations": [{"action": "create", "name": name, "content": text}]}));
+            assert_eq!(created["success"], true, "{created}");
+        }
+        let edit = |text: &str| SkillOp {
+            action: "edit".into(),
+            name: "deploy".into(),
+            content: Some(text.to_string()),
+            ..Default::default()
+        };
+        let archive = |name: &str| SkillOp {
+            action: ARCHIVE_ACTION.into(),
+            name: name.into(),
+            absorbed_into: Some("deploy".into()),
+            ..Default::default()
+        };
+        let merged = SKILL.replace("Run `make deploy`.", "Run `make deploy` or ship it.");
+        // A pinned skill stops the whole batch: the edit before it is not applied either.
+        store.set_pinned("kept", true);
+        let refused = store.apply_staged(
+            &[edit(&merged), archive("ship"), archive("kept")],
+            WriteOrigin::Curator,
+            &[],
+        );
+        let refused = refused.unwrap();
+        assert_eq!(refused["success"], false, "{refused}");
+        assert!(refused["error"].as_str().unwrap().contains("pinned"), "{refused}");
+        assert!(std::fs::read_to_string(store.find("deploy").unwrap().skill_md()).unwrap() == SKILL);
+        assert!(store.find("ship").is_some() && store.archived().is_empty());
+        // Archive needs an absorbing skill that exists, and another one than itself.
+        for bad in [None, Some("ghost"), Some("ship")] {
+            let mut op = archive("ship");
+            op.absorbed_into = bad.map(str::to_string);
+            let result = store.apply_staged(&[edit(&merged), op], WriteOrigin::Curator, &[]).unwrap();
+            assert_eq!(result["success"], false, "{bad:?}: {result}");
+        }
+        // Archives come after every other op.
+        assert!(store.plan(&[archive("ship"), edit(&merged)]).is_err());
+        // The good batch: the edit, then the move; restorable; one commit.
+        let done = store.apply_staged(&[edit(&merged), archive("ship")], WriteOrigin::Curator, &[]).unwrap();
+        assert_eq!(done["success"], true, "{done}");
+        assert!(store.find("ship").is_none());
+        assert_eq!(store.archived()[0].name, "ship");
+        assert!(std::fs::read_to_string(store.find("deploy").unwrap().skill_md()).unwrap().contains("or ship it"));
+        assert!(dir.path().join("skills/.archive/ship/SKILL.md").is_file());
+        // Byte for byte: the archived folder is the skill as it was.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("skills/.archive/ship/SKILL.md")).unwrap(),
+            SKILL.replace("name: deploy", "name: ship").replace("Deploy", "Ship")
+        );
+        store.restore_archived("ship").unwrap();
+        // The model's own tool can't ask for it.
+        let tool = store.manage_tool(&json!({"operations": [{"action": "archive", "name": "ship", "absorbed_into": "deploy"}]}));
+        assert_eq!(tool["success"], false, "{tool}");
+        assert!(tool["error"].as_str().unwrap().contains("unknown action 'archive'"), "{tool}");
+    }
+
+    #[test]
+    fn an_archive_that_fails_after_another_went_through_leaves_no_duplicate() {
+        let (dir, store) = store();
+        for name in ["deploy", "ship", "kept"] {
+            let text = SKILL.replace("name: deploy", &format!("name: {name}"));
+            let created = store.manage_tool(&json!({"operations": [{"action": "create", "name": name, "content": text}]}));
+            assert_eq!(created["success"], true, "{created}");
+        }
+        // `kept`'s archive passes the checks but its move fails: every name it could move to is
+        // taken by a folder that isn't empty.
+        let archive_dir = dir.path().join("skills/.archive");
+        let now = chrono::Utc::now();
+        let mut taken = vec![archive_dir.join("kept")];
+        for s in 0..30 {
+            let at = now + chrono::Duration::seconds(s);
+            taken.push(archive_dir.join(format!("kept-{}", at.format("%Y%m%d%H%M%S"))));
+        }
+        for path in &taken {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("x"), "x").unwrap();
+        }
+        let before = std::fs::read_to_string(store.find("deploy").unwrap().skill_md()).unwrap();
+        let op = |action: &str, name: &str| SkillOp {
+            action: action.into(),
+            name: name.into(),
+            content: (action == "edit").then(|| before.replace("make deploy", "make deploy now")),
+            absorbed_into: (action == ARCHIVE_ACTION).then(|| "deploy".to_string()),
+            ..Default::default()
+        };
+        let result = store
+            .apply_staged(
+                &[op("edit", "deploy"), op(ARCHIVE_ACTION, "ship"), op(ARCHIVE_ACTION, "kept")],
+                WriteOrigin::Curator,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(result["success"], false, "{result}");
+        // Nothing changed: the edit undone, `ship` live again and not also in the archive.
+        assert_eq!(std::fs::read_to_string(store.find("deploy").unwrap().skill_md()).unwrap(), before);
+        assert!(store.find("ship").is_some() && store.find("kept").is_some());
+        assert!(!archive_dir.join("ship").exists());
+        assert_ne!(store.record("ship").state, crate::curator::SkillState::Archived);
+        assert!(store.record("ship").archived_from.is_none());
     }
 }

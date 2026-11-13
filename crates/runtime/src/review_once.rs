@@ -223,7 +223,7 @@ fn reserved_tokens(memory: bool, user: bool, context_length: Option<usize>) -> u
 }
 
 /// The longest "why" a repair request quotes (characters).
-const MAX_REPAIR_REASON: usize = 300;
+pub(crate) const MAX_REPAIR_REASON: usize = 300;
 
 /// Whether `error` is a server turning the request down as malformed (most likely the
 /// `response_format` field), as opposed to a failure that would hit a text request too.
@@ -237,7 +237,7 @@ fn refuses_request(error: &ProviderError) -> bool {
 }
 
 /// The reply's text (thinking left out).
-fn reply_text(message: &Message) -> String {
+pub(crate) fn reply_text(message: &Message) -> String {
     message
         .content
         .iter()

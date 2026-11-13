@@ -3,6 +3,22 @@
 //! then to the archive), then, when consolidation is on, has the model merge overlapping
 //! agent-created skills into class-level umbrellas, and writes a report. It runs at most once an
 //! interval, only after the app has been idle a while, or when the user asks.
+//!
+//! Backend v2 Phase 8 (CP8.3, `PORTING.md` row `diverged`): under `budget.curator_mode = per_cluster`
+//! (the `requests` profile) the model step is not that agent loop but one request per cluster of
+//! near-duplicate skills or low-performing skill, whose answers become proposals in the staging area
+//! (`curator/`: `propose.rs` has the procedure). `balanced` and `tokens` keep the loop below.
+
+mod cluster;
+mod contract;
+mod gate;
+mod per_cluster;
+mod propose;
+mod seen;
+#[cfg(test)]
+mod tests;
+
+pub(crate) use gate::Gate;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,6 +41,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::budget::CuratorMode;
 use crate::session::{HermesEffect, OpenSession, TurnRuntime, TurnSession};
 use crate::{ProviderConfig, Runtime, TurnOptions, effort_request_params, ops};
 
@@ -90,6 +107,15 @@ impl Runtime {
         let candidates = skills.curator_candidates();
         let (llm, final_text) = match consolidate {
             None => ("skipped (consolidation off)".to_string(), String::new()),
+            // Phase 8: one request per cluster of near-duplicate skills or low performer, the
+            // answers proposals for the user (`budget.curator_mode`, the `requests` profile's).
+            Some(model) if self.budget().curator_mode == CuratorMode::PerCluster => {
+                let pass = self
+                    .ledger
+                    .scoped(Purpose::Curator, None, self.per_cluster(&model))
+                    .await;
+                (pass.summary, pass.detail)
+            }
             Some(_) if candidates.starts_with("No agent-created skills") => {
                 ("skipped (no candidates)".to_string(), String::new())
             }

@@ -2,6 +2,7 @@
 
 pub mod coding;
 pub mod compress;
+pub mod curator;
 pub mod review;
 pub mod side;
 pub mod system;
