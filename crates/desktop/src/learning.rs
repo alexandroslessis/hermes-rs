@@ -7,11 +7,27 @@
 //! Hermes: `agent/learning_graph.py` (`build_learning_graph`), `agent/learning_mutations.py`
 //! (`node_detail`, `edit_node`, `delete_node`), served as `/api/learning/*` by
 //! `hermes_cli/web_routers/status.py`.
+//!
+//! **Links (Backend v2 Phase 9, CP9.3).** A memory entry may link to skills, files, sessions and
+//! other memories (`memory.db`'s `links`). The page's graph knows nodes and `{source, target}`
+//! edges between nodes (edges to a missing node are ignored by the page), so:
+//! - a MEMORY.md / USER.md card's `skill:<name>` link to a learned skill, and its `memory:<id>`
+//!   link to another card, are **real edges** (added to `edges`, next to the old name-overlap
+//!   ones, without repeating a pair);
+//! - everything else is **additive and ignored by the page**: top-level `archive` (the newest
+//!   archive entries; the page has no node kind for them, and cannot edit them) and
+//!   `memory_links` (every link of a core card or an archive entry, with whether its end still
+//!   exists: `resolved` true/false, `null` for a file or a session, which are not looked up).
+//!   A link whose end is gone is listed as unresolved and drawn nowhere: it never breaks the
+//!   answer.
+//! - **Project memory is not in the map.** The map has no working folder, and a repository's
+//!   notes must not show up in another's view: only the user's own entries (core) and the global
+//!   archive appear.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
-use hermes_memory::{MemoryStore, Target};
+use hermes_memory::{CoreRow, MemoryStore, Target};
 use hermes_tools::SkillStore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -188,12 +204,116 @@ fn memory_edges(cards: &[Card], skills: &[Skill]) -> Vec<(String, String)> {
     edges
 }
 
+/// The `memory.db` row behind each card (by file and text), if the database knows it.
+fn card_rows(memory: &MemoryStore, cards: &[Card]) -> Vec<Option<CoreRow>> {
+    let mut by_source: Vec<(&str, Vec<CoreRow>)> = Vec::new();
+    for (source, target) in MEMORY_SOURCES {
+        by_source.push((source, memory.core_rows(target)));
+    }
+    cards
+        .iter()
+        .map(|card| {
+            by_source
+                .iter()
+                .find(|(source, _)| *source == card.source)
+                .and_then(|(_, rows)| rows.iter().find(|r| r.text.trim() == card.entry.trim()))
+                .cloned()
+        })
+        .collect()
+}
+
+/// The explicit link edges of the cards (see the module doc): to learned skills and to other
+/// cards. Pairs already in `have` (either direction for card-card) are not repeated.
+fn link_edges(
+    cards: &[Card],
+    rows: &[Option<CoreRow>],
+    skills: &[Skill],
+    have: &[(String, String)],
+) -> Vec<(String, String)> {
+    let names: HashSet<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+    let by_row: Vec<(i64, String)> = cards
+        .iter()
+        .enumerate()
+        .filter_map(|(i, card)| rows[i].as_ref().map(|r| (r.id, card_id(card, i))))
+        .collect();
+    let mut seen: HashSet<(String, String)> = have.iter().cloned().collect();
+    let mut out = Vec::new();
+    for (i, card) in cards.iter().enumerate() {
+        let Some(row) = &rows[i] else { continue };
+        let this = card_id(card, i);
+        for link in &row.links {
+            let target = match link.split_once(':') {
+                Some(("skill", name)) if names.contains(name) => name.to_string(),
+                Some(("memory", id)) => match id.parse::<i64>().ok().and_then(|id| {
+                    by_row.iter().find(|(row_id, _)| *row_id == id)
+                }) {
+                    Some((_, other)) if *other != this => other.clone(),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            let pair = (this.clone(), target.clone());
+            let reverse = (target, this.clone());
+            if !seen.contains(&pair) && !seen.contains(&reverse) {
+                seen.insert(pair.clone());
+                out.push(pair);
+            }
+        }
+    }
+    out
+}
+
+/// How many links the additive `memory_links` list holds at most.
+const MAX_LINK_ROWS: usize = 500;
+/// How many archive entries the additive `archive` list holds at most.
+const MAX_ARCHIVE_ROWS: usize = 100;
+
+/// Every link of the cards and the newest archive entries, with whether its end still exists.
+fn link_rows(
+    skills: &SkillStore,
+    memory: &MemoryStore,
+    cards: &[Card],
+    rows: &[Option<CoreRow>],
+    archive: &[hermes_memory::ArchiveRow],
+) -> Vec<Value> {
+    let core_ids: HashSet<i64> = rows.iter().flatten().map(|r| r.id).collect();
+    let mut out = Vec::new();
+    let mut push = |source: String, links: &[String]| {
+        for link in links {
+            let (kind, rest) = link.split_once(':').unwrap_or(("", link));
+            let resolved = match kind {
+                "skill" => json!(skills.find_any(rest).is_some()),
+                "memory" => json!(rest.parse::<i64>().is_ok_and(|id| {
+                    core_ids.contains(&id) || memory.live_tier_row(id)
+                })),
+                // Not looked up: a path or a session may be anywhere.
+                _ => Value::Null,
+            };
+            out.push(json!({"source": source, "kind": kind, "target": link, "resolved": resolved}));
+        }
+    };
+    for (i, card) in cards.iter().enumerate() {
+        if let Some(row) = &rows[i] {
+            push(card_id(card, i), &row.links);
+        }
+    }
+    for row in archive {
+        push(format!("archive:{}", row.id), &row.links);
+    }
+    out.truncate(MAX_LINK_ROWS);
+    out
+}
+
 /// `GET /api/learning/graph` (`StarmapGraph`).
 pub fn graph(skills: &SkillStore, memory: &MemoryStore) -> Value {
     let learned = learned_skills(skills);
     let cards = memory_cards(memory);
     let links = skill_edges(&learned);
-    let mentions = memory_edges(&cards, &learned);
+    let mut mentions = memory_edges(&cards, &learned);
+    let rows = card_rows(memory, &cards);
+    let explicit = link_edges(&cards, &rows, &learned, &mentions);
+    mentions.extend(explicit.iter().cloned());
+    let archive = memory.archive_rows(MAX_ARCHIVE_ROWS);
 
     let mut clusters: Vec<(String, usize)> = Vec::new();
     for skill in &learned {
@@ -243,7 +363,15 @@ pub fn graph(skills: &SkillStore, memory: &MemoryStore) -> Value {
         "clusters": clusters.iter().map(|(c, n)| json!({"category": c, "count": n})).collect::<Vec<_>>(),
         "memory": cards.iter().map(|card| json!({"source": card.source, "timestamp": card.timestamp,
             "title": card.title, "body": card.body, "fingerprint": card.fingerprint})).collect::<Vec<_>>(),
+        // Additive, ignored by the page (see the module doc).
+        "archive": archive.iter().map(|row| json!({
+            "id": format!("archive:{}", row.id), "kind": row.kind, "text": row.text,
+            "tags": row.tags, "links": row.links, "created": row.created, "hits": row.hits,
+        })).collect::<Vec<_>>(),
+        "memory_links": link_rows(skills, memory, &cards, &rows, &archive),
         "stats": {
+            "memory_link_edges": explicit.len(),
+            "archive_entries": archive.len(),
             "nodes": learned.len(),
             "related_edges": links.len(),
             "edges_per_node": round(links.len() as f64 / total, 3),
@@ -536,5 +664,106 @@ mod tests {
         );
         assert_eq!(delete(&skills, &memory, "deploy-checks").0, 200);
         assert!(skills.find_any("deploy-checks").is_none());
+    }
+
+    // ---- links (Phase 9, CP9.3) ---------------------------------------------------------------
+
+    fn learned_skill(skills: &SkillStore, name: &str) {
+        let dir = skills.root().join("devops").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---
+name: {name}
+description: Does {name}.
+---
+# {name}
+"),
+        )
+        .unwrap();
+        let path = skills.root().join(".usage.json");
+        let mut usage: Value = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_else(|| json!({}));
+        usage[name] = json!({"uses": 1});
+        std::fs::write(path, usage.to_string()).unwrap();
+    }
+
+    fn add_with(memory: &MemoryStore, scope: Option<&str>, tier: &str, text: &str, links: Value) {
+        let reply = memory.tool_in(
+            &json!({"target": "memory", "operations": [{"action": "add", "tier": tier, "content": text, "links": links}]}),
+            &mut hermes_memory::TurnFailures::default(),
+            scope,
+        );
+        assert_eq!(reply["success"], true, "{reply}");
+    }
+
+    #[test]
+    fn a_cards_links_are_real_edges_and_dangling_ones_break_nothing() {
+        let (_dir, skills, memory) = stores();
+        learned_skill(&skills, "release-steps");
+        // An archive entry the first card links to (`memory:<id>`), and a second core card.
+        add_with(&memory, None, "archive", "Archived release checklist for the old pipeline", json!([]));
+        let archive_id = memory.archive_rows(10)[0].id;
+        add_with(
+            &memory,
+            None,
+            "core",
+            "Tag releases from the main branch",
+            json!(["skill:release-steps", "skill:deleted-skill", format!("memory:{archive_id}"), "memory:99999", "file:C:/docs/x.md", "session:abc"]),
+        );
+        add_with(&memory, None, "core", "A second card with no links", json!([]));
+        let graph = graph(&skills, &memory);
+        let nodes = graph["nodes"].as_array().unwrap();
+        let card = nodes.iter().find(|n| n["label"] == "Tag releases from the main branch").unwrap()["id"].clone();
+        let edges = graph["edges"].as_array().unwrap();
+        // The explicit skill link is an edge between two nodes of the page's graph...
+        assert!(edges.contains(&json!({"source": card, "target": "release-steps"})), "{edges:?}");
+        // ...and nothing points at something that is not a node (the page ignores those anyway).
+        let ids: HashSet<&str> = nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
+        for edge in edges {
+            assert!(ids.contains(edge["source"].as_str().unwrap()) && ids.contains(edge["target"].as_str().unwrap()), "{edge}");
+        }
+        // Every link is listed, additively, with whether its end exists.
+        let links = graph["memory_links"].as_array().unwrap();
+        let find = |target: &str| links.iter().find(|l| l["target"] == target).unwrap().clone();
+        assert_eq!(find("skill:release-steps")["resolved"], true);
+        assert_eq!(find("skill:deleted-skill")["resolved"], false);
+        assert_eq!(find(&format!("memory:{archive_id}"))["resolved"], true);
+        assert_eq!(find("memory:99999")["resolved"], false);
+        assert_eq!(find("file:C:/docs/x.md")["resolved"], Value::Null);
+        assert_eq!(find("session:abc")["kind"], "session");
+        // The archive is listed (additive), newest first; the old fields are all still there.
+        assert_eq!(graph["archive"][0]["id"], format!("archive:{archive_id}"));
+        for key in ["nodes", "edges", "clusters", "memory", "stats"] {
+            assert!(graph.get(key).is_some(), "{key}");
+        }
+        assert_eq!(graph["stats"]["memory_link_edges"], 1);
+        // The linked skill and the archive entry go away: the endpoint still answers, the links
+        // are unresolved.
+        assert_eq!(delete(&skills, &memory, "release-steps").0, 200);
+        assert_eq!(
+            memory.delete_tier_entry(Target::Memory, hermes_memory::Tier::Archive, None, "Archived release checklist for the old pipeline"),
+            Ok(true)
+        );
+        let after = super::graph(&skills, &memory);
+        let links = after["memory_links"].as_array().unwrap();
+        assert!(links.iter().filter(|l| l["kind"] == "skill" || l["kind"] == "memory").all(|l| l["resolved"] == false), "{links:?}");
+        assert!(after["edges"].as_array().unwrap().iter().all(|e| e["target"] != "release-steps"));
+        assert!(after["archive"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn project_memory_is_never_in_the_map() {
+        let (_dir, skills, memory) = stores();
+        add_with(&memory, Some("project:c:/work/repo-a"), "project", "Repo A builds with cargo xtask", json!([]));
+        add_with(&memory, Some("project:c:/work/repo-b"), "project", "Repo B deploys with make ship", json!([]));
+        add_with(&memory, None, "archive", "A global archive fact", json!(["skill:x"]));
+        let graph = graph(&skills, &memory);
+        let text = graph.to_string();
+        assert!(!text.contains("xtask") && !text.contains("make ship"), "{text}");
+        assert_eq!(graph["archive"].as_array().unwrap().len(), 1);
+        assert_eq!(graph["nodes"].as_array().unwrap().len(), 0, "archive entries are not nodes the page could edit");
     }
 }

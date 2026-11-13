@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use crate::db::{self, MemoryDb};
 use crate::sync::{Abort, Failpoint, Inner, View, read_file};
 use crate::threats::{Scope, first_threat_message, scan_for_threats};
+use crate::similar;
 use crate::tiers::{self, Extras, Tier};
 
 /// How many times a write starts again when the file changed under it (a writer that doesn't
@@ -153,6 +154,8 @@ pub struct MemoryStore {
     inner: Mutex<Inner>,
     /// Run after every successful write: keeps the local index fresh (`hermes_tools::index`).
     on_change: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    /// Hits counted and not yet written (`retrieval.rs`).
+    pub(crate) hits: Mutex<crate::retrieval::HitBuffer>,
     /// A test's simulated crash point (`sync::Failpoint`).
     #[cfg(test)]
     pub(crate) failpoint: Mutex<Option<Failpoint>>,
@@ -215,6 +218,50 @@ pub(crate) fn find_unique_match(entries: &[String], old_text: &str) -> (Option<u
         return (None, true);
     }
     (matches.first().copied(), false)
+}
+
+/// Adds the duplicate / similar-entry notes of a write to its message (and the ids of the entries
+/// they name to its `similar_entries`), so the model learns of them in the result of the call
+/// that caused them: no extra request. `id_of` gives an entry's id, when it has one the model can
+/// quote (`core` entries are addressed by their text, and have none shown unless the database
+/// knows them).
+pub(crate) fn decorate(
+    mut message: String,
+    extra: &mut Value,
+    id_of: &dyn Fn(&str) -> Option<i64>,
+) -> String {
+    let show = |text: &str| -> String {
+        let clipped: String = text.chars().take(160).collect();
+        let more = if text.chars().count() > 160 { "…" } else { "" };
+        match id_of(text) {
+            Some(id) => format!("#{id} \"{clipped}{more}\""),
+            None => format!("\"{clipped}{more}\""),
+        }
+    };
+    if let Some(list) = extra.get("duplicates").and_then(Value::as_array) {
+        for item in list {
+            let n = item["operation"].as_u64().unwrap_or(0);
+            let entry = item["entry"].as_str().unwrap_or_default();
+            message.push_str(&format!(
+                " Operation {n} (add) repeated an entry that is already stored ({}): nothing new was added; the entry now counts as confirmed.",
+                show(entry)
+            ));
+        }
+    }
+    if let Some(list) = extra.get_mut("similar_entries").and_then(Value::as_array_mut) {
+        for item in list.iter_mut() {
+            let n = item["operation"].as_u64().unwrap_or(0);
+            let entry = item["entry"].as_str().unwrap_or_default().to_string();
+            if let Some(id) = id_of(&entry) {
+                item["id"] = json!(id);
+            }
+            message.push_str(&format!(
+                " Operation {n} (add) is similar to an existing entry: {}. Both are stored now; if they say the same thing, update the existing one (action 'patch') or remove one instead of keeping both.",
+                show(&entry)
+            ));
+        }
+    }
+    message
 }
 
 fn words(text: &str) -> HashSet<String> {
@@ -332,6 +379,8 @@ pub(crate) struct RowMeta {
     pub tags: Option<Vec<String>>,
     pub links: Option<Vec<String>>,
     pub note: Option<String>,
+    /// The call added this exact text again: the entry is confirmed (`last_confirmed` = now).
+    pub confirm: bool,
 }
 
 /// What `memory.db` does with the entries a write removes or rewrites.
@@ -371,6 +420,7 @@ impl MemoryStore {
             config: Mutex::new(config),
             inner: Mutex::new(Inner::default()),
             on_change: Mutex::new(None),
+            hits: Mutex::default(),
             #[cfg(test)]
             failpoint: Mutex::new(None),
         }
@@ -712,6 +762,16 @@ impl MemoryStore {
                 // What a read of the file will give, so database and file agree entry by entry
                 // (a patch can make two entries equal, or put a `§` line in one).
                 let texts = parse_entries(&content);
+                // The entries' ids, as the database knows them before this write, for the notes
+                // on duplicates and similar entries (`decorate`).
+                let known: Vec<(i64, String)> = tx
+                    .as_ref()
+                    .and_then(|tx| db::live_rows(tx, target.kind()).ok())
+                    .unwrap_or_default();
+                let mut extra = extra;
+                let message = decorate(message, &mut extra, &|text| {
+                    known.iter().find(|(_, t)| t == text).map(|(id, _)| *id)
+                });
                 if let Some(tx) = &tx {
                     let now = chrono::Utc::now().timestamp();
                     let (removal, supersedes) = match &leaving {
@@ -727,6 +787,9 @@ impl MemoryStore {
                         db::inherit_core_meta(tx, target.kind())?;
                     }
                     for meta in &metas {
+                        if meta.confirm {
+                            db::confirm_core(tx, target.kind(), &meta.text, now)?;
+                        }
                         let json = |list: &Option<Vec<String>>| {
                             list.as_ref().and_then(|l| serde_json::to_string(l).ok())
                         };
@@ -922,6 +985,10 @@ impl MemoryStore {
             let mut matched: Vec<Option<String>> = Vec::new();
             let mut produced: HashMap<usize, String> = HashMap::new();
             let mut metas: Vec<RowMeta> = Vec::new();
+            // CP9.3: adds that repeat an entry (no-ops that confirm it) or resemble one (added,
+            // and flagged to the model in the same result).
+            let mut duplicates: Vec<(usize, String)> = Vec::new();
+            let mut similar_found: Vec<(usize, String, String, f64)> = Vec::new();
             let empty = Extras::default();
             let meta_of = |i: usize, text: &str| {
                 let extra = extras.get(i).unwrap_or(&empty);
@@ -932,6 +999,7 @@ impl MemoryStore {
                         tags: extra.tags.as_deref().and_then(|t| tiers::clean_tags(t).ok()),
                         links: extra.links.as_deref().and_then(|l| tiers::clean_links(l).ok()),
                         note: extra.note.as_ref().map(|n| n.trim().to_string()),
+                        confirm: false,
                     }
                 })
             };
@@ -953,7 +1021,20 @@ impl MemoryStore {
                         return batch_failure(failures, format!("{pos}: content is required."), None, false);
                     }
                     metas.extend(meta_of(i, &content));
-                    if !working.contains(&content) {
+                    if working.contains(&content) {
+                        duplicates.push((i + 1, content.clone()));
+                        match metas.iter_mut().find(|m| m.text == content) {
+                            Some(meta) => meta.confirm = true,
+                            None => metas.push(RowMeta {
+                                text: content.clone(),
+                                confirm: true,
+                                ..RowMeta::default()
+                            }),
+                        }
+                    } else {
+                        if let Some((index, score)) = similar::most_similar(&content, &working) {
+                            similar_found.push((i + 1, content.clone(), working[index].clone(), score));
+                        }
                         working.push(content);
                     }
                     matched.push(None);
@@ -1073,6 +1154,23 @@ impl MemoryStore {
                 if !map.is_empty() {
                     extra[key] = Value::Object(map);
                 }
+            }
+            if !duplicates.is_empty() {
+                extra["duplicates"] = json!(duplicates
+                    .iter()
+                    .map(|(n, entry)| json!({"operation": n, "entry": entry}))
+                    .collect::<Vec<_>>());
+            }
+            if !similar_found.is_empty() {
+                extra["similar_entries"] = json!(similar_found
+                    .iter()
+                    .map(|(n, new, entry, score)| json!({
+                        "operation": n,
+                        "new_entry": new,
+                        "entry": entry,
+                        "similarity": (score * 100.0).round() / 100.0,
+                    }))
+                    .collect::<Vec<_>>());
             }
             if !produced.is_empty() {
                 extra["patched_entries_after"] = json!(produced

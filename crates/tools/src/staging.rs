@@ -60,6 +60,8 @@ pub const MAX_ITEMS_PER_SESSION: usize = 50;
 /// kept whole (an approval must never be given on a cut diff whose hidden tail differs), so a
 /// change whose payload and diff don't fit is refused instead.
 pub const MAX_ITEM_BYTES: usize = 1 << 20;
+/// The memory operation only the hygiene pass makes (`MemoryStore::demote_core`).
+pub const DEMOTE: &str = "demote";
 /// What the model is told when a write is staged.
 pub const SAVED_FOR_REVIEW: &str = "Saved for review by the user";
 
@@ -506,6 +508,32 @@ impl StagingStore {
         self.finish(Kind::Memory, json!(payload), &diff, meta)
     }
 
+    /// Stages the hygiene pass's proposal to move the `core` entry `entry` of `target` to the
+    /// archive (CP9.3). Nothing is changed now; the same proposal made twice is one item. The
+    /// model can't make this operation (`demote` is not one of the tool's actions).
+    pub fn stage_demotion(
+        &self,
+        target: Target,
+        entry: &str,
+        meta: &Meta,
+    ) -> Result<(StagedItem, bool), String> {
+        if !self.usable() {
+            return Err("Staging is not available in this session.".into());
+        }
+        let op = Operation {
+            action: DEMOTE.into(),
+            matched_entry: Some(entry.to_string()),
+            ..Operation::default()
+        };
+        let diff = memory_diff(target, std::slice::from_ref(&op), &[]);
+        let payload = MemoryPayload {
+            target,
+            operations: vec![op],
+            extras: Vec::new(),
+        };
+        self.create(Kind::Memory, json!(payload), &diff, meta)
+    }
+
     /// Stages a `skill_manage` call as the tool would have made it.
     pub fn stage_skill_call(
         &self,
@@ -644,6 +672,11 @@ fn memory_diff(target: Target, ops: &[Operation], extras: &[Extras]) -> String {
                 attached(extra, &mut push);
             }
             "remove" => push("-", entry),
+            // The hygiene pass's proposal (CP9.3): the entry leaves the core memory for the archive.
+            "demote" => {
+                push("-", entry);
+                push("+", &format!("[moved to the archive] {entry}"));
+            }
             // The whole entry becomes `content` (Phase 7's review output has it; the tool doesn't).
             "replace" => {
                 push("-", entry);
@@ -672,6 +705,14 @@ fn apply_memory(memory: &MemoryStore, op: &Value) -> Result<String, Failure> {
             ),
             false,
         ));
+    }
+    // The hygiene pass's proposal (CP9.3): not a tool call, so it has its own path. It goes
+    // through the same store writes as any other (limits, threat scan, staleness).
+    if let [op] = payload.operations.as_slice()
+        && op.action == DEMOTE
+    {
+        let entry = op.matched_entry.as_deref().unwrap_or_default();
+        return memory.demote_core(payload.target, entry);
     }
     let result = memory.apply_ext(
         payload.target,
@@ -1323,5 +1364,74 @@ mod tests {
         let result = nowhere.stage_memory_call(&f.memory, &memory_add("likes tea"), &f.meta);
         assert_eq!(result["success"], false);
         assert!(f.memory.entries(Target::Memory).is_empty());
+    }
+
+    // ---- CP9.3: the hygiene pass's demotions ----------------------------------------------
+
+    #[test]
+    fn a_demotion_is_staged_once_shown_as_a_move_and_applied_through_the_stores() {
+        let f = fixture();
+        for text in ["Old but true fact", "Entry that stays"] {
+            f.memory.apply(
+                Target::Memory,
+                &[Operation { action: "add".into(), content: Some(text.into()), ..Default::default() }],
+                &mut TurnFailures::default(),
+            );
+        }
+        let (item, fresh) = f.staging.stage_demotion(Target::Memory, "Old but true fact", &f.meta).unwrap();
+        assert!(fresh);
+        assert!(item.diff.contains("- Old but true fact") && item.diff.contains("[moved to the archive] Old but true fact"), "{}", item.diff);
+        assert_eq!(item.summary(), "demote memory");
+        // Nothing changed yet; the same proposal is not kept twice.
+        assert_eq!(f.memory.entries(Target::Memory).len(), 2);
+        let (again, fresh) = f.staging.stage_demotion(Target::Memory, "Old but true fact", &f.meta).unwrap();
+        assert!(!fresh && again.id == item.id);
+        assert_eq!(f.staging.list().len(), 1);
+        // Apply: through the same stores; the item is gone.
+        let applied = f.staging.apply(&item.id, &f.memory, &f.skills);
+        assert!(matches!(applied, Applied::Done(ref m) if m.contains("Moved to the archive")), "{applied:?}");
+        assert_eq!(f.memory.entries(Target::Memory), ["Entry that stays"]);
+        assert!(f.staging.list().is_empty());
+        let rows = f.memory.tier_index_rows().unwrap().1;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "Old but true fact");
+    }
+
+    #[test]
+    fn applying_a_demotion_after_the_entry_changed_is_stale_and_changes_nothing() {
+        let f = fixture();
+        f.memory.apply(
+            Target::Memory,
+            &[Operation { action: "add".into(), content: Some("Fact that will be rewritten".into()), ..Default::default() }],
+            &mut TurnFailures::default(),
+        );
+        let (item, _) = f.staging.stage_demotion(Target::Memory, "Fact that will be rewritten", &f.meta).unwrap();
+        f.memory.apply(
+            Target::Memory,
+            &[Operation { action: "patch".into(), old_text: Some("will be rewritten".into()), content: Some("was rewritten".into()), ..Default::default() }],
+            &mut TurnFailures::default(),
+        );
+        let applied = f.staging.apply(&item.id, &f.memory, &f.skills);
+        assert!(matches!(applied, Applied::Failed { stale: true, .. }), "{applied:?}");
+        assert_eq!(f.staging.get(&item.id).unwrap().status, Status::Stale);
+        assert_eq!(f.memory.entries(Target::Memory), ["Fact that was rewritten"]);
+        assert!(f.memory.tier_index_rows().unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn the_model_cannot_ask_for_a_demotion() {
+        let f = fixture();
+        f.memory.apply(
+            Target::Memory,
+            &[Operation { action: "add".into(), content: Some("Some entry".into()), ..Default::default() }],
+            &mut TurnFailures::default(),
+        );
+        let call = json!({"target": "memory", "operations": [{"action": "demote", "old_text": "Some entry"}]});
+        let direct = f.memory.tool(&call, &mut TurnFailures::default());
+        assert_eq!(direct["success"], false, "{direct}");
+        let staged = f.staging.stage_memory_call(&f.memory, &call, &f.meta);
+        assert_eq!(staged["success"], false, "{staged}");
+        assert!(f.staging.list().is_empty());
+        assert_eq!(f.memory.entries(Target::Memory), ["Some entry"]);
     }
 }

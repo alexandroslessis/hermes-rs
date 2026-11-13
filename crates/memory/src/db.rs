@@ -613,6 +613,34 @@ pub(crate) fn set_core_meta(
     Ok(())
 }
 
+/// The `meta` key of the generation of the non-`core` rows (`retrieval.rs`).
+pub(crate) const TIERS_GENERATION: &str = "tiers_gen";
+
+/// A non-`core` row was added, removed, rewritten or re-tagged: the index must look again.
+pub(crate) fn bump_generation(tx: &Connection) -> rusqlite::Result<()> {
+    let current: i64 = get_meta(tx, TIERS_GENERATION)?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    set_meta(tx, TIERS_GENERATION, &(current + 1).to_string())
+}
+
+/// The live `core` row holding `text` was added again: it is confirmed now.
+pub(crate) fn confirm_core(tx: &Connection, kind: &str, text: &str, now: i64) -> rusqlite::Result<()> {
+    tx.prepare_cached(
+        "UPDATE entry SET last_confirmed = ?3
+         WHERE tier = 'core' AND scope = '' AND kind = ?1 AND text = ?2 AND removed IS NULL",
+    )?
+    .execute(params![kind, text, now])?;
+    Ok(())
+}
+
+/// A live row of a non-`core` tier is confirmed now.
+pub(crate) fn confirm_row(tx: &Connection, id: i64, now: i64) -> rusqlite::Result<()> {
+    tx.prepare_cached("UPDATE entry SET last_confirmed = ?1 WHERE id = ?2")?
+        .execute(params![now, id])?;
+    Ok(())
+}
+
 /// After a patch: a live `core` row that has no tags or links of its own takes those of the row
 /// it replaced.
 pub(crate) fn inherit_core_meta(tx: &Connection, kind: &str) -> rusqlite::Result<()> {

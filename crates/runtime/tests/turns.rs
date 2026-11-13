@@ -8114,3 +8114,283 @@ async fn the_tool_writes_tiers_and_notes_in_a_turn_and_old_calls_cost_the_same()
     let next = stored_prompt(&h, &session_at(&h, &a));
     assert!(next.contains("Release checklist") && !next.contains("1. bump"), "{next}");
 }
+
+// ---- memory retrieval, dedupe, hygiene (Phase 9 CP9.3) ---------------------------------------
+
+/// A budget for `profile` with no review starting on its own (the scripted replies are the
+/// turns' only).
+fn memory_budget(profile: BudgetProfile) -> BudgetKnobs {
+    BudgetKnobs {
+        review_mode: hermes_runtime::budget::ReviewMode::Agentic,
+        ..test_budget(Some(profile))
+    }
+}
+
+const ROTATION: &str = "The deploy password rotation happens on the first Monday of every month";
+const ROTATION_ASK: &str = "when does the deploy password rotation happen";
+
+fn write_archive_reply() -> String {
+    tool_reply(&[(
+        "c1",
+        "memory",
+        json!({"target": "memory", "operations": [{"action": "add", "tier": "archive", "content": ROTATION}]}),
+    )])
+}
+
+/// Turn 1 writes an archive entry (two requests: the call, the answer); turn 2 asks about it
+/// (one request).
+async fn archive_scenario(profile: BudgetProfile) -> (Harness, String) {
+    let h = harness_budget(
+        |_| vec![write_archive_reply(), text_reply("saved"), text_reply("the first Monday")],
+        Arc::new(Bridge),
+        memory_budget(profile),
+    )
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "note that the deploy password rotates monthly on a fixed day").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let saved = tool_answer(&h.requests.lock()[1]);
+    assert_eq!(saved["success"], true, "{saved}");
+    assert_eq!(saved["tier"], "archive");
+    run_turn(&h, &session, ROTATION_ASK).await;
+    (h, session)
+}
+
+#[tokio::test]
+async fn an_archive_entry_written_in_turn_one_is_in_turn_twos_first_request_not_in_the_system_prompt() {
+    let (h, session) = archive_scenario(BudgetProfile::Requests).await;
+    // Exactly the requests the turns need: the memory write added none and neither did retrieval.
+    assert_requests(&h, Purpose::Main, 3..=3);
+    assert_eq!(total_requests(&h), 3);
+    let requests = h.requests.lock().clone();
+    // Turn 1's message is what was typed (nothing was in memory yet).
+    assert_eq!(
+        user_contents(&requests[0]),
+        ["note that the deploy password rotates monthly on a fixed day"]
+    );
+    // Turn 2's first (only) request carries the entry in the USER message, with its id.
+    let sent = user_contents(&requests[2]);
+    let last = sent.last().unwrap();
+    assert!(last.starts_with("<context>\n"), "{last}");
+    assert!(last.contains("<relevant-memory>") && last.contains("<entry id=\"archive:"), "{last}");
+    assert!(last.contains(ROTATION), "{last}");
+    assert!(last.contains("tier=\"archive\""));
+    assert!(last.ends_with(&format!("</context>\n\n{ROTATION_ASK}")), "{last}");
+    // The system prompt: the same bytes on every request, and never the entry.
+    let system = system_of(&requests[0]);
+    assert_eq!(system_of(&requests[1]), system);
+    assert_eq!(system_of(&requests[2]), system);
+    assert_eq!(requests[0]["messages"][0], requests[2]["messages"][0]);
+    assert!(!system.contains("first Monday"));
+    // What the page shows is what the user typed.
+    let messages = h.runtime.messages(&session).unwrap();
+    let user = messages.iter().rfind(|m| m.role == rmcp::model::Role::User).unwrap();
+    assert!(user.as_concat_text().contains(ROTATION));
+    assert_eq!(hermes_runtime::preinject::user_text(user), ROTATION_ASK);
+    assert_eq!(hermes_tools::references::typed_text(user), Some(ROTATION_ASK));
+    let noted = user.metadata.operation_note("preinject", "memory").unwrap();
+    assert!(noted[0].as_str().unwrap().starts_with("archive:"), "{noted}");
+}
+
+#[tokio::test]
+async fn balanced_and_tokens_are_unchanged_by_the_memory_tiers() {
+    for profile in [BudgetProfile::Balanced, BudgetProfile::Tokens] {
+        let (h, session) = archive_scenario(profile).await;
+        assert_requests(&h, Purpose::Main, 3..=3);
+        let requests = h.requests.lock().clone();
+        // The entry is stored and the next turn asks about it: nothing rides on the message.
+        assert_eq!(user_contents(&requests[2]).last().unwrap(), ROTATION_ASK, "{profile:?}");
+        assert!(!system_of(&requests[2]).contains("first Monday"), "{profile:?}");
+        let messages = h.runtime.messages(&session).unwrap();
+        assert!(messages.iter().all(|m| m.metadata.operation_note("preinject", "memory").is_none()));
+    }
+}
+
+#[tokio::test]
+async fn a_tiny_or_generic_message_gets_no_memory_even_when_an_entry_exists() {
+    let h = harness_budget(
+        |_| vec![text_reply("a"), text_reply("b"), text_reply("c")],
+        Arc::new(Bridge),
+        memory_budget(BudgetProfile::Requests),
+    )
+    .await;
+    add_in(&h, None, "archive", ROTATION);
+    let session = session_in(&h);
+    for text in ["rotation", "ok thanks", "explain this error"] {
+        run_turn(&h, &session, text).await;
+    }
+    let requests = h.requests.lock().clone();
+    assert_eq!(user_contents(&requests[2]), ["rotation", "ok thanks", "explain this error"]);
+    assert_requests(&h, Purpose::Main, 3..=3);
+}
+
+#[tokio::test]
+async fn resume_and_rewind_reproduce_the_stored_memory_block_byte_for_byte() {
+    let (h, session) = archive_scenario(BudgetProfile::Requests).await;
+    let stored = h
+        .runtime
+        .messages(&session)
+        .unwrap()
+        .iter()
+        .rfind(|m| m.role == rmcp::model::Role::User)
+        .unwrap()
+        .as_concat_text();
+    assert!(stored.contains(ROTATION));
+    // Resume from disk: the next request replays the stored message exactly.
+    let reopened = runtime_with_budget(h.data.path(), Arc::new(Bridge), memory_budget(BudgetProfile::Requests));
+    let mut turn = reopened
+        .start_turn(&session, &h.provider, TurnOptions::default(), "and who rotates it")
+        .unwrap();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(60), turn.events.recv()).await.unwrap() {
+        if matches!(event, RuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+    let resumed = h.requests.lock().last().unwrap().clone();
+    let replay = user_contents(&resumed);
+    assert_eq!(replay[1], stored, "the stored block, byte for byte");
+    assert_eq!(system_of(&resumed), system_of(&h.requests.lock()[0]));
+    drop(reopened);
+    // Rewind to before turn 2 and ask again: the same block the model saw the first time.
+    h.runtime.rewind(&session, 4).unwrap();
+    run_turn(&h, &session, ROTATION_ASK).await;
+    let again = h.requests.lock().last().unwrap().clone();
+    assert_eq!(user_contents(&again).last().unwrap(), &stored);
+}
+
+#[tokio::test]
+async fn project_memory_is_retrieved_in_its_repository_only() {
+    let h = harness_budget(
+        |_| vec![text_reply("a"), text_reply("b"), text_reply("c"), text_reply("d")],
+        Arc::new(Bridge),
+        memory_budget(BudgetProfile::Requests),
+    )
+    .await;
+    let (a, b) = two_repos(&h);
+    add_in(&h, Some(&project_scope(&a)), "project", "Release builds of alpha use the cargo release profile with lto enabled");
+    add_in(&h, Some(&project_scope(&b)), "project", "Beta deploys use terraform and the production cluster directly");
+    let ask = "how do the alpha release builds use lto";
+    run_turn(&h, &session_at(&h, &a), ask).await;
+    run_turn(&h, &session_at(&h, &b), ask).await;
+    let plain = h.work.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    run_turn(&h, &session_at(&h, &plain), ask).await;
+    let requests = h.requests.lock().clone();
+    let in_a = user_contents(&requests[0]);
+    assert!(in_a[0].contains("<entry id=\"project:") && in_a[0].contains("lto enabled"), "{}", in_a[0]);
+    assert!(in_a[0].contains("tier=\"project\"") && in_a[0].contains("memory store"), "{}", in_a[0]);
+    // (A bundled skill may ride on these words: only the memory block matters here.)
+    for (n, who) in [(1, "repository B"), (2, "a folder outside any repository")] {
+        let sent = user_contents(&requests[n])[0].clone();
+        assert!(!sent.contains("<relevant-memory>") && !sent.contains("lto enabled"), "{who} sees A's notes: {sent}");
+    }
+    // B's own words find B's notes, and only B's.
+    run_turn(&h, &session_at(&h, &b), "how does beta deploy to the production cluster with terraform").await;
+    let b_request = user_contents(h.requests.lock().last().unwrap())[0].clone();
+    assert!(b_request.contains("terraform") && !b_request.contains("lto enabled"), "{b_request}");
+    // Costs: one request per turn.
+    assert_requests(&h, Purpose::Main, 4..=4);
+}
+
+#[tokio::test]
+async fn a_retrieved_entry_counts_as_a_hit_without_a_write_per_turn() {
+    let (h, _) = archive_scenario(BudgetProfile::Requests).await;
+    let memory = h.runtime.memory();
+    let id = memory.tier_index_rows().unwrap().1[0].id;
+    // The turn's hit is counted in memory; the database is not written for it.
+    assert_eq!(memory.pending_hits(), 1);
+    assert_eq!(memory.row_stats(&[id])[0].hits, 0);
+    memory.flush_hits();
+    assert_eq!(memory.row_stats(&[id])[0].hits, 1);
+}
+
+#[tokio::test]
+async fn the_tool_answers_a_near_duplicate_in_the_same_result_without_another_request() {
+    let add = |id: &str, text: &str| {
+        tool_reply(&[(id, "memory", json!({"target": "memory", "operations": [{"action": "add", "content": text}]}))])
+    };
+    let h = harness_budget(
+        |_| {
+            vec![
+                add("c1", "The user prefers tabs over spaces"),
+                text_reply("done"),
+                add("c2", "User prefers tabs, not spaces"),
+                text_reply("done again"),
+                add("c3", "The CI pipeline runs on a self-hosted Windows runner"),
+                text_reply("distinct"),
+            ]
+        },
+        Arc::new(Bridge),
+        memory_budget(BudgetProfile::Balanced),
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "keep this about my editor settings").await;
+    run_turn(&h, &session, "keep this too").await;
+    let near = tool_answer(&h.requests.lock()[3]);
+    assert_eq!(near["success"], true, "{near}");
+    let said = near["message"].as_str().unwrap();
+    assert!(said.contains("is similar to an existing entry") && said.contains("The user prefers tabs over spaces"), "{said}");
+    assert_eq!(near["entry_count"], 2, "not silently dropped");
+    run_turn(&h, &session, "and keep this").await;
+    let distinct = tool_answer(&h.requests.lock()[5]);
+    assert_eq!(distinct["message"], "Applied 1 operation(s).", "{distinct}");
+    // Two requests a turn: the dedupe note is in the tool result of the same call.
+    assert_requests(&h, Purpose::Main, 6..=6);
+    assert_eq!(total_requests(&h), 6);
+}
+
+#[tokio::test]
+async fn the_curator_stages_stale_core_entries_for_demotion_with_zero_requests() {
+    let h = harness_budget(|_| vec![], Arc::new(Bridge), memory_budget(BudgetProfile::Requests)).await;
+    add_core(&h, hermes_memory::Target::Memory, "A stale entry nobody uses any more");
+    add_core(&h, hermes_memory::Target::Memory, "A fresh entry confirmed today");
+    add_core(&h, hermes_memory::Target::User, "A pinned stale fact about the user");
+    // Age two of them by 90 days and pin one (the pinned tag is on the row).
+    let long_ago = chrono::Utc::now().timestamp() - 90 * 86_400;
+    let conn = rusqlite::Connection::open(h.data.path().join("memory.db")).unwrap();
+    conn.execute(
+        "UPDATE entry SET created = ?1, last_confirmed = ?1 WHERE text LIKE 'A stale%' OR text LIKE 'A pinned%'",
+        [long_ago],
+    )
+    .unwrap();
+    conn.execute("UPDATE entry SET tags = '[\"pinned\"]' WHERE text LIKE 'A pinned%'", []).unwrap();
+    drop(conn);
+    // The curator without a model for consolidation: the memory pass is deterministic.
+    let outcome = h.runtime.run_curator(None).await.unwrap();
+    assert!(outcome.summary.contains("memory: 1 demotion(s) proposed"), "{}", outcome.summary);
+    assert_eq!(total_requests(&h), 0, "no model request");
+    let staged = h.runtime.staging().list();
+    assert_eq!(staged.len(), 1, "{staged:?}");
+    assert!(staged[0].diff.contains("A stale entry nobody uses any more") && staged[0].diff.contains("moved to the archive"));
+    assert_eq!(staged[0].summary(), "demote memory");
+    // Pending until the user says so: the prompt still has it.
+    assert_eq!(h.runtime.memory().entries(hermes_memory::Target::Memory).len(), 2);
+    // A second run proposes nothing new (already pending / proposed).
+    h.runtime.run_curator(None).await.unwrap();
+    assert_eq!(h.runtime.staging().list().len(), 1);
+    // Apply: through the stores; the entry is in the archive and retrievable.
+    let applied = h.runtime.apply_staged(&staged[0].id).await;
+    assert!(matches!(applied, hermes_tools::staging::Applied::Done(_)), "{applied:?}");
+    assert_eq!(h.runtime.memory().entries(hermes_memory::Target::Memory), ["A fresh entry confirmed today"]);
+    assert_eq!(h.runtime.memory().tier_index_rows().unwrap().1.len(), 1);
+    assert_eq!(total_requests(&h), 0);
+}
+
+#[tokio::test]
+async fn the_hygiene_pass_proposes_nothing_under_a_profile_that_never_retrieves_the_archive() {
+    // Under balanced/tokens an archived entry is never put back in front of the model, and no
+    // retrieval records the hits that keep a used entry out of the pass.
+    for profile in [BudgetProfile::Balanced, BudgetProfile::Tokens] {
+        let h = harness_budget(|_| vec![], Arc::new(Bridge), memory_budget(profile)).await;
+        add_core(&h, hermes_memory::Target::Memory, "A stale entry nobody retrieves");
+        let long_ago = chrono::Utc::now().timestamp() - 90 * 86_400;
+        let conn = rusqlite::Connection::open(h.data.path().join("memory.db")).unwrap();
+        conn.execute("UPDATE entry SET created = ?1, last_confirmed = ?1", [long_ago]).unwrap();
+        drop(conn);
+        let outcome = h.runtime.run_curator(None).await.unwrap();
+        assert!(!outcome.summary.contains("demotion"), "{profile:?}: {}", outcome.summary);
+        assert!(h.runtime.staging().list().is_empty(), "{profile:?}");
+        assert_eq!(total_requests(&h), 0);
+    }
+}

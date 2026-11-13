@@ -83,6 +83,17 @@ Read the existing tests near the area you change before writing a new one; the h
   Clustering, the contract and `deliver` are unit tests in `runtime/src/curator/tests.rs`
   (`bundled_skills_do_not_cluster` reads `assets/skills`; `hermes_full_skill_set_is_reported` reads
   `../hermes-agent` when it is there and never fails). Tests of the agent-loop curator pin `Balanced`.
+- Memory v2 tests (Phase 9 CP9.3, after the `// ---- memory retrieval, dedupe, hygiene` banner):
+  `archive_scenario(profile)` is turn 1 writing an archive entry through the tool and turn 2 asking
+  about it (3 requests under every profile; only `requests` attaches it, in the user message);
+  `memory_budget(profile)` is the profile's knobs with no review of its own. The pieces are unit
+  tests: `hermes_memory` `retrieval_tests.rs` (dedupe, confirmation, generation, batched hits,
+  hygiene candidates, `demote_core`), `hermes_tools` `index_memory_tests.rs` (retrieval goldens on a
+  fixture, a 240-entry archive that small talk and vague requests leave alone, two repositories'
+  isolation incl. the filter-before-limit case, freshness across stores,
+  skill boost, schema bump), `runtime/src/memory_hygiene.rs` and `review_once/tests.rs` (supersedes),
+  `desktop/src/learning.rs` (link edges, dangling links, no project memory). The curator turns test
+  backdates `memory.db` rows with `rusqlite` (a dev-dependency of the runtime only for that).
 - Known flaky under heavy load: `an_exhausted_budget_ends_with_a_toolless_summary` (timing).
   Re-run it alone before suspecting your change.
 

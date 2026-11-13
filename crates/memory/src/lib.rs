@@ -3,6 +3,8 @@
 
 mod db;
 mod notes;
+mod retrieval;
+mod similar;
 mod store;
 mod sync;
 #[cfg(test)]
@@ -19,4 +21,8 @@ pub use store::{
 pub use tiers::{
     Extras, PROJECT_LIMIT_DEFAULT, PROJECT_LIMIT_MAX, PROJECT_LIMIT_MIN, Tier,
 };
+pub use retrieval::{
+    ArchiveRow, CoreRow, HitRef, IndexRow, PINNED_TAG, RowStats, STALE_DAYS, StaleEntry,
+};
+pub use similar::{most_similar, normalized, word_set};
 pub use tool::{Parsed, PendingWrite, ReadCall};

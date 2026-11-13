@@ -28,7 +28,7 @@ pub const MAX_PATCH: usize = hermes_tools::skill_manage::MAX_SKILL_CONTENT_CHARS
 /// A reply longer than this (bytes) is not read at all.
 pub const MAX_REPLY_BYTES: usize = 512 * 1024;
 
-const MEMORY_FIELDS: [&str; 5] = ["op", "target", "old", "text", "why"];
+const MEMORY_FIELDS: [&str; 6] = ["op", "target", "old", "text", "why", "supersedes"];
 const SKILL_FIELDS: [&str; 5] = ["op", "name", "patch", "scope", "why"];
 
 /// A memory operation.
@@ -59,6 +59,10 @@ pub struct MemoryChange {
     pub old: Option<String>,
     pub text: Option<String>,
     pub why: String,
+    /// CP9.3: an `add` whose text contradicts the live entry with this id (the `id` the packet
+    /// shows): the new entry takes its place and the old one is marked `superseded_by` it. Only
+    /// the store can say whether the id names a live entry of the target (`apply.rs`).
+    pub supersedes: Option<i64>,
 }
 
 /// A skill operation.
@@ -137,7 +141,8 @@ pub fn schema() -> Value {
                         "target": {"type": "string", "enum": ["memory", "user"]},
                         "old": nullable,
                         "text": nullable,
-                        "why": {"type": "string"}
+                        "why": {"type": "string"},
+                        "supersedes": {"type": ["integer", "null"]}
                     }
                 }
             },
@@ -335,7 +340,11 @@ fn memory_change(index: usize, item: &Value) -> Result<MemoryChange, String> {
     let old = text_field(object, "old", MAX_MEMORY_TEXT)?;
     let text = text_field(object, "text", MAX_MEMORY_TEXT)?;
     let why = text_field(object, "why", MAX_WHY)?.unwrap_or_default();
+    let supersedes = supersedes_field(object)?;
     match action {
+        _ if supersedes.is_some() && action != MemoryAction::Add => {
+            return Err("'supersedes' goes with add only (replace and remove name 'old')".into());
+        }
         MemoryAction::Add if text.is_none() => return Err("add needs 'text'".into()),
         MemoryAction::Add if old.is_some() => return Err("add takes no 'old'".into()),
         MemoryAction::Replace if old.is_none() || text.is_none() => {
@@ -352,7 +361,27 @@ fn memory_change(index: usize, item: &Value) -> Result<MemoryChange, String> {
         old,
         text,
         why,
+        supersedes,
     })
+}
+
+/// The `supersedes` field: absent or null is none; a positive whole number (or its text, with an
+/// optional leading `#`) is an entry id; anything else is an error.
+fn supersedes_field(object: &serde_json::Map<String, Value>) -> Result<Option<i64>, String> {
+    let bad = || "'supersedes' must be an entry id (a positive whole number) or null".to_string();
+    match object.get("supersedes") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(id) if id > 0 => Ok(Some(id)),
+            _ => Err(bad()),
+        },
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(Value::String(s)) => match s.trim().trim_start_matches('#').parse::<i64>() {
+            Ok(id) if id > 0 => Ok(Some(id)),
+            _ => Err(bad()),
+        },
+        Some(_) => Err(bad()),
+    }
 }
 
 /// `Ok(None)` for `{"op": "none"}`.

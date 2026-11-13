@@ -99,12 +99,14 @@ fn golden_input() -> PacketInput {
                 target: Target::Memory,
                 enabled: true,
                 entries: vec!["The repo builds with cargo.".into()],
+                ids: Vec::new(),
                 usage: "27/2200".into(),
             },
             MemoryFile {
                 target: Target::User,
                 enabled: false,
                 entries: Vec::new(),
+                ids: Vec::new(),
                 usage: "0/1375".into(),
             },
         ],
@@ -204,6 +206,7 @@ fn big_input() -> PacketInput {
                 entries: (0..40)
                     .map(|i| format!("Fact {i}: {}", long(8, "x")))
                     .collect(),
+                ids: Vec::new(),
                 usage: "2200/2200".into(),
             },
             MemoryFile {
@@ -212,6 +215,7 @@ fn big_input() -> PacketInput {
                 entries: (0..30)
                     .map(|i| format!("Pref {i}: {}", long(6, "y")))
                     .collect(),
+                ids: Vec::new(),
                 usage: "1375/1375".into(),
             },
         ],
@@ -336,7 +340,8 @@ fn the_estimate_is_pessimistic_for_code_and_non_latin_text() {
             entries: (0..20)
                 .map(|i| format!("{i}: {}", "偏好".repeat(30)))
                 .collect(),
-            usage: "1375/1375".into(),
+            ids: Vec::new(),
+                usage: "1375/1375".into(),
         }],
     };
     for budget in [500, 2_000, 8_000, 24_000] {
@@ -846,4 +851,140 @@ fn write_approval_in_a_store_stages_its_writes() {
     assert!(matches!(reports[0].result, OpResult::Staged(_)));
     assert!(s.ctx.memory.entries(Target::Memory).is_empty());
     assert_eq!(s.ctx.staging.list()[0].reason, "write approval is on");
+}
+
+
+// ---- supersedes (Phase 9, CP9.3) -------------------------------------------------------------
+
+fn core_id(s: &Stores, target: Target, containing: &str) -> i64 {
+    s.ctx
+        .memory
+        .core_rows(target)
+        .into_iter()
+        .find(|r| r.text.contains(containing))
+        .unwrap()
+        .id
+}
+
+fn add_entry(s: &Stores, target: Target, text: &str) {
+    let done = s.ctx.memory.apply(
+        target,
+        &[hermes_memory::Operation { action: "add".into(), content: Some(text.into()), ..Default::default() }],
+        &mut hermes_memory::TurnFailures::default(),
+    );
+    assert_eq!(done["success"], true, "{done}");
+}
+
+fn supersede(target: &str, text: &str, id: serde_json::Value) -> Parsed {
+    parse(json!({"memory": [{"op": "add", "target": target, "old": null, "text": text, "why": "signal 1", "supersedes": id}], "skills": []}))
+}
+
+#[test]
+fn the_old_contract_is_still_valid_and_supersedes_is_optional() {
+    // No `supersedes` at all (every old reply), or null: an ordinary add.
+    for item in [
+        json!({"op": "add", "target": "memory", "old": null, "text": "x", "why": ""}),
+        json!({"op": "add", "target": "memory", "old": null, "text": "x", "why": "", "supersedes": null}),
+    ] {
+        let parsed = parse(json!({"memory": [item], "skills": []}));
+        assert_eq!(parsed.memory.len(), 1, "{parsed:?}");
+        assert_eq!(parsed.memory[0].supersedes, None);
+    }
+    // Numbers and their text are ids; anything else is refused alone.
+    assert_eq!(supersede("memory", "x", json!(12)).memory[0].supersedes, Some(12));
+    assert_eq!(supersede("memory", "x", json!("#7")).memory[0].supersedes, Some(7));
+    for bad in [json!(0), json!(-3), json!(1.5), json!("abc"), json!([1]), json!(true)] {
+        let parsed = supersede("memory", "x", bad.clone());
+        assert!(parsed.memory.is_empty() && parsed.rejected.len() == 1, "{bad}: {parsed:?}");
+    }
+    // Only an add can supersede (a replace or remove names `old`).
+    let parsed = parse(json!({"memory": [{"op": "replace", "target": "memory", "old": "a", "text": "b", "why": "", "supersedes": 3}], "skills": []}));
+    assert!(parsed.memory.is_empty() && parsed.rejected[0].reason.contains("add only"), "{parsed:?}");
+    // The schema offers the field (strict mode needs it required too: `the_schema_is_strict`).
+    let schema = contract::schema();
+    assert!(schema["properties"]["memory"]["items"]["properties"]["supersedes"].is_object());
+}
+
+#[test]
+fn a_valid_supersedes_replaces_the_old_entry_marks_it_and_waits_for_the_user() {
+    let s = stores();
+    add_entry(&s, Target::Memory, "Builds use make.");
+    add_entry(&s, Target::Memory, "Tests run with cargo test.");
+    let old = core_id(&s, Target::Memory, "use make");
+    let reports = apply::apply_all(&s.ctx, &supersede("memory", "Builds use cargo.", json!(old)));
+    // Like a replace, it changes an entry the user has: held, in every session.
+    let lines = results(&reports);
+    assert!(lines[0].starts_with("memory[0] staged"), "{lines:#?}");
+    assert_eq!(s.ctx.memory.entries(Target::Memory), ["Builds use make.", "Tests run with cargo test."]);
+    let staged = s.ctx.staging.list();
+    assert_eq!(staged.len(), 1);
+    assert!(staged[0].diff.contains("- Builds use make.") && staged[0].diff.contains("+ Builds use cargo."), "{}", staged[0].diff);
+    // Approving it: the new entry is in, the old one is out of the prompt and marked.
+    let applied = s.ctx.staging.apply(&staged[0].id, &s.ctx.memory, &s.ctx.skills);
+    assert!(matches!(applied, hermes_tools::staging::Applied::Done(_)), "{applied:?}");
+    assert_eq!(s.ctx.memory.entries(Target::Memory), ["Builds use cargo.", "Tests run with cargo test."]);
+    let new = core_id(&s, Target::Memory, "use cargo");
+    assert_eq!(s.ctx.memory.successor_of(old), Some(new));
+    assert!(s.ctx.memory.core_entry_by_id(Target::Memory, old).is_none(), "gone from the live entries");
+}
+
+#[test]
+fn a_supersedes_that_names_no_live_entry_of_the_same_store_is_rejected() {
+    let s = stores();
+    add_entry(&s, Target::Memory, "Builds use make.");
+    add_entry(&s, Target::User, "Prefers short answers.");
+    let user_id = core_id(&s, Target::User, "short answers");
+    // The archive is another scope: its row id is not an entry of MEMORY.md.
+    let archived = s.ctx.memory.tool(
+        &json!({"target": "memory", "operations": [{"action": "add", "tier": "archive", "content": "An archived fact about zebras"}]}),
+        &mut hermes_memory::TurnFailures::default(),
+    );
+    assert_eq!(archived["success"], true, "{archived}");
+    let archive_id = s.ctx.memory.tier_index_rows().unwrap().1[0].id;
+    let make_id = core_id(&s, Target::Memory, "use make");
+    let cases = [
+        ("an id that was never used", json!(99_999)),
+        ("an archive row", json!(archive_id)),
+        ("the other file's entry", json!(user_id)),
+    ];
+    for (why, id) in cases {
+        let reports = apply::apply_all(&s.ctx, &supersede("memory", "Builds use cargo.", id));
+        let lines = results(&reports);
+        assert!(lines[0].starts_with("memory[0] rejected") && lines[0].contains("not a live entry"), "{why}: {lines:#?}");
+    }
+    // A superseded entry is no longer live: a second review can't supersede it again.
+    s.ctx.memory.apply(
+        Target::Memory,
+        &[hermes_memory::Operation { action: "replace".into(), old_text: Some("use make".into()), content: Some("Builds use cargo.".into()), ..Default::default() }],
+        &mut hermes_memory::TurnFailures::default(),
+    );
+    let reports = apply::apply_all(&s.ctx, &supersede("memory", "Builds use bazel.", json!(make_id)));
+    assert!(results(&reports)[0].contains("rejected"), "{reports:?}");
+    assert!(s.ctx.staging.list().is_empty(), "a rejected operation stages nothing");
+    assert_eq!(s.ctx.memory.entries(Target::Memory), ["Builds use cargo."]);
+    assert_eq!(s.ctx.memory.entries(Target::User), ["Prefers short answers."]);
+}
+
+#[test]
+fn a_tainted_session_stages_a_supersede_with_its_reason() {
+    let mut s = stores();
+    add_entry(&s, Target::Memory, "Builds use make.");
+    let old = core_id(&s, Target::Memory, "use make");
+    s.ctx.hold = Some(apply::Hold { reason: "this turn read a web page".into(), sources: vec!["https://example.com".into()] });
+    let reports = apply::apply_all(&s.ctx, &supersede("memory", "Builds use cargo.", json!(old)));
+    assert!(results(&reports)[0].starts_with("memory[0] staged"));
+    let staged = s.ctx.staging.list();
+    assert_eq!(staged[0].reason, "this turn read a web page");
+    assert_eq!(s.ctx.memory.entries(Target::Memory), ["Builds use make."]);
+}
+
+#[test]
+fn the_packet_shows_entry_ids_only_when_it_has_them() {
+    let mut input = golden_input();
+    let plain = packet::build(&input, 24_000);
+    assert!(!plain.text.contains("<entry id="), "no ids: the packet is what it was");
+    input.memory[0].ids = vec![42];
+    let with_ids = packet::build(&input, 24_000);
+    assert!(with_ids.text.contains("<entry id=\"42\">The repo builds with cargo.</entry>"), "{}", with_ids.text);
+    assert_eq!(with_ids.text.replace(" id=\"42\"", ""), plain.text);
 }

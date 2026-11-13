@@ -633,11 +633,22 @@ pub(crate) fn gather(
     }
     let memory = [Target::Memory, Target::User]
         .into_iter()
-        .map(|target| MemoryFile {
-            target,
-            enabled: memory.enabled(target),
-            entries: memory.entries(target),
-            usage: memory.usage(target),
+        .map(|target| {
+            let entries = memory.entries(target);
+            // The ids the review may name in `supersedes` (the file is the truth for what is
+            // shown: an entry the database doesn't know has no id).
+            let rows = memory.core_rows(target);
+            let ids = entries
+                .iter()
+                .map(|entry| rows.iter().find(|r| &r.text == entry).map_or(0, |r| r.id))
+                .collect();
+            MemoryFile {
+                target,
+                enabled: memory.enabled(target),
+                entries,
+                ids,
+                usage: memory.usage(target),
+            }
         })
         .collect();
     PacketInput {

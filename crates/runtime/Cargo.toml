@@ -35,6 +35,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 image.workspace = true
+# turns.rs backdates `memory.db` rows to test the hygiene pass.
+rusqlite.workspace = true
 base64.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["signal"] }

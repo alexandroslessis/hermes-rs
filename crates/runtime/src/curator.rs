@@ -103,6 +103,9 @@ impl Runtime {
         state.run_count += 1;
         state.last_run_summary = Some(format!("auto: {auto}"));
         skills.save_curator_state(&state);
+        // Phase 9: the memory entries nobody has used for 60 days are proposed for the archive
+        // (staged for the user; no model request, whatever the profile).
+        let demotions = self.memory_hygiene().await;
 
         let candidates = skills.curator_candidates();
         let (llm, final_text) = match consolidate {
@@ -147,7 +150,10 @@ impl Runtime {
                 Err(error) => (format!("error ({error:#})"), String::new()),
             },
         };
-        let summary = format!("auto: {auto}; llm: {llm}");
+        let mut summary = format!("auto: {auto}; llm: {llm}");
+        if demotions > 0 {
+            summary.push_str(&format!("; memory: {demotions} demotion(s) proposed"));
+        }
         let after: Vec<String> = skills.curated().into_iter().map(|s| s.name).collect();
         let report = self
             .write_curator_report(start, &counts, &summary, &before, &after, &final_text)

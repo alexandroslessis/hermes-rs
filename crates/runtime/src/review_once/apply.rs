@@ -187,17 +187,36 @@ fn apply_memory(ctx: &ApplyContext, change: &MemoryChange) -> OpResult {
             change.target.file_name()
         ));
     }
-    let op = Operation {
+    let mut op = Operation {
         action: change.action.name().to_string(),
         content: change.text.clone(),
         old_text: change.old.clone(),
         matched_entry: None,
     };
+    // CP9.3: an `add` that supersedes an entry is a replace of it (the old entry leaves the
+    // prompt, marked `superseded_by` the new one), so it is held like one. The id must name a
+    // live entry of this very store: the user's own core memory of this target, not another
+    // tier, kind or scope.
+    if let Some(id) = change.supersedes {
+        let Some(old) = memory.core_entry_by_id(change.target, id) else {
+            return OpResult::Rejected(format!(
+                "supersedes #{id}: that is not a live entry of {} (only entries of the same store, as the packet shows them)",
+                change.target.file_name()
+            ));
+        };
+        op = Operation {
+            action: "replace".into(),
+            content: change.text.clone(),
+            old_text: Some(old),
+            matched_entry: None,
+        };
+    }
+    let replaces = change.action != MemoryAction::Add || change.supersedes.is_some();
     let hold = ctx
         .hold
         .clone()
         .or_else(|| memory.config().write_approval.then(write_approval_hold))
-        .or_else(|| (change.action != MemoryAction::Add).then(unattended_hold));
+        .or_else(|| replaces.then(unattended_hold));
     let done = match change.target {
         Target::User => "User profile updated",
         Target::Memory => "Memory updated",

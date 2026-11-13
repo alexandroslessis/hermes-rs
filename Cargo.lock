@@ -3275,6 +3275,7 @@ dependencies = [
  "parking_lot",
  "regex",
  "rmcp",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

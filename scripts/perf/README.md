@@ -102,7 +102,7 @@ as `tool.progress` frames reaches it; a command that prints in two bursts must p
 before the `tool.complete` answer carries the result, patches/0017) and that a stop mid-command
 keeps the output (the interrupted turn's `tool.complete` carries the result it had printed).
 `memory-check.mjs` checks the Star map's routes (graph, node detail, edit, delete, a stale id) and that
-Settings ▸ Memory reaches the store; it restores the perf instance's memory files after.
+Settings ▸ Memory reaches the store; it restores the perf instance's memory files after. Phase 9 CP9.3 adds, through `memory.db` in the same folder (Node's `node:sqlite`): a core card's `skill:` link is a graph edge and dangling links break nothing, the additive `archive` / `memory_links` fields, another repository's project memory is never in the map, and `POST /api/curator/run` stages (under `requests`, the default profile: the pass is off under `balanced` / `tokens`) a `demote memory` item for a 90-day-old core entry (no model request) that Apply moves to the archive.
 `artifacts-check.mjs` checks the Artifacts view through the page (a written file named in a reply
 and a link are listed).
 `archive-check.mjs` checks archived sessions (archive from PATCH and the shortcut, the `archived=`

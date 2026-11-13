@@ -11,6 +11,7 @@ mod guards;
 pub mod governor;
 pub mod ledger;
 pub mod mcp;
+pub mod memory_hygiene;
 mod ops;
 pub mod preinject;
 mod review;

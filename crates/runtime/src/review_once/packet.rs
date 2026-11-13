@@ -78,6 +78,9 @@ pub struct MemoryFile {
     pub target: Target,
     pub enabled: bool,
     pub entries: Vec<String>,
+    /// The id of each entry in `memory.db` (0: unknown), parallel to `entries`; empty: no ids
+    /// are shown. An id lets the review's `add` name the entry it `supersedes`.
+    pub ids: Vec<i64>,
     /// `MemoryStore::usage`: "used/limit" characters.
     pub usage: String,
 }
@@ -414,9 +417,13 @@ fn write_memory(w: &mut Writer, file: &MemoryFile) {
     // Room is kept for the closing line so a cut is always said.
     const LEFT_OUT_LINE: usize = 64;
     let mut left_out = 0usize;
-    for entry in &file.entries {
+    for (index, entry) in file.entries.iter().enumerate() {
+        let open = match file.ids.get(index).copied().filter(|id| *id > 0) {
+            Some(id) => format!("<entry id=\"{id}\">"),
+            None => "<entry>".to_string(),
+        };
         let block = format!(
-            "<entry>{}</entry>\n",
+            "{open}{}</entry>\n",
             neutralise(&redact(entry, Source::Output))
         );
         if left_out > 0 || units(&block) + LEFT_OUT_LINE * ASCII_UNITS > w.room() {

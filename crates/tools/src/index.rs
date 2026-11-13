@@ -67,7 +67,7 @@ use crate::skills::{self, SkillStore};
 const GLOBAL: &str = "global";
 
 /// Bump to throw the old file away (the schema or the way text is indexed changed).
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 /// Repositories whose skills the index keeps (the least recently asked about go first).
 const MAX_PROJECTS: usize = 32;
 /// A file modified this recently is re-read even when its stat is unchanged (see the module doc).
@@ -142,6 +142,16 @@ pub const DEFAULT_MIN_SKILL_SCORE: f64 = 2.5;
 pub const DEFAULT_MIN_MEMORY_SCORE: f64 = 1.0;
 /// A hit must also reach this share of the best hit's score (the tail of an `OR` query is noise).
 const MIN_RELATIVE_SCORE: f64 = 0.3;
+/// What one retrieved memory that links to a skill adds to that skill's score, and the most a
+/// skill gets from all of them (a skill needs 5.0 to be attached: this never decides alone).
+const SKILL_LINK_BOOST: f64 = 1.0;
+const MAX_SKILL_BOOST: f64 = 2.0;
+/// A `project` / `archive` entry is only retrieved for a message with this many search words
+/// (stopwords left out): "fix the bug" or "explain this error" (two) is too vague to pull notes
+/// out of an archive of hundreds (CP9.3 review, tested on a 240-entry archive).
+const MIN_TIER_MESSAGE_WORDS: usize = 3;
+/// ...and that shares this many of them (stemmed) with the entry.
+const MIN_TIER_SHARED_WORDS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkillHit {
@@ -157,9 +167,10 @@ pub struct SkillHit {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryHit {
-    /// Stable for an entry's text: `<tier>:<hash>` (Phase 9 replaces it with real ids).
+    /// Stable for an entry's text: `<tier>:<hash>` for the files' entries; `project:<n>` /
+    /// `archive:<n>` with the row's id in `memory.db` (CP9.3; `memory:<n>` links name the same n).
     pub id: String,
-    /// `memory` or `user`.
+    /// `memory` or `user` (the files' entries), or `project` / `archive` (CP9.3).
     pub tier: String,
     pub text: String,
     pub score: f64,
@@ -239,7 +250,7 @@ impl LocalIndex {
                  path UNINDEXED, mtime UNINDEXED, hash UNINDEXED, scope UNINDEXED,
                  tokenize = 'porter unicode61');
              CREATE VIRTUAL TABLE IF NOT EXISTS memory_doc USING fts5(
-                 id UNINDEXED, tier UNINDEXED, scope UNINDEXED, text, tags,
+                 id UNINDEXED, tier UNINDEXED, scope UNINDEXED, text, tags, kind UNINDEXED,
                  tokenize = 'porter unicode61');
              CREATE TABLE IF NOT EXISTS skill_files(
                  path TEXT PRIMARY KEY, doc INTEGER, mtime INTEGER NOT NULL, size INTEGER NOT NULL,
@@ -314,6 +325,7 @@ impl LocalIndex {
             let tx = conn.transaction()?;
             let mut report = self.refresh_skills(&tx)?;
             report.memory_rebuilt = self.refresh_memory(&tx)?;
+            report.memory_rebuilt |= self.refresh_tiers(&tx)?;
             tx.commit()?;
             Ok(report)
         })();
@@ -571,6 +583,86 @@ impl LocalIndex {
         Ok(rebuilt)
     }
 
+    /// Re-indexes the `project` and `archive` rows of `memory.db` when their generation changed
+    /// (CP9.3). Only live rows are indexed (a row the agent removed or rewrote is not), each with
+    /// its scope: `global` for the archive, the repository's `project:<key>` for a project entry.
+    /// A row is re-inserted only when it is new or its tags changed; rows that are gone (removed,
+    /// superseded, deleted by the user) are deleted, so what the user erased is not searchable.
+    fn refresh_tiers(&self, tx: &rusqlite::Transaction<'_>) -> Result<bool> {
+        let stored: Option<String> = tx
+            .query_row("SELECT value FROM meta WHERE key = 'memory:tiers'", [], |r| r.get(0))
+            .optional()?;
+        let current = self.memory.tier_index_rows();
+        let Some((generation, rows)) = current else {
+            // `memory.db` can't be used: what was indexed from it is dropped.
+            if stored.is_none() {
+                return Ok(false);
+            }
+            tx.execute("DELETE FROM memory_doc WHERE tier IN ('project', 'archive')", [])?;
+            tx.execute("DELETE FROM meta WHERE key = 'memory:tiers'", [])?;
+            return Ok(true);
+        };
+        if stored.as_deref() == Some(generation.as_str()) {
+            return Ok(false);
+        }
+        let mut existing: HashMap<String, (i64, String)> = HashMap::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT rowid, id, tags FROM memory_doc WHERE tier IN ('project', 'archive')",
+            )?;
+            let found = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(1)?, (r.get::<_, i64>(0)?, r.get::<_, String>(2)?)))
+            })?;
+            for row in found {
+                let (id, value) = row?;
+                existing.insert(id, value);
+            }
+        }
+        let mut keep: HashSet<String> = HashSet::new();
+        for row in &rows {
+            let id = format!("{}:{}", row.tier, row.id);
+            let tags = row.tags.join(" ");
+            keep.insert(id.clone());
+            match existing.get(&id) {
+                Some((_, old_tags)) if *old_tags == tags => continue,
+                Some((rowid, _)) => {
+                    tx.execute("DELETE FROM memory_doc WHERE rowid = ?1", [rowid])?;
+                }
+                None => {}
+            }
+            let scope = if row.tier == "project" { row.scope.as_str() } else { GLOBAL };
+            tx.execute(
+                "INSERT INTO memory_doc(id, tier, scope, text, tags, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, row.tier, scope, row.text, tags, row.kind],
+            )?;
+        }
+        for (id, (rowid, _)) in &existing {
+            if !keep.contains(id) {
+                tx.execute("DELETE FROM memory_doc WHERE rowid = ?1", [rowid])?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('memory:tiers', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+            [&generation],
+        )?;
+        Ok(true)
+    }
+
+    /// Whether `memory.db`'s non-core rows changed since they were indexed (a write by another
+    /// process; this process's own writes mark the index dirty).
+    fn tiers_stale(&self) -> bool {
+        let current = self.memory.tier_generation();
+        let stored: Option<String> = self
+            .conn
+            .lock()
+            .query_row("SELECT value FROM meta WHERE key = 'memory:tiers'", [], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten();
+        current != stored
+    }
+
     /// The best skills and memory entries for `query`. Blocking; refreshes first when dirty.
     /// Empty when the query has no usable words. A refresh that fails is logged and the query
     /// answers from the index as it is (better a stale hit than no context at all).
@@ -584,7 +676,7 @@ impl LocalIndex {
             })
             // Matches no row: a session outside a repository sees the user's skills only.
             .unwrap_or_else(|| GLOBAL.to_string());
-        if self.dirty.load(Ordering::SeqCst)
+        if (self.dirty.load(Ordering::SeqCst) || self.tiers_stale())
             && let Err(e) = self.refresh()
         {
             tracing::warn!("index refresh before a query failed: {e:#}");
@@ -594,8 +686,21 @@ impl LocalIndex {
             return Ok(Retrieval::default());
         };
         let disabled = self.skills.config().disabled;
+        // The memory scope of this session: the user's own entries and the archive are `global`;
+        // a project entry is only ever selected for the repository it belongs to (the SQL below
+        // names it, so another repository's rows are never read). No repository: no row matches.
+        let memory_scope = query
+            .project_root
+            .as_deref()
+            .map(project_skills::memory_scope_key)
+            .unwrap_or_default();
         let conn = self.conn.lock();
         let mut out = Retrieval::default();
+        // Skills a retrieved memory links to (`skill:<name>`) rank up (bounded).
+        let mut boosts: HashMap<String, f64> = HashMap::new();
+        if limits.memory > 0 {
+            out.memory = self.query_memory(&conn, query, limits, &expr, &memory_scope, &mut boosts)?;
+        }
         if limits.skills > 0 {
             // Weights: name, category, description, body (then the unindexed columns). The body
             // weighs little: a word that only occurs in a long text is weak evidence.
@@ -617,10 +722,14 @@ impl LocalIndex {
                     r.get::<_, String>(5)?,
                 ))
             })?;
+            let mut found: Vec<SkillHit> = Vec::new();
             for row in rows {
                 let (name, category, description, path, score, row_scope) = row?;
+                // A linked memory raises a skill that already matches; it never brings in one
+                // that does not.
+                let score = score + boosts.get(&name).copied().unwrap_or(0.0);
                 if score < limits.min_skill_score {
-                    break;
+                    continue;
                 }
                 if disabled.contains(&name) {
                     continue;
@@ -632,15 +741,8 @@ impl LocalIndex {
                 {
                     continue;
                 }
-                if out
-                    .skills
-                    .first()
-                    .is_some_and(|best| score < best.score * MIN_RELATIVE_SCORE)
-                {
-                    break;
-                }
                 let category = (!category.is_empty()).then_some(category);
-                out.skills.push(SkillHit {
+                found.push(SkillHit {
                     name,
                     category,
                     description,
@@ -651,47 +753,162 @@ impl LocalIndex {
                         .then(|| query.project_root.clone())
                         .flatten(),
                 });
-                if out.skills.len() >= limits.skills {
-                    break;
-                }
             }
+            // Best first (stable: the SQL's order breaks ties), the tail of an OR query dropped.
+            found.sort_by(|a, b| b.score.total_cmp(&a.score));
+            let best = found.first().map_or(0.0, |h| h.score);
+            found.retain(|h| h.score >= best * MIN_RELATIVE_SCORE);
+            found.truncate(limits.skills);
+            out.skills = found;
         }
-        if limits.memory > 0 {
-            let mut stmt = conn.prepare_cached(
-                "SELECT id, tier, text, -bm25(memory_doc, 0.0, 0.0, 0.0, 1.0, 2.0)
-                 FROM memory_doc WHERE memory_doc MATCH ?1
-                 ORDER BY bm25(memory_doc, 0.0, 0.0, 0.0, 1.0, 2.0) LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![expr, (limits.memory * 3 + 6) as i64], |r| {
-                Ok(MemoryHit {
+        Ok(out)
+    }
+
+    /// The memory half of [`Self::query`]: the user's own entries (`core`, ranked by BM25 as in
+    /// Phase 5) and, from CP9.3, the archive and this repository's project entries, ranked by BM25
+    /// plus a little recency and hits. `boosts` collects the skills the hits link to.
+    fn query_memory(
+        &self,
+        conn: &Connection,
+        query: &IndexQuery,
+        limits: &Limits,
+        expr: &str,
+        memory_scope: &str,
+        boosts: &mut HashMap<String, f64>,
+    ) -> Result<Vec<MemoryHit>> {
+        struct Candidate {
+            hit: MemoryHit,
+            rank: f64,
+            links: Vec<String>,
+        }
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, tier, text, -bm25(memory_doc, 0.0, 0.0, 0.0, 1.0, 2.0, 0.0), tags, kind
+             FROM memory_doc WHERE memory_doc MATCH ?1 AND scope IN ('global', ?3)
+             ORDER BY bm25(memory_doc, 0.0, 0.0, 0.0, 1.0, 2.0, 0.0) LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![expr, (limits.memory * 3 + 6) as i64, memory_scope], |r| {
+            Ok((
+                MemoryHit {
                     id: r.get(0)?,
                     tier: r.get(1)?,
                     text: r.get(2)?,
                     score: r.get(3)?,
-                })
-            })?;
-            for hit in rows {
-                let hit = hit?;
+                },
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            ))
+        })?;
+        let rows: Vec<(MemoryHit, String, String)> = rows.collect::<rusqlite::Result<_>>()?;
+        // The message's own search words (stopwords left out, the way the query reads them;
+        // stemmed): the tier rows must share some (below).
+        let mut own: Vec<String> = Vec::new();
+        push_tokens(&query.message, MESSAGE_CHARS, MESSAGE_TOKENS, &mut own);
+        let message_words = hermes_memory::word_set(&own.join(" "));
+        let own_words = own.len() >= MIN_TIER_MESSAGE_WORDS;
+        let tier_ids: Vec<i64> = rows
+            .iter()
+            .filter(|(hit, _, _)| hit.tier == "project" || hit.tier == "archive")
+            .filter_map(|(hit, _, _)| hit.id.split_once(':')?.1.parse().ok())
+            .collect();
+        // What the rows are worth now; a row removed since the index was built has no stats and
+        // is dropped here (a refresh is only a cache).
+        let stats: HashMap<i64, hermes_memory::RowStats> = self
+            .memory
+            .row_stats(&tier_ids)
+            .into_iter()
+            .map(|s| (s.id, s))
+            .collect();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let mut found: Vec<Candidate> = Vec::new();
+        for (hit, tags, kind) in rows {
+            let tiered = hit.tier == "project" || hit.tier == "archive";
+            let target = if tiered {
+                match kind.as_str() {
+                    "user" => Some(Target::User),
+                    "fact" => Some(Target::Memory),
+                    _ => None,
+                }
+            } else {
+                Target::parse(&hit.tier)
+            };
+            if target.is_some_and(|t| !self.memory.enabled(t)) {
+                continue;
+            }
+            if !tiered {
                 if hit.score < limits.min_memory_score {
-                    break;
-                }
-                if out
-                    .memory
-                    .first()
-                    .is_some_and(|best| hit.score < best.score * MIN_RELATIVE_SCORE)
-                {
-                    break;
-                }
-                if Target::parse(&hit.tier).is_some_and(|t| !self.memory.enabled(t)) {
                     continue;
                 }
-                out.memory.push(hit);
-                if out.memory.len() >= limits.memory {
-                    break;
+                let rank = hit.score;
+                found.push(Candidate { hit, rank, links: Vec::new() });
+                continue;
+            }
+            // Not for a short or vague message ("fix the bug", "looks good, thanks"): see
+            // `MIN_TIER_MESSAGE_WORDS`.
+            if !own_words {
+                continue;
+            }
+            let Some(stat) = hit
+                .id
+                .split_once(':')
+                .and_then(|(_, n)| n.parse::<i64>().ok())
+                .and_then(|id| stats.get(&id))
+            else {
+                continue;
+            };
+            // Search words shared with the message itself (a match through the assistant's last
+            // text or the project name alone is not enough): at least two. One shared word is
+            // not enough whatever its BM25 score: in an archive of hundreds of entries any rare
+            // word scores high ("thanks" pulled in "thanks the reviewers in the changelog"). No
+            // BM25 floor: over a handful of rows SQLite's idf makes every score near zero.
+            let shared = hermes_memory::word_set(&format!("{} {}", hit.text, tags))
+                .intersection(&message_words)
+                .count();
+            if shared < MIN_TIER_SHARED_WORDS {
+                continue;
+            }
+            // Relevance first; hits and recency only reorder entries that already match.
+            let touched = stat
+                .created
+                .max(stat.last_confirmed)
+                .max(stat.last_hit.unwrap_or(0));
+            let age_days = (now - touched).max(0) as f64 / 86_400.0;
+            let recency = 0.5 * 0.5f64.powf(age_days / 90.0);
+            let popular = (0.3 * (1.0 + stat.hits.max(0) as f64).ln()).min(1.0);
+            let rank = hit.score + recency + popular;
+            found.push(Candidate { hit, rank, links: stat.links.clone() });
+        }
+        let best = found.iter().map(|c| c.hit.score).fold(0.0, f64::max);
+        found.retain(|c| c.hit.score >= best * MIN_RELATIVE_SCORE);
+        found.sort_by(|a, b| b.rank.total_cmp(&a.rank));
+        found.truncate(limits.memory);
+        for candidate in &found {
+            for link in &candidate.links {
+                if let Some(name) = link.strip_prefix("skill:") {
+                    let boost = boosts.entry(name.to_string()).or_insert(0.0);
+                    *boost = (*boost + SKILL_LINK_BOOST).min(MAX_SKILL_BOOST);
                 }
             }
         }
-        Ok(out)
+        Ok(found.into_iter().map(|c| c.hit).collect())
+    }
+
+    /// Counts the memory entries that were put in front of the model: `hits` goes up for each,
+    /// in a batch (`MemoryStore::record_hits`). Blocking (it may write the batch).
+    pub fn record_hits(&self, hits: &[MemoryHit]) {
+        let refs = hits.iter().filter_map(|hit| {
+            let (tier, rest) = hit.id.split_once(':')?;
+            match tier {
+                "project" | "archive" => rest.parse().ok().map(hermes_memory::HitRef::Row),
+                "memory" | "user" => Some(hermes_memory::HitRef::Core {
+                    target: Target::parse(tier)?,
+                    text: hit.text.clone(),
+                }),
+                _ => None,
+            }
+        });
+        self.memory.record_hits(refs);
     }
 
     pub async fn query_async(
@@ -1933,3 +2150,7 @@ pub(super) mod tests {
         assert_eq!(hits.skills[0].name, "arxiv");
     }
 }
+
+#[cfg(test)]
+#[path = "index_memory_tests.rs"]
+mod memory_tests;

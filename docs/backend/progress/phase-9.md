@@ -334,3 +334,231 @@ note kept for a surviving row, string tags/links, junction), hermes_tools 246 + 
 linked worktree), store 12, prompts 23, llm 468+5; runtime lib 169; `--test turns` 196 (7
 ignored) under default, balanced, requests, tokens; hermes-desktop 174 + acp 68;
 `cargo build --workspace` ok, no warnings. Request counts unchanged.
+
+## CP9.3 — retrieval into the context block, dedupe on add, hygiene, supersedes, links for the map
+Worktree: C:\Users\alexandros\repos\hermes-rs-p9   Branch: backend/p9-memory   Model: Sonnet 5.5 (subagent)
+Cut on top of CP9.1 + CP9.2 (+ their reviews, b9bc0c0). Uncommitted. Phase 9's last checkpoint.
+Done:
+- **Retrieval.** Under `requests` (`budget.memory_preload` = 3; `balanced`/`tokens` have 0 and are
+  byte for byte unchanged) `Runtime::begin_turn`'s existing Phase 5 step now also finds the `project`
+  entries of the session's repository and the global `archive` entries, and puts them in the
+  `<context>` block of the **user message** as `<entry id="archive:<n>" tier="archive">` (or
+  `project:<n>`; `<n>` = the row id in `memory.db`, the number a `memory:<n>` link names), with one
+  extra sentence about the memory tool. Same machinery as skills: stored with the message (resume,
+  rewind and branches replay the bytes; the `preinject` note lists the ids; the page shows the typed
+  text); "already attached" is read off the conversation. Nothing reaches the system prompt.
+- **`index.db` schema 4** (`index.rs`): `memory_doc` gets a `kind` column and also holds the live
+  `project` / `archive` rows: `scope` = `global` (the user's own entries and the archive) or
+  `project:<key>` (`memory_scope_key`, worktrees folded in). The query selects
+  `scope IN ('global', <own>)` **in SQL before the LIMIT** (a test fills the candidate list with another
+  repository's 40 better matches: the session's own entry still comes back). Rows are re-indexed when
+  `memory.db`'s **generation** (`meta.tiers_gen`, bumped in the transaction of every non-core write and
+  delete) changed: this process's writes mark the index dirty (the existing hook) and a query refreshes
+  first, another process's are seen by comparing the generation at each query. Soft-removed and
+  superseded rows are never indexed; a row the user deleted is deleted from the index; a retrieved row
+  is re-checked against `memory.db` (`row_stats`).
+- **Ranking and gates** (tier rows only; core hits as in Phase 5): BM25 (text 1.0, tags 2.0) plus up to
+  0.5 recency (half-life 90 days from the last confirmation / hit) plus up to 1.0 hits (0.3 * ln(1+hits)).
+  Relevance gates, because BM25 over a handful of rows is near zero (SQLite floors the idf): the message
+  needs two own words (`word_count`, Phase 5's rule) and the row must share two stemmed words with it, or
+  one with a score >= 1.0; a match through the assistant's last text or the project name alone is not
+  enough; a hit under 30% of the best one's score is dropped. Disabled kinds (Settings) are skipped.
+- **Mid-session visibility**: tested end to end (`turns`): turn 1's `memory` call writes an archive entry,
+  turn 2's first request carries it in the user message, not in the system prompt (byte-identical across
+  all three requests).
+- **Hits** (`retrieval.rs`): the entries attached to a message get `hits + 1` through
+  `MemoryStore::record_hits`: counted in memory, written in one transaction at 20 waiting entries, a
+  minute after the first, at drop and before the hygiene pass (so a turn costs no database write of its
+  own; a crash loses up to a minute). Called from the same `spawn_blocking` as the query. The last hit
+  time is `meta` key `hit:<id>` (no schema change, an older build still opens the file). A core entry's
+  hit is found by its text.
+- **Skill boost**: `skill:<name>` links of the retrieved tier entries raise that skill's score by 1.0 each,
+  at most 2.0, before the thresholds; only a skill that already matches the message (a linked skill that
+  doesn't is never brought in); the skills part of `query` was reordered (memory first) and collects
+  before cutting, identical results without a boost (the Phase 5 goldens pass unchanged).
+- **Dedupe on add** (`similar.rs`, any tier, in the same batch planner): the new text's stemmed word
+  set is compared with the live entries of the same tier, scope and kind (Jaccard >= 0.6, or one set 90%
+  inside the other when it has >= 4 words). Decision: a **byte-exact repeat is a no-op that counts as
+  a confirmation** (`last_confirmed` = now, tags still applied) with a sentence in `message` and a
+  `duplicates` field; a **near-duplicate is added and flagged** in the result of the same call
+  (`similar_entries` with the old entry's row id and text, and a sentence naming `#id`, the entry and
+  "update the existing one (action 'patch') or remove one") — no extra request, never a silently
+  dropped fact; a batch that removes/patches the similar entry first is not flagged. Non-duplicate
+  results are byte-identical (CP9.2's old-shape comparison test passes unmodified).
+- **Hygiene** (`memory_hygiene.rs`, in `curate()` for every profile, zero requests): `core` entries not
+  confirmed or hit for 60 days, not tagged `pinned`, <= 1000 characters (the archive's cap), not proposed
+  in the last 30 days, still in the file, are staged oldest first, at most 5 per run, as a `memory` item
+  with one `demote` operation (summary "demote memory", diff "- entry / + [moved to the archive] entry",
+  reason "memory hygiene: not used or confirmed for 60 days", session `curator`); the staging area's own
+  rule keeps one item per identical proposal. Never applied directly. Apply = `MemoryStore::demote_core`:
+  the entry is re-looked up (changed since = stale, nothing copied), copied to the archive with its tags
+  and links through `apply_ext` (limits, threat scan), then removed from core. The tool refuses `demote`.
+  `last_confirmed` moves on a repeat `add`, a patch or a replace (new row); entries made by the migration
+  count from migration day, so nothing is proposed for 60 days after the upgrade.
+- **Supersedes** (`review_once`): a memory `add` may carry `supersedes: <id>` (optional, null/absent =
+  today's contract; the schema lists it, strict mode requires it nullable; only valid on `add`; numbers or
+  "#12"). The packet shows `<entry id="12">` for entries the database knows (unchanged text otherwise,
+  golden intact) and the prompt explains the field. Applying: the id must name a live `core` entry of the
+  same file (an archive row, the other file, a removed row: rejected, nothing staged); the op then becomes a
+  replace of that entry (the old row is marked `superseded_by` the new one, so it leaves the prompt and the
+  index) and is **held for the user** like any review replace (tainted: with the taint reason).
+- **Map** (`learning.rs`): the page already draws `{source,target}` edges between nodes, so a core card's
+  `skill:<name>` link to a learned skill and `memory:<id>` link to another card are real edges (no pair
+  repeated; edges only join existing nodes); additive fields the page ignores: `archive` (newest 100 archive
+  entries) and `memory_links` (every link of a core card or archive entry with `resolved` true / false /
+  null) and two `stats`. Dangling links (skill deleted, memory removed) are listed unresolved and drawn
+  nowhere. **Project memory is not in the map** (it has no working folder; a repository's notes must not
+  show in another's view). No patch (the page's shapes are unchanged).
+Files: `crates/memory/src/{similar,retrieval,retrieval_tests,store,tiers,db,lib}.rs`,
+`crates/tools/src/{index,index_memory_tests,staging}.rs`,
+`crates/runtime/src/{memory_hygiene,preinject,curator,lib}.rs`, `crates/runtime/src/review_once.rs`,
+`crates/runtime/src/review_once/{contract,packet,apply,tests}.rs`, `crates/runtime/{Cargo.toml,tests/turns.rs}`,
+`crates/prompts/src/review.rs`, `crates/desktop/src/learning.rs`, `scripts/perf/{memory-check.mjs,README.md}`,
+`PORTING.md`, `GAPS.md`, `docs/{ARCHITECTURE,PITFALLS,TESTING}.md`, this note.
+Tests: (all `CARGO_TARGET_DIR=target/claude`, temp folders only)
+- `cargo build --workspace`: ok, no warnings.
+- `cargo test -p hermes_memory -p hermes_tools -p hermes_store -p hermes_prompts -p hermes_llm`: green (hermes_memory 101 + 1 ignored (CP9.1/9.2's 81 unmodified; new: 4 `similar`, 16 `retrieval_tests`), hermes_tools 264 + 1 ignored (new: 15 `index_memory_tests`, 3 staging demotion), store 12, prompts 23, llm 468+5).
+- `cargo test -p hermes_runtime`: lib 178 (new: 4 `memory_hygiene`, 5 supersedes/contract/packet in `review_once`); `--test turns` 204 (7 ignored; 8 new) green under default and under `HERMES_TEST_PROFILE=balanced|requests|tokens`.
+- `cargo test -p hermes-desktop`: lib 176 (2 new in `learning.rs`) green.
+- Live: `scripts/perf/memory-check.mjs` against my own instance (port 47810, data in target/perf): all checks passed (22, 10 of them new); instance stopped.
+Request counts: unchanged baselines. New, exact: archive scenario = 2 requests (the memory call, the
+answer) + 1 (turn 2, entry attached or not) = 3 under `requests`, `balanced` and `tokens`; four turns in
+two repositories = 4; three turns with a near-duplicate and a distinct add = 6 (the dedupe note adds none);
+the curator's hygiene pass = 0 (`total_requests == 0`).
+Deviations from the plan:
+- Dedupe by stemmed word sets (Jaccard / containment), not "BM25 top-1": it also covers `core` (planner sees
+  plain texts, the database may be off) and doesn't depend on how many other entries exist.
+- A `supersedes` is applied as a replace and therefore always held for the user (the plan says "staged when
+  tainted as today"); see the first item below.
+- `last_hit` lives in `meta`, not a column (no schema change). "Pinned" = the tag `pinned`.
+- Tier rows must share two own words with the message (or one with a good score) on top of BM25 (small
+  corpora score ~0 in BM25); the plan didn't say.
+For the reviewer:
+- **Supersedes is held in every session** (a background review never changes an entry the user has
+  unattended: Hermes's rule, CP7.2). Confirm, or allow a direct apply for an entry the agent itself wrote.
+- **Relevance gate for tier rows** (two shared stemmed words, or one with BM25 >= 1.0; recency/hits only
+  reorder) is tuned on small fixtures (a 13-query golden); a real archive of thousands of entries is
+  untested. The thresholds are constants in `index.rs` / `similar.rs`.
+- **Core entries are still retrieved too** (Phase 5 behaviour, `memory:<hash>` ids) although they are in
+  the system prompt; I left it (changing it would change `requests` behaviour outside this checkpoint).
+- **Hits for core** are found by text and also feed the hygiene pass (a core entry the model sees retrieved
+  stays out of the pass); an entry only ever in the prompt, never retrieved, goes stale after 60 days even
+  if the model uses it every turn. That is the plan's "hit/confirmed" in the only form we can observe.
+- **Demotion of USER.md entries** is proposed like MEMORY.md ones (user facts go stale less than tool
+  facts; staged, so the user decides). Say if `user` should be exempt.
+- **Pinning has no UI** (add the same text again with the tag `pinned`); no page lists, pins or erases
+  project / archive entries (the Star map only lists archive entries additively, the page ignores them).
+  `delete_tier_entry` still has no caller.
+- Hit counting writes the batch from the turn's blocking task when due (20 entries / a minute): a slow
+  disk could add its latency to that one turn; bounded by the 3 s query timeout only for the query part.
+- `memory_hygiene` and demotion also run when the user clicks "run curator" (any profile).
+- The review prompt grew (one sentence + `supersedes` in the text-contract shape): a one-time cache miss
+  for review requests. The model might copy the example value; an unreadable id is rejected alone.
+- `rusqlite` is a dev-dependency of `hermes_runtime` (one turns test backdates rows).
+- Not verified: a real model's use of `supersedes` / the dedupe note; the webapp (no patch was needed, none applied); disk-full behaviour of hit batches.
+
+### Review (Opus 5.5)
+`main` had not moved (b9bc0c0 + CP9.3 uncommitted); no merge. `/code-review` not run as a skill
+(subagent); manual pass over the whole diff, the page's Star map source and a live run.
+
+**Caching (evidence).** Retrieval only ever writes the user message's `<context>` block, through
+Phase 5's `Block` path (stored with the message, `preinject` note, `typed_text`); the turns tests
+compare the system prompt byte for byte over all three requests of the archive scenario, replay the
+stored block byte for byte after a resume from disk and after a rewind, and see turn 1's archive
+write in turn 2's first request (`tiers_gen` + the dirty hook; another `MemoryStore` on the same
+folder is seen by the generation, `another_stores_write_is_seen_without_a_hook`). `balanced` /
+`tokens`: no block, no note, same three requests. **Map shape:** the page's `StarmapGraph`
+(`types/hermes.ts`) reads `nodes`, `edges`, `clusters`, `memory`, `stats` only; edges are drawn
+generically (`simulation.ts` keeps an edge only when both ends are nodes; `star-map.tsx`
+adjacency), so card→skill and card→card edges are drawn and `archive` / `memory_links` are ignored
+(TypeScript types are compile-time only; no runtime schema check). Driven in my own instance over
+DevTools (`#/starmap` with a card linking a skill, another card, a dangling memory id and a missing
+skill, plus an archive row holding `</entry>`): the canvas rendered, no page error, the archive text
+not shown. No cwd: project memory is never read by `graph`.
+
+**Findings and fixes:**
+1. *Noise on a real-sized archive.* The gate ("two of the message's words, or one with BM25 >= 1.0")
+   counted stopwords (the memory crate's short list: "how", "do", "what", "you" counted) and, on a
+   240-entry archive, "looks good, thanks" pulled "... thanks the reviewers in the changelog", "fix
+   the bug" and "explain this error" pulled four entries each (any rare word scores > 1.0 once there
+   are hundreds of rows; on a handful every score is ~0, which is why the floor never bit in the
+   goldens). Now: the message's words are the index's own search words (its stopword list), a tier
+   row needs a message of **>= 3** of them and **>= 2 shared** (stemmed); the one-word path is gone.
+   New test `a_large_varied_archive_injects_nothing_for_small_talk_or_vague_requests` (16 small-talk /
+   vague messages: nothing; two specific questions: their entry first). The 13 goldens pass unchanged.
+2. *Block structure could be forged.* `sanitize` only rewrote `</context>`: an archive entry (written
+   by the agent, maybe from tainted evidence and approved) holding `</entry><entry id="memory:x"
+   tier="core">` or `</relevant-memory><relevant-skills><skill ...>` broke out of its element. New
+   `sanitize_body` writes the `<` of the block's own tags (any case, opening or closing) as `&lt;`, for
+   entry and skill bodies; `Vec<T>`, `<b>`, `<entrypoint>` untouched. Test
+   `an_entry_cannot_break_out_of_its_element_or_forge_another`. (Only new messages change; stored
+   blocks replay as stored.)
+3. *Hygiene under balanced/tokens would make the agent forget.* There is no archive search tool, and
+   only `requests` retrieves the archive or records hits; under the other profiles every core entry
+   would be "unused" after 60 days and a demotion would take it out of the model's sight for good. The
+   pass now runs only when `budget.memory_preload` > 0. Test
+   `the_hygiene_pass_proposes_nothing_under_a_profile_that_never_retrieves_the_archive`.
+4. *A hit flush could cost the turn its block.* `record_hits` ran inside the query's 3 s time limit; a
+   due batch waiting on `memory.db` (busy timeout 5 s, another process writing) would time the
+   retrieval out. Hits are now recorded in a task of their own after the block is returned, and only
+   for a block that is used.
+5. *Demotion vs a hand edit* (no change needed, test added): `a_hand_edit_of_memory_md_between_proposal_and_apply_is_kept_never_clobbered`
+   — editing another entry by hand keeps the edit and still demotes; editing the proposed entry by
+   hand makes Apply stale, the file byte-identical, nothing copied.
+
+Checked, no change: scope filter in SQL before `LIMIT` (`scope IN ('global', ?3)`, test with 40
+better foreign rows); no cwd = `''` matches no project row; worktree key = main checkout's; schema-4
+bump drops and rebuilds `index.db` (a cache); soft-removed/superseded rows never indexed, a retrieved
+row re-checked by `row_stats`, a user delete bumps the generation and leaves the index at the next
+query; dedupe: only byte-exact repeats are no-ops, "port 8080" vs "port 8081" is flagged similar but
+both stored, "prefers tabs" vs "prefers spaces" not similar; hits/recency bounded (+1.0 / +0.5, and
+only among rows that pass the gate, so the hits feedback loop can reorder but never inject);
+`supersedes`: validated against live core rows of the same file, hallucinated ids rejected alone,
+always held (agree: conservative, matches CP7.2), cannot remove core entries unapproved; hygiene
+zero requests, staged only, 5 per run, 30-day re-proposal in `meta` (survives restarts), pinned
+exempt; `sessions.db` untouched; blocking work in `spawn_blocking`; `rusqlite` dev-dependency fine.
+Live check: 21 checks, not 22 as the note says (all pass).
+Left: an archive entry is not threat-scanned again when injected (scanned at write); the map's
+`archive` list includes `user` rows when USER.md is disabled (ignored by the page); core entries still
+retrieved although in the prompt (Phase 5, unchanged); USER.md entries are demotable (staged, the
+user decides); no UI to pin or to list/erase project and archive entries.
+Tests (`CARGO_TARGET_DIR=target/claude`): hermes_memory 101 + 1 ignored, hermes_tools 265 + 1 ignored,
+store 12, prompts 23, llm 468 + 7 ignored (+5 integration); runtime lib 180; `--test turns` 205 (7 ignored; 1 new) under default, balanced, requests, tokens;
+hermes-desktop 176 + acp 68; `cargo build --workspace` ok, no warnings. Live: `memory-check.mjs` all
+passed against my instance (stopped after). Request counts unchanged; Phase 9 baselines note added.
+
+### User checklist (Phase 9)
+1. Open Settings > Memory (or the Star map): your existing MEMORY.md / USER.md entries are all still
+   there, unchanged. Your files next to the app data still hold them
+   (`%APPDATA%\hermes-rs\memories\MEMORY.md`, `USER.md`).
+2. In a session inside repository A, ask the agent to "remember in this project's memory that release builds
+   need the lto profile" (it uses tier `project`). Start a new session in A and ask "how do release builds work here":
+   the agent already knows (a new session in A has the project notes in its instructions; under the default
+   `requests` profile a note written *during* a session also rides on your next message there; the
+   transcript shows only what you typed).
+   Start a session in repository B (or a folder outside a repository) and ask the same: it does not know.
+3. In any session, tell the agent a fact for the archive ("keep a note in the archive that the deploy password
+   rotates on the first Monday"). A few messages later (same or another session), ask "when does the deploy
+   password rotation happen": the answer comes without a memory tool call. (This needs the `requests`
+   budget profile, the default: Settings > Model > Budget profile. A short or vague message, such as
+   "thanks" or "fix the bug", never pulls archive notes in: ask with at least three real words.)
+4. Ask the agent to remember something it already has, reworded: its tool result says "similar to an existing
+   entry #N ..." and it may update that entry; asking the exact same thing again says "already stored".
+5. Under the `requests` profile only (the default; nothing is proposed under balanced/tokens, which never bring
+   archive notes back), after a core entry has gone 60 days unconfirmed (nothing is proposed in the first 60
+   days after the upgrade; the curator runs on its schedule or when you start it): Settings > Memory > "Waiting for
+   your review" lists "demote memory" items. Apply moves the entry to the archive (it leaves MEMORY.md and the prompt, and is
+   still found when a message is about it); Reject keeps it (it is not proposed again for 30 days). To keep an
+   entry out of this for good, ask the agent to add the same entry again with the tag `pinned` (there is no
+   pin button: pinning cannot be done from the UI).
+6. Settings > Memory > reset deletes MEMORY.md / USER.md contents only (what its dialog names): project and
+   archive notes stay. **No page lists or erases project / archive entries** (cannot be done from the UI):
+   ask the agent to remove one (it is then hidden from the agent but kept in `memory.db` as a removed row),
+   or erase by hand in `memory.db` with the app closed.
+7. Backups: before the first migration the app copied your files next to them as
+   `MEMORY.md.bak.pre-memory-db.<time>` / `USER.md.bak.pre-memory-db.<time>` (never deleted by the app; they
+   hold the old text); a file you emptied or deleted by hand is copied to `<file>.bak.dropped.<time>` first;
+   a damaged `memory.db` is moved aside to `memory.db.corrupt-<time>`. All in `%APPDATA%\hermes-rs\`
+   (`memories\` for the files, the folder itself for `memory.db`).
+8. The Star map: a memory card whose entry links a skill (`skill:name`) is joined to that skill by a line.
+   Project memory is never shown there.

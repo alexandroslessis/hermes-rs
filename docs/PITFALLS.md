@@ -772,8 +772,9 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   never reach MEMORY.md / USER.md and are not synced from them. A query for the core view must
   keep `tier = 'core' AND scope = ''` (`db::LIVE_CORE`, `db::knows`); one for another tier must
   filter `removed IS NULL`. A hand edit of the file, the Star map and the index (`memory_doc`) see
-  `core` only; `archive` and `project` are not indexed or retrieved until CP9.3 (indexing project
-  rows globally would leak one repository's memory into another's context).
+  `core` only until CP9.3, which indexes `archive` and `project` with a scope (see the CP9.3
+  section below; indexing project rows globally would leak one repository's memory into another's
+  context).
 - **Project scope = Phase 8's git root, worktrees folded in.** `memory_scope()` of the session's
   tools (`project_skills::memory_scope_key(find_root(cwd))`) is the only source of the scope; it
   is never read from the model's arguments (`take_extras` sets it, a staged operation carries it,
@@ -821,3 +822,74 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   it into `core`; approve staged writes with a current build.
 - **Tags and links of core entries live in the database only** (the file can't hold them); a patch
   carries them over, a hand edit of the file does not (the changed text is a new row).
+
+## Memory retrieval, dedupe, hygiene and links (Phase 9 CP9.3)
+
+- **Retrieval reaches the user message, never the system prompt.** Under `requests`
+  (`budget.memory_preload` = 3) the `project` entries of the session's repository and the global
+  `archive` are searched per turn and ride in the `<context>` block of the user message
+  (`<entry id="archive:<n>" tier="archive">`), stored with it (resume and rewind replay the same
+  bytes; the page shows the typed text). `balanced` and `tokens` have `memory_preload` 0: nothing
+  is searched, nothing is attached, byte for byte as before. An entry written this session is
+  retrievable by the **next** turn (the write marks the index dirty and a query refreshes first);
+  the frozen system prompt never changes.
+- **The scope filter is in SQL, before the limit.** `memory_doc.scope` is `global` for the user's
+  own entries and the archive and `project:<key>` for a repository's rows
+  (`memory_scope_key`, worktrees folded into their checkout); the query says `scope IN ('global',
+  <own>)`, so another repository's rows are never read, let alone ranked. Keep it that way if you
+  add a column or a ranking step: a filter after `LIMIT` lets a big repository crowd a small one
+  out, and a filter in Rust has already read the rows.
+- **A project entry is the repository's own words about itself, and the user's.** They are not
+  tainted text (the agent or the user wrote them), but a repository's skills are (Phase 8); the
+  index never mixes them up (`scope` columns of two tables, two schemas). Project entries are
+  also in the system prompt of a session that **starts** in the repository (CP9.2's snapshot);
+  retrieval adds the ones written since, and may repeat one the prompt already has (as for core
+  entries since Phase 5).
+- **The index is a cache of `memory.db`'s generation.** `meta.tiers_gen` (in `memory.db`) is bumped
+  in the transaction of every non-core write and delete, by any process; the index compares it
+  at each query, so the ACP binary's write is seen by the desktop app. A new write path for the
+  `project` / `archive` tiers must call `db::bump_generation` or the index will not notice.
+  A retrieved row is re-checked against `memory.db` (`row_stats`): a row removed since the index
+  was refreshed is dropped.
+- **Hits are batched and approximate.** `record_hits` counts in memory and writes one transaction
+  at 20 waiting entries, after a minute, at drop and before the hygiene pass; a crash loses up to
+  a minute of hits. `hit:<row id>` in `meta` is the last hit time (no schema change; the key stays
+  after a purge, it holds no text). A `core` entry's hit is found by its text.
+- **Dedupe is a word-set comparison, not BM25** (`similar.rs`; the plan said BM25). Byte-exact
+  repeats are no-ops that confirm the entry; anything similar is **added and flagged** in the same
+  result (`similar_entries`, `message`), never dropped. The ids in the note are `memory.db` row
+  ids (core entries have one too); the model still edits an entry by `old_text`. Thresholds are
+  `similar::{JACCARD_MIN, CONTAINMENT_MIN}`; a very short entry (< 3 words) is never "similar".
+- **Tier retrieval needs a specific message.** A `project` / `archive` row is attached only when
+  the message has at least 3 search words (stopwords out) and the row shares at least 2 of them
+  (stemmed); BM25 decides the order, not the gate (over a few rows SQLite's idf makes every score
+  ~0; over hundreds any rare word scores high, so "looks good, thanks" pulled in an entry about
+  thanking reviewers). Constants `MIN_TIER_MESSAGE_WORDS` / `MIN_TIER_SHARED_WORDS` in `index.rs`;
+  `a_large_varied_archive_injects_nothing_for_small_talk_or_vague_requests` is the 240-entry check.
+  Hits and recency only reorder matches (at most +1.5 over BM25), so a popular entry can't win a
+  message it doesn't match.
+- **Block text is data.** Entry and skill bodies go through `preinject::sanitize_body`: besides
+  `</context>`, the `<` of the block's own tags (`entry`, `relevant-memory`, `relevant-skills`,
+  `skill`, `context`, opening or closing, any case) is written `&lt;`, so an archive entry can't
+  close its element and forge a `tier="core"` one. Other angle brackets (`Vec<T>`) are kept.
+- **Hits are counted outside the query's time limit** (`preinject::retrieve` spawns the
+  `record_hits` call): a due batch waiting up to 5 s on a `memory.db` another process is writing
+  must not cost the turn its block.
+- **Hygiene proposes, the user decides.** The curator's memory pass (`memory_hygiene.rs`, zero
+  requests, **only when `budget.memory_preload` > 0**, i.e. `requests`: under `balanced` / `tokens`
+  nothing retrieves the archive, so a demotion would make the agent forget, and nothing records
+  the hits that mark an entry as used) stages `demote` items for `core` entries not confirmed or hit for 60
+  days, at most 5 a run, oldest first. Pin an entry by adding the same text again with the tag
+  `pinned` (a patch needs a change). A row proposed is not proposed again for 30 days, so a
+  rejection sticks. Entries over 1000 characters (the archive's cap) are never proposed. A new
+  entry counts from the day it was made, so nothing is proposed in the first 60 days of a store.
+  Applying (`demote_core`) copies to the archive first and then removes from core: a failure
+  between the two leaves a copy in both, never a loss.
+- **`supersedes` is a replace.** A review `add` with `supersedes: id` names a live `core` entry of
+  the same file (an archive row, the other file's entry or a removed one is refused); it is held
+  for the user like any replace (a background review never changes the user's entries
+  unattended). The ids come from the packet (`<entry id="...">`).
+- **The Star map**: only `core` cards are nodes (the page can only edit those); their `skill:` /
+  `memory:` links are edges. The archive is an additive list the page ignores; **project memory is
+  never in the map** (no working folder to scope it by). A link whose end is gone is listed with
+  `resolved: false` and drawn nowhere.

@@ -227,7 +227,7 @@ pub fn review_message(memory: bool, skills: bool, focus: Option<&str>) -> String
 
 /// What the evidence review returns, as the JSON-in-text contract states it.
 const EVIDENCE_REVIEW_SHAPE: &str = "{\"memory\": [{\"op\": \"add|replace|remove\", \"target\": \
-\"memory|user\", \"old\": \"...\", \"text\": \"...\", \"why\": \"...\"}], \"skills\": [{\"op\": \
+\"memory|user\", \"old\": \"...\", \"text\": \"...\", \"why\": \"...\", \"supersedes\": \"entry id or null\"}], \"skills\": [{\"op\": \
 \"create|patch|none\", \"name\": \"...\", \"patch\": \"...\", \"scope\": \"global|project\", \"why\": \"...\"}]}";
 
 /// The evidence review's system prompt. `memory` / `user`: whether MEMORY.md / USER.md take
@@ -273,7 +273,10 @@ expectations about how the agent should behave.\n  \
 paths and endpoints that matter.\n\
 One fact goes to ONE store. Entries are short, self-contained sentences. Don't add what an entry \
 already says: replace that entry instead. Operations:\n  \
-• add: `text` is the new entry; `old` is null.\n  \
+• add: `text` is the new entry; `old` is null. When the new text contradicts ONE current \
+entry (the user changed their mind; a fact is no longer true), set `supersedes` to that entry's id \
+(the `id` attribute of its <entry> in the packet) so the new entry takes its place; otherwise \
+`supersedes` is null.\n  \
 • replace: `old` is a short substring that occurs in exactly one current entry; `text` is the \
 complete new entry that takes its place.\n  \
 • remove: `old` selects the entry as for replace; `text` is null. Only for an entry the evidence \

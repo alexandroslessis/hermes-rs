@@ -475,6 +475,10 @@ impl MemoryStore {
                         (entries, message, extra, leaving, metas)
                     }
                 };
+                let mut extra = extra;
+                let message = crate::store::decorate(message, &mut extra, &|text| {
+                    before.iter().find(|r| r.text == text).map(|r| r.id)
+                });
                 let supersedes: Vec<(String, String)> = match leaving {
                     Leaving::Mark(pairs) => pairs,
                     Leaving::Purge => Vec::new(),
@@ -526,6 +530,9 @@ impl MemoryStore {
                             if tags != row.tags || links != row.links {
                                 db::set_row_meta(&tx, row.id, &tags, &links)?;
                             }
+                            if meta.is_some_and(|m| m.confirm) {
+                                db::confirm_row(&tx, row.id, now)?;
+                            }
                             kept.push(row.id);
                             row.id
                         }
@@ -556,6 +563,7 @@ impl MemoryStore {
                         .map(|index| ids[index]);
                     db::mark_removed(&tx, row.id, now, "store", successor)?;
                 }
+                db::bump_generation(&tx)?;
                 let own: usize = next.join(ENTRY_DELIMITER).chars().count();
                 let usage = match tier {
                     Tier::Project => {
@@ -707,6 +715,7 @@ impl MemoryStore {
                 return Ok(false);
             };
             let slugs = db::purge_entry(&tx, target.kind(), row.id).map_err(failed)?;
+            db::bump_generation(&tx).map_err(failed)?;
             tx.commit().map_err(failed)?;
             db.checkpoint();
             slugs
