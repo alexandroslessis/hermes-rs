@@ -341,6 +341,10 @@ pub fn summarize_tool_result(
                 str_arg(args, "language")
             )
         }
+        "read_file" if args.get("paths").is_some_and(Value::is_array) => format!(
+            "[read_file] read {} files ({len} chars){failed}",
+            args["paths"].as_array().map_or(0, Vec::len)
+        ),
         "read_file" => format!(
             "[read_file] read {} from line {} ({len} chars){failed}",
             shown_arg(args, "path", "?"),

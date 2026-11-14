@@ -98,6 +98,28 @@ pub struct Block {
 }
 
 impl Block {
+    /// A block that holds only the first-turn context pack (`context_pack.rs`): no skills, no
+    /// memory. It carries the same note as any block (empty lists), so the page, the session
+    /// search and the compaction cut it off the user's text the same way.
+    pub fn pack_only(pack: &str) -> Block {
+        Block {
+            text: format!("{OPEN}\n{pack}\n{CLOSE}"),
+            skills: Vec::new(),
+            memory: Vec::new(),
+            project_skills: Vec::new(),
+        }
+    }
+
+    /// This block with the context pack at its front (the pack is its first element).
+    pub fn with_pack(mut self, pack: &str) -> Block {
+        match self.text.strip_prefix(&format!("{OPEN}\n")) {
+            Some(rest) => self.text = format!("{OPEN}\n{pack}\n{rest}"),
+            // Not a block this module made: the pack alone is what the message gets.
+            None => return Block::pack_only(pack),
+        }
+        self
+    }
+
     /// The user's message with the block in front of its text, and noted (see [`Self::note`]).
     /// What the user wrote stays available as the `references` note's `typed` text.
     pub fn attach(&self, mut message: Message) -> Message {
@@ -384,8 +406,15 @@ fn sanitize(text: &str) -> String {
 /// tier="core">`, `</relevant-memory>`). Their `<` is written `&lt;` (CP9.3 review).
 const BLOCK_TAGS: [&str; 5] = ["context", "relevant-memory", "relevant-skills", "entry", "skill"];
 
-/// [`sanitize`], and none of the block's own tags can be opened or closed by `text`.
+/// [`sanitize`], and none of the block's own tags (nor the pack's `<repo-context>`) can be opened
+/// or closed by `text`.
 fn sanitize_body(text: &str) -> String {
+    escape_tags(text, &["repo-context"])
+}
+
+/// [`sanitize`], and none of the block's own tags, nor any of `extra`, can be opened or closed by
+/// `text` (the context pack escapes its own element's tags with it).
+pub(crate) fn escape_tags(text: &str, extra: &[&str]) -> String {
     let text = sanitize(text);
     let mut out = String::with_capacity(text.len());
     let mut rest = text.as_str();
@@ -393,7 +422,7 @@ fn sanitize_body(text: &str) -> String {
         out.push_str(&rest[..at]);
         let after = &rest[at + 1..];
         let name = after.strip_prefix('/').unwrap_or(after);
-        let forged = BLOCK_TAGS.iter().any(|tag| {
+        let forged = BLOCK_TAGS.iter().chain(extra).any(|tag| {
             name.get(..tag.len()).is_some_and(|head| head.eq_ignore_ascii_case(tag))
                 && !name[tag.len()..]
                     .chars()

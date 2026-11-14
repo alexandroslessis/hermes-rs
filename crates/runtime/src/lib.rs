@@ -5,6 +5,7 @@ pub mod budget;
 pub mod changes;
 mod commands;
 pub mod compress;
+pub mod context_pack;
 mod curator;
 mod delegate;
 mod guards;
@@ -1275,11 +1276,34 @@ impl Runtime {
         // query blocks (SQLite), so a message that gets one is added in the turn's task, like
         // the ones with `@url:` references or images below. Not for a scripted first step (the
         // prelude is added by the synchronous path) nor for the prompts a slash command writes.
+        let retrieve =
+            (budget.skills_preload > 0 || budget.memory_preload > 0) && self.index.is_some();
+        // The first message of a session in a git repository also carries a repository overview
+        // (Phase 10, `context_pack.rs`): once, while the conversation has no user message yet, so
+        // a resumed session or a later message gets none (the stored block is replayed).
+        let pack_target: Option<(PathBuf, PathBuf)> = if budget.context_pack
+            && text.is_some_and(preinject::eligible)
+            && prelude.is_none()
+            && !open
+                .conversation
+                .lock()
+                .messages()
+                .iter()
+                .any(|m| m.role == rmcp::model::Role::User)
+        {
+            let cwd = PathBuf::from(open.record.lock().cwd.clone());
+            open.tools
+                .project_root()
+                .or_else(|| hermes_tools::project_skills::find_root(&cwd))
+                .map(|root| (root, cwd))
+        } else {
+            None
+        };
         let inject = text.is_some_and(preinject::eligible)
             && prelude.is_none()
-            && (budget.skills_preload > 0 || budget.memory_preload > 0)
-            && self.index.is_some();
-        let index_for_turn = self.index.clone().filter(|_| inject);
+            && (retrieve || pack_target.is_some());
+        let index_for_turn = self.index.clone().filter(|_| inject && retrieve);
+        let pack_cache = self.config.data_dir.join("cache").join("context-pack");
         // A message with `@url:` references or images is added once its pages are fetched and
         // its images prepared, in the turn's task (that can take seconds).
         let deferred = text
@@ -1452,6 +1476,23 @@ impl Runtime {
                         block
                     }
                     None => None,
+                };
+                // The repository overview goes in front of whatever the index attached (or
+                // alone). Collected off the async workers, bounded in time; no pack when it
+                // fails. Not tainting (see `context_pack.rs`).
+                let block = match pack_target {
+                    Some((root, cwd)) if built.is_ok() && !turn_cancel.is_cancelled() => {
+                        let pack = tokio::select! {
+                            pack = context_pack::build(root, cwd, Some(pack_cache), context_pack::Git::system()) => pack,
+                            _ = turn_cancel.cancelled() => None,
+                        };
+                        match (pack, block) {
+                            (Some(pack), Some(block)) => Some(block.with_pack(&pack)),
+                            (Some(pack), None) => Some(preinject::Block::pack_only(&pack)),
+                            (None, block) => block,
+                        }
+                    }
+                    _ => block,
                 };
                 let added = built
                     .map(|user| match &block {

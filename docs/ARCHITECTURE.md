@@ -265,6 +265,21 @@ that hides it from the model, frees it again), and how `preinject::strip` / `use
 page, `/undo`, rewind, the `/review` briefing and the compaction summarizer only what the user
 typed (session search's rows: `hermes_store::without_attached_context`, the same cut).
 
+**First-turn context pack** (Phase 10 CP10.2, `runtime/src/context_pack.rs`): under `requests`
+(`budget.context_pack`; `balanced` and `tokens` off) the first user message of a session whose folder is
+inside a git repository (`project_skills::find_root`, a worktree counts) gets a `<repo-context>` element
+at the front of its `<context>` block (`Block::with_pack`, or a block of its own): branch, the last 5
+commit subjects, `git status --short`, the project file names, the README head and a depth-3
+`.gitignore`-aware tree, at most 14,000 characters. Collected in the turn's task (`spawn_blocking`, 12 s
+overall, every `git` call 4 s with `core.fsmonitor` and `.gitattributes` filters off and no inherited `GIT_*`
+variables, output capped; a failure leaves a part out), cached
+per repository + HEAD + a fingerprint of the status text in `<data>/cache/context-pack/` (32 files at
+most), stored with the message (resume and rewind replay it; the page, `/undo` and session search see only
+what was typed, through the `preinject` note), never in the system prompt, once per session (a session that
+already has a user message gets none). Repository text is untrusted: tags escaped, a README past the
+context-file threat scan; it does not taint (PITFALLS "The first-turn context pack").
+`read_file` also takes `paths` (up to 20 files, one entry each) and `search_files` `group_by_file`.
+
 Data folder (`%APPDATA%\hermes-rs`, or `HERMES_RS_HOME`):
 
 | Path | Owner |

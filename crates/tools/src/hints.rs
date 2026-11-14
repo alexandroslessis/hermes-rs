@@ -199,6 +199,16 @@ impl HintTracker {
                 self.add_candidate(path, shell_cwd, &mut candidates);
             }
         }
+        // `read_file` with `paths` (Phase 10): each file, as a single read of it would.
+        if tool == "read_file"
+            && let Some(paths) = args.get("paths").and_then(Value::as_array)
+        {
+            for path in paths.iter().filter_map(Value::as_str).take(20) {
+                if !path.trim().is_empty() {
+                    self.add_candidate(path, shell_cwd, &mut candidates);
+                }
+            }
+        }
         if tool == "terminal"
             && let Some(command) = args.get("command").and_then(Value::as_str)
         {
@@ -341,6 +351,12 @@ mod tests {
         assert!(hint.contains("[Subdirectory context discovered: app/AGENTS.md]\napp rules"));
         assert!(!hint.contains("root rules"));
         assert!(tracker.check("read_file", &args, dir.path()).is_none());
+        // A multi-path read finds the same hints (once).
+        let mut tracker = HintTracker::new(dir.path(), home.path());
+        let args = json!({"paths": ["README.md", "app/src/main.rs"]});
+        let hint = tracker.check("read_file", &args, dir.path()).unwrap();
+        assert!(hint.contains("app rules"), "{hint}");
+        assert!(tracker.check("read_file", &json!({"path": "app/src/main.rs"}), dir.path()).is_none());
     }
 
     #[test]

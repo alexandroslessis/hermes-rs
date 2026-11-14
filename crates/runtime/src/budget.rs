@@ -194,6 +194,9 @@ pub struct BudgetKnobs {
     pub skills_preload: u32,
     /// Memory entries attached the same way (top k), 0 = none.
     pub memory_preload: u32,
+    /// The first user message of a session inside a git repository carries a repository overview
+    /// (file tree, project docs, git state) in its `<context>` block (Phase 10, `context_pack.rs`).
+    pub context_pack: bool,
     pub titles: TitleMode,
     pub tool_schemas: ToolSchemas,
 }
@@ -234,6 +237,7 @@ impl BudgetKnobs {
         skills_index: SkillsIndex::Full,
         skills_preload: 0,
         memory_preload: 0,
+        context_pack: false,
         titles: TitleMode::Model,
         tool_schemas: ToolSchemas::All,
     };
@@ -289,6 +293,8 @@ pub fn for_profile(profile: BudgetProfile) -> BudgetKnobs {
             skills_index: SkillsIndex::CategoriesAndRetrieval,
             skills_preload: 3,
             memory_preload: 3,
+            // Phase 10: the first message of a session in a repository carries its overview.
+            context_pack: true,
             // Phase 4: titles from the first message, no request.
             titles: TitleMode::Heuristic,
             tool_schemas: balanced.tool_schemas,
@@ -312,9 +318,10 @@ pub fn for_profile(profile: BudgetProfile) -> BudgetKnobs {
 
 /// What `budget.*` in the config can set: the profile, and each of these numbers on top of it
 /// (`budget.max_iterations: 100`). Names are the knob's field names.
-pub const OVERRIDE_KEYS: [&str; 22] = [
+pub const OVERRIDE_KEYS: [&str; 23] = [
     "skills_preload",
     "memory_preload",
+    "context_pack",
     "max_iterations",
     "empty_response_retries",
     "length_continuations",
@@ -426,6 +433,13 @@ pub fn apply_override(
         // 0 switches the injection off (balanced's value): a valid choice.
         "skills_preload" => knobs.skills_preload = count(key, value, 0, 10)? as u32,
         "memory_preload" => knobs.memory_preload = count(key, value, 0, 20)? as u32,
+        // true / false; "" is the Settings select's "the profile's own" (no override).
+        "context_pack" if value.as_str().is_some_and(|v| v.trim().is_empty()) => {}
+        "context_pack" => {
+            knobs.context_pack = value
+                .as_bool()
+                .ok_or_else(|| "budget.context_pack must be true or false".to_string())?
+        }
         _ => return Err(format!("budget.{key} is not a budget setting")),
     }
     Ok(())
@@ -496,6 +510,7 @@ mod tests {
         assert_eq!(k.skills_index, SkillsIndex::Full);
         assert_eq!(k.skills_preload, 0);
         assert_eq!(k.memory_preload, 0);
+        assert!(!k.context_pack); // Phase 10: not in today's behaviour
         assert_eq!(k.titles, TitleMode::Model);
         assert_eq!(k.tool_schemas, ToolSchemas::All);
     }
@@ -561,6 +576,9 @@ mod tests {
         // Phase 5: categories in the prompt, the top 3 skills and memory entries on the message.
         assert_eq!(r.skills_index, SkillsIndex::CategoriesAndRetrieval);
         assert_eq!((r.skills_preload, r.memory_preload), (3, 3));
+        // Phase 10: the first message of a session in a repository carries its overview.
+        assert!(r.context_pack);
+        assert!(!for_profile(BudgetProfile::Tokens).context_pack);
         // Phase 7: the evidence review at idle.
         assert_eq!(r.review_mode, ReviewMode::IdleOnce);
         // Phase 8: the curator asks once per cluster or repair, 3 a run at most.
@@ -600,6 +618,25 @@ mod tests {
         assert_eq!((knobs.skills_preload, knobs.memory_preload), (0, 5));
         let knobs = from_config(&json!({"profile": "balanced", "skills_preload": 2}));
         assert_eq!(knobs.skills_preload, 2);
+    }
+
+    #[test]
+    fn the_context_pack_knob_is_a_validated_boolean_that_overrides_the_profile() {
+        use serde_json::json;
+        assert!(check_config_value("context_pack", &json!(true)).is_ok());
+        assert!(check_config_value("context_pack", &json!(false)).is_ok());
+        assert!(check_config_value("context_pack", &json!("")).is_ok());
+        assert!(check_config_value("context_pack", &json!(null)).is_ok());
+        for bad in [json!(1), json!("yes"), json!(0.5), json!([true])] {
+            assert!(check_config_value("context_pack", &bad).is_err(), "{bad}");
+        }
+        assert!(!from_config(&json!({"profile": "requests", "context_pack": false})).context_pack);
+        assert!(from_config(&json!({"profile": "balanced", "context_pack": true})).context_pack);
+        assert!(from_config(&json!({"profile": "tokens", "context_pack": true})).context_pack);
+        // A bad value in a hand-edited file leaves the profile's.
+        assert!(from_config(&json!({"profile": "requests", "context_pack": "yes"})).context_pack);
+        assert!(!from_config(&json!({"profile": "balanced", "context_pack": 1})).context_pack);
+        assert!(from_config(&json!({"profile": "requests", "context_pack": ""})).context_pack);
     }
 
     #[test]

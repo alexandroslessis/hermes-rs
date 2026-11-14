@@ -484,8 +484,28 @@ impl SessionTools {
                     "content",
                     redact::Source::File { secret_file },
                 );
+                // `paths`: one entry per file, masked by that file's own name.
+                if let Some(Value::Array(files)) = output.value.get_mut("files") {
+                    for entry in files {
+                        let secret_file = entry
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .is_some_and(|p| redact::is_secret_file(Path::new(p)));
+                        redact_field(entry, "content", redact::Source::File { secret_file });
+                    }
+                }
             }
             "search_files" => {
+                // `group_by_file`: one text per file.
+                if let Some(Value::Array(groups)) = output.value.get_mut("groups") {
+                    for entry in groups {
+                        let secret_file = entry
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .is_some_and(|p| redact::is_secret_file(Path::new(p)));
+                        redact_field(entry, "text", redact::Source::File { secret_file });
+                    }
+                }
                 if let Some(Value::Array(matches)) = output.value.get_mut("matches") {
                     for entry in matches {
                         let secret_file = entry
@@ -630,6 +650,8 @@ impl SessionTools {
                 }
                 return;
             }
+            // `paths`: `files::read_files` taints the files it read (a failed one is not read).
+            "read_file" if args.get("paths").is_some_and(|paths| !paths.is_null()) => return,
             // `search_files` without a path searches the working folder.
             "read_file" | "search_files" => args.get("path").and_then(Value::as_str).unwrap_or("."),
             // A local image (a web one was handled above; a `data:` URL is the model's own).
@@ -654,6 +676,23 @@ impl SessionTools {
             self.mark_tainted(taint::outside_file_source(&self.shown(&resolved)))
                 .await;
         }
+    }
+}
+
+impl SessionTools {
+    /// Whether a file the session just read lies outside its working folder (the taint rule for
+    /// reads, `taint_after_call`); the path policy decides, off the async workers.
+    pub(crate) async fn read_outside(&self, resolved: PathBuf) -> bool {
+        let ctx = path_policy::PolicyContext::new(
+            self.cwd(),
+            self.scratch_dir.clone(),
+            self.data_dir.clone(),
+            self.home.clone(),
+        );
+        tokio::task::spawn_blocking(move || path_policy::classify(&resolved, &ctx))
+            .await
+            .ok()
+            == Some(path_policy::PathClass::Outside)
     }
 }
 

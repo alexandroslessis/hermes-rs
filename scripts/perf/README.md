@@ -92,6 +92,13 @@ bundled skill covers reaches the model with the skill body in a `<context>` bloc
 `session.resume`, the rewind box and the sidebar's search (`/api/sessions/search`) see only what was typed, the same skill is pointed at (not repeated) on the next message,
 "hello" gets no block, the system prompt lists categories and is the same bytes on every request, `balanced` sends the message
 as typed with the full skills list.
+`context-pack-check.mjs` checks the first-turn context pack and the batching wording (Phase 10 CP10.2) with its own provider on :47900
+and temp folders (a git repository, a plain folder): under `requests` the first message of a session in the repository reaches the model
+with a `<repo-context>` element (branch, commits, status, README head, tree) in its `<context>` block and costs one request, the system
+prompt has none of it, `session.resume`, the rewind box and session search show only what was typed, the second message gets none and the
+first is replayed byte for byte, a second session on the same HEAD gets the same pack, a hostile README cannot close the block, a plain
+folder / `balanced` / `budget.context_pack` false get none (and `balanced` with the knob true gets one), a bad value is refused, and each
+profile's frozen prompt has the parallel-calls line (the todo wording only under `requests`).
 `path-policy-check.mjs` checks the file tools' path policy (a model asking to write into the app's data, skills
  and memories folders is refused, naming the right tool, and nothing is written) with its own provider
  on :47900.

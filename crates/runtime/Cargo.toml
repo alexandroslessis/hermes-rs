@@ -22,6 +22,7 @@ hermes_memory.workspace = true
 hermes_prompts.workspace = true
 hermes_store.workspace = true
 hermes_tools.workspace = true
+ignore.workspace = true
 parking_lot.workspace = true
 # `signals.rs` matches words (`\b`, case-insensitive letters), which needs the Unicode tables.
 regex = { workspace = true, features = ["unicode"] }

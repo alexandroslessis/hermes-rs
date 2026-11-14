@@ -68,6 +68,14 @@ pub fn title(name: &str, args: &Value) -> String {
                 clip(&format!("Run {language} script: {first}"), 80)
             }
         }
+        "read_file" if args.get("paths").is_some_and(Value::is_array) => {
+            let names: Vec<&str> = args["paths"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            match names.as_slice() {
+                [] => "Read files".to_string(),
+                [one] => clip(&format!("Read {one}"), 80),
+                [first, rest @ ..] => clip(&format!("Read {first} and {} more", rest.len()), 80),
+            }
+        }
         "read_file" => {
             let from = args.get("offset").and_then(Value::as_u64);
             let count = args.get("limit").and_then(Value::as_u64);
@@ -158,6 +166,16 @@ pub fn absolute(path: &str, cwd: &str) -> String {
 
 /// The file a call names, as `ToolCallLocation`s (with the line a read starts at).
 pub fn locations(args: &Value, cwd: &str) -> Vec<Value> {
+    // `read_file` with `paths` (Phase 10): one location per file.
+    if let Some(paths) = args.get("paths").and_then(Value::as_array) {
+        let mut out: Vec<Value> = std::iter::once(text_arg(args, &["path"]))
+            .chain(paths.iter().filter_map(Value::as_str))
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| json!({"path": absolute(p, cwd)}))
+            .collect();
+        out.dedup();
+        return out;
+    }
     let path = text_arg(args, &["path", "file_path", "file"]);
     if path.is_empty() {
         return Vec::new();
@@ -518,6 +536,14 @@ mod tests {
             vec![json!({"path": "C:\\x\\b.rs", "line": 7})]
         );
         assert!(locations(&json!({"command": "ls"}), cwd).is_empty());
+        // `read_file` with `paths`: one location each.
+        assert_eq!(
+            locations(&json!({"paths": ["src/a.rs", "C:/x/b.rs", " "]}), cwd),
+            vec![
+                json!({"path": "C:\\Users\\a\\proj\\src\\a.rs"}),
+                json!({"path": "C:\\x\\b.rs"})
+            ]
+        );
     }
 
     #[test]

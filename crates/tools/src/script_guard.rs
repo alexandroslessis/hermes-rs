@@ -81,6 +81,7 @@ pub struct Analysis {
 
 impl Analysis {
     /// Whether anything makes the script ask in the modes that only ask about flagged commands.
+    #[cfg(test)]
     pub fn flagged(&self) -> bool {
         !self.dangerous.is_empty() || !self.dynamic.is_empty() || !self.persistence.is_empty()
     }

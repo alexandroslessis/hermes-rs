@@ -1026,7 +1026,115 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   is unchanged, it only names the tools it needs). It is
   offered where `terminal` is: it belongs to the `terminal` toolset, so switching that toolset off
   removes `run_script` too; subagents get it like `terminal`; the background review and the curator
-  are whitelisted and never see it. Prompt guidance about batching with it is CP10.2.
+  are whitelisted and never see it. The batching guidance that names it is in the next section (CP10.2).
 - **Failure bookkeeping treats it like the terminal** (`guards.rs`: a nonzero `exit_code` is a failure,
   a success resets the no-progress counter; `compress.rs` summarises a pruned result as
   `[run_script] ran a <language> script -> exit N, M lines output`).
+
+## The first-turn context pack, batching guidance, multi-path reads (Phase 10 CP10.2)
+
+- **Frozen prompt changes once.** Every new session's system prompt gains one sentence
+  (`BATCHING_GUIDANCE`, after Hermes's parallel-calls text, only when `run_script` is offered), and
+  `requests` sessions gain the todo sentence inside `BUDGET_GUIDANCE_REQUESTS`; the `read_file` and
+  `search_files` schemas change (a `paths` / `group_by_file` property, `path` no longer `required`). A
+  session that already exists keeps its stored prompt, so only the tool schemas (sent every request)
+  change its cached prefix: the first request after the upgrade is a cache miss, as at Phase 3 and
+  CP10.1. Nothing in the new text depends on a number that can change mid-session.
+- **The pack rides on the first user message, nowhere else.** `begin_turn` adds it when the conversation
+  has no user message yet, the budget knob `context_pack` is on (`requests`; `balanced` and `tokens` off;
+  `budget.context_pack` true / false overrides any profile) and the message is not an app-written prompt
+  (`preinject::eligible`). It is stored with the message (the `preinject` note, empty skill and memory
+  lists when nothing else was attached), so a resume, a branch or a rewind that keeps the message replays
+  the same bytes. A rewind to the very start leaves a session with no user message: its next first
+  message gets a fresh pack (identical while the repository state is). A compaction that hides the first
+  message does not bring a second pack. The page's text, `/undo`, session search and the review briefing
+  use `preinject::user_text` / `strip` as for a skill block.
+- **Repository text is untrusted, and the pack does not taint the session.** File names, the README and
+  commit subjects can say anything. Defences: the element's wording calls them data and not an
+  instruction; control, bidi and zero-width characters become `?`; the block's own tags and the
+  element's (`repo-context`, `readme`, `tree`, `changes`, `commits`) are written `&lt;` where repository
+  text has them (`preinject::escape_tags`, applied also over the cache's content, so a hand-edited
+  cache file cannot forge them); the README goes past `scan_context` (the system prompt's
+  project-context scan: an injection phrase makes it a `[BLOCKED ...]` note); it is read as a plain file
+  inside the repository only (no link followed; a link as `README.md` is not read), 8 KB of it at most;
+  the tree does not descend into a symlink or junction. **Decision: no taint** (implementer, confirmed
+  by the CP10.2 review). What taint gates (Phase 6): a flagged command is never smart-approved (always
+  asks in Manual / AcceptEdits / Auto, Yolo warns), an `Outside` write asks, and `memory` /
+  `skill_manage` writes are staged for the user. Tainting on a README head would set all three for
+  practically every session in a repository under the default profile (nearly every repository has a
+  README): self-improvement would be staged always and the taint warning would stop meaning anything.
+  The README is written by the same people as `AGENTS.md` / `CLAUDE.md`, which the system prompt
+  already loads as *instructions* (a stronger channel than a labelled "data, not instructions" block)
+  after the same `scan_context`, without tainting; the pack does not lower that bar. Project skills
+  (Phase 8) taint on delivery for a different reason: a skill is a procedure the model is told to
+  follow, with scripts it may run. The pack also reads nothing the session could not read itself with
+  `read_file` inside its own folder, which never taints either. The **residual risk** is real and
+  shared with `AGENTS.md`: an injection in a hostile repository's first 2,000 README characters or its
+  last 5 commit subjects reaches the model past the threat scan's patterns only; hardline, the path
+  policy and the mode's own approvals (Manual and AcceptEdits ask for flagged commands; Auto asks the
+  judge) still guard what the model then does. Turn the pack off (`budget.context_pack: false`) for
+  repositories you do not trust, as you would not open them with `AGENTS.md` loading either.
+- **Cached per HEAD, bounded.** Key: repository root + HEAD commit + a hash of `git status --short
+  --branch`. The branch line and the status lines are always read fresh; the tree, project-file names,
+  README head and commit subjects come from the cache when the key matches. A commit, a branch change
+  (the status text carries it), an edited or added tracked file or an untracked file at the top of an
+  untracked folder is a new key. A new file *inside* an already-untracked folder does not change the
+  status text, so the cached tree can miss it until the next change; the model has `search_files`. No
+  HEAD (no commit yet), no `git`, or a status that failed or timed out: nothing is cached (every session
+  recomputes the tree and README, a few milliseconds). 32 files at most (the oldest by modified time
+  go), each at most 64 KB, written as a temporary file then renamed; an absent, unreadable, oversized,
+  corrupt or wrong-version file is recomputed and replaced. The folder is `<data>/cache/context-pack/`,
+  safe to delete.
+- **Capped.** `TOTAL_CHARS` is 14,000 (about 3,500 tokens). Per part: 5 commit subjects of 100
+  characters, 25 status lines (1,800 characters), 2,000 README characters, a tree of at most 300 lines /
+  9,000 characters, 40 entries a folder (`... N more`), depth 3, the deepest level that fits (the tree
+  falls back to depth 2 or 1 and says so). The order of cutting when something is too big: the tree's
+  end, then the README's tail; every cut says so (`[... N more lines cut]`). A walk reads at most 20,000
+  entries and 8 s; a huge or flat folder cannot starve the folders after it (each folder is read for its
+  first 40 entries only).
+- **`git` never hangs or runs repository code.** Each call has a 4 s limit (the whole collection 8 s, the
+  turn waits at most 12 s), its output is read up to 256 KB, stdin is closed; when git exits but a
+  program it started still holds the output pipe, the reader is abandoned at the limit, not joined.
+  A repository's own `.git/config` (not brought by a clone, but by a copied folder or an archive) has
+  two routes to make `git status` run a program, both closed and tested with a real config:
+  `core.fsmonitor` (`-c core.fsmonitor=false`) and a `.gitattributes` `filter=<x>` whose
+  `filter.<x>.clean` / `.process` command `status` runs on a file whose stat data changed (verified:
+  plain `git status` ran it). Attributes are read from git's empty tree (`GIT_ATTR_SOURCE`, git 2.42+;
+  an older git ignores the variable and keeps this route open; a SHA-256 repository makes the variable
+  an error and the git parts are left out). Side effect: a stat-dirty file whose content differs from
+  the index only through a filter or `.gitattributes` line-ending rule (a Git LFS file touched since
+  the last `git status`) shows as modified in the pack. Also `--no-optional-locks` (nothing written,
+  so no `post-index-change` hook), no pager, `color.ui=false`, `log --no-show-signature --format=%s` (no
+  `gpg.program`), and every inherited `GIT_*` variable dropped (`GIT_DIR`, `GIT_CONFIG_*`,
+  `GIT_EXTERNAL_DIFF`...). Hooks do not run for `status` / `log` / `rev-parse`; `diff.external` and
+  textconv are for `diff` only; `core.sshCommand` / credential helpers for network commands only;
+  `include.path` only adds config of the same kinds. System and global config are kept (the user's
+  `safe.directory`, `core.autocrlf`): another owner's repository is still refused by git, and the git
+  parts are left out. For comparison, the page's coding rail (`desktop/src/git.rs`, `/api/git/status`)
+  runs a plain `git status` in the same folder when the page shows it. Without `git` on PATH the pack
+  still has the tree and README.
+- **The pack repeats nothing the system prompt has.** `AGENTS.md` / `CLAUDE.md` / `.hermes.md` are
+  already loaded into the system prompt's project context (the first found wins), so the pack lists
+  their names and sizes only and says the prompt carries the first one found. This deviates from the
+  plan's "the head of AGENTS.md/CLAUDE.md/README": a second copy would cost thousands of characters on
+  every first message for nothing.
+- **`read_file` with `paths`.** At most 20 files per call (the rest each answered with an error), 160,000
+  characters of file content in all (one file may use 100,000 of them; once less than 2,000 are left the
+  next file is refused with "ask again"), `offset` / `limit` apply to every file, duplicates are read
+  once, `path` and `paths` together read both. The result is `{files: [...], files_read, files_failed}`;
+  an entry is the single read's result plus its `path`, an error is that entry's own `success: false` /
+  `error` (the call is an error only when every file failed). Secrets are masked per file by its name
+  (`.env`, `*.env`...), the read-before-write record is kept per fully read file, and a file read from
+  outside the working folder taints the session as a single read does, per file *actually read* (inside
+  `files::read_files`, so a background review's own reads, `SIDE_READ`, do not); a file that failed taints
+  nothing. The old single-`path` call has the same bytes as before (a test pins its result, its
+  not-found error and the missing-`path` error). `read_file` results are never spilled to a file
+  (`spill_oversized` exempts it), which is why the total is bounded here.
+- **`search_files` `group_by_file`.** Opt-in, `output_mode` `content` only: `{groups: [{path,
+  match_count, text}], total_count}` with `text` in grep's format (`N:line` for a match, `N-line` for
+  context, `--` between ranges, neighbouring windows merged); `limit`, `offset`, `truncated` and
+  `next_offset` count matches as before and the budget profile's context factor applies. Secrets are
+  masked per group. The default shape is unchanged.
+- **The todo wording** (`requests`): "update the todo list only at phase boundaries" rides in the budget
+  guidance, frozen with the session; the `todo_list` tool is unchanged, so a model that ignores the
+  sentence still works.

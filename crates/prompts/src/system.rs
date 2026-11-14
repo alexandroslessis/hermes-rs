@@ -48,7 +48,7 @@ pub struct SystemPromptInput<'a> {
 
 /// Not in Hermes (it has no budget profiles): what the `requests` profile adds to the system
 /// prompt. No numbers in it: the knobs can change mid-session, the prompt cannot.
-pub const BUDGET_GUIDANCE_REQUESTS: &str = "Budget: the user's model provider limits how many requests you may make per day, not how large they are. Spend context freely and requests sparingly: batch independent tool calls into one step, read whole files and wide search results instead of slices, and load a skill or a memory entry in your first step when it may apply, so a task takes as few round trips as possible. Don't stop to confirm what you can decide yourself.";
+pub const BUDGET_GUIDANCE_REQUESTS: &str = "Budget: the user's model provider limits how many requests you may make per day, not how large they are. Spend context freely and requests sparingly: batch independent tool calls into one step, read whole files and wide search results instead of slices, and load a skill or a memory entry in your first step when it may apply, so a task takes as few round trips as possible. Don't stop to confirm what you can decide yourself. Update the todo list only at phase boundaries (when a phase of the plan is finished or the plan changes), not after every step.";
 
 /// What the `tokens` profile adds to the system prompt (see [`BUDGET_GUIDANCE_REQUESTS`]).
 pub const BUDGET_GUIDANCE_TOKENS: &str = "Budget: the user is limited by tokens, not by requests. Keep the context small: search before reading, read only the lines you need, prefer narrow commands, keep tool output and your answers short, and don't repeat what is already in the conversation. An extra tool call is fine when it keeps the context smaller.";
@@ -103,6 +103,9 @@ fn guidance_parts(input: &SystemPromptInput) -> Vec<Option<String>> {
     }
     parts.push(Some(text::TASK_COMPLETION_GUIDANCE.to_string()));
     parts.push(Some(text::PARALLEL_TOOL_CALL_GUIDANCE.to_string()));
+    if input.tool_names.contains(&"run_script") {
+        parts.push(Some(text::BATCHING_GUIDANCE.to_string()));
+    }
     parts.push(tool_guidance_block(input.tool_names));
     parts.push(Some(text::STEER_CHANNEL_NOTE.to_string()));
     if model_matches(input.model, text::TOOL_USE_ENFORCEMENT_MODELS) {
@@ -464,6 +467,32 @@ mod tests {
         assert_eq!(with.context, plain.context);
         assert_eq!(with.volatile, plain.volatile);
         assert!(BUDGET_GUIDANCE_REQUESTS != BUDGET_GUIDANCE_TOKENS);
+    }
+
+    #[test]
+    fn batching_guidance_is_in_every_profile_and_todo_guidance_only_in_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ["terminal", "run_script", "read_file", "todo_list"];
+        for guidance in [None, Some(BUDGET_GUIDANCE_REQUESTS), Some(BUDGET_GUIDANCE_TOKENS)] {
+            let mut i = input(dir.path(), "anthropic/claude", &tools);
+            i.budget_guidance = guidance;
+            let stable = build_system_prompt(&i).stable;
+            assert!(stable.contains(text::BATCHING_GUIDANCE), "{guidance:?}");
+            assert!(stable.contains("`run_script`") && stable.contains("parallel tool calls"));
+            assert_eq!(
+                stable.contains("todo list only at phase boundaries"),
+                guidance == Some(BUDGET_GUIDANCE_REQUESTS)
+            );
+        }
+        // Without the script tool the line is not there (it would name a tool that isn't offered).
+        let without = build_system_prompt(&input(dir.path(), "anthropic/claude", &["terminal"]));
+        assert!(!without.stable.contains(text::BATCHING_GUIDANCE));
+        // It sits right after Hermes's parallel-calls text, in the stable tier.
+        let stable = build_system_prompt(&input(dir.path(), "anthropic/claude", &tools)).stable;
+        assert!(
+            stable.find(text::PARALLEL_TOOL_CALL_GUIDANCE.trim()).unwrap()
+                < stable.find(text::BATCHING_GUIDANCE).unwrap()
+        );
     }
 
     #[test]

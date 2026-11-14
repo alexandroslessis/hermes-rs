@@ -49,7 +49,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 7 | Review rewrite: signals, evidence packet, one shot — ✅ 2026-11-13 | M–L | 5, 6 | **Opus** | C |
 | 8 | Skills v2: outcomes, provenance, project skills, curator v2 — ✅ 2026-11-13 | M–L | 7 | Sonnet | B |
 | 9 | Memory v2: tiers, structured entries, links — ✅ 2026-11-13 | L | 5, 7 | Sonnet (CP9.1 **Opus**) | B |
-| 10 | Fewer round trips: script tool, first-turn context, batching | M | 3 | Sonnet | A |
+| 10 | Fewer round trips: script tool, first-turn context, batching — ✅ 2026-11-14 | M | 3 | Sonnet | A |
 | 11 | Token mode: deferred tool schemas | S–M | 3 | Sonnet | A |
 | 12 | Provider fallback chain | M | 2 | Sonnet | A |
 | 13a/c/f | Perf: `Arc<Message>`, `spawn_blocking`, typed dispatch | M | 0 | Sonnet | filler |
@@ -771,6 +771,20 @@ in repo A → it appears in A's sessions, not in B's.
 for `run_script` (a script containing `Remove-Item -Recurse C:\` asks).
 **User checklist:** ask for a repo overview → answered in 1–2 calls.
 
+**Done 2026-11-14** ([progress](progress/phase-10.md)). Built as planned, with these notes for later
+phases:
+- `run_script` belongs to the `terminal` toolset; it asks as a whole script, a dynamic construct
+  always asks and is never smart-approved or remembered (PITFALLS "run_script").
+- The context pack quotes the README head only; `AGENTS.md` / `CLAUDE.md` are named with their
+  sizes (the system prompt already carries the first one found). It is cached per repository +
+  HEAD + a status fingerprint in `<data>/cache/context-pack/` (not in a session's scratch, which
+  goes with the session), and does **not** taint the session (reasoning in PITFALLS "The first-turn
+  context pack"). It is unconditional on the first message (also for a "hi"): about 3,500 tokens
+  at most, once, cached after the first request. `budget.context_pack` has no Settings switch.
+- `read_file` with `paths` returns `{files, files_read, files_failed}` (no top-level `content`):
+  a later phase that reads `read_file` results (hints, delegation summaries, renderers) must handle
+  both shapes.
+
 ---
 
 ## Phase 11 — Token mode: deferred tool schemas
@@ -984,13 +998,13 @@ phase under `requests`.
 
 | Scenario | Baseline | After 3 | After 5 | After 7 | After 10 |
 |---|---|---|---|---|---|
-| S1 read 3, edit 1 | 5 | 5 | 5 | 5 | |
-| S2 empty reply after tools | 3 | 3 | 3 | 3 | |
-| S2b empty first reply | 2 | 2 | 2 | 2 | |
-| S3 truncated call | 3 | 3 | 3 | 3 | |
-| S4 ten turns (incl. review) | 11 | 11 | 11 | 10 (0 review) | |
-| S5 delegate two | 4 | 4 | 4 | 4 | |
-| S6 task a skill covers (CP5.2) | 2 (`skill_view`) | 2 | 1 | 1 | |
+| S1 read 3, edit 1 | 5 | 5 | 5 | 5 | 5 (a model that batches: 2 with one `run_script`, 3 with `paths` or parallel reads) |
+| S2 empty reply after tools | 3 | 3 | 3 | 3 | 3 |
+| S2b empty first reply | 2 | 2 | 2 | 2 | 2 |
+| S3 truncated call | 3 | 3 | 3 | 3 | 3 |
+| S4 ten turns (incl. review) | 11 | 11 | 11 | 10 (0 review) | 10 |
+| S5 delegate two | 4 | 4 | 4 | 4 | 4 |
+| S6 task a skill covers (CP5.2) | 2 (`skill_view`) | 2 | 1 | 1 | 1 |
 
 Phase 0 baselines (2026-11-11, `balanced` = today's behaviour; all counted as `main` until Phase 2
 labels requests). After 3 (`requests`, 2026-11-12): unchanged. Phase 3 only moves caps the
@@ -1040,6 +1054,17 @@ the call, the answer), turn 2 asks about it (1) = 3 under `requests`, `balanced`
 archive search tool, so under the other two the entry is not reached at all); the dedupe note on
 `add` costs 0 (it is in the same tool result); the curator's memory hygiene pass costs 0 (and runs
 under `requests` only).
+
+After 10 (`requests`, 2026-11-14): S1-S6 unchanged as scripted (the mock replays the same calls;
+`baseline_s*` pass under every profile). What a model that batches gets (`turns.rs`, after the
+`Phase 10, CP10.2` banner): S1 in **2** main requests with one `run_script` (reads three files and
+edits one), **3** with one multi-path `read_file` or three parallel reads, then the edit (CP10.1:
+three reads as one script = 2 instead of 4). "Give me an overview of this repository" as the first
+message of a session in a git repository: **1** request, with the branch, commits, status, README
+head and tree already on the message (the first-turn context pack; at most 14,000 characters,
+cached by the prompt after the first request). The counts that need a model to choose the batched
+form are what the mock is scripted to do; the tests assert that the batched calls work and what the
+pack contains, not that a real model will batch.
 
 Since Phase 2 the mock also splits them by purpose (the `x-hermes-rs-purpose` header): S1-S3 are
 all `main`; S4 is 10 `main` + 1 `review`; S5 is 2 `main` + 2 `delegate`. The totals above are

@@ -315,6 +315,20 @@ impl Relay {
                                 }
                                 _ => {}
                             }
+                            // `read_file` with `paths` (Phase 10): each file it names.
+                            if call.name.as_ref() == "read_file" {
+                                for path in args
+                                    .get("paths")
+                                    .and_then(serde_json::Value::as_array)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(serde_json::Value::as_str)
+                                {
+                                    if !self.files_read.iter().any(|seen| seen == path) {
+                                        self.files_read.push(path.to_string());
+                                    }
+                                }
+                            }
                             self.registry.append_tail(
                                 &self.subagent_id,
                                 &format!("\n▸ {}\n", progress_line(&call.name, &args)),

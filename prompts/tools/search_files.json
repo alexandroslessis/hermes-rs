@@ -1,6 +1,6 @@
 {
   "name": "search_files",
-  "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Respects .gitignore and skips hidden and binary files.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls. Discovery order is the fast default; 'modified' sorts newest-first and may scan the full tree.",
+  "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Respects .gitignore and skips hidden and binary files.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts. With group_by_file the matches come back grouped per file (one text per file, matched lines as N:text and context lines as N-text), which is shorter when many matches share files.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls. Discovery order is the fast default; 'modified' sorts newest-first and may scan the full tree.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -49,6 +49,11 @@
         "type": "integer",
         "description": "Number of context lines before and after each match (grep mode only)",
         "default": 0
+      },
+      "group_by_file": {
+        "type": "boolean",
+        "description": "Content search with output_mode=content: group the matches per file, with overlapping context merged (default false: one entry per match).",
+        "default": false
       }
     },
     "required": ["pattern"]

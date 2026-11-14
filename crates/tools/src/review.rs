@@ -190,8 +190,21 @@ impl ReviewTools {
                 let output = crate::files::SIDE_READ
                     .scope((), self.tools.dispatch(name, args, None))
                     .await;
-                if let (false, Some(path)) = (output.is_error, path) {
-                    self.mark_read(&path);
+                if let (false, Some(path), None) =
+                    (output.is_error, &path, output.value.get("files"))
+                {
+                    self.mark_read(path);
+                }
+                // `paths` (Phase 10): each file that was read, by the path its entry names.
+                if let Some(Value::Array(files)) = output.value.get("files") {
+                    for entry in files {
+                        if entry.get("success") == Some(&Value::Bool(false)) {
+                            continue;
+                        }
+                        if let Some(read) = entry.get("path").and_then(Value::as_str) {
+                            self.mark_read(Path::new(read));
+                        }
+                    }
                 }
                 output
             }
@@ -368,6 +381,36 @@ mod tests {
                 .starts_with("Refusing background review delete")
         );
         assert!(skills.find("deploy").is_some());
+    }
+
+    /// A multi-path `read_file` (Phase 10) counts for each file it read, as single reads would;
+    /// a file that failed counts for nothing.
+    #[tokio::test]
+    async fn a_multi_path_read_counts_for_each_file_it_read() {
+        let (_dir, review, skills) = review_tools(false);
+        let created = skills.manage_tool(&json!({"operations": [
+            {"action": "create", "name": "deploy", "content": SKILL}
+        ]}));
+        assert_eq!(created["success"], true, "{created}");
+        let skill_md = skills.find("deploy").unwrap().skill_md();
+        let patch = json!({"operations": [
+            {"action": "patch", "name": "deploy", "old_string": "Run the script.", "new_string": "Run the script twice."}
+        ]});
+        let missing = review
+            .dispatch("read_file", json!({"path": "no-such.md", "paths": ["also-missing.md"]}))
+            .await;
+        assert!(missing.is_error);
+        let refused = review.dispatch("skill_manage", patch.clone()).await;
+        assert_eq!(refused.value["_read_before_write_required"], true, "{}", refused.value);
+        let read = review
+            .dispatch(
+                "read_file",
+                json!({"paths": ["no-such.md", skill_md.display().to_string()]}),
+            )
+            .await;
+        assert_eq!(read.value["files_read"], 1, "{}", read.value);
+        let patched = review.dispatch("skill_manage", patch).await;
+        assert_eq!(patched.value["success"], true, "{}", patched.value);
     }
 
     /// A review's `read_file` is its own: it doesn't satisfy the session's read-before-write

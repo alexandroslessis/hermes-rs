@@ -35,6 +35,10 @@ struct SearchArgs {
     output_mode: Option<String>,
     #[serde(default)]
     context: Option<usize>,
+    /// Content search, `content` output: matches grouped per file (Phase 10). Off by default: the
+    /// flat list is the shape since the start.
+    #[serde(default)]
+    group_by_file: Option<bool>,
 }
 
 fn default_target() -> String {
@@ -91,6 +95,7 @@ pub async fn search_files(tools: &SessionTools, args: Value) -> ToolOutput {
     let limit = args.limit.unwrap_or(50).clamp(1, 1000);
     let offset = args.offset.unwrap_or(0);
     let context_factor = tools.limits().search_context_factor.max(1);
+    let group = args.group_by_file.unwrap_or(false);
     let task = tokio::task::spawn_blocking(move || match args.target.as_str() {
         "files" => search_names(
             &root,
@@ -107,6 +112,7 @@ pub async fn search_files(tools: &SessionTools, args: Value) -> ToolOutput {
             args.file_glob.as_deref(),
             args.output_mode.as_deref().unwrap_or("content"),
             args.context.unwrap_or(0).min(10) * context_factor,
+            group,
             offset,
             limit,
         ),
@@ -191,6 +197,7 @@ fn search_content(
     file_glob: Option<&str>,
     output_mode: &str,
     context: usize,
+    group: bool,
     offset: usize,
     limit: usize,
 ) -> ToolOutput {
@@ -204,6 +211,8 @@ fn search_content(
     };
 
     let mut matches = Vec::new();
+    let mut groups = Vec::new();
+    let mut taken = 0usize;
     let mut counts = serde_json::Map::new();
     let mut matched_files = Vec::new();
     let mut total = 0usize;
@@ -220,13 +229,19 @@ fn search_content(
         let text = String::from_utf8_lossy(&bytes);
         let lines: Vec<&str> = text.lines().collect();
         let mut file_count = 0;
+        let mut picked: Vec<usize> = Vec::new();
         for (index, line) in lines.iter().enumerate() {
             if !regex.is_match(line) {
                 continue;
             }
             file_count += 1;
             total += 1;
-            if output_mode == "content" && total > offset && matches.len() < limit {
+            if output_mode == "content" && total > offset && taken < limit {
+                taken += 1;
+                if group {
+                    picked.push(index);
+                    continue;
+                }
                 let mut entry = json!({
                     "path": shown(&path, cwd),
                     "line": index + 1,
@@ -244,6 +259,13 @@ fn search_content(
                 }
                 matches.push(entry);
             }
+        }
+        if !picked.is_empty() {
+            groups.push(json!({
+                "path": shown(&path, cwd),
+                "match_count": picked.len(),
+                "text": grouped_text(&lines, &picked, context, &regex),
+            }));
         }
         if file_count > 0 {
             counts.insert(shown(&path, cwd), json!(file_count));
@@ -268,7 +290,11 @@ fn search_content(
         }
         "count" => json!({"counts": counts, "total_count": total}),
         _ => {
-            let mut result = json!({"matches": matches, "total_count": total});
+            let mut result = if group {
+                json!({"groups": groups, "total_count": total})
+            } else {
+                json!({"matches": matches, "total_count": total})
+            };
             if total > offset + limit {
                 result["truncated"] = json!(true);
                 result["next_offset"] = json!(offset + limit);
@@ -277,6 +303,32 @@ fn search_content(
         }
     };
     ToolOutput::ok(result)
+}
+
+/// One file's matches as grep prints them: `N:text` for a matching line, `N-text` for a context
+/// line, `--` between ranges that do not touch. Windows of neighbouring matches are merged, so a
+/// line is shown once.
+fn grouped_text(lines: &[&str], picked: &[usize], context: usize, regex: &Regex) -> String {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for &index in picked {
+        let start = index.saturating_sub(context);
+        let end = (index + context + 1).min(lines.len());
+        match ranges.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => ranges.push((start, end)),
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (n, (start, end)) in ranges.iter().enumerate() {
+        if n > 0 {
+            out.push("--".to_string());
+        }
+        for line in *start..*end {
+            let mark = if regex.is_match(lines[line]) { ':' } else { '-' };
+            out.push(format!("{}{mark}{}", line + 1, clip(lines[line])));
+        }
+    }
+    out.join("\n")
 }
 
 fn clip(line: &str) -> String {
@@ -340,6 +392,79 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0]["path"], "src/main.rs");
         assert_eq!(matches[0]["line"], 1);
+    }
+
+    #[tokio::test]
+    async fn grouped_search_gives_one_text_per_file_with_merged_context() {
+        let (dir, tools) = tools_in();
+        let body: String = (1..=30).map(|n| format!("row {n}\n")).collect();
+        std::fs::write(dir.path().join("rows.txt"), &body).unwrap();
+        std::fs::write(dir.path().join("other.txt"), "row 1\nrow 2\n").unwrap();
+        let flat = search_files(&tools, json!({"pattern": "row (10|11|25)$", "context": 1})).await;
+        // The default shape is untouched: no `groups`, one entry per match.
+        assert!(flat.value.get("groups").is_none());
+        assert_eq!(flat.value["matches"].as_array().unwrap().len(), 3);
+        let out = search_files(
+            &tools,
+            json!({"pattern": "row (10|11|25)$", "context": 1, "group_by_file": true}),
+        )
+        .await;
+        assert!(out.value.get("matches").is_none());
+        assert_eq!(out.value["total_count"], 3);
+        let groups = out.value["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["path"], "rows.txt");
+        assert_eq!(groups[0]["match_count"], 3);
+        // 10 and 11 share one window (9..12), 25 has its own; matches use `:`, context `-`.
+        assert_eq!(
+            groups[0]["text"],
+            "9-row 9\n10:row 10\n11:row 11\n12-row 12\n--\n24-row 24\n25:row 25\n26-row 26"
+        );
+        // Without context it is only the matching lines; the limit counts matches, `total_count` all.
+        let out = search_files(
+            &tools,
+            json!({"pattern": "row 1$|row 2$", "group_by_file": true, "limit": 2}),
+        )
+        .await;
+        let shown: usize = out.value["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["match_count"].as_u64().unwrap() as usize)
+            .sum();
+        assert_eq!((shown, out.value["total_count"].as_u64()), (2, Some(4)));
+        assert_eq!(out.value["truncated"], true);
+        assert_eq!(out.value["next_offset"], 2);
+        // The budget profile's context factor applies as for the flat shape.
+        tools.set_limits(crate::ToolLimits {
+            search_context_factor: 2,
+            ..Default::default()
+        });
+        let out = search_files(
+            &tools,
+            json!({"pattern": "row 15$", "context": 1, "group_by_file": true}),
+        )
+        .await;
+        assert_eq!(out.value["groups"][0]["text"].as_str().unwrap().lines().count(), 5);
+        // Other modes ignore the flag.
+        let files = search_files(&tools, json!({"pattern": "row", "output_mode": "files_only", "group_by_file": true})).await;
+        assert_eq!(files.value["total_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn grouped_search_masks_secrets_by_file() {
+        let (dir, tools) = tools_in();
+        std::fs::write(dir.path().join("prod.env"), "OPENAI_KEY=sk-abcdefghijklmnop1234\n").unwrap();
+        let out = tools
+            .dispatch(
+                "search_files",
+                json!({"pattern": "OPENAI", "group_by_file": true, "path": "."}),
+                None,
+            )
+            .await;
+        let text = out.value.to_string();
+        assert!(text.contains("prod.env") && text.contains("groups"), "{text}");
+        assert!(!text.contains("sk-abcdefghij"), "{text}");
     }
 
     #[tokio::test]

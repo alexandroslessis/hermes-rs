@@ -104,6 +104,23 @@ Read the existing tests near the area you change before writing a new one; the h
   `tool_result_texts` reads the results back, and `one_run_script_call_does_the_work_of_three_tool_calls`
   holds the request counts (4 main requests with three terminal calls, 2 with one script).
   The tests use PowerShell (always present on Windows); no live check: the page calls nothing new.
+- Context pack, multi-path reads and batching guidance (Phase 10 CP10.2): `crates/runtime/src/context_pack_tests.rs`
+  builds real git repositories in temp folders (skipped when `git` is missing): sections, cache per HEAD +
+  status (a sentinel put into the cache file shows through; a commit or a status change replaces it; corrupt,
+  oversized and wrong-key entries are recomputed; hand-edited entries cannot forge tags), a 6,000-file tree
+  with a 3,000-file folder (size, lines and time bounded), git missing, a process that sleeps or floods
+  (`run_limited`), hostile README / commit subject, links and junctions not followed, empty repository,
+  detached HEAD, a linked worktree, a repository's `core.fsmonitor` and `.gitattributes` clean filter not
+  run (each with a control: plain `git status` runs it), a process that exits leaving a program holding its
+  output pipe, stale temporary cache files swept, the cap under oversized parts.
+  `turns.rs` has a `// ---- Phase 10, CP10.2` banner: the pack in the first message only (not in the system
+  prompt, stored, replayed byte for byte after a reopen and a rewind, not tainting), none outside a
+  repository or under `balanced` / `tokens` / the knob off, in front of the attached skills, cached across
+  sessions, a hostile README, S1 in 2 requests (one script) and 3 (multi-path or parallel reads) against the
+  baseline's 5, taint per path of a multi-path read, the guidance lines in each profile's frozen prompt.
+  Two Phase 8 tests (`a_repositorys_skill_is_attached...`, `a_hostile_project_skill...`) run with
+  `context_pack: false`: their repositories are fixtures and the pack's tree would name the skill folders.
+  Live check: `scripts/perf/context-pack-check.mjs`.
 - Known flaky under heavy load: `an_exhausted_budget_ends_with_a_toolless_summary` (timing).
   Re-run it alone before suspecting your change.
 
