@@ -1597,8 +1597,9 @@ impl Gateway {
         let system = tokens(record.system_prompt.len());
         let messages = self.runtime.messages(id).unwrap_or_default();
         let conversation = tokens(serde_json::to_string(&messages).map_or(0, |json| json.len()));
-        // Every request also carries the tool definitions: the built-in tools and MCP servers'.
-        let (builtin, mcp) = self.runtime.tool_definitions();
+        // Every request also carries the tool definitions: the built-in tools and MCP servers'
+        // (a deferred session's, Phase 11: the ones it actually sends).
+        let (builtin, mcp) = self.runtime.session_tool_definitions(id);
         let json_tokens = |tools: &[Value]| {
             if tools.is_empty() {
                 0

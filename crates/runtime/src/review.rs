@@ -214,8 +214,12 @@ async fn review(job: ReviewJob) -> Result<(Vec<String>, Option<u64>)> {
             .with_text(prompt)
             .with_generated_id_if_missing(),
     );
+    // The review has the whole tool list (`skill_manage` among it): the deferred-tools block of a
+    // `tokens` session's prompt, which says the opposite, is left out (Phase 11).
+    let mut record = session.record.lock().clone();
+    record.system_prompt = hermes_prompts::deferred::strip_block(&record.system_prompt);
     let fork = Arc::new(OpenSession {
-        record: Mutex::new(session.record.lock().clone()),
+        record: Mutex::new(record),
         conversation: Mutex::new(conversation),
         tools: session.tools.clone(),
         running: Mutex::new(None),
@@ -269,6 +273,7 @@ async fn review(job: ReviewJob) -> Result<(Vec<String>, Option<u64>)> {
         Step::Operation(Arc::new(ops::UnhandledToolCalls {
             tool_names,
             disabled: Default::default(),
+            deferred: None,
         })),
         Step::Operation(Arc::new(ops::LengthContinuation::new(state.clone(), &budget))),
         Step::Operation(Arc::new(ops::EmptyResponseRecovery {

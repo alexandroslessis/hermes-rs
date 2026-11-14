@@ -99,6 +99,12 @@ prompt has none of it, `session.resume`, the rewind box and session search show 
 first is replayed byte for byte, a second session on the same HEAD gets the same pack, a hostile README cannot close the block, a plain
 folder / `balanced` / `budget.context_pack` false get none (and `balanced` with the knob true gets one), a bad value is refused, and each
 profile's frozen prompt has the parallel-calls line (the todo wording only under `requests`).
+`deferred-tools-check.mjs` checks the deferred tool schemas (Phase 11 CP11.2) with its own provider on :47900: under `tokens` the request's tool list is the
+core tools plus `tool_search` (under 60% of the full block's bytes), the frozen prompt names the deferred tools and says there is no `skill_manage`, a model that
+calls `tool_search` gets the schema and the loaded tool is in the next request's list after `tool_search` with the old list unchanged before it (three main
+requests: one more than a profile that has the tool from the start), the page sees the `tool_search` call like any tool, a deferred tool called before it was
+loaded is not run and answers with its schema, a session keeps its list when the profile changes, `requests` / `balanced` send all 18 tools byte-identical in
+every request with no `tool_search`, the context breakdown counts fewer tool tokens for the deferred session, and `budget.tool_schemas` overrides the profile (a bad value is refused).
 `path-policy-check.mjs` checks the file tools' path policy (a model asking to write into the app's data, skills
  and memories folders is refused, naming the right tool, and nothing is written) with its own provider
  on :47900.

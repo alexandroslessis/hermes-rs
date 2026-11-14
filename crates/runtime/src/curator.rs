@@ -268,6 +268,7 @@ impl Runtime {
             Step::Operation(Arc::new(ops::UnhandledToolCalls {
                 tool_names,
                 disabled: Default::default(),
+                deferred: None,
             })),
             Step::Operation(Arc::new(ops::LengthContinuation::new(
                 state.clone(),

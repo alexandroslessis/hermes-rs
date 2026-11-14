@@ -13,10 +13,10 @@
 //! from the next *session* (prompt caching, ground rule 8); a compaction or a model switch, which
 //! rebuild the prompt anyway, take the profile the session runs under then.
 //!
-//! A knob whose `requests` or `tokens` value needs a later phase (deferred
-//! tool schemas) holds its `balanced`
-//! value until that phase lands: the enum has the variant, [`for_profile`] says which phase flips
-//! it in a comment, and nothing consumes the later variant yet.
+//! A knob whose `requests` or `tokens` value needs a later phase holds its `balanced` value until
+//! that phase lands: the enum has the variant and [`for_profile`] says which phase flips it. Phase
+//! 11 flipped the last one: `tokens` has `tool_schemas: Deferred` (`deferred.rs`); a session's frozen
+//! prompt records whether its tools are deferred, so a profile change reaches only new sessions.
 
 use serde::{Deserialize, Serialize};
 
@@ -131,8 +131,20 @@ pub enum TitleMode {
 pub enum ToolSchemas {
     /// Every tool's schema (today).
     All,
-    /// Core tools plus a loader for the rest (Phase 11).
+    /// Core tools plus `tool_search`, which loads the rest on demand; the main agent has no
+    /// `skill_manage` (Phase 11, `deferred.rs`). The `tokens` value. It changes the tool list
+    /// mid-session (a cache miss at each load): accepted only where tokens matter most.
     Deferred,
+}
+
+impl ToolSchemas {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "all" => Some(Self::All),
+            "deferred" => Some(Self::Deferred),
+            _ => None,
+        }
+    }
 }
 
 /// Fractions of the context window at which the conversation is compressed.
@@ -199,6 +211,9 @@ pub struct BudgetKnobs {
     pub context_pack: bool,
     pub titles: TitleMode,
     pub tool_schemas: ToolSchemas,
+    /// `tool_schemas` `Deferred`: how many MCP tools (in server-name order) stay in the tool
+    /// list; the rest are deferred like the built-in rarely used ones.
+    pub deferred_mcp_keep: usize,
 }
 
 impl BudgetKnobs {
@@ -240,6 +255,7 @@ impl BudgetKnobs {
         context_pack: false,
         titles: TitleMode::Model,
         tool_schemas: ToolSchemas::All,
+        deferred_mcp_keep: 3,
     };
 
     pub fn for_profile(profile: BudgetProfile) -> Self {
@@ -298,6 +314,7 @@ pub fn for_profile(profile: BudgetProfile) -> BudgetKnobs {
             // Phase 4: titles from the first message, no request.
             titles: TitleMode::Heuristic,
             tool_schemas: balanced.tool_schemas,
+            deferred_mcp_keep: balanced.deferred_mcp_keep,
         },
         BudgetProfile::Tokens => BudgetKnobs {
             profile: BudgetProfile::Tokens,
@@ -307,8 +324,8 @@ pub fn for_profile(profile: BudgetProfile) -> BudgetKnobs {
             },
             result_size_pct: 50,
             skills_index: SkillsIndex::NamesOnly,
-            // Phase 11: ToolSchemas::Deferred.
-            tool_schemas: balanced.tool_schemas,
+            // Phase 11: core tools + tool_search, the rest on demand.
+            tool_schemas: ToolSchemas::Deferred,
             ..balanced
         },
     }
@@ -318,7 +335,9 @@ pub fn for_profile(profile: BudgetProfile) -> BudgetKnobs {
 
 /// What `budget.*` in the config can set: the profile, and each of these numbers on top of it
 /// (`budget.max_iterations: 100`). Names are the knob's field names.
-pub const OVERRIDE_KEYS: [&str; 23] = [
+pub const OVERRIDE_KEYS: [&str; 25] = [
+    "tool_schemas",
+    "deferred_mcp_keep",
     "skills_preload",
     "memory_preload",
     "context_pack",
@@ -433,6 +452,17 @@ pub fn apply_override(
         // 0 switches the injection off (balanced's value): a valid choice.
         "skills_preload" => knobs.skills_preload = count(key, value, 0, 10)? as u32,
         "memory_preload" => knobs.memory_preload = count(key, value, 0, 20)? as u32,
+        // "" is the Settings select's "the profile's own" (no override). Applies from the next
+        // session: a session's frozen prompt says whether its tools are deferred.
+        "tool_schemas" if value.as_str().is_some_and(|v| v.trim().is_empty()) => {}
+        "tool_schemas" => {
+            knobs.tool_schemas = value
+                .as_str()
+                .and_then(ToolSchemas::parse)
+                .ok_or_else(|| "budget.tool_schemas must be all or deferred".to_string())?
+        }
+        // 0 defers every MCP tool; at most 50 (more is the same as `all` for any real server).
+        "deferred_mcp_keep" => knobs.deferred_mcp_keep = count(key, value, 0, 50)? as usize,
         // true / false; "" is the Settings select's "the profile's own" (no override).
         "context_pack" if value.as_str().is_some_and(|v| v.trim().is_empty()) => {}
         "context_pack" => {
@@ -583,9 +613,9 @@ mod tests {
         assert_eq!(r.review_mode, ReviewMode::IdleOnce);
         // Phase 8: the curator asks once per cluster or repair, 3 a run at most.
         assert_eq!((r.curator_mode, r.curator_max_requests), (CuratorMode::PerCluster, 3));
-        // Later phases: still balanced.
+        // Phase 11: only `tokens` defers tools.
         let b = BudgetKnobs::BALANCED;
-        assert_eq!(r.tool_schemas, b.tool_schemas);
+        assert_eq!(r.tool_schemas, ToolSchemas::All);
 
         let t = for_profile(BudgetProfile::Tokens);
         assert_eq!(
@@ -595,6 +625,7 @@ mod tests {
         assert_eq!(t.result_size_pct, 50);
         assert_eq!(t.skills_index, SkillsIndex::NamesOnly);
         assert_eq!((t.skills_preload, t.memory_preload), (0, 0));
+        assert_eq!((t.tool_schemas, t.deferred_mcp_keep), (ToolSchemas::Deferred, 3));
         // Everything else is today's.
         assert_eq!(
             BudgetKnobs {
@@ -602,6 +633,7 @@ mod tests {
                 compress_at: b.compress_at,
                 result_size_pct: 100,
                 skills_index: SkillsIndex::Full,
+                tool_schemas: ToolSchemas::All,
                 ..t
             },
             b
@@ -637,6 +669,36 @@ mod tests {
         assert!(from_config(&json!({"profile": "requests", "context_pack": "yes"})).context_pack);
         assert!(!from_config(&json!({"profile": "balanced", "context_pack": 1})).context_pack);
         assert!(from_config(&json!({"profile": "requests", "context_pack": ""})).context_pack);
+    }
+
+    /// Phase 11: `tool_schemas` (all | deferred, "" = the profile's) and `deferred_mcp_keep`
+    /// (0..=50) are validated; a bad hand-edited value leaves the profile's.
+    #[test]
+    fn the_deferred_tool_knobs_are_validated() {
+        use serde_json::json;
+        for good in [json!("all"), json!("deferred"), json!(" Deferred "), json!(""), json!(null)] {
+            assert!(check_config_value("tool_schemas", &good).is_ok(), "{good}");
+        }
+        for bad in [json!("some"), json!(true), json!(1), json!(["all"])] {
+            assert!(check_config_value("tool_schemas", &bad).is_err(), "{bad}");
+        }
+        assert!(check_config_value("deferred_mcp_keep", &json!(0)).is_ok());
+        assert!(check_config_value("deferred_mcp_keep", &json!(50)).is_ok());
+        assert!(check_config_value("deferred_mcp_keep", &json!(51)).is_err());
+        assert!(check_config_value("deferred_mcp_keep", &json!(-1)).is_err());
+        let config = |extra: serde_json::Value| {
+            let mut value = json!({"profile": "requests"});
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            from_config(&value)
+        };
+        assert_eq!(config(json!({})).tool_schemas, ToolSchemas::All);
+        assert_eq!(config(json!({"tool_schemas": "deferred"})).tool_schemas, ToolSchemas::Deferred);
+        assert_eq!(config(json!({"tool_schemas": "bogus"})).tool_schemas, ToolSchemas::All);
+        assert_eq!(
+            from_config(&json!({"profile": "tokens", "tool_schemas": ""})).tool_schemas,
+            ToolSchemas::Deferred
+        );
+        assert_eq!(config(json!({"deferred_mcp_keep": 7})).deferred_mcp_keep, 7);
     }
 
     #[test]

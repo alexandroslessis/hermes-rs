@@ -1176,3 +1176,75 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   carried it too. Only `skill_view` loads it.
 - **The skill carries the old long text word for word** ("Original description" in each section), so
   nothing was lost; when a Hermes update changes one of the four schemas, merge it there.
+
+## Deferred tool schemas, `tool_search` (Phase 11 CP11.2)
+
+- **This is the one place the tool list changes mid-session, on purpose, and it breaks the prompt
+  cache.** Only in `tokens` (`budget.tool_schemas: deferred`): the request's `tools` are the core tools +
+  `tool_search`; each time the model loads tools, the list grows (loaded tools are appended after
+  `tool_search`, in load order) and the provider's prefix cache is missed from the `tools` array on,
+  once per load. Accepted because the user said tokens matter more than cache hits in this profile and
+  the list is ~12 KB (~3,100 tokens) shorter on every request. The system prompt never changes
+  (frozen). Do not add a second place where a list changes mid-session; do not turn this on for
+  `requests` (its point is the cache: one request per task).
+- **A session is deferred when its frozen system prompt holds a *sealed* `# Deferred tools` block**
+  (`hermes_prompts::deferred::is_deferred_prompt`), nothing else: no per-session flag, no side file. The
+  profile decides it once, when the session's first prompt is built. **A compaction or a model switch
+  keeps the session's kind of list** (`PromptTools::of_session`): they rebuild the prompt with the
+  then-current profile's budget wording, but the block stays in a deferred session and stays out of a
+  plain one (a flip would add or drop ~11 KB of tools under the model; `turns.rs`
+  `a_compaction_or_a_model_switch_keeps_the_kind_of_tool_list`, all three directions).
+- **The seal.** The block's last line is `<!-- End deferred tools <16 hex> -->`, an FNV-1a 64 of the
+  prompt text before the block (`seal`, `find_block`). The block ends the stable tier, which is only the
+  identity and fixed guidance, so a *copy* of the block (a repository's AGENTS.md or docs quoting it, a
+  skill, a memory entry) never counts: it cannot make a `balanced` / `requests` session deferred nor be
+  stripped from the review's prompt. **Never change `fnv64`** or the line's shape: every stored deferred
+  session would turn into a plain one.
+- **The loaded set is a function of the conversation** (`deferred::loaded_in`): every *answered*
+  `tool_search` call (its `names`, at most 8, exact) and every answered direct call to a deferred tool
+  loads that tool. So a restart, a branch and a rewind rebuild the same list with nothing stored (a rewind
+  drops the later loads), and a compaction keeps loads because it hides messages from the model but
+  keeps them in the conversation (a test asserts the `tool_search` call was hidden and the tool is
+  still listed). **Consequence: `tool_search`'s argument handling and `loaded_in` must stay the same
+  function** (`requested_names` + the 8-name rule): change one and an old session's list changes on
+  resume. A call nobody answered (withdrawn, cancelled) loads nothing.
+- **A deferred tool called before it was loaded is not run.** The model has not seen its schema; the
+  answer is an error carrying the schema ("deferred tool ... not run ... call it again"), and the call
+  counts as a load, so the retry costs the same one round trip `tool_search` would have. Auto-running it
+  was rejected: arguments formed without the schema are wrong often enough (a small local model's
+  `delegate_task` or `patch`). It is answered by `UnhandledToolCalls` (the tool operation only runs tools
+  in the list), so `ValidateToolCalls` must keep seeing deferred names as valid (no invalid-name strike,
+  no "does not exist").
+- **Gating still holds.** The wrapper sits *inside* `GuardedTools`: a tool of a switched-off toolset is
+  not listed, not run, and `tool_search` says "turned off" instead of returning its schema; an MCP
+  tool of a server that is not connected is not in the inner list so it is "unknown". A loaded name
+  that is switched off later is filtered at list time; switched on again, it appears with a schema the
+  model never saw (rare; the model can call `tool_search` again, which says "already loaded").
+- **`skill_manage` is absent for the main agent in `tokens`** and for its subagents; the review and
+  the curator keep it (they use `ReviewTools`, whose list is the whole `SessionTools` list: the
+  wrapper is only on the main agent's chain). Everything in the frozen prompt that told the model to
+  call it is rewritten or dropped for these sessions (`PromptTools`, `hermes_prompts::deferred::
+  without_skill_manage` for the skills block, the gated `SKILLS_GUIDANCE` / memory-routing sentence, the
+  `memory` schema's "via skill_manage" clause), and the deferred block says the review saves skills.
+  A test greps the prompt and every core description for `skill_manage`; a new prompt sentence that names
+  the tool must be gated the same way. The review's fork gets the prompt with the block stripped
+  (`strip_block`): its own instructions and tool list say the opposite.
+- **Subagents** of a deferred session do not use `tool_search`: they get the whole small set (everything
+  but `delegate_task`, `clarify`, `memory`, and `skill_manage`) with a plain prompt. They make few
+  requests; the machinery would cost a round trip for tools they often need (web, session search).
+- **Which MCP tools are core is recorded in the block** (`<!-- core MCP tools: a, b, c -->`, the first
+  `budget.deferred_mcp_keep` connected when the session was made, server-name order; default 3: a small
+  server stays whole, a large one's first three are core). Every other MCP tool is deferred, *including
+  the tools of a server that connects later* (MCP servers connect in the background at start-up, so a
+  session made or resumed early can see a server arrive mid-session): they are not named in the block,
+  `tool_search`'s `query` finds them and `names` loads them. So a late server, a reconnect or a changed
+  `deferred_mcp_keep` never moves a tool out of a running session's list (counting "the first N" anew
+  every request did: a server whose name sorts first pushed a core tool out unseen).
+- **Estimates.** The page's context breakdown (`context.breakdown`, `Runtime::context_breakdown`) counts
+  what a deferred session sends (`Runtime::session_tool_definitions`: core + `tool_search` + loaded).
+  `compress::tool_definition_tokens()`, the fixed part of the compression trigger's estimate before the
+  provider has reported usage once, still counts all 18 schemas (~3k tokens high for a deferred session,
+  until the first usage report): conservative, left as is.
+- **`tool_search` is not in `hermes_prompts::tools::tool_names()`**, and `crates/desktop`'s
+  `every_tool_belongs_to_one_toolset` does not know it: it is not a toolset tool (it cannot be switched
+  off). The page and ACP show it as a generic tool call (ACP title "Load tools: ...").

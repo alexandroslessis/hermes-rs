@@ -230,6 +230,7 @@ async fn harness_budget_quiet(replies: Vec<String>) -> Harness {
 fn test_budget(profile: Option<BudgetProfile>) -> BudgetKnobs {
     // `HERMES_TEST_PROFILE=requests|balanced|tokens` runs the whole suite under that profile
     // (a test whose counts depend on a profile's caps names its profile and does not read this).
+    let named = profile.is_some();
     let profile = profile
         .or_else(|| {
             std::env::var("HERMES_TEST_PROFILE")
@@ -237,10 +238,19 @@ fn test_budget(profile: Option<BudgetProfile>) -> BudgetKnobs {
                 .and_then(|name| BudgetProfile::parse(&name))
         })
         .unwrap_or(BudgetProfile::Balanced);
-    BudgetKnobs {
+    let mut knobs = BudgetKnobs {
         max_iterations: 20,
         ..for_profile(profile)
+    };
+    // Phase 11 CP11.2: the suite's tests call every tool directly, which a `tokens` session
+    // (deferred schemas) answers with the schema instead of running. A run under
+    // `HERMES_TEST_PROFILE=tokens` therefore keeps `tokens`' other knobs and the full tool list;
+    // a test that names `Tokens` itself (`harness_profile`) gets the deferred list, and the
+    // CP11.2 tests below cover it.
+    if !named {
+        knobs.tool_schemas = hermes_runtime::budget::ToolSchemas::All;
     }
+    knobs
 }
 
 async fn harness_profile(replies: Vec<String>, profile: BudgetProfile) -> Harness {
@@ -3704,7 +3714,14 @@ async fn s4_ten_turn_session_with_review(profile: BudgetProfile) {
 
 /// S5: the parent delegates two children, then answers.
 async fn s5_delegate_two_children(profile: BudgetProfile) {
-    let h = harness_profile(vec![
+    // `tokens` defers `delegate_task` (Phase 11 CP11.2): the parent loads it first, one more
+    // request; everything else is the same.
+    let deferred = profile == BudgetProfile::Tokens;
+    let mut replies = Vec::new();
+    if deferred {
+        replies.push(search_call("s0", &["delegate_task"]));
+    }
+    replies.extend([
         tool_reply(&[(
             "d1",
             "delegate_task",
@@ -3713,15 +3730,16 @@ async fn s5_delegate_two_children(profile: BudgetProfile) {
         text_reply("- 3 files"),
         text_reply("- 1 file"),
         text_reply("Both children reported."),
-    ], profile)
-    .await;
+    ]);
+    let h = harness_profile(replies, profile).await;
     let session = session_in(&h);
     let events = run_turn(&h, &session, "delegate two counts").await;
     assert_eq!(finished_status(&events), TurnStatus::Completed);
     // The parent's two requests and one per child.
-    assert_requests(&h, Purpose::Main, 2..=2);
+    let extra = usize::from(deferred);
+    assert_requests(&h, Purpose::Main, 2 + extra..=2 + extra);
     assert_requests(&h, Purpose::Delegate, 2..=2);
-    assert_eq!(h.requests.lock().len(), 4);
+    assert_eq!(h.requests.lock().len(), 4 + extra);
 }
 
 #[tokio::test]
@@ -9105,10 +9123,13 @@ async fn the_long_tool_schemas_are_short_in_every_profile() {
         let tools = requests[0]["tools"].as_array().unwrap();
         let mut four = 0;
         for name in ["skill_manage", "session_search", "memory", "delegate_task"] {
-            let tool = tools
-                .iter()
-                .find(|t| t["function"]["name"] == name)
-                .unwrap_or_else(|| panic!("{profile:?}: {name} is offered"));
+            let Some(tool) = tools.iter().find(|t| t["function"]["name"] == name) else {
+                // CP11.2: a `tokens` session offers only `memory` of the four (the others are
+                // deferred or, `skill_manage`, the review's); their schemas are unit-tested.
+                assert_eq!(profile, BudgetProfile::Tokens, "{profile:?}: {name} is offered");
+                assert!(name != "memory", "tokens offers memory");
+                continue;
+            };
             let description = tool["function"]["description"].as_str().unwrap();
             assert!(
                 description.ends_with("Details: skill_view hermes-tools-guide"),
@@ -9121,4 +9142,864 @@ async fn the_long_tool_schemas_are_short_in_every_profile() {
         assert!(four <= 10_100, "{profile:?}: the four schemas are {four} bytes");
         assert!(all <= 27_700, "{profile:?}: the tools block is {all} bytes");
     }
+}
+
+// ---- Phase 11, CP11.2: deferred tool schemas (`tokens` only) ---------------------------------------
+
+fn tool_names_in(request: &Value) -> Vec<String> {
+    request["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The contents of the `tool` role messages a request carries, in order.
+fn tool_results_in(request: &Value) -> Vec<String> {
+    sent_messages(request)
+        .into_iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+fn search_call(id: &str, names: &[&str]) -> String {
+    tool_reply(&[(id, "tool_search", json!({"names": names}))])
+}
+
+/// What the request's `tools` array weighs, as sent.
+fn tools_bytes(request: &Value) -> usize {
+    request["tools"].to_string().len()
+}
+
+async fn finish(runtime: &Runtime, provider: &ProviderConfig, session: &str, text: &str) {
+    let mut turn = runtime
+        .start_turn(session, provider, TurnOptions::default(), text)
+        .unwrap();
+    while let Some(event) = turn.events.recv().await {
+        if matches!(event, RuntimeEvent::TurnFinished(_)) {
+            break;
+        }
+    }
+}
+
+/// The core tools of a deferred session, in the order the list has them.
+const TOKENS_CORE: [&str; 10] = [
+    "terminal",
+    "run_script",
+    "read_file",
+    "write_file",
+    "patch",
+    "search_files",
+    "todo_list",
+    "memory",
+    "skills_list",
+    "skill_view",
+];
+
+/// The other profiles' list is what it was before CP11.2: all 18 tools in the schema order, no
+/// `tool_search`, the same in every request of a session and of a second turn. (The size is
+/// CP11.1's schemas plus the array's separators; pinned so a change is a decision.)
+#[tokio::test]
+async fn other_profiles_send_every_tool_unchanged() {
+    let mut sizes = Vec::new();
+    for profile in [BudgetProfile::Requests, BudgetProfile::Balanced] {
+        let h = harness_profile(
+            vec![
+                tool_reply(&[("c1", "read_file", json!({"path": "missing.txt"}))]),
+                text_reply("one"),
+                text_reply("two"),
+            ],
+            profile,
+        )
+        .await;
+        let session = session_in(&h);
+        run_turn(&h, &session, "go").await;
+        run_turn(&h, &session, "again").await;
+        let requests = h.requests.lock().clone();
+        assert_eq!(requests.len(), 3, "{profile:?}");
+        let expected: Vec<&str> = hermes_prompts::tools::tool_names().collect();
+        assert_eq!(expected.len(), 18);
+        for request in &requests {
+            assert_eq!(tool_names_in(request), expected, "{profile:?}");
+            assert_eq!(request["tools"], requests[0]["tools"], "{profile:?}: the list changed");
+        }
+        // Every entry is the schema file's text, nothing added or rewritten.
+        for (entry, name) in requests[0]["tools"].as_array().unwrap().iter().zip(&expected) {
+            let schema = hermes_prompts::tools::tool_schema(name).unwrap();
+            assert_eq!(entry["function"]["description"], schema.description, "{name}");
+        }
+        let system = system_of(&requests[0]);
+        assert!(!system.contains("# Deferred tools"), "{profile:?}");
+        assert!(system.contains("skill_manage"), "{profile:?}: the prompt still names skill_manage");
+        sizes.push(tools_bytes(&requests[0]));
+    }
+    assert_eq!(sizes[0], sizes[1]);
+    println!("requests and balanced: tools {} bytes", sizes[0]);
+    assert!((27_300..=27_700).contains(&sizes[0]), "{}", sizes[0]);
+}
+
+/// `tokens`: the list is the core tools and `tool_search`; the byte saving is at least what the
+/// removed schemas weigh minus the loader's own; the prompt names what is deferred and tells the
+/// model to call no `skill_manage`.
+#[tokio::test]
+async fn tokens_sends_the_core_tools_and_tool_search_only() {
+    let h = harness_profile(vec![text_reply("ok"), text_reply("ok")], BudgetProfile::Tokens).await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "hello").await;
+    let tokens_request = h.requests.lock()[0].clone();
+    let mut expected: Vec<String> = TOKENS_CORE.iter().map(|s| s.to_string()).collect();
+    expected.push("tool_search".into());
+    assert_eq!(tool_names_in(&tokens_request), expected);
+
+    let balanced = harness_profile(vec![text_reply("ok")], BudgetProfile::Balanced).await;
+    let balanced_session = session_in(&balanced);
+    run_turn(&balanced, &balanced_session, "hello").await;
+    let balanced_request = balanced.requests.lock()[0].clone();
+
+    // The threshold: what the eight removed tools weigh, less `tool_search`, computed from the
+    // schema files (the `memory` description's one rewritten sentence is a few bytes).
+    let weight = |name: &str| {
+        let schema = hermes_prompts::tools::tool_schema(name).unwrap();
+        json!({"type": "function", "function": {"name": schema.name,
+            "description": schema.description, "parameters": schema.parameters}})
+        .to_string()
+        .len()
+            + 1
+    };
+    let removed: usize = hermes_prompts::deferred::BUILTIN
+        .iter()
+        .map(|(name, _)| weight(name))
+        .sum::<usize>()
+        + weight("skill_manage");
+    let search = hermes_prompts::deferred::tool_search_schema().unwrap();
+    let added = json!({"type": "function", "function": {"name": search.name,
+        "description": search.description, "parameters": search.parameters}})
+    .to_string()
+    .len()
+        + 1;
+    let (before, after) = (tools_bytes(&balanced_request), tools_bytes(&tokens_request));
+    println!(
+        "tools: balanced {before} bytes, tokens {after} bytes (saved {}, removed {removed}, tool_search {added})",
+        before - after
+    );
+    println!(
+        "system prompt: balanced {} bytes, tokens {} bytes",
+        system_of(&balanced_request).len(),
+        system_of(&tokens_request).len()
+    );
+    // The same profile with its schemas not deferred (the `tokens` behaviour of CP11.1): the
+    // whole request body before and after, for the Phase 11 baseline.
+    let undeferred = harness_budget(
+        |_| vec![text_reply("ok")],
+        Arc::new(Bridge),
+        BudgetKnobs {
+            tool_schemas: hermes_runtime::budget::ToolSchemas::All,
+            ..test_budget(Some(BudgetProfile::Tokens))
+        },
+    )
+    .await;
+    let undeferred_session = session_in(&undeferred);
+    run_turn(&undeferred, &undeferred_session, "hello").await;
+    let undeferred_request = undeferred.requests.lock()[0].clone();
+    let (body_before, body_after) = (
+        undeferred_request.to_string().len(),
+        tokens_request.to_string().len(),
+    );
+    println!(
+        "tokens request body for \"hello\": {body_before} bytes before CP11.2, {body_after} after ({} saved, ~{} tokens); tools {} -> {}; system prompt {} -> {}",
+        body_before - body_after,
+        (body_before - body_after) / 4,
+        tools_bytes(&undeferred_request),
+        after,
+        system_of(&undeferred_request).len(),
+        system_of(&tokens_request).len(),
+    );
+    assert!(body_after + 9_000 < body_before, "{body_before} -> {body_after}");
+    assert!(before - after + 64 >= removed - added, "saved {}", before - after);
+    assert!(after * 10 < before * 6, "tokens' tools are {after} of {before} bytes");
+
+    // The prompt: the block with every deferred name, and nothing that sends the model to skill_manage.
+    let system = system_of(&tokens_request);
+    assert!(system.contains("# Deferred tools"));
+    for (name, _) in hermes_prompts::deferred::BUILTIN {
+        assert!(system.contains(&format!("- {name}: ")), "{name}");
+    }
+    assert!(system.contains("no skill_manage tool"));
+    for phrase in ["(skill_manage)", "with skill_manage", "via skill_manage", "skill_manage("] {
+        assert!(!system.contains(phrase), "the prompt tells the model to use skill_manage: {phrase}");
+    }
+    // No core tool's description sends it there either.
+    for tool in tokens_request["tools"].as_array().unwrap() {
+        let description = tool["function"]["description"].as_str().unwrap();
+        assert!(!description.contains("skill_manage"), "{}", tool["function"]["name"]);
+    }
+    // Frozen: the next turn sends the same prompt and the same list.
+    run_turn(&h, &session, "again").await;
+    let second = h.requests.lock()[1].clone();
+    assert_eq!(system_of(&second), system);
+    assert_eq!(second["tools"], tokens_request["tools"]);
+}
+
+/// The whole flow: `tool_search` loads `session_search`, the next request has it (after the
+/// loader, the rest of the list unchanged before it), the model calls it, it runs. One extra
+/// request compared with a profile that has the tool from the start.
+#[tokio::test]
+async fn tool_search_loads_a_tool_for_the_next_request_and_costs_one_round_trip() {
+    let h = harness_profile(
+        vec![
+            search_call("s1", &["session_search"]),
+            tool_reply(&[("c1", "session_search", json!({"query": "nothing"}))]),
+            text_reply("done"),
+        ],
+        BudgetProfile::Tokens,
+    )
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "what did we do last week?").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 3);
+    let first = tool_names_in(&requests[0]);
+    let second = tool_names_in(&requests[1]);
+    assert!(!first.contains(&"session_search".to_string()));
+    assert_eq!(second[..first.len()], first[..], "the loaded tool comes after the whole old list");
+    assert_eq!(second.last().unwrap(), "session_search");
+    assert_eq!(tool_names_in(&requests[2]), second);
+    assert_eq!(system_of(&requests[0]), system_of(&requests[1]));
+    let search_result = tool_results_in(&requests[1]).pop().unwrap();
+    let parsed: Value = serde_json::from_str(&search_result).unwrap();
+    assert_eq!(parsed["loaded"], json!(["session_search"]));
+    assert_eq!(parsed["schemas"][0]["name"], "session_search");
+    assert!(parsed["schemas"][0]["parameters"]["properties"]["query"].is_object());
+    // It ran: not an error, not the deferred answer.
+    let ran = tool_results_in(&requests[2]).pop().unwrap();
+    assert!(!ran.contains("deferred tool"), "{ran}");
+
+    // Without deferral the same task is one request shorter: the tool is there from the start.
+    let b = harness_profile(
+        vec![
+            tool_reply(&[("c1", "session_search", json!({"query": "nothing"}))]),
+            text_reply("done"),
+        ],
+        BudgetProfile::Balanced,
+    )
+    .await;
+    let session = session_in(&b);
+    run_turn(&b, &session, "what did we do last week?").await;
+    assert_eq!(b.requests.lock().len(), 2);
+}
+
+/// A deferred tool called before its schema was loaded is not run: the answer carries the schema
+/// and the tool is in the list from the next request, so the retry runs.
+#[tokio::test]
+async fn a_deferred_tool_called_directly_is_not_run_but_answers_with_its_schema() {
+    let h = harness_profile(
+        vec![
+            tool_reply(&[("c1", "session_search", json!({"query": "x"}))]),
+            tool_reply(&[("c2", "session_search", json!({"query": "x"}))]),
+            text_reply("done"),
+        ],
+        BudgetProfile::Tokens,
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "search please").await;
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 3);
+    let answer = tool_results_in(&requests[1]).pop().unwrap();
+    let parsed: Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(parsed["success"], false);
+    assert!(parsed["error"].as_str().unwrap().contains("not run"), "{answer}");
+    assert_eq!(parsed["schema"]["name"], "session_search");
+    assert!(tool_names_in(&requests[1]).contains(&"session_search".to_string()));
+    let ran = tool_results_in(&requests[2]).pop().unwrap();
+    assert!(!ran.contains("deferred tool"), "{ran}");
+    // A call to skill_manage is told who saves skills.
+    let h = harness_profile(
+        vec![
+            tool_reply(&[("c1", "skill_manage", json!({"operations": []}))]),
+            text_reply("ok"),
+        ],
+        BudgetProfile::Tokens,
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "save a skill").await;
+    let requests = h.requests.lock().clone();
+    let answer = tool_results_in(&requests[1]).pop().unwrap();
+    assert!(answer.contains("background review"), "{answer}");
+    assert!(!tool_names_in(&requests[1]).contains(&"skill_manage".to_string()));
+}
+
+/// Unknown names get the list of what can be loaded; names already loaded or already in the list
+/// are said so; too many names load nothing; a keyword query lists matches and loads none.
+#[tokio::test]
+async fn tool_search_answers_unknown_loaded_and_too_many_names() {
+    let nine: Vec<String> = (0..9).map(|i| format!("web_search_{i}")).collect();
+    let h = harness_profile(
+        vec![
+            search_call("s1", &["nonexistent", "terminal"]),
+            search_call("s2", &["session_search"]),
+            search_call("s3", &["session_search"]),
+            tool_reply(&[("s4", "tool_search", json!({"names": nine}))]),
+            tool_reply(&[("s5", "tool_search", json!({"query": "web"}))]),
+            tool_reply(&[("s6", "tool_search", json!({}))]),
+            text_reply("done"),
+        ],
+        BudgetProfile::Tokens,
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "load things").await;
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 7);
+    let results = tool_results_in(&requests[6]);
+    let parse = |text: &String| serde_json::from_str::<Value>(text).unwrap();
+    // 1: unknown + a core tool.
+    let first = parse(&results[0]);
+    assert_eq!(first["unknown"], json!(["nonexistent"]));
+    assert_eq!(first["already_in_your_tool_list"], json!(["terminal"]));
+    assert!(first["available_deferred"].as_array().unwrap().iter().any(|n| n == "session_search"));
+    // 2 and 3: loaded, then already loaded.
+    assert_eq!(parse(&results[1])["loaded"], json!(["session_search"]));
+    let third = parse(&results[2]);
+    assert_eq!(third["already_loaded"], json!(["session_search"]));
+    assert!(third.get("schemas").is_none(), "no schema is repeated");
+    // 4: nine names.
+    let fourth = parse(&results[3]);
+    assert_eq!(fourth["success"], false);
+    assert!(fourth["error"].as_str().unwrap().contains("nothing was loaded"));
+    // 5: a query lists matches, loads none.
+    let fifth = parse(&results[4]);
+    let matches: Vec<&str> = fifth["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(matches, ["web_search", "web_extract"]);
+    assert!(!tool_names_in(&requests[6]).contains(&"web_search".to_string()));
+    // 6: neither names nor query.
+    assert_eq!(parse(&results[5])["success"], false);
+}
+
+/// A resumed session (a new `Runtime` on the same data folder) has the loaded tools again, and
+/// a rewind drops the loads made after the point it rewinds to.
+#[tokio::test]
+async fn the_loaded_set_survives_a_restart_and_a_rewind_drops_later_loads() {
+    let h = harness_profile(
+        vec![
+            search_call("s1", &["session_search"]),
+            text_reply("one"),
+            search_call("s2", &["web_search"]),
+            text_reply("two"),
+            text_reply("three"),
+            text_reply("four"),
+        ],
+        BudgetProfile::Tokens,
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "first").await;
+    run_turn(&h, &session, "second").await;
+    // A restart: a fresh runtime over the same data.
+    let again = runtime_with_budget(
+        h.data.path(),
+        Arc::new(Bridge),
+        test_budget(Some(BudgetProfile::Tokens)),
+    );
+    finish(&again, &h.provider, &session, "third").await;
+    let tools = tool_names_in(&h.requests.lock().last().unwrap().clone());
+    assert_eq!(
+        tools[tools.len() - 2..],
+        ["session_search", "web_search"],
+        "load order, after the core tools and tool_search"
+    );
+    // Rewind to before the second user message: web_search was loaded after it.
+    let messages = again.messages(&session).unwrap();
+    let second_user = messages
+        .iter()
+        .position(|m| m.role == rmcp::model::Role::User && m.as_concat_text() == "second")
+        .unwrap();
+    again.rewind(&session, second_user).unwrap();
+    finish(&again, &h.provider, &session, "fourth").await;
+    let tools = tool_names_in(&h.requests.lock().last().unwrap().clone());
+    assert!(tools.contains(&"session_search".to_string()));
+    assert!(!tools.contains(&"web_search".to_string()), "{tools:?}");
+}
+
+/// A compaction hides old messages from the model but the tools they loaded stay loaded.
+#[tokio::test]
+async fn a_compaction_keeps_the_loaded_tools() {
+    let h = harness_profile(
+        vec![
+            text_reply("one"),
+            search_call("s1", &["session_search"]),
+            text_reply(&format!("big {}", "x".repeat(30_000))),
+            text_reply(&format!("big {}", "x".repeat(30_000))),
+            text_reply(&format!("big {}", "x".repeat(30_000))),
+            text_reply("five"),
+            text_reply("## Goal\nthe summary"),
+            text_reply("six"),
+        ],
+        BudgetProfile::Tokens,
+    )
+    .await;
+    let session = session_in(&h);
+    for text in ["first", "second", "third", "fourth", "fifth"] {
+        run_turn(&h, &session, text).await;
+    }
+    let events = collect(
+        h.runtime
+            .compress(&session, &h.provider, TurnOptions::default(), None)
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let messages = h.runtime.messages(&session).unwrap();
+    let hidden_load = messages.iter().any(|m| {
+        !m.is_agent_visible()
+            && m.content.iter().any(|c| {
+                c.as_tool_request()
+                    .is_some_and(|r| r.tool_call.as_ref().is_ok_and(|c| c.name == "tool_search"))
+            })
+    });
+    assert!(hidden_load, "the compaction must have hidden the tool_search call from the model");
+    run_turn(&h, &session, "sixth").await;
+    let last = h.requests.lock().last().unwrap().clone();
+    assert!(tool_names_in(&last).contains(&"session_search".to_string()));
+    // The rebuilt prompt is still a deferred one.
+    assert!(system_of(&last).contains("# Deferred tools"));
+}
+
+/// Tools the user switched off are never handed out: not in the schemas `tool_search` returns,
+/// not in the list, not run when called.
+#[tokio::test]
+async fn a_switched_off_tool_cannot_be_loaded() {
+    let h = harness_profile(
+        vec![
+            search_call("s1", &["session_search", "web_search"]),
+            tool_reply(&[("c1", "session_search", json!({"query": "x"}))]),
+            text_reply("done"),
+        ],
+        BudgetProfile::Tokens,
+    )
+    .await;
+    h.runtime.set_disabled_tools(["session_search".to_string()]);
+    let session = session_in(&h);
+    run_turn(&h, &session, "go").await;
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 3);
+    let parsed: Value = serde_json::from_str(&tool_results_in(&requests[1])[0]).unwrap();
+    assert_eq!(parsed["turned_off_by_the_user"], json!(["session_search"]));
+    assert_eq!(parsed["loaded"], json!(["web_search"]));
+    let schemas: Vec<&str> = parsed["schemas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(schemas, ["web_search"]);
+    let tools = tool_names_in(&requests[1]);
+    assert!(tools.contains(&"web_search".to_string()));
+    assert!(!tools.contains(&"session_search".to_string()));
+    assert!(tool_results_in(&requests[2]).pop().unwrap().contains("turned off"));
+    // A switched-off toolset's tools stay out of the core list.
+    let h = harness_profile(vec![text_reply("ok")], BudgetProfile::Tokens).await;
+    h.runtime
+        .set_disabled_tools(["terminal", "run_script", "process_manage"].map(String::from));
+    let session = session_in(&h);
+    run_turn(&h, &session, "go").await;
+    let tools = tool_names_in(&h.requests.lock()[0]);
+    assert!(!tools.contains(&"terminal".to_string()) && !tools.contains(&"run_script".to_string()));
+}
+
+/// An MCP server with several tools.
+#[derive(Clone)]
+struct Many(usize);
+
+impl rmcp::ServerHandler for Many {
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let schema = json!({"type": "object", "properties": {"a": {"type": "number"}}});
+        let Value::Object(schema) = schema else {
+            unreachable!()
+        };
+        let schema = Arc::new(schema);
+        Ok(rmcp::model::ListToolsResult::with_all_items(
+            (0..self.0)
+                .map(|i| {
+                    rmcp::model::Tool::new(
+                        format!("t{i}"),
+                        format!("Tool number {i}. It does thing {i} with a number."),
+                        schema.clone(),
+                    )
+                })
+                .collect(),
+        ))
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        Ok(
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(format!(
+                "ran {}",
+                request.name
+            ))])
+            .into(),
+        )
+    }
+}
+
+async fn connect_many(h: &Harness, count: usize) {
+    use rmcp::ServiceExt as _;
+    let (client_write, server_read) = tokio::io::duplex(64 * 1024);
+    let (server_write, client_read) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let running = Many(count).serve((server_read, server_write)).await.unwrap();
+        let _ = running.waiting().await;
+    });
+    h.runtime
+        .mcp()
+        .connect_transport("many", (client_read, client_write))
+        .await
+        .unwrap();
+}
+
+/// MCP tools past the first N are deferred like the built-in ones: named in the prompt, loaded
+/// by `tool_search`, then callable.
+#[tokio::test]
+async fn mcp_tools_past_the_first_few_are_deferred() {
+    let budget = BudgetKnobs {
+        deferred_mcp_keep: 2,
+        ..test_budget(Some(BudgetProfile::Tokens))
+    };
+    let h = harness_budget(
+        |_| {
+            vec![
+                search_call("s1", &["mcp__many__t4"]),
+                tool_reply(&[("c1", "mcp__many__t4", json!({"a": 1}))]),
+                text_reply("done"),
+            ]
+        },
+        Arc::new(Bridge),
+        budget,
+    )
+    .await;
+    connect_many(&h, 5).await;
+    assert_eq!(h.runtime.mcp().tool_names().len(), 5);
+    let session = session_in(&h);
+    run_turn(&h, &session, "use the tools").await;
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 3);
+    let first = tool_names_in(&requests[0]);
+    let mcp: Vec<&String> = first.iter().filter(|n| n.starts_with("mcp__")).collect();
+    assert_eq!(mcp, ["mcp__many__t0", "mcp__many__t1"]);
+    let system = system_of(&requests[0]);
+    for i in 2..5 {
+        assert!(
+            system.contains(&format!("- mcp__many__t{i}: Tool number {i}")),
+            "{system}"
+        );
+    }
+    assert!(!system.contains("- mcp__many__t1"));
+    assert!(tool_names_in(&requests[1]).contains(&"mcp__many__t4".to_string()));
+    assert!(tool_results_in(&requests[2]).pop().unwrap().contains("ran t4"));
+
+    // The default N (3) keeps a small server whole, and N = 0 defers all of it.
+    for (keep, in_list) in [(3, 3), (0, 0)] {
+        let budget = BudgetKnobs {
+            deferred_mcp_keep: keep,
+            ..test_budget(Some(BudgetProfile::Tokens))
+        };
+        let h = harness_budget(|_| vec![text_reply("ok")], Arc::new(Bridge), budget).await;
+        connect_many(&h, 3).await;
+        let session = session_in(&h);
+        run_turn(&h, &session, "hi").await;
+        let tools = tool_names_in(&h.requests.lock()[0]);
+        assert_eq!(tools.iter().filter(|n| n.starts_with("mcp__")).count(), in_list, "keep {keep}");
+    }
+}
+
+/// The review keeps `skill_manage` (and the whole tool list, without the deferred block in its
+/// prompt) while the main agent never had it.
+#[tokio::test]
+async fn the_review_has_skill_manage_in_tokens_and_the_main_agent_does_not() {
+    let skill = "---\nname: greet-users\ndescription: Greet the user by their name.\n---\n\n# Greet\n\nSay hello by name.\n";
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let h = harness_budget(
+        |_| {
+            vec![
+                text_reply("Hello Sam!"),
+                tool_reply(&[(
+                    "call_r1",
+                    "skill_manage",
+                    json!({"operations": [{"action": "create", "name": "greet-users", "content": skill}]}),
+                )]),
+                text_reply("Saved a greeting skill."),
+            ]
+        },
+        Arc::new(ReviewBridge(tx)),
+        test_budget(Some(BudgetProfile::Tokens)),
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "Greet me, I'm Sam.").await;
+    h.runtime
+        .refine(&session, &h.provider, TurnOptions::default(), None)
+        .unwrap();
+    let (actions, _) = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actions, vec!["Skill 'greet-users' created"]);
+    let requests = h.requests.lock().clone();
+    assert!(!tool_names_in(&requests[0]).contains(&"skill_manage".to_string()));
+    let review = tool_names_in(&requests[1]);
+    assert!(review.contains(&"skill_manage".to_string()), "{review:?}");
+    assert!(!review.contains(&"tool_search".to_string()));
+    assert!(system_of(&requests[0]).contains("# Deferred tools"));
+    assert!(
+        !system_of(&requests[1]).contains("# Deferred tools"),
+        "the review's prompt has no deferred block"
+    );
+}
+
+/// A subagent of a deferred session has the whole small set: no `tool_search`, no `skill_manage`,
+/// no `delegate_task` (children never delegate), and its prompt has no deferred block.
+#[tokio::test]
+async fn a_subagent_of_a_deferred_session_has_the_whole_small_set() {
+    let h = harness_scripted(
+        |_| {
+            vec![
+                search_call("s1", &["delegate_task"]),
+                tool_reply(&[("d1", "delegate_task", json!({"tasks": [{"goal": "say hi"}]}))]),
+                text_reply("all done"),
+            ]
+        },
+        Arc::new(Bridge),
+        test_budget(Some(BudgetProfile::Tokens)),
+        HashMap::from([("delegate", vec![text_reply("hi from the child")])]),
+        HashMap::new(),
+    )
+    .await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "delegate it").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests.len(), 4, "{:?}", requests.iter().map(tool_names_in).collect::<Vec<_>>());
+    let child = requests
+        .iter()
+        .find(|r| system_of(r).contains("focused subagent"))
+        .expect("the child's request");
+    let tools = tool_names_in(child);
+    for gone in ["tool_search", "skill_manage", "delegate_task", "clarify", "memory"] {
+        assert!(!tools.contains(&gone.to_string()), "{gone}");
+    }
+    for kept in ["terminal", "session_search", "web_search", "vision_analyze", "skill_view"] {
+        assert!(tools.contains(&kept.to_string()), "{kept}");
+    }
+    assert!(!system_of(child).contains("# Deferred tools"));
+    assert!(!system_of(child).contains("skill_manage("));
+}
+
+/// The profile a session started under keeps its tool list: switching the budget profile
+/// mid-session changes nothing until a new session.
+#[tokio::test]
+async fn a_session_keeps_its_tool_list_when_the_profile_changes() {
+    let h = harness_profile(
+        vec![text_reply("one"), text_reply("two")],
+        BudgetProfile::Tokens,
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "first").await;
+    h.runtime.set_budget(test_budget(Some(BudgetProfile::Balanced)));
+    run_turn(&h, &session, "second").await;
+    let requests = h.requests.lock().clone();
+    assert_eq!(tool_names_in(&requests[1]), tool_names_in(&requests[0]));
+    assert!(tool_names_in(&requests[1]).contains(&"tool_search".to_string()));
+    // And the other way round: a session begun under balanced is not deferred by switching.
+    let h = harness_profile(
+        vec![text_reply("one"), text_reply("two"), text_reply("three")],
+        BudgetProfile::Balanced,
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "first").await;
+    h.runtime.set_budget(test_budget(Some(BudgetProfile::Tokens)));
+    run_turn(&h, &session, "second").await;
+    let requests = h.requests.lock().clone();
+    assert_eq!(requests[1]["tools"], requests[0]["tools"]);
+    assert!(!tool_names_in(&requests[1]).contains(&"tool_search".to_string()));
+    // A new session under tokens is deferred.
+    let fresh = session_in(&h);
+    run_turn(&h, &fresh, "hello").await;
+    let last = h.requests.lock().last().unwrap().clone();
+    assert!(tool_names_in(&last).contains(&"tool_search".to_string()));
+}
+
+// ---- CP11.2 review: a session's kind of tool list never flips ---------------------------------
+
+/// The deferred block of a prompt, as text (from its marker to its sealed last line).
+fn deferred_block_of(system: &str) -> String {
+    let start = system.find("# Deferred tools").unwrap();
+    let end = start + system[start..].find("<!-- End deferred tools ").unwrap();
+    let close = end + system[end..].find("-->").unwrap() + 3;
+    system[start..close].to_string()
+}
+
+/// A compaction or a model switch rebuilds the prompt under the profile of the moment, but the
+/// session keeps its kind of tool list: a `tokens` session stays deferred under `balanced`, and a
+/// `balanced` session never becomes deferred under `tokens` (the list would lose 11 KB of tools
+/// under the model). The budget wording does follow the profile, as before.
+#[tokio::test]
+async fn a_compaction_or_a_model_switch_keeps_the_kind_of_tool_list() {
+    for (start, then) in [
+        (BudgetProfile::Tokens, BudgetProfile::Balanced),
+        (BudgetProfile::Balanced, BudgetProfile::Tokens),
+        (BudgetProfile::Requests, BudgetProfile::Tokens),
+    ] {
+        let deferred = start == BudgetProfile::Tokens;
+        let mut replies: Vec<String> = vec![text_reply("one")];
+        for _ in 0..3 {
+            replies.push(text_reply(&format!("big {}", "x".repeat(30_000))));
+        }
+        replies.extend([
+            text_reply("five"),
+            text_reply("## Goal\nthe summary"),
+            text_reply("after the compaction"),
+            text_reply("after the model switch"),
+        ]);
+        let h = harness_profile(replies, start).await;
+        let session = session_in(&h);
+        for text in ["first", "second", "third", "fourth", "fifth"] {
+            run_turn(&h, &session, text).await;
+        }
+        let before = h.requests.lock()[0].clone();
+        h.runtime.set_budget(test_budget(Some(then)));
+        let events = collect(
+            h.runtime
+                .compress(&session, &h.provider, TurnOptions::default(), None)
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(finished_status(&events), TurnStatus::Completed, "{start:?}");
+        run_turn(&h, &session, "sixth").await;
+        let compacted = h.requests.lock().last().unwrap().clone();
+        assert_ne!(system_of(&compacted), system_of(&before), "{start:?}: the prompt was rebuilt");
+        assert_eq!(compacted["tools"], before["tools"], "{start:?} -> {then:?}: the list flipped");
+        assert_eq!(system_of(&compacted).contains("# Deferred tools"), deferred, "{start:?}");
+        h.runtime
+            .set_session_model(&session, "other-model", None)
+            .unwrap();
+        run_turn(&h, &session, "seventh").await;
+        let switched = h.requests.lock().last().unwrap().clone();
+        assert!(system_of(&switched).contains("other-model"), "{start:?}");
+        assert_eq!(switched["tools"], before["tools"], "{start:?} -> {then:?}: the list flipped");
+    }
+}
+
+/// A copy of the deferred block in a project's context file (a repository whose docs quote it)
+/// does not make a plain session deferred, and the review does not strip it from the context.
+#[tokio::test]
+async fn a_copied_deferred_block_in_a_context_file_changes_nothing() {
+    let tokens = harness_profile(vec![text_reply("ok")], BudgetProfile::Tokens).await;
+    let session = session_in(&tokens);
+    run_turn(&tokens, &session, "hello").await;
+    let copied = deferred_block_of(&system_of(&tokens.requests.lock()[0]));
+    for profile in [BudgetProfile::Balanced, BudgetProfile::Requests] {
+        let h = harness_profile(vec![text_reply("ok")], profile).await;
+        std::fs::write(h.work.path().join("AGENTS.md"), format!("Our docs:\n\n{copied}\n")).unwrap();
+        let session = session_in(&h);
+        run_turn(&h, &session, "hello").await;
+        let request = h.requests.lock()[0].clone();
+        assert!(system_of(&request).contains(&copied), "{profile:?}: the context file is in");
+        let expected: Vec<&str> = hermes_prompts::tools::tool_names().collect();
+        assert_eq!(tool_names_in(&request), expected, "{profile:?}: the full list");
+    }
+}
+
+/// Which MCP tools stay in a deferred session's list is what its prompt recorded: a server that
+/// connects later has its tools deferred (found by `query`, loadable by name), and a changed
+/// `deferred_mcp_keep` reaches new sessions only.
+#[tokio::test]
+async fn the_core_mcp_tools_are_the_ones_the_session_started_with() {
+    let h = harness_profile(
+        vec![
+            text_reply("one"),
+            tool_reply(&[("q1", "tool_search", json!({"query": "number 1"}))]),
+            search_call("s1", &["mcp__many__t1"]),
+            text_reply("two"),
+            text_reply("three"),
+        ],
+        BudgetProfile::Tokens,
+    )
+    .await;
+    let session = session_in(&h);
+    run_turn(&h, &session, "first").await;
+    connect_many(&h, 3).await;
+    run_turn(&h, &session, "second").await;
+    let requests = h.requests.lock().clone();
+    // Connected after the session began: not in its list until loaded.
+    assert!(!tool_names_in(&requests[1]).iter().any(|n| n.starts_with("mcp__")));
+    let found: Value = serde_json::from_str(&tool_results_in(&requests[2])[0]).unwrap();
+    assert_eq!(found["matches"][0]["name"], "mcp__many__t1", "{found}");
+    assert_eq!(
+        tool_names_in(&requests[3]).last().map(String::as_str),
+        Some("mcp__many__t1")
+    );
+    // A session begun with the server connected keeps its 3; keep = 0 later changes nothing.
+    let fresh = session_in(&h);
+    run_turn(&h, &fresh, "third").await;
+    let first = h.requests.lock().last().unwrap().clone();
+    assert_eq!(tool_names_in(&first).iter().filter(|n| n.starts_with("mcp__")).count(), 3);
+    h.runtime.set_budget(BudgetKnobs {
+        deferred_mcp_keep: 0,
+        ..test_budget(Some(BudgetProfile::Tokens))
+    });
+    run_turn(&h, &fresh, "fourth").await;
+    let later = h.requests.lock().last().unwrap().clone();
+    assert_eq!(later["tools"], first["tools"]);
+}
+
+/// The page's context breakdown counts the tools a deferred session sends, not all 18.
+#[tokio::test]
+async fn the_context_breakdown_counts_the_tools_a_deferred_session_sends() {
+    let mut counted = Vec::new();
+    for profile in [BudgetProfile::Balanced, BudgetProfile::Tokens] {
+        let h = harness_profile(vec![text_reply("ok")], profile).await;
+        let session = session_in(&h);
+        run_turn(&h, &session, "hello").await;
+        let sent = tools_bytes(&h.requests.lock()[0]);
+        let breakdown = h.runtime.context_breakdown(&session).unwrap();
+        let (builtin, _) = h.runtime.session_tool_definitions(&session);
+        counted.push((breakdown.tool_definitions, sent, builtin.len()));
+    }
+    let [(balanced, balanced_sent, all), (tokens, tokens_sent, listed)] = counted[..] else {
+        unreachable!()
+    };
+    assert_eq!((all, listed), (18, 11));
+    assert!(tokens * 10 < balanced * 7, "{tokens} of {balanced}");
+    // Within the estimator's slack of what is really sent (the entries' JSON wrapping).
+    assert!(tokens * 4 <= tokens_sent && balanced * 4 <= balanced_sent);
 }

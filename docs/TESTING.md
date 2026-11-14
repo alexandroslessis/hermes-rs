@@ -127,6 +127,16 @@ Read the existing tests near the area you change before writing a new one; the h
   (every property name of the four schemas appears in the skill), `turns.rs`
   `the_long_tool_schemas_are_short_in_every_profile` (bytes of the request's `tools` in each profile, one
   request). The whole `turns` suite passes unchanged under each profile: request counts did not move.
+- Deferred tools (Phase 11 CP11.2): `hermes_prompts` `deferred.rs` (block, strip, size caps, the skill_manage rewrites), `hermes_runtime`
+  `deferred.rs` (`loaded_in`: order, direct calls, unanswered calls, too many names, truncation), and in `turns.rs` (after the `CP11.2` banner):
+  `other_profiles_send_every_tool_unchanged` (18 tools, same list every request, schema text, size pinned), `tokens_sends_the_core_tools_and_tool_search_only`
+  (the list, the byte saving against a threshold computed from the schema files, the prompt, no `skill_manage` anywhere), the flow
+  `tool_search_loads_a_tool_for_the_next_request_and_costs_one_round_trip` (3 requests vs 2), the direct call, unknown / already loaded / too many
+  names / query, restart + rewind, compaction, switched-off tools, MCP tools past N (a `Many` mock server), the review with `skill_manage`, a subagent, a
+  profile change mid-session; and (CP11.2 review) `a_compaction_or_a_model_switch_keeps_the_kind_of_tool_list`, `a_copied_deferred_block_in_a_context_file_changes_nothing`,
+  `the_core_mcp_tools_are_the_ones_the_session_started_with`, `the_context_breakdown_counts_the_tools_a_deferred_session_sends`. Live:
+  `scripts/perf/deferred-tools-check.mjs`. Under `HERMES_TEST_PROFILE=tokens` the suite keeps `tokens`' other knobs but **not** its deferred list
+  (`test_budget(None)` sets `tool_schemas: All`: the other tests call deferred tools directly); the deferral is covered by the tests that name `Tokens`.
 - Known flaky under heavy load: `an_exhausted_budget_ends_with_a_toolless_summary` (timing).
   Re-run it alone before suspecting your change.
 

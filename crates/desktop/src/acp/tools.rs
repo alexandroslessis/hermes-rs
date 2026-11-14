@@ -107,6 +107,21 @@ pub fn title(name: &str, args: &Value) -> String {
             format!("Fetch {}", clip(url, 80))
         }
         "delegate_task" => delegate_title(args),
+        // Phase 11: the `tokens` profile's loader (`names`, or a `query`); a generic card.
+        "tool_search" => {
+            let names: Vec<&str> = args
+                .get("names")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if names.is_empty() {
+                clip(&format!("Find tools \"{}\"", text_arg(args, &["query"])), 80)
+            } else {
+                clip(&format!("Load tools: {}", names.join(", ")), 80)
+            }
+        }
         other => other.replace('_', " "),
     }
 }
@@ -500,6 +515,12 @@ mod tests {
             title("web_extract", &json!({"urls": ["https://a.example/x"]})),
             "Fetch https://a.example/x"
         );
+        assert_eq!(
+            title("tool_search", &json!({"names": ["web_search", "session_search"]})),
+            "Load tools: web_search, session_search"
+        );
+        assert_eq!(title("tool_search", &json!({"query": "web"})), "Find tools \"web\"");
+        assert_eq!(kind("tool_search"), "other");
         assert_eq!(
             title("delegate_task", &json!({"goal": "review it"})),
             "Delegate: review it"

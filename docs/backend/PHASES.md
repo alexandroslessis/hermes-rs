@@ -50,7 +50,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 8 | Skills v2: outcomes, provenance, project skills, curator v2 — ✅ 2026-11-13 | M–L | 7 | Sonnet | B |
 | 9 | Memory v2: tiers, structured entries, links — ✅ 2026-11-13 | L | 5, 7 | Sonnet (CP9.1 **Opus**) | B |
 | 10 | Fewer round trips: script tool, first-turn context, batching — ✅ 2026-11-14 | M | 3 | Sonnet | A |
-| 11 | Token mode: deferred tool schemas | S–M | 3 | Sonnet | A |
+| 11 | Token mode: deferred tool schemas — ✅ 2026-11-14 | S–M | 3 | Sonnet | A |
 | 12 | Provider fallback chain | M | 2 | Sonnet | A |
 | 13a/c/f | Perf: `Arc<Message>`, `spawn_blocking`, typed dispatch | M | 0 | Sonnet | filler |
 | 13b | Perf: store writer actor | M | 0 | **Opus** | C |
@@ -803,6 +803,15 @@ into a request) and the notes for the reviewer are in [progress/phase-11.md](pro
 Measured, the four schemas were 13.1 KB serialised (not the 6.4 / 3.9 / 2.8 / 2.7 KB of the files) and are
 now 10.0 KB (~780 tokens saved per request): the rest of the ~8k tokens has to come from CP11.2.
 
+**CP11.2 status (2026-11-14):** implemented ([progress](progress/phase-11.md)). Built as step 3 says, with these decisions
+(PITFALLS "Deferred tool schemas" has the reasons): the `tool_schemas` knob (`all` | `deferred`, `tokens` = `deferred`) and
+`deferred_mcp_keep` (default 3) are overridable; a session is deferred when its **frozen prompt** holds the `# Deferred tools`
+block (so a profile change reaches new sessions only); the loaded set is a function of the conversation (no stored state);
+deferred = `session_search`, `delegate_task`, `web_search`, `web_extract`, `vision_analyze`, `process_manage`, `clarify` + MCP
+tools past the first 3; a deferred tool called before loading is **not run**, it answers with its schema; subagents get the whole
+small set without `skill_manage`. Measured, not the plan's ~8k: the tools array goes from 27.7 KB to 15.3 KB (~3,100 tokens
+fewer on every request); the rest of the ~8k exists only with MCP servers (each deferred MCP tool saves its own schema).
+
 1. Measure each schema's size (`prompts/tools/*.json`), record in this doc.
 2. **Shorter schemas:** rewrite `skill_manage` (6.4 KB), `session_search` (3.9 KB), `memory`
    (2.8 KB), `delegate_task` (2.7 KB) descriptions to ~1 KB each for all profiles, keeping the
@@ -818,6 +827,17 @@ now 10.0 KB (~780 tokens saved per request): the rest of the ~8k tokens has to c
    memory notes or the review picks them up).
 
 **Tests:** request body size assertions in `turns.rs` per profile.
+
+**Phase 11 status (2026-11-14): done** (CP11.1 and CP11.2 reviewed). The CP11.2 review added: a compaction or a
+model switch keeps a session's kind of tool list (no flip between the full list and the deferred one); the block is
+*sealed* (a checksum of the prompt before it), so a copy of it in a repository's context file never makes a plain session
+deferred; the block records the session's core MCP tools (a server connecting later, or a changed `deferred_mcp_keep`, never
+moves a tool out of a running session's list); the page's context breakdown counts the tools a deferred session sends.
+**Live check:** `deferred-tools-check.mjs`. **User checklist:** Settings > Budget profile > **tokens**, start a **new** chat and
+say "hello": the context gauge's *Tool definitions* is roughly 2,500-3,000 tokens smaller than in a new chat under **requests**; ask
+"what did we talk about in my other chats?": a **tool search** card, then **session search**, then the answer; ask to "save
+what you learned as a skill": it says the background review saves skills; switch back to **requests**: that chat keeps its
+short list, a new chat has every tool (the full list is in [progress/phase-11.md](progress/phase-11.md)).
 
 ---
 
@@ -1070,6 +1090,14 @@ head and tree already on the message (the first-turn context pack; at most 14,00
 cached by the prompt after the first request). The counts that need a model to choose the batched
 form are what the mock is scripted to do; the tests assert that the batched calls work and what the
 pack contains, not that a real model will batch.
+
+After 11 (`tokens`, 2026-11-14): S1-S6 and every other count unchanged in all profiles (`requests` and `balanced` send
+the same 18 tools, same bytes, as before: `other_profiles_send_every_tool_unchanged`). What changed is the body of each `tokens`
+request (`turns.rs`, `tokens_sends_the_core_tools_and_tool_search_only`, a one-line "hello" turn): **35,991 -> 24,665 bytes**
+(~2,800 tokens fewer per request; `tools` 27,675 -> 15,332 bytes, the frozen prompt gains the 1.1 KB deferred block and its 17-byte seal, 996 bytes net). One
+use of a deferred tool costs one extra request (`tool_search`, then the call: 3 main requests against 2 when the tool is in the list from
+the start; `tool_search_loads_a_tool_for_the_next_request_and_costs_one_round_trip`), and the list change misses the provider's prompt cache from
+the `tools` array on at each load. A deferred tool called before it was loaded costs the same one extra request. S5 (delegate two) under `tokens` is 5 requests (3 main + 2 delegate): the parent loads `delegate_task` first.
 
 Since Phase 2 the mock also splits them by purpose (the `x-hermes-rs-purpose` header): S1-S3 are
 all `main`; S4 is 10 `main` + 1 `review`; S5 is 2 `main` + 2 `delegate`. The totals above are

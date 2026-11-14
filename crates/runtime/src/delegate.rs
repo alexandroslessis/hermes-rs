@@ -87,6 +87,9 @@ pub struct Delegator {
     pub quota: Option<(crate::governor::Governor, String)>,
     /// The turn's budget knobs: how many children, their iteration budget, retry caps.
     pub budget: crate::budget::BudgetKnobs,
+    /// The parent is a deferred session (Phase 11): the children have no `skill_manage` either
+    /// (the background review saves skills), and otherwise the whole small set, no `tool_search`.
+    pub no_skill_manage: bool,
 }
 
 /// The parent's tools plus `delegate_task`.
@@ -153,6 +156,14 @@ async fn call_mcp(
 struct ChildToolProvider {
     inner: Arc<SessionTools>,
     mcp: Arc<crate::mcp::McpManager>,
+    no_skill_manage: bool,
+}
+
+impl ChildToolProvider {
+    fn blocked(&self, name: &str) -> bool {
+        BLOCKED_TOOLS.contains(&name)
+            || (self.no_skill_manage && name == hermes_prompts::deferred::REVIEW_ONLY)
+    }
 }
 
 #[async_trait]
@@ -161,7 +172,7 @@ impl ToolProvider<TurnSession> for ChildToolProvider {
         let tools = self.inner.tools(session).await?;
         Ok(tools
             .into_iter()
-            .filter(|tool| !BLOCKED_TOOLS.contains(&tool.name.as_ref()))
+            .filter(|tool| !self.blocked(tool.name.as_ref()))
             .chain(self.mcp.tools())
             .collect())
     }
@@ -176,7 +187,7 @@ impl ToolProvider<TurnSession> for ChildToolProvider {
         if call.name.starts_with("mcp__") {
             return Ok(call_mcp(&self.mcp, &self.inner, call).await);
         }
-        if BLOCKED_TOOLS.contains(&call.name.as_ref()) {
+        if self.blocked(call.name.as_ref()) {
             let text = json!({"success": false, "error": format!("{} is not available to subagents.", call.name)});
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 text.to_string(),
@@ -610,6 +621,7 @@ impl Delegator {
         let tool_names: Vec<String> = SessionTools::tool_names()
             .into_iter()
             .filter(|name| !BLOCKED_TOOLS.contains(name))
+            .filter(|name| !(self.no_skill_manage && *name == hermes_prompts::deferred::REVIEW_ONLY))
             .map(str::to_string)
             .chain(self.mcp.tool_names())
             .collect();
@@ -617,6 +629,7 @@ impl Delegator {
             inner: Arc::new(ChildToolProvider {
                 inner: tools.clone(),
                 mcp: self.mcp.clone(),
+                no_skill_manage: self.no_skill_manage,
             }),
             scratch_dir: scratch.clone(),
             state: state.clone(),
@@ -646,6 +659,7 @@ impl Delegator {
             Step::Operation(Arc::new(ops::UnhandledToolCalls {
                 tool_names,
                 disabled: self.disabled.clone(),
+                deferred: None,
             })),
             // A steer from the page's subagent row, after the child's next tool results.
             Step::Operation(Arc::new(ops::DeliverSteer {

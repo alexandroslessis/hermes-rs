@@ -271,6 +271,18 @@ examples, gotchas, the old text) is the bundled skill `assets/skills/autonomous-
 loaded on demand with `skill_view` (the local index never retrieves it, so it is never pre-injected). `crates/prompts/src/tools.rs` holds byte budgets (`SHORTENED`) and
 the snapshot test; `prompts/tools/README.md` has the rules.
 
+**Deferred tools** (Phase 11 CP11.2, `runtime/src/deferred.rs`, `prompts/src/deferred.rs`): in a `tokens` session
+(`budget.tool_schemas: deferred`) the main agent's tool chain is `GuardedTools { DeferredTools { DelegatingTools { SessionTools } } }`.
+`DeferredTools::tools` lists the core tools, `tool_search`, then the tools the conversation has loaded (`loaded_in`: a function of the
+answered `tool_search` / direct deferred calls, so resume, rewind, branch and compaction need no stored state); `call` answers
+`tool_search` with the schemas. A session is deferred exactly when its frozen prompt holds the *sealed* `# Deferred tools` block (built by
+`PromptSource` for `PromptTools::Deferred`, which also drops `skill_manage` and the guidance that names it; the seal is a checksum of the
+prompt before the block, so a copy in a context file does not count). A compaction or a model switch keeps the session's kind
+(`PromptTools::of_session`). The block also records which MCP tools stay core; later ones are deferred. A call to a deferred tool that is
+not loaded is answered by `UnhandledToolCalls` with the schema. In every other profile (and any session whose prompt lacks the block) the
+wrapper is transparent. Review, curator and subagents do not go through it. The decisions and the cache cost are in PITFALLS "Deferred tool
+schemas".
+
 **First-turn context pack** (Phase 10 CP10.2, `runtime/src/context_pack.rs`): under `requests`
 (`budget.context_pack`; `balanced` and `tokens` off) the first user message of a session whose folder is
 inside a git repository (`project_skills::find_root`, a worktree counts) gets a `<repo-context>` element

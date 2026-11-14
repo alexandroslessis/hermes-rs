@@ -1,0 +1,21 @@
+{
+  "name": "tool_search",
+  "description": "Load tools that are not in your tool list. The system prompt's \"Deferred tools\" section names them. Pass `names` (exact names, at most 8, all you need at once): the result holds each tool's full schema and the tools are in your tool list from your next step. `query` (a few words) only lists deferred tools whose name or description match, without loading them.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "names": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 8,
+        "description": "Exact names of the deferred tools to load."
+      },
+      "query": {
+        "type": "string",
+        "description": "Words to look for in deferred tool names and descriptions (at most 8 matches are listed)."
+      }
+    }
+  }
+}

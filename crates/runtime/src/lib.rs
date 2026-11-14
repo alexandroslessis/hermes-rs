@@ -8,6 +8,7 @@ pub mod compress;
 pub mod context_pack;
 mod curator;
 mod delegate;
+pub mod deferred;
 mod guards;
 pub mod governor;
 pub mod ledger;
@@ -712,7 +713,12 @@ impl Runtime {
                 PathBuf::from(&record.cwd),
             )
         };
-        let prompt = self.system_prompt(&provider, model, context_length, &cwd)?;
+        // The session keeps its kind of tool list (Phase 11): a model switch under another
+        // profile rewrites the prompt but never adds or removes the deferred block.
+        let mode = PromptTools::of_session(&open.record.lock().system_prompt);
+        let mut source = self.prompt_source(self.budget());
+        source.tools = mode;
+        let prompt = source.build(&provider, model, context_length, &cwd, true)?;
         self.store
             .set_provider_model(session_id, &provider, model, &prompt)?;
         let mut record = open.record.lock();
@@ -756,6 +762,8 @@ impl Runtime {
     ) -> Result<String> {
         let mut source = self.prompt_source(self.budget());
         source.project_skills = false;
+        // The curator has its own tool set (the skill tools): nothing deferred, nothing hidden.
+        source.tools = PromptTools::All;
         source.build(provider, model, context_length, cwd, false)
     }
 
@@ -782,6 +790,11 @@ impl Runtime {
             skills: self.skills.clone(),
             project_skills: true,
             budget,
+            mcp: self.mcp.clone(),
+            tools: match budget.tool_schemas {
+                budget::ToolSchemas::All => PromptTools::All,
+                budget::ToolSchemas::Deferred => PromptTools::Deferred,
+            },
         }
     }
 
@@ -799,7 +812,14 @@ impl Runtime {
         if budget.skills_index == budget::SkillsIndex::CategoriesAndRetrieval {
             budget.skills_index = budget::SkillsIndex::Full;
         }
-        let source = self.prompt_source(budget);
+        let mut source = self.prompt_source(budget);
+        // A subagent has the whole small set (no `tool_search`: it makes few requests); without
+        // `skill_manage` when its parent has none (Phase 11).
+        source.tools = if deferred::is_deferred_session(&open.record.lock().system_prompt) {
+            PromptTools::NoSkillManage
+        } else {
+            PromptTools::All
+        };
         let (provider, model, cwd) = {
             let record = open.record.lock();
             (
@@ -850,9 +870,13 @@ impl Runtime {
         context_length: Option<usize>,
         budget: budget::BudgetKnobs,
     ) -> compress::PromptRebuild {
-        let source = self.prompt_source(budget);
+        let mut source = self.prompt_source(budget);
         let (provider, model, cwd) = {
             let record = open.record.lock();
+            // Phase 11: the session keeps its kind of tool list across a compaction (the budget
+            // wording follows the profile, the deferred block does not: a session's tools never
+            // flip between the full list and the deferred one).
+            source.tools = PromptTools::of_session(&record.system_prompt);
             (
                 record.provider.clone(),
                 record.model.clone(),
@@ -1035,6 +1059,54 @@ impl Runtime {
             .filter_map(|tool| serde_json::to_value(tool).ok())
             .collect();
         (builtin, mcp)
+    }
+
+    /// [`Self::tool_definitions`] as one session's requests carry them: a deferred session
+    /// (Phase 11) sends its core tools, `tool_search` and what it loaded, not all of them, so the
+    /// page's context breakdown counts that. Any other session (or an unknown id): every tool.
+    pub fn session_tool_definitions(
+        &self,
+        session_id: &str,
+    ) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        let (builtin, mcp) = self.tool_definitions();
+        let Ok(open) = self.open(session_id) else {
+            return (builtin, mcp);
+        };
+        let prompt = open.record.lock().system_prompt.clone();
+        if !deferred::is_deferred_session(&prompt) {
+            return (builtin, mcp);
+        }
+        let as_tool = |value: &serde_json::Value| {
+            let parameters = value["parameters"]
+                .as_object()
+                .or_else(|| value["inputSchema"].as_object())
+                .cloned()
+                .unwrap_or_default();
+            rmcp::model::Tool::new(
+                value["name"].as_str().unwrap_or_default().to_string(),
+                value["description"].as_str().unwrap_or_default().to_string(),
+                Arc::new(parameters),
+            )
+        };
+        let all: Vec<rmcp::model::Tool> = builtin.iter().chain(&mcp).map(as_tool).collect();
+        let conversation = open.conversation.lock().clone();
+        let Some(listed) = deferred::listed(all, &prompt, &conversation) else {
+            return (builtin, mcp);
+        };
+        let names: std::collections::HashSet<&str> =
+            listed.iter().map(|tool| tool.name.as_ref()).collect();
+        let keep = |value: &serde_json::Value| {
+            names.contains(value["name"].as_str().unwrap_or_default())
+        };
+        let mut builtin: Vec<serde_json::Value> = builtin.into_iter().filter(keep).collect();
+        if let Ok(search) = hermes_prompts::deferred::tool_search_schema() {
+            builtin.push(serde_json::json!({
+                "name": search.name,
+                "description": search.description,
+                "parameters": search.parameters,
+            }));
+        }
+        (builtin, mcp.into_iter().filter(keep).collect())
     }
 
     /// The session's background processes (empty when it isn't open in this process).
@@ -1535,11 +1607,28 @@ impl Runtime {
                 .map(str::to_string)
                 .chain(self_mcp.tool_names())
                 .collect();
-            let tools: Arc<dyn ToolProvider<TurnSession>> = Arc::new(ops::GuardedTools {
-                inner: Arc::new(delegate::DelegatingTools {
+            // Phase 11: a session whose frozen prompt holds the deferred block has the core tools
+            // and `tool_search`; the wrapper is transparent in any other session.
+            let deferred_session =
+                deferred::is_deferred_session(&runtime.session.record.lock().system_prompt);
+            let mut unhandled_names = tool_names.clone();
+            if deferred_session {
+                unhandled_names.retain(|name| name != hermes_prompts::deferred::REVIEW_ONLY);
+                unhandled_names.push(hermes_prompts::deferred::TOOL_SEARCH.to_string());
+            }
+            let mut tool_names = tool_names;
+            if deferred_session {
+                tool_names.push(hermes_prompts::deferred::TOOL_SEARCH.to_string());
+            }
+            let deferral = Arc::new(deferred::DeferredTools::new(
+                Arc::new(delegate::DelegatingTools {
                     inner: runtime.session.tools.clone(),
                     delegator,
                 }),
+                disabled.clone(),
+            ));
+            let tools: Arc<dyn ToolProvider<TurnSession>> = Arc::new(ops::GuardedTools {
+                inner: deferral.clone(),
                 scratch_dir: runtime.session.tools.scratch_dir().to_path_buf(),
                 state: state.clone(),
                 result_limit: ops::result_size_limit(context_length, &budget),
@@ -1565,8 +1654,9 @@ impl Runtime {
                 ))),
                 Step::Operation(Arc::new(ToolOperation::new().with_provider(tools))),
                 Step::Operation(Arc::new(ops::UnhandledToolCalls {
-                    tool_names,
+                    tool_names: unhandled_names,
                     disabled: disabled.clone(),
+                    deferred: Some(deferral),
                 })),
                 Step::Operation(Arc::new(ops::DeliverSteer {
                     state: state.clone(),
@@ -1870,7 +1960,19 @@ impl Runtime {
         let total = compress::estimate_text(&prompt);
         Ok(ContextBreakdown {
             system_prompt: total.saturating_sub(skills + memory),
-            tool_definitions: compress::tool_definition_tokens(),
+            // What this session's requests carry (a deferred one: not every tool), counted like
+            // `compress::tool_definition_tokens`.
+            tool_definitions: self
+                .session_tool_definitions(session_id)
+                .0
+                .iter()
+                .map(|tool| {
+                    tool["name"].as_str().map_or(0, str::len)
+                        + tool["description"].as_str().map_or(0, str::len)
+                        + tool["parameters"].to_string().len()
+                })
+                .sum::<usize>()
+                .div_ceil(4),
             skills,
             memory,
             conversation: compress::estimate_messages(open.conversation.lock().messages()),
@@ -2226,6 +2328,7 @@ impl Runtime {
             disabled: Arc::new(self.disabled_tools.lock().clone()),
             quota: Some((self.governor(), provider_id.to_string())),
             budget,
+            no_skill_manage: deferred::is_deferred_session(&open.record.lock().system_prompt),
         })
     }
 
@@ -2645,6 +2748,32 @@ struct PromptSource {
     /// The knobs when this source was made: a new session's prompt takes its budget wording
     /// and skills block from them, and keeps them (the prompt is frozen).
     budget: budget::BudgetKnobs,
+    /// The connected MCP servers, whose tools the deferred block names.
+    mcp: Arc<mcp::McpManager>,
+    tools: PromptTools,
+}
+
+/// What the prompt says about the tool list (Phase 11, `deferred.rs`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptTools {
+    /// Every tool, as before Phase 11.
+    All,
+    /// A deferred session's main agent: the core tools and `tool_search`, the deferred block, and
+    /// no `skill_manage`.
+    Deferred,
+    /// A subagent of a deferred session: every tool but `skill_manage`, nothing deferred.
+    NoSkillManage,
+}
+
+impl PromptTools {
+    /// What a rebuilt prompt (compaction, model switch) of a session says: what its prompt says now.
+    fn of_session(system_prompt: &str) -> Self {
+        if deferred::is_deferred_session(system_prompt) {
+            Self::Deferred
+        } else {
+            Self::All
+        }
+    }
 }
 
 impl PromptSource {
@@ -2658,7 +2787,13 @@ impl PromptSource {
     ) -> Result<String> {
         let home = dirs::home_dir().context("no home directory")?;
         let soul = std::fs::read_to_string(self.data_dir.join("SOUL.md")).ok();
-        let tool_names = SessionTools::tool_names();
+        let mut tool_names = SessionTools::tool_names();
+        // Phase 11: the main agent of a deferred session, and its subagents, have no
+        // `skill_manage` (the background review keeps it), so the prompt must not tell them to
+        // call it: the guidance that is gated on the tool drops out with it.
+        if self.tools != PromptTools::All {
+            tool_names.retain(|name| *name != hermes_prompts::deferred::REVIEW_ONLY);
+        }
         // The skills of the repository `cwd` is in (and only that one's) join the user's own;
         // known when the prompt is made, kept by it (the prompt is frozen: a later change of the
         // session's folder doesn't rewrite it, it changes what the tools and the index see).
@@ -2674,6 +2809,12 @@ impl PromptSource {
             },
             project.as_deref(),
         );
+        let skills_index = match skills_index {
+            Some(index) if self.tools != PromptTools::All => {
+                Some(hermes_prompts::deferred::without_skill_manage(&index))
+            }
+            other => other,
+        };
         // Memory as it is now; writes during the session don't change this prompt. A session in
         // a git repository also gets that repository's project memory (and no other's): the
         // same root the skills use (a linked worktree counts as its main checkout), known when
@@ -2695,7 +2836,32 @@ impl PromptSource {
         // The project this folder belongs to, so the agent knows its other folders.
         let projects = self.store.list_projects().unwrap_or_default();
         let project = hermes_store::project_for_path(&projects, &cwd.display().to_string());
-        let prompt = build_system_prompt(&SystemPromptInput {
+        let budget_guidance: Option<String> = match self.budget.profile {
+            // Balanced is the prompt from before profiles, byte for byte.
+            budget::BudgetProfile::Balanced => None,
+            budget::BudgetProfile::Requests => {
+                Some(hermes_prompts::BUDGET_GUIDANCE_REQUESTS.to_string())
+            }
+            budget::BudgetProfile::Tokens => Some(hermes_prompts::BUDGET_GUIDANCE_TOKENS.to_string()),
+        };
+        // The deferred block ends the stable tier: frozen with the prompt, built from the MCP
+        // tools connected now (one that connects later is found by `tool_search`'s `query`).
+        let block = (self.tools == PromptTools::Deferred).then(|| {
+            let mcp = self.mcp.tools();
+            let keep = self.budget.deferred_mcp_keep;
+            hermes_prompts::deferred::block(
+                &deferred::prompt_entries(&mcp, keep),
+                &deferred::prompt_core_mcp(&mcp, keep),
+            )
+        });
+        let budget_guidance = match (&block, budget_guidance) {
+            (Some(block), Some(text)) => Some(format!("{text}
+
+{block}")),
+            (Some(block), None) => Some(block.clone()),
+            (None, text) => text,
+        };
+        let mut prompt = build_system_prompt(&SystemPromptInput {
             model,
             provider,
             cwd,
@@ -2710,16 +2876,17 @@ impl PromptSource {
             soul: soul.as_deref(),
             memory: memory.as_deref(),
             skills_index: skills_index.as_deref(),
-            budget_guidance: match self.budget.profile {
-                // Balanced is the prompt from before profiles, byte for byte.
-                budget::BudgetProfile::Balanced => None,
-                budget::BudgetProfile::Requests => Some(hermes_prompts::BUDGET_GUIDANCE_REQUESTS),
-                budget::BudgetProfile::Tokens => Some(hermes_prompts::BUDGET_GUIDANCE_TOKENS),
-            },
+            budget_guidance: budget_guidance.as_deref(),
             project: project.map(|p| (p.name.as_str(), p.folders.as_slice())),
             context_length,
             now: chrono::Local::now(),
         });
+        // The block ends the stable tier; sealed against the text before it, so only this one
+        // counts (`hermes_prompts::deferred::seal`).
+        if let Some(block) = &block {
+            prompt.stable = hermes_prompts::deferred::seal(&prompt.stable, block)
+                .context("the deferred block must end the stable tier")?;
+        }
         Ok(prompt.full())
     }
 }

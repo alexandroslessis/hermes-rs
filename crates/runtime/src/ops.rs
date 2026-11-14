@@ -484,6 +484,9 @@ pub struct UnhandledToolCalls {
     pub tool_names: Vec<String>,
     /// Tools the user switched off: a call to one is told so (not that it doesn't exist).
     pub disabled: Arc<HashSet<String>>,
+    /// A deferred session's tool wrapper (Phase 11): a call to a deferred tool that is not loaded
+    /// yet gets its schema back, and one to `skill_manage` is told the review saves skills.
+    pub deferred: Option<Arc<crate::deferred::DeferredTools>>,
 }
 
 #[async_trait]
@@ -494,7 +497,7 @@ impl Operation<TurnSession, HermesEffect> for UnhandledToolCalls {
 
     async fn run(
         &self,
-        _session: &TurnSession,
+        session: &TurnSession,
         conversation: &Conversation,
         emit: &Emitter,
     ) -> Result<OperationResult<HermesEffect>> {
@@ -527,8 +530,14 @@ impl Operation<TurnSession, HermesEffect> for UnhandledToolCalls {
                 .filter(|tool| !self.disabled.contains(*tool))
                 .cloned()
                 .collect();
+            let deferred_reply = match (&self.deferred, self.disabled.contains(&name)) {
+                (Some(deferred), false) => deferred.unavailable_reply(session, &name).await,
+                _ => None,
+            };
             let text = if self.disabled.contains(&name) {
                 format!("{name} is turned off by the user (Capabilities ▸ Tools); do without it.")
+            } else if let Some(reply) = deferred_reply {
+                reply
             } else {
                 invalid_tool_name_message(&name, &available)
             };
