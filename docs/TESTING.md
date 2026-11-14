@@ -121,6 +121,12 @@ Read the existing tests near the area you change before writing a new one; the h
   Two Phase 8 tests (`a_repositorys_skill_is_attached...`, `a_hostile_project_skill...`) run with
   `context_pack: false`: their repositories are fixtures and the pack's tree would name the skill folders.
   Live check: `scripts/perf/context-pack-check.mjs`.
+- Short tool schemas (Phase 11 CP11.1): `hermes_prompts` `tools.rs` tests (byte budgets per schema and for the
+  whole block, the shape snapshot `crates/prompts/tests/fixtures/tool_shapes.json`, the phrases a call depends
+  on, the pointer sentence), `hermes_tools` `skills.rs` `the_tools_guide_is_bundled_and_documents_every_parameter...`
+  (every property name of the four schemas appears in the skill), `turns.rs`
+  `the_long_tool_schemas_are_short_in_every_profile` (bytes of the request's `tools` in each profile, one
+  request). The whole `turns` suite passes unchanged under each profile: request counts did not move.
 - Known flaky under heavy load: `an_exhausted_budget_ends_with_a_toolless_summary` (timing).
   Re-run it alone before suspecting your change.
 

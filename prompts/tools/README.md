@@ -5,6 +5,8 @@ The JSON schemas hermes-rs sends to the model. Each starts from the Hermes schem
 model is never promised something the tool doesn't do. When a tool gains a feature, restore the
 Hermes wording for it.
 
+**Short schemas (Phase 11 CP11.1).** `skill_manage`, `session_search`, `memory` and `delegate_task` are the exceptions: their `description` strings (top level and parameters) are shortened, because the tool list is sent with every request, and end with `Details: skill_view hermes-tools-guide`. The long text lives in the bundled skill `assets/skills/autonomous-ai-agents/hermes-tools-guide/SKILL.md` (a section per tool: when to use, every parameter, examples, gotchas, and the old description word for word). Rules for these four: change only `description` strings (the shape is pinned by `crates/prompts/tests/fixtures/tool_shapes.json`); anything that decides how a call must be *formed* (a required parameter, an enum, a limit, a recovery step) and every rule that keeps junk out of memory and skills (what not to store, no logs in skills, don't repeat a finished call) stays in the short text; rationale, examples and rare edge cases go in the skill; every parameter must be named in the skill (a test checks). Byte budgets are in `crates/prompts/src/tools.rs` (`SHORTENED`) and fail when exceeded. A schema that grows past its budget is a decision: raise the number and say why here.
+
 | Tool | Changes from Hermes |
 |---|---|
 | `todo_list` | none |
@@ -20,3 +22,4 @@ Hermes wording for it.
 | `web_extract` | "use a browser tool instead" → "say so rather than guessing" (no browser tools). |
 | `vision_analyze` | none (native path only: on a model without vision the tool says so instead of using an auxiliary vision model). |
 | `delegate_task` | Joined mode only (results return in the call; no background delivery, so no `action` list/steer/stop or `group`); no `output_schema` or `images` per task; flat (children never delegate); execute_code and cronjob references replaced; the parallel limit is not stated as a number (it follows the budget profile; the refusal names it). |
+| `skill_manage`, `session_search`, `memory`, `delegate_task` (Phase 11 CP11.1) | Descriptions shortened to the call-forming facts plus a pointer to the `hermes-tools-guide` skill; the Hermes text is kept in the skill. `session_search`'s `session_id` description now says what the code does (alone = read the whole session; with `around_message_id` = scroll), where Hermes's said it "must be paired". Earlier changes to these four (Phase 3 and 9) stand: `delegate_task` joined mode only and no stated parallel number, `memory`'s `tier`/`tags`/`links`/`note`. |

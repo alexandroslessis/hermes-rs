@@ -265,6 +265,12 @@ that hides it from the model, frees it again), and how `preinject::strip` / `use
 page, `/undo`, rewind, the `/review` briefing and the compaction summarizer only what the user
 typed (session search's rows: `hermes_store::without_attached_context`, the same cut).
 
+**Short tool schemas** (Phase 11 CP11.1): `prompts/tools/{skill_manage,session_search,memory,delegate_task}.json`
+carry only what a call needs plus `Details: skill_view hermes-tools-guide`; the rest (every parameter,
+examples, gotchas, the old text) is the bundled skill `assets/skills/autonomous-ai-agents/hermes-tools-guide`,
+loaded on demand with `skill_view` (the local index never retrieves it, so it is never pre-injected). `crates/prompts/src/tools.rs` holds byte budgets (`SHORTENED`) and
+the snapshot test; `prompts/tools/README.md` has the rules.
+
 **First-turn context pack** (Phase 10 CP10.2, `runtime/src/context_pack.rs`): under `requests`
 (`budget.context_pack`; `balanced` and `tokens` off) the first user message of a session whose folder is
 inside a git repository (`project_skills::find_root`, a worktree counts) gets a `<repo-context>` element

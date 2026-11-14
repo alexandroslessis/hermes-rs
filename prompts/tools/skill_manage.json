@@ -1,12 +1,12 @@
 {
   "name": "skill_manage",
-  "description": "Create, update or delete skills: your procedural memory for recurring tasks. The call is an operations array (a single edit is a list of one); it applies atomically — any failure rolls every touched skill back. Ops: create (full SKILL.md; lands in the skills directory; must precede that skill's other ops), patch (targeted old_string/new_string fix — preferred; content alone REPLACES the whole file, read it via skill_view() first), write_file/remove_file (supporting files), delete (sole op only). Existing skills are modified wherever they live. Description: max 60 chars, 'Use when <trigger>. <behavior>.', never the category name (the index shows it). Write lessons, not logs: imperative rule + why, no PR numbers/dates/incident narration, one rule per lesson, references/ named by topic (extend before adding). skill_view() shows format conventions.",
+  "description": "Create, update or delete skills (procedural memory). `operations` is an ordered array (one edit = list of one), applied atomically: any failure rolls everything back. create (full SKILL.md; before that skill's other ops), patch (old_string/new_string preferred; `content` alone REPLACES the whole file, skill_view first), write_file/remove_file (supporting files), delete (sole op only). Existing skills are edited wherever they live. Skill description: max 60 chars, 'Use when <trigger>. <behavior>.', never the category name. Write lessons, not logs: imperative rule + why, one rule per lesson, no PR numbers/dates/incident narration. Details: skill_view hermes-tools-guide",
   "parameters": {
     "type": "object",
     "properties": {
       "operations": {
         "type": "array",
-        "description": "Ordered ops; each names its target skill (lowercase, hyphens/underscores, max 64 chars). Each action is its own shape; another action's text slot is invalid.",
+        "description": "Ordered ops, each naming its skill (lowercase, hyphens/underscores, max 64 chars). Each action has its own shape; another action's text slot is invalid.",
         "items": {
           "anyOf": [
             {
@@ -24,7 +24,7 @@
                 },
                 "content": {
                   "type": "string",
-                  "description": "Full SKILL.md text (YAML frontmatter + markdown body)."
+                  "description": "Full SKILL.md (YAML frontmatter + markdown body)."
                 },
                 "category": {
                   "type": "string",
@@ -52,7 +52,7 @@
                 },
                 "old_string": {
                   "type": "string",
-                  "description": "Text to find (same matching semantics as the patch tool)."
+                  "description": "Text to find (as in the patch tool)."
                 },
                 "new_string": {
                   "type": "string",
@@ -64,7 +64,7 @@
                 },
                 "file_path": {
                   "type": "string",
-                  "description": "Optional supporting file (write_file's shape); default SKILL.md."
+                  "description": "Optional supporting file; default SKILL.md."
                 }
               },
               "required": [
@@ -113,11 +113,11 @@
                 },
                 "file_path": {
                   "type": "string",
-                  "description": "Path RELATIVE to the skill's own directory, e.g. 'references/api.md' — no leading slash, never absolute; first segment references/, templates/, scripts/, or assets/."
+                  "description": "Path RELATIVE to the skill's directory, e.g. 'references/api.md'; no leading slash, never absolute; first segment references/, templates/, scripts/ or assets/."
                 },
                 "file_content": {
                   "type": "string",
-                  "description": "Full text of the supporting file."
+                  "description": "Full text of the file."
                 }
               },
               "required": [
@@ -142,7 +142,7 @@
                 },
                 "file_path": {
                   "type": "string",
-                  "description": "Supporting file (write_file's shape)."
+                  "description": "Supporting file to remove (same path shape as write_file)."
                 }
               },
               "required": [

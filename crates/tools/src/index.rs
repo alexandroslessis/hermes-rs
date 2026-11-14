@@ -725,6 +725,10 @@ impl LocalIndex {
             let mut found: Vec<SkillHit> = Vec::new();
             for row in rows {
                 let (name, category, description, path, score, row_scope) = row?;
+                // Reference text for the tools, loaded on demand only (`skills::TOOLS_GUIDE`).
+                if name == skills::TOOLS_GUIDE && row_scope == GLOBAL {
+                    continue;
+                }
                 // A linked memory raises a skill that already matches; it never brings in one
                 // that does not.
                 let score = score + boosts.get(&name).copied().unwrap_or(0.0);
@@ -1200,6 +1204,39 @@ pub(super) mod tests {
         ("what is the weather like tomorrow in the mountains", None),
         ("", None),
     ];
+
+    /// CP11.1 review: `hermes-tools-guide` (23 KB) names memory, sessions, search, skills and
+    /// subagents, so ordinary coding messages scored up to 10.5 against it, over the 5.0 that
+    /// pre-injection attaches at (clipped to 12,000 characters, ~3k tokens on such a turn). It is
+    /// reference text loaded with `skill_view` only: the index never retrieves it, whatever the
+    /// message, and the other skills rank as if it were not there.
+    #[test]
+    fn the_tools_guide_is_never_retrieved() {
+        let f = bundled();
+        f.index.refresh().unwrap();
+        assert!(f.skills.find(skills::TOOLS_GUIDE).is_some(), "the guide is bundled");
+        let anything = Limits {
+            min_skill_score: 0.0,
+            ..Limits::default()
+        };
+        for message in [
+            "fix the memory leak in the session manager",
+            "write a tool to manage memory sessions",
+            "refactor the memory store and session search tools",
+            "the memory tool failed with an error",
+            "delegate the tests to subagents in parallel",
+            "use delegate_task to search sessions",
+            "the skill_manage call failed",
+            "hermes tools guide",
+        ] {
+            let hits = f.index.query(&q(message), &anything).unwrap().skills;
+            assert!(
+                hits.iter().all(|h| h.name != skills::TOOLS_GUIDE),
+                "{message:?}: {:?}",
+                hits.iter().map(|h| (&h.name, h.score)).collect::<Vec<_>>()
+            );
+        }
+    }
 
     #[test]
     fn goldens() {

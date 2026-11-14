@@ -1,0 +1,328 @@
+{
+ "delegate_task": {
+  "name": "delegate_task",
+  "parameters": {
+   "properties": {
+    "tasks": {
+     "items": {
+      "properties": {
+       "context": {
+        "type": "string"
+       },
+       "goal": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "goal"
+      ],
+      "type": "object"
+     },
+     "minItems": 1,
+     "type": "array"
+    }
+   },
+   "required": [
+    "tasks"
+   ],
+   "type": "object"
+  }
+ },
+ "memory": {
+  "name": "memory",
+  "parameters": {
+   "properties": {
+    "operations": {
+     "items": {
+      "additionalProperties": false,
+      "properties": {
+       "action": {
+        "enum": [
+         "add",
+         "patch",
+         "remove",
+         "note_read"
+        ],
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       },
+       "links": {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       "note": {
+        "type": "string"
+       },
+       "old_text": {
+        "type": "string"
+       },
+       "tags": {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       "tier": {
+        "enum": [
+         "core",
+         "project",
+         "archive"
+        ],
+        "type": "string"
+       }
+      },
+      "required": [
+       "action"
+      ],
+      "type": "object"
+     },
+     "type": "array"
+    },
+    "target": {
+     "enum": [
+      "memory",
+      "user"
+     ],
+     "type": "string"
+    }
+   },
+   "required": [
+    "target",
+    "operations"
+   ],
+   "type": "object"
+  }
+ },
+ "session_search": {
+  "name": "session_search",
+  "parameters": {
+   "properties": {
+    "after": {
+     "type": "string"
+    },
+    "around_message_id": {
+     "type": "integer"
+    },
+    "before": {
+     "type": "string"
+    },
+    "detail": {
+     "default": "adaptive",
+     "enum": [
+      "adaptive",
+      "full"
+     ],
+     "type": "string"
+    },
+    "exclude_session_ids": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "limit": {
+     "default": 3,
+     "type": "integer"
+    },
+    "query": {
+     "type": "string"
+    },
+    "role_filter": {
+     "type": "string"
+    },
+    "session_id": {
+     "type": "string"
+    },
+    "sort": {
+     "enum": [
+      "newest",
+      "oldest"
+     ],
+     "type": "string"
+    },
+    "window": {
+     "default": 5,
+     "type": "integer"
+    }
+   },
+   "required": [],
+   "type": "object"
+  }
+ },
+ "skill_manage": {
+  "name": "skill_manage",
+  "parameters": {
+   "properties": {
+    "operations": {
+     "items": {
+      "anyOf": [
+       {
+        "additionalProperties": false,
+        "properties": {
+         "action": {
+          "enum": [
+           "create"
+          ],
+          "type": "string"
+         },
+         "category": {
+          "type": "string"
+         },
+         "content": {
+          "type": "string"
+         },
+         "name": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "name",
+         "action",
+         "content"
+        ],
+        "type": "object"
+       },
+       {
+        "additionalProperties": false,
+        "properties": {
+         "action": {
+          "enum": [
+           "patch"
+          ],
+          "type": "string"
+         },
+         "file_path": {
+          "type": "string"
+         },
+         "name": {
+          "type": "string"
+         },
+         "new_string": {
+          "type": "string"
+         },
+         "old_string": {
+          "type": "string"
+         },
+         "replace_all": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "name",
+         "action",
+         "old_string",
+         "new_string"
+        ],
+        "type": "object"
+       },
+       {
+        "additionalProperties": false,
+        "properties": {
+         "action": {
+          "enum": [
+           "patch"
+          ],
+          "type": "string"
+         },
+         "content": {
+          "type": "string"
+         },
+         "name": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "name",
+         "action",
+         "content"
+        ],
+        "type": "object"
+       },
+       {
+        "additionalProperties": false,
+        "properties": {
+         "action": {
+          "enum": [
+           "write_file"
+          ],
+          "type": "string"
+         },
+         "file_content": {
+          "type": "string"
+         },
+         "file_path": {
+          "type": "string"
+         },
+         "name": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "name",
+         "action",
+         "file_path",
+         "file_content"
+        ],
+        "type": "object"
+       },
+       {
+        "additionalProperties": false,
+        "properties": {
+         "action": {
+          "enum": [
+           "remove_file"
+          ],
+          "type": "string"
+         },
+         "file_path": {
+          "type": "string"
+         },
+         "name": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "name",
+         "action",
+         "file_path"
+        ],
+        "type": "object"
+       },
+       {
+        "additionalProperties": false,
+        "properties": {
+         "absorbed_into": {
+          "type": "string"
+         },
+         "action": {
+          "enum": [
+           "delete"
+          ],
+          "type": "string"
+         },
+         "name": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "name",
+         "action"
+        ],
+        "type": "object"
+       }
+      ]
+     },
+     "type": "array"
+    }
+   },
+   "required": [
+    "operations"
+   ],
+   "type": "object"
+  }
+ }
+}

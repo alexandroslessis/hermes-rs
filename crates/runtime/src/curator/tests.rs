@@ -194,7 +194,7 @@ fn a_library_of_thousands_is_cut_to_the_cap() {
     );
 }
 
-/// The 39 skills the app bundles (the plan's "37" plus two nested ones): none clusters, and the
+/// The 40 skills the app bundles (the plan's "37", two nested ones and our own `hermes-tools-guide`): none clusters, and the
 /// most similar pair stays far under the threshold.
 #[test]
 fn bundled_skills_do_not_cluster() {

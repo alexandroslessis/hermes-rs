@@ -9085,3 +9085,40 @@ async fn the_system_prompt_has_the_batching_guidance_in_every_profile_and_the_to
         assert_eq!(system_of(&h.requests.lock()[1]), system);
     }
 }
+
+/// Phase 11 / CP11.1: the four long tool schemas (`skill_manage`, `session_search`, `memory`,
+/// `delegate_task`) are short in every profile, point at the `hermes-tools-guide` skill, and the
+/// turn still takes one request. Before CP11.1 the four were 13,092 bytes of the request's `tools`
+/// and the whole list 30,501 (`docs/backend/progress/phase-11.md`).
+#[tokio::test]
+async fn the_long_tool_schemas_are_short_in_every_profile() {
+    for profile in [
+        BudgetProfile::Requests,
+        BudgetProfile::Balanced,
+        BudgetProfile::Tokens,
+    ] {
+        let h = harness_profile(vec![text_reply("ok")], profile).await;
+        let session = session_in(&h);
+        run_turn(&h, &session, "hello").await;
+        let requests = h.requests.lock().clone();
+        assert_eq!(requests.len(), 1, "{profile:?}: request count");
+        let tools = requests[0]["tools"].as_array().unwrap();
+        let mut four = 0;
+        for name in ["skill_manage", "session_search", "memory", "delegate_task"] {
+            let tool = tools
+                .iter()
+                .find(|t| t["function"]["name"] == name)
+                .unwrap_or_else(|| panic!("{profile:?}: {name} is offered"));
+            let description = tool["function"]["description"].as_str().unwrap();
+            assert!(
+                description.ends_with("Details: skill_view hermes-tools-guide"),
+                "{profile:?} {name}: {description}"
+            );
+            four += tool.to_string().len();
+        }
+        let all = requests[0]["tools"].to_string().len();
+        println!("{profile:?}: four schemas {four} bytes, tools block {all} bytes");
+        assert!(four <= 10_100, "{profile:?}: the four schemas are {four} bytes");
+        assert!(all <= 27_700, "{profile:?}: the tools block is {all} bytes");
+    }
+}

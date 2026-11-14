@@ -798,6 +798,11 @@ phases:
 
 **Goal:** in the `tokens` profile, cut ~8k tokens of tool schemas per request.
 
+**CP11.1 status (2026-11-14):** implemented and reviewed; the sizes table (before and after, as serialised
+into a request) and the notes for the reviewer are in [progress/phase-11.md](progress/phase-11.md).
+Measured, the four schemas were 13.1 KB serialised (not the 6.4 / 3.9 / 2.8 / 2.7 KB of the files) and are
+now 10.0 KB (~780 tokens saved per request): the rest of the ~8k tokens has to come from CP11.2.
+
 1. Measure each schema's size (`prompts/tools/*.json`), record in this doc.
 2. **Shorter schemas:** rewrite `skill_manage` (6.4 KB), `session_search` (3.9 KB), `memory`
    (2.8 KB), `delegate_task` (2.7 KB) descriptions to ~1 KB each for all profiles, keeping the

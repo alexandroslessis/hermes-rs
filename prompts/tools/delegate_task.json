@@ -1,6 +1,6 @@
 {
   "name": "delegate_task",
-  "description": "Spawn isolated subagents for parallel or context-heavy work. Each gets its own conversation, terminal session, and toolset, and only its final summary returns to you. Pass every task in `tasks` — one entry spawns one subagent, several run in parallel (limit in the tasks description).\n\nParallel children are joined and their results return in this tool call.\n\nUSE FOR: reasoning-heavy subtasks, work that would flood your context, or independent parallel workstreams.\nDO NOT USE FOR (use these instead):\n- Mechanical multi-step work with no reasoning needed -> do it yourself with terminal\n- A single tool call -> call the tool directly\n- Tasks needing user interaction -> subagents cannot ask questions\n- Durable work that must survive this session -> terminal(background=True, notify=True); Stop or closing the session halts running subagents; each returns an 'interrupted' completion with partial output.\n\nRULES:\n- Children know nothing of this conversation: pass everything needed via 'context', including any required output language, tone, or style (e.g. \"respond in Chinese\").\n- Child summaries are SELF-REPORTS, not verified facts: a child claiming \"uploaded successfully\" or \"file written\" may be wrong. For external side effects (uploads, remote writes, publishing), require a verifiable handle (URL, ID, absolute path) and verify it yourself before telling the user the operation succeeded.\n- Children cannot close tracked work: a child asked to close it returns findings instead; the parent applies the transition.\n- Children cannot call delegate_task, clarify, or memory.\n- Children inherit the parent model.",
+  "description": "Spawn isolated subagents for parallel or context-heavy work; each gets its own conversation, terminal and toolset, and only its final summary returns (joined: results come back in this call). Pass every task in `tasks`: one entry = one subagent, several run in parallel. Use for reasoning-heavy subtasks, work that would flood your context, independent workstreams; not for mechanical steps (use terminal), a single tool call, anything needing the user (children cannot ask questions) or durable work that must outlive the session (terminal background). Children know nothing of this conversation: put everything needed in `context` (also any required language or tone). Summaries are SELF-REPORTS: verify external side effects (uploads, remote writes) through a URL, ID or path before telling the user. Children cannot call delegate_task, clarify or memory, and inherit your model. Details: skill_view hermes-tools-guide",
   "parameters": {
     "type": "object",
     "properties": {
@@ -12,18 +12,22 @@
           "properties": {
             "goal": {
               "type": "string",
-              "description": "What this subagent should accomplish. Be specific and self-contained — it knows nothing about your conversation history."
+              "description": "What the subagent should accomplish: specific and self-contained; it knows nothing of your conversation."
             },
             "context": {
               "type": "string",
-              "description": "Background THIS child needs: file paths, error messages, constraints. Each child sees only its own context — repeat shared background in every task that needs it."
+              "description": "Background THIS child needs: file paths, error messages, constraints. Each child sees only its own context: repeat shared background in every task."
             }
           },
-          "required": ["goal"]
+          "required": [
+            "goal"
+          ]
         },
-        "description": "The task(s), run in parallel (how many at once follows the user's budget profile: a longer list is refused, and the error states the limit). Each entry spawns one subagent with isolated context and terminal session; a single task is a one-entry array. Required."
+        "description": "The task(s), run in parallel (how many at once follows the user's budget profile: a longer list is refused and the error states the limit). Each entry = one subagent."
       }
     },
-    "required": ["tasks"]
+    "required": [
+      "tasks"
+    ]
   }
 }

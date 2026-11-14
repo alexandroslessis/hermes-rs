@@ -1138,3 +1138,41 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **The todo wording** (`requests`): "update the todo list only at phase boundaries" rides in the budget
   guidance, frozen with the session; the `todo_list` tool is unchanged, so a model that ignores the
   sentence still works.
+
+## Short tool schemas and `hermes-tools-guide` (Phase 11 CP11.1)
+
+- **The tool list text changes for every session once, on upgrade.** The descriptions of
+  `skill_manage`, `session_search`, `memory` and `delegate_task` shrank (and end with `Details:
+  skill_view hermes-tools-guide`), so the first request after the upgrade is a cache miss, as at
+  Phase 3, CP10.1 and CP10.2. The system prompt's text is unchanged. A session that already exists
+  keeps its stored prompt; only the tool schemas (sent every request) differ.
+- **Measured honestly: about 3.1 KB (~780 tokens), not the plan's "8k".** The plan's sizes (6.4 KB for
+  `skill_manage`...) were the pretty-printed files; as serialised into a request the four were 3.5 /
+  3.4 / 3.7 / 2.5 KB (13.1 KB), most of `skill_manage`'s being its six-way `anyOf` structure, which is
+  frozen. The four now take 10.0 KB (9.5 KB before the review put back behaviour rules the
+  short text must keep: no PR numbers/dates in skills, "don't repeat the call", what not to store,
+  archive entries one line). The ~8k saving of Phase 11 comes from CP11.2 (deferring tools),
+  not from shorter text. Table: `docs/backend/progress/phase-11.md`.
+- **Only `description` strings changed.** Names, types, `required`, enums, defaults and the `anyOf`
+  shapes are pinned by `crates/prompts/tests/fixtures/tool_shapes.json` (the old schemas with every
+  description removed): a call, a staging record, an ACP card or a review contract written against
+  the old schema is still valid. If you change a shape on purpose, regenerate that fixture and say so.
+- **What stays in the short text is what decides how a call is formed** (required parameters, enums,
+  limits, the rules that keep junk out of memory and skills, the one-batch rule, the `note_read` call by itself, the 60/64-character skill limits, the
+  `delete` sole-op rule, what a path may start with). A test lists phrases the four must still say.
+  Rationale, examples and rare edge cases are in the skill. A parameter added to one of the four
+  without a word in the skill fails `the_tools_guide_is_bundled_and_documents_every_parameter...`.
+- **`hermes-tools-guide` is an ordinary bundled skill**, not prompt text: embedded from
+  `assets/skills/autonomous-ai-agents/` (not `skills/`, which mirrors Hermes), seeded into the user's
+  skills folder with the others, listed by `skills_list` and in the index (one line under `balanced`,
+  a name under `tokens`, one more in a category count under `requests`), loaded with `skill_view`. It
+  is in the seeding manifest, so the curator never proposes changes to it, but the agent's own
+  `skill_manage` can still patch it (as any bundled skill, existing rule): a user who edits it keeps
+  their text across upgrades (the manifest hash check), which also means an app upgrade does not
+  refresh an edited guide. **It is never retrieved by the local index** (`skills::TOOLS_GUIDE`,
+  skipped in `LocalIndex::query`): its text names memory, sessions, search and subagents, so ordinary
+  coding messages ("fix the memory leak in the session manager": 9.6, threshold 5.0) would have had
+  12,000 characters of it pre-injected under `requests`, and the review's related skills would have
+  carried it too. Only `skill_view` loads it.
+- **The skill carries the old long text word for word** ("Original description" in each section), so
+  nothing was lost; when a Hermes update changes one of the four schemas, merge it there.

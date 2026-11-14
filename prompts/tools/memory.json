@@ -1,54 +1,78 @@
 {
   "name": "memory",
-  "description": "Save durable facts to persistent memory that survive across sessions. Memory is injected into every future turn, so keep entries compact and high-signal.\n\nHOW: make ALL your changes to one target in ONE call via an 'operations' array (each item: {action, content?, old_text?}). The batch applies atomically and the char limit is checked only on the FINAL result — so a single call can remove/patch stale entries to free room AND add new ones, even when an add alone would overflow. The response reports current/limit chars and confirms completion; one batch call finishes the update, so don't repeat it.\n\nWHEN: only for facts that apply to EVERY session regardless of task: who the user is, stable environment facts, standing conventions with no task home. Anything learned while doing a task (procedures, pitfalls, and the user's preferences and corrections for that kind of work) belongs in the task's skill via skill_manage, where it loads only when relevant; memory is injected into every turn and must stay small.\n\nIF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that removes or shortens enough stale entries and adds the new one together.\n\nTARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your notes (environment, conventions, tool quirks, lessons).\n\nSKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, completed-work logs, temporary TODO state (use session_search for those). Reusable procedures belong in a skill, not memory.\n\nTIERS (optional; omit for 'core', as above): 'project' = notes for the current git repository only, shown in chats in that repository (small limit); 'archive' = stored without a size limit, not shown in every chat (entries stay one-line summaries). 'note' (project/archive only) on an add or patch stores a long body in a file linked from the entry; read it with action 'note_read' + old_text + tier, as a call by itself. 'tags' and 'links' ('skill:name', 'file:path', 'session:id', 'memory:id') are optional labels. One call writes one tier.",
+  "description": "Durable facts that persist across sessions and are injected into every turn: keep entries compact. Put ALL changes to one target in ONE `operations` call ({action, content?, old_text?}); it is atomic and the char limit is checked on the FINAL result, so remove/patch stale entries and add new ones together. When full, an add is rejected with the entries shown: reissue ONE batch that frees room and adds. The result confirms completion: don't repeat the call. Only facts true for EVERY session (who the user is, stable environment facts, standing conventions); what you learn doing a task (procedures, pitfalls, per-task preferences) belongs in that task's skill via skill_manage. Skip trivial or easily re-discovered facts, raw dumps, task progress, completed-work logs, TODO state. One call writes one tier. note_read must be a call by itself. Details: skill_view hermes-tools-guide",
   "parameters": {
     "type": "object",
     "properties": {
       "target": {
         "type": "string",
-        "enum": ["memory", "user"],
-        "description": "Which memory store: 'memory' for personal notes, 'user' for user profile."
+        "enum": [
+          "memory",
+          "user"
+        ],
+        "description": "'memory' = your notes (environment, conventions, tool quirks, lessons); 'user' = who the user is (name, role, preferences, style)."
       },
       "operations": {
         "type": "array",
-        "description": "Changes applied atomically in one call against the final char budget; a single change is a one-item list.",
+        "description": "Changes applied atomically against the final char budget; one change = a one-item list.",
         "items": {
           "type": "object",
           "properties": {
-            "action": {"type": "string", "enum": ["add", "patch", "remove", "note_read"]},
+            "action": {
+              "type": "string",
+              "enum": [
+                "add",
+                "patch",
+                "remove",
+                "note_read"
+              ]
+            },
             "content": {
               "type": "string",
-              "description": "Required for 'add' and 'patch'. For 'add', the new entry. For 'patch', the text that replaces old_text; the rest of the entry is kept."
+              "description": "Required for add/patch. add: the new entry. patch: the text that replaces old_text (rest of the entry kept)."
             },
             "old_text": {
               "type": "string",
-              "description": "REQUIRED for 'patch' and 'remove': text from one entry. 'patch' replaces exactly this span (it must occur once in the entry); 'remove' deletes the whole entry. Omit for 'add'."
+              "description": "REQUIRED for patch/remove: text from one entry. patch replaces exactly this span (must occur once there); remove deletes the whole entry."
             },
             "tier": {
               "type": "string",
-              "enum": ["core", "project", "archive"],
-              "description": "Where the entry lives (default core). Applies to every action, including finding the entry for patch/remove/note_read."
+              "enum": [
+                "core",
+                "project",
+                "archive"
+              ],
+              "description": "core (default) | project (this git repo, small limit) | archive (no limit, not shown every chat; one-line entries, long text in `note`). Applies to every action, incl. finding the entry for patch/remove/note_read."
             },
             "tags": {
               "type": "array",
-              "items": {"type": "string"},
+              "items": {
+                "type": "string"
+              },
               "description": "Up to 8 short labels, for add or patch."
             },
             "links": {
               "type": "array",
-              "items": {"type": "string"},
+              "items": {
+                "type": "string"
+              },
               "description": "Up to 8 of 'skill:<name>', 'file:<path>', 'session:<id>', 'memory:<id>', for add or patch."
             },
             "note": {
               "type": "string",
-              "description": "Long-form body (project/archive tiers only), for add or patch."
+              "description": "Long body (project/archive only), kept in a linked file; add or patch. Read with action note_read + old_text + tier."
             }
           },
-          "required": ["action"],
+          "required": [
+            "action"
+          ],
           "additionalProperties": false
         }
       }
     },
-    "required": ["target", "operations"]
+    "required": [
+      "target",
+      "operations"
+    ]
   }
 }

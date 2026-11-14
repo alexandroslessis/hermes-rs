@@ -136,6 +136,7 @@ A row marked `diverged` is backend behaviour we deliberately changed (AGENTS.md 
 | `compress.rs` | `agent/context_compressor.py` |
 | `review.rs` | `agent/background_review.py`, `agent/curator.py`, `agent/learn_prompt.py` |
 | `titles.rs` | `agent/title_generator.py` |
+| `prompts/tools/{skill_manage,session_search,memory,delegate_task}.json`, `assets/skills/autonomous-ai-agents/hermes-tools-guide/` | `tools/skill_manager_tool.py`, `tools/session_search_tool.py`, `tools/memory_tool.py`, `tools/delegate_tool.py` (schemas). **diverged** (Phase 11 CP11.1): the four schemas' `description` strings are shortened (about 3.5 KB of the 30.5 KB tools block; names, types, `required`, enums and defaults are untouched, checked against a snapshot in `hermes_prompts`) and end with `Details: skill_view hermes-tools-guide`. The long-form text (Hermes's wording as it stood in our schemas, every parameter, examples, gotchas) is the bundled skill `hermes-tools-guide`, ours (not in `skills/`, which mirrors Hermes). A Hermes update that changes one of those schemas: merge the change into the skill's "Original description" section and the short text, not into a long description |
 | **Store** (`crates/store`) | |
 | `projects.rs` | `hermes_cli/projects_db.py` |
 
