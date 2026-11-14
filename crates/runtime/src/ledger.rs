@@ -199,27 +199,7 @@ fn prune(entry: &mut ProviderDays, now: i64) {
 /// The daily limit a provider's 429 message states as "N of N" ("...daily request limit reached
 /// (800 of 800)"): `Some(N)` when both numbers are the same, `None` otherwise.
 pub fn daily_limit_in(message: &str) -> Option<u32> {
-    // Thousands separators ("1,000 of 1,000") are dropped first, so the numbers stay whole.
-    let chars: Vec<char> = message.chars().collect();
-    let message: String = chars
-        .iter()
-        .enumerate()
-        .filter(|&(i, &c)| {
-            !(c == ','
-                && i > 0
-                && chars[i - 1].is_ascii_digit()
-                && chars.get(i + 1).is_some_and(char::is_ascii_digit))
-        })
-        .map(|(_, &c)| c)
-        .collect();
-    let words: Vec<&str> = message
-        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | '.' | ';' | ':'))
-        .filter(|word| !word.is_empty())
-        .collect();
-    words.windows(3).find_map(|w| {
-        let (used, limit) = (w[0].parse::<u32>().ok()?, w[2].parse::<u32>().ok()?);
-        (w[1].eq_ignore_ascii_case("of") && used == limit && limit > 0).then_some(limit)
-    })
+    hermes_llm::fallback::daily_limit_in(message)
 }
 
 fn unix_now() -> i64 {
@@ -247,6 +227,9 @@ struct Inner {
     /// take the read lock for a moment. The request path never touches it.
     shared: Arc<parking_lot::RwLock<Snapshot>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Providers that answered "the daily quota is used up" (a 429 the fallback chain switched
+    /// on), with the unix time their day starts over. In memory only: a restart asks again.
+    exhausted: Mutex<std::collections::HashMap<String, i64>>,
 }
 
 impl Drop for Inner {
@@ -294,7 +277,31 @@ impl Ledger {
                 tx,
                 shared,
                 thread: Mutex::new(thread),
+                exhausted: Mutex::new(Default::default()),
             }),
+        }
+    }
+
+    /// Remembers that `provider` is out of requests until `until` (unix time): the governor then
+    /// refuses it without a request (backend v2 Phase 12, so the next turn does not spend a
+    /// request to learn what the last one learned).
+    pub fn mark_exhausted(&self, provider: &str, until: i64) {
+        if let Ok(mut map) = self.inner.exhausted.lock() {
+            map.insert(provider.to_string(), until);
+        }
+    }
+
+    /// When `provider`'s exhausted mark ends, while it is still in the future.
+    pub fn exhausted_until(&self, provider: &str) -> Option<i64> {
+        let now = unix_now();
+        let mut map = self.inner.exhausted.lock().ok()?;
+        match map.get(provider).copied() {
+            Some(until) if until > now => Some(until),
+            Some(_) => {
+                map.remove(provider);
+                None
+            }
+            None => None,
         }
     }
 

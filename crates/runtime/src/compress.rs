@@ -1035,6 +1035,33 @@ pub struct AutoCompress {
     pub state: SharedTurnState,
     pub summarizer: Summarizer,
     pub rebuild_prompt: PromptRebuild,
+    /// The provider fallback chain's current target (Phase 12): once the turn runs on a fallback
+    /// (or is about to), its window decides when to compress, and the summary the session model
+    /// would write is written there (the session's provider is the one that could not serve).
+    pub fallback: Option<Arc<hermes_agent::fallback::FallbackShared>>,
+}
+
+impl Summarizer {
+    /// The same summarizer for a fallback target's window, with the session model's part on the
+    /// target's provider.
+    fn bound_to(&self, bound: &hermes_agent::fallback::Bound) -> Summarizer {
+        let mut summarizer = self.clone();
+        if let Some(window) = bound.window.filter(|&n| n > 0) {
+            summarizer.window = Some(window);
+        }
+        match summarizer.fallback.take() {
+            // The session's own model writes the summary: on the target's provider instead.
+            None => {
+                summarizer.llm = bound.provider.clone();
+                summarizer.model = bound.model.clone();
+                summarizer.context_length = bound.window.or(summarizer.context_length);
+            }
+            // An auxiliary compression model keeps its own provider; the session model behind
+            // it (who writes the summary when the auxiliary cannot) becomes the target's.
+            Some(inner) => summarizer.fallback = Some(Box::new(inner.bound_to(bound))),
+        }
+        summarizer
+    }
 }
 
 #[async_trait]
@@ -1066,9 +1093,20 @@ impl Operation<TurnSession, HermesEffect> for AutoCompress {
                 return not_applicable();
             }
         }
-        let budget = Budget::with_compress_at(self.summarizer.window, self.summarizer.compress_at);
+        let bound_summarizer = self
+            .fallback
+            .as_ref()
+            .and_then(|shared| shared.bound())
+            .map(|bound| self.summarizer.bound_to(&bound));
+        let summarizer = bound_summarizer.as_ref().unwrap_or(&self.summarizer);
+        let budget = Budget::with_compress_at(summarizer.window, summarizer.compress_at);
         let fixed = estimate_text(&session.system_prompt) + tool_definition_tokens();
-        let tokens = session.context_tokens(conversation, fixed);
+        let mut tokens = session.context_tokens(conversation, fixed);
+        if bound_summarizer.is_some() {
+            // The last reported size came from the primary provider (its tokenizer, its cache);
+            // a fallback is judged by the estimate of the whole request.
+            tokens = tokens.max(fixed + estimate_messages(conversation.messages()));
+        }
         if tokens < budget.threshold {
             return not_applicable();
         }
@@ -1079,7 +1117,7 @@ impl Operation<TurnSession, HermesEffect> for AutoCompress {
             .messages()
             .iter()
             .rposition(|message| is_real_user_turn(message) && message.is_user_visible());
-        let result = compact(conversation, fixed, &self.summarizer, None, kickoff).await;
+        let result = compact(conversation, fixed, summarizer, None, kickoff).await;
         let compacted = match result {
             Ok(Some(compacted)) => compacted,
             Ok(None) => {

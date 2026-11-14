@@ -51,7 +51,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 9 | Memory v2: tiers, structured entries, links — ✅ 2026-11-13 | L | 5, 7 | Sonnet (CP9.1 **Opus**) | B |
 | 10 | Fewer round trips: script tool, first-turn context, batching — ✅ 2026-11-14 | M | 3 | Sonnet | A |
 | 11 | Token mode: deferred tool schemas — ✅ 2026-11-14 | S–M | 3 | Sonnet | A |
-| 12 | Provider fallback chain | M | 2 | Sonnet | A |
+| 12 | Provider fallback chain — ✅ 2026-11-14 | M | 2 | Sonnet | A |
 | 13a/c/f | Perf: `Arc<Message>`, `spawn_blocking`, typed dispatch | M | 0 | Sonnet | filler |
 | 13b | Perf: store writer actor | M | 0 | **Opus** | C |
 | 13d/e | Perf: session actor, explicit agent loop | L | all others | **Opus** | last, alone |

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
-use hermes_llm::base::Provider;
+use hermes_llm::base::{MessageStream, Provider};
 use hermes_llm::conversation::message::{InferenceMetadata, Message, MessageContent};
 use hermes_llm::conversation::token_usage::ProviderUsage;
 use hermes_llm::conversation::{
@@ -17,6 +17,10 @@ use hermes_llm::errors::ProviderError;
 use hermes_llm::model::ModelConfig;
 use tracing_futures::Instrument;
 
+use crate::events::AgentEvent;
+use crate::fallback::{
+    switch_notice, Bound, ChainRun, FallbackChain, FallbackTarget, Pending,
+};
 use crate::machine::MachineSession;
 use crate::operation::{
     applied, messages_since_kickoff, not_applicable, trailing_error, Emitter, Inference,
@@ -253,7 +257,71 @@ pub struct InferenceRunner<'a, S, E> {
     request_preparer: Arc<dyn InferenceRequestPreparer<S> + 'a>,
     output: Mutex<InferenceOutput>,
     empty_response_retries: usize,
+    /// The providers after this one that a failing request may move to (Phase 12).
+    chain: Option<FallbackChain>,
+    run: Mutex<ChainRun>,
     effect: std::marker::PhantomData<fn() -> E>,
+}
+
+/// What serves a request: the provider and the model asked for.
+struct Serving {
+    provider: Arc<dyn Provider>,
+    model: String,
+}
+
+/// The result of opening a request's stream.
+enum Opened {
+    Stream(MessageStream, Serving),
+    /// Every provider that could serve it failed (or none was allowed): the error to show.
+    Failed(ProviderError),
+    /// The conversation does not fit the next provider's window: compress, then ask again.
+    Compress,
+}
+
+/// The error shown when no provider of the chain could serve the request: the first one's, with
+/// what happened at each position.
+fn exhausted(first_error: Option<ProviderError>, trail: &[String]) -> ProviderError {
+    with_trail(
+        first_error.unwrap_or_else(|| {
+            ProviderError::RequestFailed("no provider of the fallback chain could serve the request".into())
+        }),
+        trail,
+    )
+}
+
+/// Why a request left a provider, for the notice.
+struct Cause {
+    from: usize,
+    /// A sentence naming the provider ("a has used up its request quota").
+    reason: String,
+    /// The provider is out of requests until its reset.
+    quota: bool,
+}
+
+/// Where the next request of a failing one goes.
+enum Pick {
+    Use(usize),
+    Compress(usize),
+    Exhausted,
+}
+
+/// Appends what happened at each position of the chain to the error the user will read.
+fn with_trail(mut error: ProviderError, trail: &[String]) -> ProviderError {
+    if !trail.is_empty() {
+        if let Some(details) = error.details_mut() {
+            details.push_str(&format!("\n\nFallback chain: {}", trail.join("; ")));
+        }
+    }
+    error
+}
+
+/// An error in one line, for the chain's trail.
+fn brief(error: &ProviderError) -> String {
+    let text = error.to_string().replace('\n', " ");
+    match text.char_indices().nth(160) {
+        Some((end, _)) => format!("{}...", &text[..end]),
+        None => text,
+    }
 }
 
 /// The agent-visible conversation as the provider sees it: tool requests left
@@ -286,6 +354,17 @@ fn messages_for_provider(
         })
         .filter(|message| keep_empty_messages || !message.content.is_empty())
         .collect()
+}
+
+/// The messages as one provider takes them: signed reasoning of another provider dropped, the
+/// conversation projected, repaired and merged.
+fn finalize_request(mut messages: Vec<Message>, provider: &str) -> Conversation {
+    drop_foreign_signed_thinking(&mut messages, provider);
+    let projected = Conversation::new_unvalidated(messages).agent_visible_messages();
+    let (fixed, _) = fix_conversation(Conversation::new_unvalidated(projected));
+    Conversation::new_unvalidated(merge_consecutive_messages_for_request(
+        fixed.messages().clone(),
+    ))
 }
 
 /// Signed reasoning only verifies with the provider account that produced it.
@@ -368,8 +447,17 @@ impl<'a, S: MaybeSync, E: InferenceEffect> InferenceRunner<'a, S, E> {
             request_preparer: Arc::new(IdentityInferenceRequestPreparer),
             output: Mutex::new(InferenceOutput::default()),
             empty_response_retries: DEFAULT_EMPTY_RESPONSE_RETRIES,
+            chain: None,
+            run: Mutex::new(ChainRun::default()),
             effect: std::marker::PhantomData,
         }
+    }
+
+    /// The providers a request moves to when this one cannot serve it (see [`crate::fallback`]).
+    /// An empty chain changes nothing.
+    pub fn with_fallback(mut self, chain: FallbackChain) -> Self {
+        self.chain = (!chain.targets.is_empty()).then_some(chain);
+        self
     }
 
     /// How often an empty reply is requested again before the empty-response marker is given.
@@ -384,6 +472,286 @@ impl<'a, S: MaybeSync, E: InferenceEffect> InferenceRunner<'a, S, E> {
     ) -> Self {
         self.request_preparer = request_preparer;
         self
+    }
+
+    /// Opens the stream of one request. Without a chain this is `provider.stream`. With one it
+    /// also moves the request to the next provider when the failure is the provider's (see
+    /// [`hermes_llm::fallback::classify`]), the governor refuses a provider, or the request
+    /// does not fit a provider's window; the position is kept for the rest of the turn.
+    #[allow(clippy::too_many_arguments)]
+    async fn open_stream(
+        &self,
+        primary: &ModelConfig,
+        max_tokens: Option<i32>,
+        system_prompt: &str,
+        request: &Conversation,
+        base: Option<&[Message]>,
+        tools: &[rmcp::model::Tool],
+        emit: &Emitter,
+    ) -> Opened {
+        let (Some(chain), Some(base)) = (&self.chain, base) else {
+            return match self
+                .provider
+                .stream(primary, system_prompt, request.messages(), tools)
+                .await
+            {
+                Ok(stream) => Opened::Stream(
+                    stream,
+                    Serving {
+                        provider: self.provider.clone(),
+                        model: primary.model_name.clone(),
+                    },
+                ),
+                Err(error) => Opened::Failed(error),
+            };
+        };
+        let primary_name = self.provider.get_name().to_string();
+        let label = |index: usize| -> String {
+            match index {
+                0 => primary_name.clone(),
+                n => chain.targets[n - 1].label.clone(),
+            }
+        };
+        let tokens = chain.gate.estimate(system_prompt, request.messages(), tools);
+
+        // Where this request starts: after a compression asked for a target, at that target;
+        // else where the turn is now, unless the gate refuses that provider.
+        let mut trail: Vec<String> = Vec::new();
+        let mut first_error: Option<ProviderError> = None;
+        let mut cause: Option<Cause> = None;
+        let pending = self.run.lock().unwrap().pending.take();
+        let start = match pending {
+            Some(pending) => {
+                trail = pending.trail;
+                first_error = pending.first_error;
+                cause = Some(Cause {
+                    from: pending.from,
+                    reason: pending.reason,
+                    quota: pending.quota,
+                });
+                self.pick(chain, pending.index, tokens, &label, &mut trail)
+            }
+            None => {
+                let current = self.run.lock().unwrap().current;
+                match chain.gate.allow(current) {
+                    Ok(()) => Pick::Use(current),
+                    Err(why) => {
+                        // Our own decision (the provider's configured daily limit is used up):
+                        // no request is spent finding out.
+                        let name = label(current);
+                        trail.push(format!("{name}: {why}"));
+                        first_error = Some(ProviderError::RateLimitExceeded {
+                            details: why,
+                            retry_delay: None,
+                        });
+                        cause = Some(Cause {
+                            from: current,
+                            reason: format!(
+                                "{name} {}",
+                                hermes_llm::fallback::Trigger::GovernorExhausted.describe()
+                            ),
+                            quota: true,
+                        });
+                        self.pick(chain, current + 1, tokens, &label, &mut trail)
+                    }
+                }
+            }
+        };
+        let mut index = match start {
+            Pick::Use(index) => index,
+            Pick::Compress(next) => {
+                return self.ask_compression(chain, next, cause, first_error, trail);
+            }
+            Pick::Exhausted => return Opened::Failed(exhausted(first_error, &trail)),
+        };
+
+        loop {
+            self.settle(chain, index, &mut cause, emit, &label);
+            let (provider, config, name) = if index == 0 {
+                (self.provider.clone(), primary.clone(), label(0))
+            } else {
+                let target: &FallbackTarget = &chain.targets[index - 1];
+                let config = match max_tokens {
+                    Some(tokens) => target.model_config.clone().with_max_tokens(Some(tokens)),
+                    None => target.model_config.clone(),
+                };
+                (target.provider.clone(), config, target.label.clone())
+            };
+            let opened = if index == 0 {
+                provider
+                    .stream(&config, system_prompt, request.messages(), tools)
+                    .await
+            } else {
+                let request = finalize_request(base.to_vec(), &name);
+                provider
+                    .stream(&config, system_prompt, request.messages(), tools)
+                    .await
+            };
+            let error = match opened {
+                Ok(mut stream) => {
+                    // The first item decides: an error before anything arrived is still a failure
+                    // of the request, not of a response that was half delivered.
+                    match stream.next().await {
+                        Some(Err(error)) => error,
+                        first => {
+                            // An ended stream is not polled again (not every stream is fused).
+                            let stream: MessageStream = match first {
+                                Some(item) => {
+                                    Box::pin(futures::stream::once(async { item }).chain(stream))
+                                }
+                                None => Box::pin(futures::stream::empty()),
+                            };
+                            return Opened::Stream(
+                                stream,
+                                Serving {
+                                    provider,
+                                    model: config.model_name.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+                Err(error) => error,
+            };
+            let Some(trigger) = hermes_llm::fallback::classify(&error) else {
+                // Not the provider's failure (auth, a bad request, context length...): the same
+                // request fails anywhere, and a wrong key is for the user to see.
+                trail.push(format!("{name}: {}", brief(&error)));
+                let shown = if first_error.is_none() {
+                    error
+                } else {
+                    with_trail(error, &trail)
+                };
+                return Opened::Failed(shown);
+            };
+            chain.gate.failed(index, trigger, &error);
+            tracing::warn!(provider = %name, trigger = trigger.as_str(), "request failed, trying the next provider: {error}");
+            trail.push(format!("{name}: {}", brief(&error)));
+            cause = Some(Cause {
+                from: index,
+                reason: format!("{name} {}", trigger.describe()),
+                quota: trigger.is_quota(),
+            });
+            first_error.get_or_insert(error);
+            match self.pick(chain, index + 1, tokens, &label, &mut trail) {
+                Pick::Use(next) => index = next,
+                Pick::Compress(next) => {
+                    return self.ask_compression(chain, next, cause, first_error, trail);
+                }
+                Pick::Exhausted => return Opened::Failed(exhausted(first_error, &trail)),
+            }
+        }
+    }
+
+    /// The first position from `start` on that the gate allows and the request fits.
+    fn pick(
+        &self,
+        chain: &FallbackChain,
+        start: usize,
+        tokens: usize,
+        label: &dyn Fn(usize) -> String,
+        trail: &mut Vec<String>,
+    ) -> Pick {
+        for index in start.max(1)..=chain.targets.len() {
+            let target = &chain.targets[index - 1];
+            if let Err(why) = chain.gate.allow(index) {
+                trail.push(format!("{}: skipped, {why}", label(index)));
+                continue;
+            }
+            if let Some(limit) = target.fit_limit.filter(|&limit| tokens > limit) {
+                // Compression first (once per target and turn); never an over-limit request.
+                if self.run.lock().unwrap().compress_asked.insert(index) {
+                    return Pick::Compress(index);
+                }
+                trail.push(format!(
+                    "{}: skipped, the conversation (about {tokens} tokens) does not fit its window ({limit} tokens)",
+                    label(index)
+                ));
+                continue;
+            }
+            return Pick::Use(index);
+        }
+        Pick::Exhausted
+    }
+
+    /// Records that `index` should be tried once the conversation is compressed for its window,
+    /// and tells the turn's compress step which window that is.
+    fn ask_compression(
+        &self,
+        chain: &FallbackChain,
+        index: usize,
+        cause: Option<Cause>,
+        first_error: Option<ProviderError>,
+        trail: Vec<String>,
+    ) -> Opened {
+        let target = &chain.targets[index - 1];
+        chain.shared.bind(Some(Bound {
+            label: target.label.clone(),
+            provider: target.provider.clone(),
+            model: target.model_config.model_name.clone(),
+            window: target.window,
+        }));
+        let cause = cause.unwrap_or(Cause {
+            from: 0,
+            reason: String::new(),
+            quota: false,
+        });
+        self.run.lock().unwrap().pending = Some(Pending {
+            index,
+            from: cause.from,
+            reason: cause.reason,
+            quota: cause.quota,
+            first_error,
+            trail,
+        });
+        // The conversation is rebuilt after the compression, so what this call prepared is dropped.
+        self.output().additional_messages.clear();
+        Opened::Compress
+    }
+
+    /// The request goes to `index`: remember it for the rest of the turn, bind the compress step
+    /// to its window, and tell the user which provider now has the conversation.
+    fn settle(
+        &self,
+        chain: &FallbackChain,
+        index: usize,
+        cause: &mut Option<Cause>,
+        emit: &Emitter,
+        label: &dyn Fn(usize) -> String,
+    ) {
+        let previous = {
+            let mut run = self.run.lock().unwrap();
+            std::mem::replace(&mut run.current, index)
+        };
+        if previous != index || cause.is_some() {
+            chain.shared.bind((index > 0).then(|| {
+                let target = &chain.targets[index - 1];
+                Bound {
+                    label: target.label.clone(),
+                    provider: target.provider.clone(),
+                    model: target.model_config.model_name.clone(),
+                    window: target.window,
+                }
+            }));
+        }
+        let Some(cause) = cause.take() else {
+            return;
+        };
+        let model = if index == 0 {
+            self.model_config.model_name.clone()
+        } else {
+            chain.targets[index - 1].model_config.model_name.clone()
+        };
+        emit.emit(AgentEvent::Status {
+            kind: "fallback",
+            text: switch_notice(
+                &cause.reason,
+                &label(index),
+                &model,
+                &label(0),
+                cause.quota && cause.from == 0,
+            ),
+        });
     }
 
     fn output(&self) -> MutexGuard<'_, InferenceOutput> {
@@ -498,7 +866,8 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
             self.output().additional_messages = additional_messages;
 
             let provider_name = self.provider.get_name();
-            drop_foreign_signed_thinking(&mut messages_for_provider, provider_name);
+            // The fallback chain takes the same messages, finished for its own provider.
+            let fallback_base = self.chain.is_some().then(|| messages_for_provider.clone());
             if let Some(session_id) = latest_provider_session_id(conversation, provider_name) {
                 if let Err(error) = self.provider.resume(session_id).await {
                     tracing::warn!(
@@ -509,42 +878,44 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
                 }
             }
 
-            let projected =
-                Conversation::new_unvalidated(messages_for_provider).agent_visible_messages();
-            let (fixed, _) = fix_conversation(Conversation::new_unvalidated(projected));
-            let conversation_for_provider = Conversation::new_unvalidated(
-                merge_consecutive_messages_for_request(fixed.messages().clone()),
-            );
+            let conversation_for_provider = finalize_request(messages_for_provider, provider_name);
             let successful_tool_response =
                 ends_with_successful_tool_response(conversation.messages());
             let mut empty_responses = 0;
             let empty_output = loop {
             let attempt_start = self.output().usage.len();
-            let stream = self
-                .provider
-                .stream(
+            let opened = self
+                .open_stream(
                     &model_config,
+                    session.max_tokens_override(),
                     &system_prompt,
-                    conversation_for_provider.messages(),
+                    &conversation_for_provider,
+                    fallback_base.as_deref(),
                     &tools,
+                    emit,
                 )
                 .await;
-
-            let mut stream = match stream {
-                Ok(stream) => stream,
-                Err(err) => return self.error_outcome(&err, &mut operation_logs, emit),
+            let (mut stream, serving) = match opened {
+                Opened::Stream(stream, serving) => (stream, serving),
+                Opened::Failed(err) => return self.error_outcome(&err, &mut operation_logs, emit),
+                // The turn's compress step makes the conversation fit the next provider; this
+                // runs again after it.
+                Opened::Compress => {
+                    self.output().additional_messages.clear();
+                    return applied(Vec::<E>::new());
+                }
             };
 
-            let requested_model = model_config.model_name.clone();
-            let resolved_model = self
+            let requested_model = serving.model.clone();
+            let resolved_model = serving
                 .provider
                 .fetch_model_info(&requested_model)
                 .await
                 .ok()
                 .and_then(|model_info| model_info.resolved_model);
-            let provider_session_id = self.provider.provider_session_id();
+            let provider_session_id = serving.provider.provider_session_id();
             let inference = Some(InferenceMetadata {
-                provider: self.provider.get_name().to_string(),
+                provider: serving.provider.get_name().to_string(),
                 requested_model,
                 resolved_model,
                 provider_session_id,

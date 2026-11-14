@@ -137,6 +137,18 @@ Read the existing tests near the area you change before writing a new one; the h
   `the_core_mcp_tools_are_the_ones_the_session_started_with`, `the_context_breakdown_counts_the_tools_a_deferred_session_sends`. Live:
   `scripts/perf/deferred-tools-check.mjs`. Under `HERMES_TEST_PROFILE=tokens` the suite keeps `tokens`' other knobs but **not** its deferred list
   (`test_budget(None)` sets `tool_schemas: All`: the other tests call deferred tools directly); the deferral is covered by the tests that name `Tokens`.
+- Provider fallback (Phase 12 CP12.1): classification and config validation are unit tests (`crates/llm/src/fallback.rs`: real OpenRouter /
+  OpenAI / Ollama bodies and Retry-After values; `crates/desktop/src/fallback.rs`; `crates/runtime/src/fallback.rs`: the gate, the cap, the fit
+  limit). `turns.rs` (after the `Phase 12` banner) runs two or three mock providers, `duo(a_handler, b_handler, http_retries)`, each recording
+  (purpose, body) per request: the daily 429 -> b with the same messages and tools, the notice and the ledger on both; the next turn skips a known
+  used-up primary; 5xx after the retries (counts 2 and 1), the next turn re-probes; a tool call after the switch stays on b and runs once; a
+  missing model (404 and 400 wordings); 400 / 401 / 403 / 422 / per-minute 429 / plain 404 never reach b (zero requests); our limit at 0 goes
+  to b with no request to a, b's own limit refuses the turn, a used-up b is skipped for c; a chain that runs out shows the first error plus
+  `Fallback chain:`; an auth error on b is shown; a stream that breaks half way (bad JSON, or an in-stream server error that would switch had it
+  come first) is not re-asked and nothing is duplicated; an in-stream error as the FIRST frame does move to b; a working primary
+  makes the same requests as without a chain; a smaller window compresses first (the summary request goes to b) and the real request fits; a
+  fallback nothing can make fit is skipped and never sent the request; a session resumes on the primary after a restart.
+  Live: `scripts/perf/fallback-check.mjs`.
 - Known flaky under heavy load: `an_exhausted_budget_ends_with_a_toolless_summary` (timing).
   Re-run it alone before suspecting your change.
 

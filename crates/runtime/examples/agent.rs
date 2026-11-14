@@ -152,6 +152,7 @@ async fn main() -> Result<()> {
             effort: std::env::var("HERMES_EFFORT").ok(),
             supports_vision: std::env::var("HERMES_VISION").is_ok(),
             aux: Default::default(),
+            fallback: Vec::new(),
         },
         &prompt,
     )?;

@@ -111,6 +111,13 @@ const USAGE_LIMIT_MARKERS: &[&str] = &[
     "usage limit has been reached",
     "usage_limit_reached",
     "request limit reached",
+    // Daily quotas worded by the day (OpenRouter's free tier: "free-models-per-day", Groq's
+    // "tokens per day (TPD)", "daily request limit"): backend v2 Phase 12 switches provider on
+    // these, so they must not be slept out first.
+    "per-day",
+    "per day",
+    "daily request limit",
+    "daily limit",
 ];
 
 /// True when a rate-limit error says a request/usage limit is reached (a daily or monthly
@@ -147,11 +154,21 @@ fn is_thinking_signature_error(message: &str) -> bool {
 
 pub fn should_retry(error: &ProviderError, config: &RetryConfig) -> bool {
     match error {
-        ProviderError::RateLimitExceeded { details, .. } if is_usage_limit(details) => false,
+        ProviderError::RateLimitExceeded {
+            details,
+            retry_delay,
+        } if crate::fallback::is_daily_quota(details, *retry_delay) => false,
         ProviderError::RateLimitExceeded { .. }
         | ProviderError::ServerError(_)
         | ProviderError::NetworkError(_) => true,
         ProviderError::RequestFailed(message) if is_permanent_request_failure(message) => false,
+        // A model the provider does not have will not appear on the next try (the fallback chain
+        // moves on instead, Phase 12).
+        ProviderError::RequestFailed(message)
+            if crate::fallback::is_model_not_found(message) =>
+        {
+            false
+        }
         ProviderError::RequestFailed(_) => !config.transient_only,
         _ => false,
     }
@@ -318,8 +335,20 @@ mod tests {
     #[test]
     fn default_config_retries_request_failed() {
         let config = RetryConfig::default();
-        let error = ProviderError::RequestFailed("Bad request (400): model not found".into());
+        let error = ProviderError::RequestFailed("Bad request (400): upstream hiccup".into());
         assert!(should_retry(&error, &config));
+    }
+
+    #[test]
+    fn never_retries_a_missing_model() {
+        // The model will not appear on the next try; the fallback chain moves on instead.
+        let config = RetryConfig::default();
+        for message in [
+            "Bad request (400): model not found",
+            "Resource not found (404) at https://x/v1/chat/completions: model \"m\" not found, try pulling it first",
+        ] {
+            assert!(!should_retry(&ProviderError::RequestFailed(message.into()), &config));
+        }
     }
 
     #[test]
@@ -355,7 +384,7 @@ mod tests {
     #[test]
     fn transient_only_skips_request_failed() {
         let config = RetryConfig::default().transient_only();
-        let error = ProviderError::RequestFailed("Bad request (400): model not found".into());
+        let error = ProviderError::RequestFailed("Bad request (400): upstream hiccup".into());
         assert!(!should_retry(&error, &config));
     }
 

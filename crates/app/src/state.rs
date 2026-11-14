@@ -357,6 +357,7 @@ impl AppState {
                 effort: self.config.efforts.get(&model).cloned(),
                 supports_vision: self.supports_vision(&model),
                 aux: Default::default(),
+                fallback: Vec::new(),
             },
             model,
         })

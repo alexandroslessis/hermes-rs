@@ -10,6 +10,7 @@ pub mod branch;
 pub mod commands;
 pub mod endpoints;
 pub mod export;
+pub mod fallback;
 pub mod files;
 pub mod gateway;
 pub mod git;

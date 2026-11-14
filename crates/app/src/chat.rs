@@ -1630,6 +1630,7 @@ impl ChatView {
                     effort: state.config.efforts.get(&self.model).cloned(),
                     supports_vision: state.supports_vision(&self.model),
                     aux: state.aux_models(),
+                    fallback: Vec::new(),
                 },
             )
         };

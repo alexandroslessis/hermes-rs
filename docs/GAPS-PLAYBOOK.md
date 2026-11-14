@@ -187,6 +187,10 @@ key); files come from replies, terminal output and producer tools' path keys.
 
 ## 3.8 Model fallbacks — M
 
+**Done 2026-11-14 as backend v2 Phase 12** (what was built and how it differs from the plan below:
+`docs/ARCHITECTURE.md` "The provider fallback chain"; the rules are in `crates/agent/src/fallback.rs` and
+`crates/llm/src/fallback.rs`). The text below is the original plan, kept for the Hermes references.
+
 **What the user gets:** when a request to the main model fails (rate limit, server error,
 unreachable endpoint), the turn retries on the next model in a chain.
 **Page:** sub-page `fallbacks`, field `fallback_providers` (`fallback-models-field.tsx`); Hermes's

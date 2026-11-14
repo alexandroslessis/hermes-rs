@@ -105,6 +105,12 @@ calls `tool_search` gets the schema and the loaded tool is in the next request's
 requests: one more than a profile that has the tool from the start), the page sees the `tool_search` call like any tool, a deferred tool called before it was
 loaded is not run and answers with its schema, a session keeps its list when the profile changes, `requests` / `balanced` send all 18 tools byte-identical in
 every request with no `tool_search`, the context breakdown counts fewer tool tokens for the deferred session, and `budget.tool_schemas` overrides the profile (a bad value is refused).
+`fallback-check.mjs` checks the provider fallback chain (Phase 12) with two providers of its own (:47900 is the session's, :47901 is added as a custom
+endpoint and removed again; stop `mock_llm.py` first): without a chain a 401 ends the turn and only the first provider is asked; with one, 401 and
+400 still never reach the fallback; an invalid chain (unknown provider, the main model, a half entry) is ignored; the daily limit used up on our side goes
+straight to the fallback with a `fallback` status line that names it and the cache; a daily-quota 429 completes the turn on the fallback, the next turn
+does not ask the first provider again, and with the chain emptied the turn is refused by the governor. It leaves an empty `fallback_providers` and no
+limit in the instance's config.
 `path-policy-check.mjs` checks the file tools' path policy (a model asking to write into the app's data, skills
  and memories folders is refused, naming the right tool, and nothing is written) with its own provider
  on :47900.

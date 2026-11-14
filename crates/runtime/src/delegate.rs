@@ -677,6 +677,7 @@ impl Delegator {
                 state: state.clone(),
                 summarizer: self.summarizer.clone(),
                 rebuild_prompt: Arc::new(move || Ok(child_prompt.clone())),
+                fallback: None,
             })),
             Step::Inference(Arc::new(
                 InferenceRunner::new(self.llm.clone(), model_config)

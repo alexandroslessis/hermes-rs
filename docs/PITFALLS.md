@@ -1248,3 +1248,51 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **`tool_search` is not in `hermes_prompts::tools::tool_names()`**, and `crates/desktop`'s
   `every_tool_belongs_to_one_toolset` does not know it: it is not a toolset tool (it cannot be switched
   off). The page and ACP show it as a generic tool call (ACP title "Load tools: ...").
+
+
+## The provider fallback chain (Phase 12)
+
+- **A switch sends the conversation to another provider.** That is the user's explicit choice (they listed
+  it), and the notice names the provider each time. It is why only some failures switch (`hermes_llm::fallback::
+  classify`) and why **401 / 403 never do**: a wrong key on the main provider would otherwise be hidden behind a
+  working fallback, and the conversation would go to a provider the user did not pick for that failure. A user
+  with only a local model (Ollama) who adds a hosted provider has chosen to send their conversation there when
+  the local server is down; the Settings text says so. No key is ever read from the chain's entries: an entry
+  names a provider configured under Providers, whose own endpoint and key are used.
+- **`fallback_providers` is dropped entry by entry, with a warning in `logs\desktop.log`** (unknown or key-less
+  provider, a model absent from a fixed model list, the main model itself, repeats, more than 3). A chain that
+  "does nothing" is usually one of these: look in the log. A wrong model id on a discovering provider is not
+  checked ahead; it shows as a skipped fallback ("does not serve the model") when it is needed.
+- **The next turn tries the primary again**, so while the primary is down each turn spends one failed request
+  (and its `http_retries`) before the fallback answers. Only a daily quota is remembered: the provider's own
+  "N of N" 429, or our configured limit, keeps the primary refused until its reset (in memory: a restart asks
+  again). To stop asking a dead primary, switch the model (or remove it from use) rather than waiting.
+- **Prompt caching restarts on the new provider**, and the notice says so. A long conversation re-read on the
+  fallback costs its whole input once; later requests of the turn are cached there. The fallback's context
+  window may be smaller: the conversation is compressed for it first (the one allowed exception to "never
+  rewrite history"), and a fallback it still does not fit is skipped. The compress step judges a fallback by the
+  estimate of the whole request (characters / 4), not by the last usage the primary reported.
+- **A half-delivered response is not re-asked on the fallback.** If the stream breaks after text reached the
+  page, the turn ends with the error as before: switching would answer the question twice. Only a failure
+  before the first chunk moves the request.
+- **Changed retry rules** (`should_retry`): a daily-quota 429 (any of the wordings in `fallback.rs`, a
+  Retry-After of an hour or more) and a missing model are no longer retried by the provider layer; before, the
+  missing model cost `http_retries` extra requests, and a quota 429 whose body lacked the old markers was slept
+  out up to the retry cap.
+- **Model-not-found is read from the provider's words**, not the status alone (a plain 404 is a wrong URL, the
+  user's configuration to fix, and does not switch). The URL the provider layer prefixes to a 404 is ignored,
+  so a host named `models.*` is not "model not found". "model" and "not found" / "does not exist" must be in
+  the same sentence, within 120 characters ("tool call id not found ... the model" is an ordinary 400).
+- **The review, curator, titles, approval judge and `delegate_task` children do not use the chain** (and the
+  compression summary uses the fallback only while the turn runs on it). A primary at its quota still makes
+  those jobs wait or fail as before; the governor's "background jobs wait under 20%" keeps them from
+  spending the last requests.
+- **The page's Fallbacks sub-page is the page's own** (`fallback-models-field.tsx`, the `fallback_providers`
+  key): it writes the extra routing keys its editor keeps (`base_url`...), which this backend ignores. It was
+  hidden by `hide.css` until Phase 12 and **was not opened in a rebuilt page** (no webapp build in the
+  worktree). Read from Hermes's source at `HERMES_COMMIT` instead: the sub-page (`config-subpages.ts`, fields
+  `['fallback_providers']`) renders `FallbackModelsField` for that key, whose only backend calls are
+  `GET /api/model/options` (served; the Auxiliary page uses it, `slug` = our provider id, which is what
+  `fallback.rs` matches) and the ordinary config autosave. `scripts/perf/fallback-check.mjs` writes the key
+  through `config.set` like the page's autosave. If the editor misbehaves in the app, re-add
+  `nav-config:model:fallbacks` to `hide.css`; the key still works from the file.

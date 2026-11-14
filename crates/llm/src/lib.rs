@@ -7,6 +7,7 @@ pub mod conversation;
 pub mod discovery;
 pub mod documents;
 pub mod errors;
+pub mod fallback;
 pub mod formats;
 pub mod goose_mode;
 pub mod http_status;

@@ -225,7 +225,7 @@ Two settings files, with different owners — don't mix them up:
 | File | Read/written by | Holds |
 |---|---|---|
 | `config.json` | `providers::Settings::load/save`, `aux_models.rs` | providers (custom endpoints), the default model, the side jobs' models (`aux_models`), shared with GPUI |
-| `desktop-config.json` | `rest.rs` (`config_value("a.b")`, `set_config_value`) | everything on Hermes's Settings page (Hermes's `config.yaml` keys, dotted) |
+| `desktop-config.json` | `rest.rs` (`config_value("a.b")`, `set_config_value`) | everything on Hermes's Settings page (Hermes's `config.yaml` keys, dotted); `fallback_providers` is the fallback chain (read per turn by `fallback.rs`) |
 | `ui-preferences.json` | `rest.rs` | the page's interface preferences |
 
 `Gateway::apply_settings()` pushes `desktop-config.json` values into the runtime (approvals mode,
@@ -242,6 +242,8 @@ allow / warn / deny per purpose. The limit comes from Settings ▸ Providers ▸
 (`daily_request_limit`, patch 0021) or the `requests.limits.<provider id>` config key, else it is
 learned from a provider's "N of N" 429. The page sees it as `requests.status` and as the status
 bar's allowance gauge (`plan_gauge` in `session.usage`).
+
+**Provider fallback** (Phase 12): see "The provider fallback chain" at the end of this file.
 
 **Budget profiles** (Phase 3): `runtime/src/budget.rs` holds every limit the agent loop spends
 requests or tokens on (iteration budget, retry caps, compression thresholds, result/read/search
@@ -434,3 +436,79 @@ archive), then, with a model, one of:
   external / project, the absorber exists) for all archives before the first change; a failure after
   an archive went through takes it back out of `.archive` (no duplicate). A model's
   `skill_manage` call can't use it (`parse_call` refuses the action).
+
+## The provider fallback chain (Phase 12 CP12.1)
+
+When the main provider cannot serve a request, the turn goes on with the next provider the user
+listed (GAPS 3.8). Four small modules, one per layer; the switch itself is in one place,
+`InferenceRunner::open_stream` (`crates/agent/src/inference.rs`).
+
+| Layer | File | What it holds |
+|---|---|---|
+| `hermes_llm` | `fallback.rs` | `classify(&ProviderError) -> Option<Trigger>`: the only place that decides which failures switch. Also `daily_limit_in` (the "N of N" of a quota 429) |
+| `hermes_agent` | `fallback.rs`, `inference.rs` | `FallbackChain` (targets, `FallbackGate`, `FallbackShared`), the walk in `open_stream`, the notice |
+| `hermes_runtime` | `fallback.rs` | `FallbackModel` (a configured provider + model), the gate (governor, ledger, token estimate), `TurnOptions.fallback` |
+| `hermes-desktop` | `fallback.rs` | `fallback_providers` (config record) -> validated `FallbackModel`s |
+
+**Config.** `fallback_providers` in `desktop-config.json`: `[{provider, model}, ...]`, in the order tried,
+at most 3 (`MAX_FALLBACKS`). It is the key Hermes's own Settings ▸ Model ▸ Fallbacks sub-page edits (unhidden in
+`hide.css`; the schema entry is in `rest.rs`). It is global, not per profile or per session: this backend has
+no profile layering and a session stores only its own provider and model. Read at every turn
+(`Gateway::turn_options`), so a change applies from the next message. An entry names a provider that is
+configured under Settings ▸ Providers; its endpoint and key are that provider's, and nothing else in the entry
+is read (the page may write `base_url`, `api_key`... beside it; they are ignored, a key never travels in the
+chain). Unusable entries are dropped with a logged warning, never a failed turn: unknown or key-less provider,
+a model a fixed model list does not contain, the main model itself, a repeat, the fourth and later. A model that
+a discovering provider does not have is not checked (it would cost a network call per turn): the provider
+answers "model not found", which moves on.
+
+**What switches** (`classify`; the table is in the module doc): a daily-quota 429 (the "N of N" body, "usage
+limit reached", "free-models-per-day", "per day", a Retry-After of an hour or more), our own governor at 0 for
+the provider (no request is sent), 5xx or no answer after the provider layer's own retries, and an unknown
+model (404, or 400 saying "not a valid model" / "does not exist"). **Never** 401 / 403 (a wrong key is the
+user's to fix, and the conversation would leave for a provider the user did not choose for that failure), 400,
+422, 413 / context too long (compression handles it), 402, a per-minute 429 (the existing back-off), a stream
+that stopped decoding. `should_retry` no longer retries a daily-quota 429 or a missing model (they would cost
+`http_retries` extra requests of the scarce quota before the switch).
+
+**One request, not the session.** The runner is built per turn and keeps the chain position in a `ChainRun`:
+after a switch the rest of the TURN stays on the fallback (no flapping between providers mid-turn), and the
+next turn starts at the primary again. The primary is skipped without a request only when the governor knows it
+is out of requests until its reset: its configured daily limit is used up, or it answered a daily-quota 429
+(`Ledger::mark_exhausted`, in memory, until the provider's next reset, honoured by `Governor::check`, so by
+`begin_turn` too). An outage or an unknown model is not remembered: the next turn asks the primary once, at the
+cost of one failed request (plus its retries) per turn while it is down. The same request is re-issued: same
+messages and tools, signed reasoning of another provider dropped as for any provider change
+(`finalize_request`), the fallback's model and (known) window, no reasoning-effort params (they are
+model-specific). Tool results already executed are not re-run: only the model call moves.
+
+**A response is never delivered twice.** A request moves only before anything of its response reached the
+page: an HTTP error before the stream, or an error as the stream's first item (the runner peeks it). Once a
+chunk was delivered, a failing stream ends the turn as it always did (what arrived stays, the error follows);
+it is never re-asked on another provider (that would answer twice).
+
+**Every provider keeps its own limits.** The gate asks `Governor::check(provider, Main)` for each position
+before a request goes there, so a switch cannot spend a quota the user capped; a refused fallback is skipped and
+the walk continues. The ledger counts a request on the provider that served it (every client is labelled with its
+provider id), so a turn that moved shows one request on each. `begin_turn` refuses a turn at 0 only when no
+provider of the chain may take it.
+
+**Context length is checked before switching.** Per target, `fit_limit` is the compression threshold of its
+window (`Budget::with_compress_at`); the runner estimates the request (`FallbackGate::estimate`, chars / 4).
+If it does not fit, the runner asks for compression once per target and turn: it records a `Pending` and returns
+an empty `applied`, the machine loops, and `AutoCompress` (which reads `FallbackShared`) compresses for that
+window, writing the summary on the target's provider instead of the session's (an auxiliary compression model
+keeps its own provider, with the target behind it in place of the session model); then the runner re-checks. Still too big: the target is skipped, never sent an over-limit request.
+Compression is the one allowed exception to prompt caching. A target with an unknown window is not checked.
+
+**The notice.** `AgentEvent::Status { kind: "fallback", text }` -> `status.update`, the one kind the page keeps as
+a line in the conversation (the same one the taint warnings use). Text: which provider could not serve and why,
+`switched to B (model) for the rest of this turn`, that the conversation is now sent to B, that its prompt cache
+starts empty (the next request reads everything again), and that the next message tries A again. If the whole
+chain fails, the error shown is the first provider's own, followed by `Fallback chain: a: ...; b: ...`.
+
+**Who uses the chain.** Only the main turn. The review, curator, titles, compression summaries (except for the
+fallback's window, above), the approval judge and `delegate_task` children keep their own providers: the
+governor already defers background jobs when quota is low, and a chain for them would send work the user did
+not see to another provider. ACP (`hermes-acp`) drives the same gateway, so it gets the chain too (the notice
+reaches Zed as a thought line, like the compression status). Subagents of a turn run on the primary.

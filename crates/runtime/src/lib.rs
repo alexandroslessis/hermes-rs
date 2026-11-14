@@ -9,6 +9,7 @@ pub mod context_pack;
 mod curator;
 mod delegate;
 pub mod deferred;
+pub mod fallback;
 mod guards;
 pub mod governor;
 pub mod ledger;
@@ -136,6 +137,9 @@ pub struct TurnOptions {
     pub supports_vision: bool,
     /// Models for side jobs (Hermes's `auxiliary.*`); each falls back to the turn's model.
     pub aux: AuxModels,
+    /// The providers the turn's requests move to, in order, when the main provider cannot serve
+    /// one (backend v2 Phase 12, `fallback.rs`). Empty: no fallback, nothing changes.
+    pub fallback: Vec<fallback::FallbackModel>,
 }
 
 /// A model for a side job, on its own provider.
@@ -1227,6 +1231,7 @@ impl Runtime {
             effort,
             supports_vision,
             aux,
+            fallback,
         } = options;
         let effort_params = effort
             .as_deref()
@@ -1235,6 +1240,18 @@ impl Runtime {
         let cancel = CancellationToken::new();
         // The daily request quota: refused only when it is used up, warned when nearly so.
         let quota_notice = match self.governor().check(&provider.id, Purpose::Main) {
+            // A used-up provider with a fallback that may still be used is not a refusal: the
+            // turn's first request moves to the fallback (and says so).
+            governor::Verdict::Deny(_)
+                if fallback.iter().any(|model| {
+                    !self
+                        .governor()
+                        .check(&model.provider.id, Purpose::Main)
+                        .is_denied()
+                }) =>
+            {
+                None
+            }
             governor::Verdict::Deny(why) => anyhow::bail!("{why}"),
             governor::Verdict::Warn(text) => Some(text),
             governor::Verdict::Allow => None,
@@ -1281,6 +1298,9 @@ impl Runtime {
                 return Err(error);
             }
         };
+        // The providers a request moves to when this one cannot serve it (Phase 12).
+        let fallback_chain = fallback::build(&provider.id, &fallback, &budget, &self.ledger);
+        let fallback_shared = fallback_chain.as_ref().map(|chain| chain.shared.clone());
         let state: ops::SharedTurnState = Arc::default();
         *open.turn_state.lock() = Some(state.clone());
         open.tools.begin_turn();
@@ -1673,11 +1693,16 @@ impl Runtime {
                     state: state.clone(),
                     summarizer: summarizer.clone(),
                     rebuild_prompt,
+                    fallback: fallback_shared,
                 })),
-                Step::Inference(Arc::new(
-                    InferenceRunner::new(llm, model_config)
-                        .with_empty_response_retries(budget.empty_response_retries),
-                )),
+                Step::Inference(Arc::new({
+                    let runner = InferenceRunner::new(llm, model_config)
+                        .with_empty_response_retries(budget.empty_response_retries);
+                    match fallback_chain {
+                        Some(chain) => runner.with_fallback(chain),
+                        None => runner,
+                    }
+                })),
             ];
             let machine = StateMachine::new(steps, turn_cancel.clone());
             let result = machine.run(&runtime, &session_id, &emit).await;

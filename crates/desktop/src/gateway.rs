@@ -1511,6 +1511,15 @@ impl Gateway {
                 .as_ref()
                 .is_some_and(|r| self.sends_images(&r.provider, &r.model)),
             aux,
+            // Settings ▸ Model ▸ Fallbacks (`fallback.rs`): the providers a request moves to when
+            // the main one cannot serve it.
+            fallback: crate::fallback::resolve(
+                &self.rest.config_value("fallback_providers"),
+                &settings,
+                record.as_ref().map(|r| (r.provider.as_str(), r.model.as_str())),
+                &context,
+                &|provider, model| self.sends_images(provider, model),
+            ),
         }
     }
 

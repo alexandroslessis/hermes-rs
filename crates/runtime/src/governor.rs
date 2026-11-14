@@ -99,6 +99,13 @@ impl Governor {
 
     /// May a request of `purpose` go to `provider` now?
     pub fn check(&self, provider: &str, purpose: Purpose) -> Verdict {
+        // A provider that told us its quota is used up stays refused until its reset.
+        if let Some(until) = self.ledger.exhausted_until(provider) {
+            return Verdict::Deny(format!(
+                "The daily request quota of {provider} is used up (the provider said so). It resets at {}.",
+                reset_text(until)
+            ));
+        }
         decide(&self.ledger.usage(provider), purpose, provider)
     }
 }

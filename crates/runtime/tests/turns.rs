@@ -825,6 +825,7 @@ async fn effort_is_sent_only_when_set() {
         effort: Some("high".into()),
         supports_vision: false,
         aux: Default::default(),
+        fallback: Default::default(),
     };
     let mut turn = h
         .runtime
@@ -1682,6 +1683,7 @@ async fn live_refine_saves_something() {
         effort: None,
         supports_vision: false,
         aux: Default::default(),
+        fallback: Default::default(),
     };
     let session = runtime
         .create_session(&provider, &model, Some(32768), work.path())
@@ -1920,6 +1922,7 @@ async fn a_request_past_the_threshold_is_compressed_before_the_next_call() {
         effort: None,
         supports_vision: false,
         aux: Default::default(),
+        fallback: Default::default(),
     };
     // `balanced` compresses at 75% of a small window (`requests` waits for 90%).
     let h = harness_profile(
@@ -2006,6 +2009,7 @@ async fn live_compress_keeps_what_matters() {
         effort: None,
         supports_vision: false,
         aux: Default::default(),
+        fallback: Default::default(),
     };
     let session = runtime
         .create_session(&provider, &model, Some(16384), work.path())
@@ -2137,6 +2141,7 @@ async fn too_much_attached_context_refuses_the_message() {
         effort: None,
         supports_vision: false,
         aux: Default::default(),
+        fallback: Default::default(),
     };
     // Each file fits on its own (under half of 2k tokens), together they don't.
     let error = h
@@ -2300,6 +2305,7 @@ fn vision(supports_vision: bool) -> TurnOptions {
         effort: None,
         supports_vision,
         aux: Default::default(),
+        fallback: Default::default(),
     }
 }
 
@@ -2424,6 +2430,7 @@ async fn live_vision_sees_attached_and_loaded_images() {
         effort: None,
         supports_vision: true,
         aux: Default::default(),
+        fallback: Default::default(),
     };
     let session = runtime
         .create_session(&provider, &model, Some(128_000), work.path())
@@ -2809,6 +2816,7 @@ async fn live_delegate_task_counts_files_in_a_subagent() {
         effort: None,
         supports_vision: false,
         aux: Default::default(),
+        fallback: Default::default(),
     };
     let session = runtime
         .create_session(&provider, &model, Some(32_768), work.path())
@@ -2974,6 +2982,7 @@ async fn live_mcp_stdio_server_is_used_by_a_real_model() {
         effort: None,
         supports_vision: false,
         aux: Default::default(),
+        fallback: Default::default(),
     };
     let session = runtime
         .create_session(&provider, &model, Some(32_768), work.path())
@@ -10002,4 +10011,715 @@ async fn the_context_breakdown_counts_the_tools_a_deferred_session_sends() {
     assert!(tokens * 10 < balanced * 7, "{tokens} of {balanced}");
     // Within the estimator's slack of what is really sent (the entries' JSON wrapping).
     assert!(tokens * 4 <= tokens_sent && balanced * 4 <= balanced_sent);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phase 12: the provider fallback chain (docs/backend/PHASES.md). Two mock providers, "a" (the
+// session's) and "b" (the chain's); every request each one sees is recorded with its purpose.
+// ---------------------------------------------------------------------------------------------
+
+use hermes_runtime::fallback::FallbackModel;
+
+/// What a mock provider answers to its n-th request (counting from 0).
+type Handler = Box<dyn Fn(usize) -> ResponseTemplate + Send + Sync>;
+
+struct Mock2 {
+    n: std::sync::atomic::AtomicUsize,
+    log: Arc<Mutex<Vec<(String, Value)>>>,
+    handler: Handler,
+}
+
+impl Respond for Mock2 {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let n = self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let purpose = request
+            .headers
+            .get("x-hermes-rs-purpose")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("main")
+            .to_string();
+        self.log.lock().push((purpose, request.body_json().unwrap()));
+        (self.handler)(n)
+    }
+}
+
+fn ok(text: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(text_reply(text))
+}
+
+/// OpenRouter's per-account daily limit, as the user's provider answers it.
+fn daily_429() -> ResponseTemplate {
+    ResponseTemplate::new(429)
+        .insert_header("retry-after", "19919")
+        .set_body_json(json!({"error": {
+            "message": "Rate limit exceeded: user daily request limit reached (800 of 800). \
+                        Retry after 19919 seconds.",
+            "code": 429,
+            "metadata": {"retry_after_seconds": 19919}
+        }}))
+}
+
+fn error_status(status: u16, message: &str) -> ResponseTemplate {
+    ResponseTemplate::new(status).set_body_json(json!({"error": {"message": message}}))
+}
+
+struct Duo {
+    runtime: Runtime,
+    data: tempfile::TempDir,
+    work: tempfile::TempDir,
+    _servers: Vec<MockServer>,
+    a: ProviderConfig,
+    b: ProviderConfig,
+    a_log: Arc<Mutex<Vec<(String, Value)>>>,
+    b_log: Arc<Mutex<Vec<(String, Value)>>>,
+}
+
+/// One more mock provider with its own request log.
+async fn mock_provider(
+    id: &str,
+    handler: Handler,
+) -> (MockServer, ProviderConfig, Arc<Mutex<Vec<(String, Value)>>>) {
+    let server = MockServer::start().await;
+    let log = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(Mock2 {
+            n: Default::default(),
+            log: log.clone(),
+            handler,
+        })
+        .mount(&server)
+        .await;
+    let config = ProviderConfig {
+        id: id.into(),
+        base_url: format!("{}/v1", server.uri()),
+        api_key: Some("key".into()),
+    };
+    (server, config, log)
+}
+
+/// Provider "a" and provider "b" under a budget whose provider layer retries `http_retries` times.
+async fn duo(a: Handler, b: Handler, http_retries: usize) -> Duo {
+    let (sa, a_cfg, a_log) = mock_provider("a", a).await;
+    let (sb, b_cfg, b_log) = mock_provider("b", b).await;
+    let data = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let budget = BudgetKnobs {
+        http_retries,
+        ..test_budget(None)
+    };
+    let runtime = runtime_with_budget(data.path(), Arc::new(Bridge), budget);
+    Duo {
+        runtime,
+        data,
+        work,
+        _servers: vec![sa, sb],
+        a: a_cfg,
+        b: b_cfg,
+        a_log,
+        b_log,
+    }
+}
+
+impl Duo {
+    fn session(&self) -> String {
+        self.runtime
+            .create_session(&self.a, "model-a", None, self.work.path())
+            .unwrap()
+            .id
+    }
+
+    fn chain(&self, window: Option<usize>) -> TurnOptions {
+        TurnOptions {
+            fallback: vec![FallbackModel {
+                provider: self.b.clone(),
+                model: "model-b".into(),
+                context_length: window,
+                supports_vision: false,
+            }],
+            ..Default::default()
+        }
+    }
+
+    async fn turn(&self, session: &str, options: TurnOptions, text: &str) -> Vec<RuntimeEvent> {
+        let turn = self
+            .runtime
+            .start_turn(session, &self.a, options, text)
+            .unwrap();
+        collect(turn).await
+    }
+
+    fn a_count(&self) -> usize {
+        self.a_log.lock().len()
+    }
+
+    fn b_count(&self) -> usize {
+        self.b_log.lock().len()
+    }
+
+    fn texts(&self, session: &str) -> Vec<String> {
+        self.runtime
+            .messages(session)
+            .unwrap()
+            .iter()
+            .map(|m| m.as_concat_text())
+            .collect()
+    }
+}
+
+/// The "switched to" lines the page would show.
+fn switch_notices(events: &[RuntimeEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::Agent(AgentEvent::Status { kind, text }) if text.contains("switched to") => {
+                assert_eq!(*kind, "fallback", "the status kind the page keeps");
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Waits for the ledger thread to show `n` requests today for `provider`.
+async fn wait_used(runtime: &Runtime, provider: &str, n: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while runtime.ledger().usage(provider).used < n && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_daily_quota_429_moves_the_request_to_the_fallback_and_the_turn_completes() {
+    let d = duo(
+        Box::new(|_| daily_429()),
+        Box::new(|_| ok("answered on b")),
+        3,
+    )
+    .await;
+    let session = d.session();
+    let began = std::time::Instant::now();
+    let events = d.turn(&session, d.chain(None), "hello").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    // The quota 429 is not retried (the reset is hours away): one request to a, one to b.
+    assert_eq!((d.a_count(), d.b_count()), (1, 1));
+    assert!(began.elapsed() < Duration::from_secs(30));
+    assert_eq!(d.texts(&session).last().unwrap(), "answered on b");
+    // The same request, for the other model: messages and tools are the same.
+    let (a, b) = (d.a_log.lock()[0].1.clone(), d.b_log.lock()[0].1.clone());
+    assert_eq!(a["model"], "model-a");
+    assert_eq!(b["model"], "model-b");
+    assert_eq!(a["messages"], b["messages"]);
+    assert_eq!(a["tools"], b["tools"]);
+    // The page is told which provider has the conversation, and that its cache starts over.
+    let notices = switch_notices(&events);
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].starts_with("a has used up its request quota: switched to b (model-b)"), "{}", notices[0]);
+    assert!(notices[0].contains("a is out of requests until it resets"), "{}", notices[0]);
+    assert!(notices[0].contains("switched to b (model-b)"));
+    assert!(notices[0].contains("cache"));
+    // The ledger counts each request on the provider that took it (b's answer is a main request).
+    wait_used(&d.runtime, "a", 1).await;
+    wait_used(&d.runtime, "b", 1).await;
+    assert_eq!(d.runtime.ledger().usage("a").used, 1);
+    assert_eq!(d.runtime.ledger().usage("b").used, 1);
+    assert_eq!(d.runtime.ledger().usage("b").by_purpose.get("main"), Some(&1));
+    // No other failure is shown: the turn's history holds one error-free answer.
+    assert!(d.runtime.messages(&session).unwrap().iter().all(|m| {
+        !m.content.iter().any(|c| c.as_error().is_some())
+    }));
+}
+
+#[tokio::test]
+async fn a_known_used_up_quota_sends_the_next_turn_straight_to_the_fallback() {
+    let d = duo(
+        Box::new(|_| daily_429()),
+        Box::new(|n| ok(&format!("b{n}"))),
+        3,
+    )
+    .await;
+    let session = d.session();
+    d.turn(&session, d.chain(None), "one").await;
+    assert_eq!((d.a_count(), d.b_count()), (1, 1));
+    // The provider said its quota is gone until its reset: no request is spent finding out.
+    let events = d.turn(&session, d.chain(None), "two").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!((d.a_count(), d.b_count()), (1, 2));
+    assert_eq!(d.texts(&session).last().unwrap(), "b1");
+    // The chain is still announced: the conversation goes to b in this turn too.
+    assert_eq!(switch_notices(&events).len(), 1);
+    // Taking the fallback away (the user removed it) makes the refusal the governor always gave.
+    let refused = d
+        .runtime
+        .start_turn(&session, &d.a, TurnOptions::default(), "three")
+        .err()
+        .expect("refused without a fallback");
+    assert!(format!("{refused:#}").contains("used up"), "{refused:#}");
+}
+
+#[tokio::test]
+async fn a_server_error_is_retried_first_then_the_fallback_answers_and_the_next_turn_asks_the_primary_again() {
+    // a: two 503s (the request and its one retry), then healthy.
+    let d = duo(
+        Box::new(|n| {
+            if n < 2 {
+                error_status(503, "upstream overloaded")
+            } else {
+                ok("a is back")
+            }
+        }),
+        Box::new(|_| ok("answered on b")),
+        1,
+    )
+    .await;
+    let session = d.session();
+    let events = d.turn(&session, d.chain(None), "hello").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    // The provider layer's own retry came first (2 requests to a), then one to b.
+    assert_eq!((d.a_count(), d.b_count()), (2, 1));
+    assert_eq!(d.texts(&session).last().unwrap(), "answered on b");
+    let notices = switch_notices(&events);
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].starts_with("a kept answering with server errors: switched to b"), "{}", notices[0]);
+    assert!(notices[0].contains("The next message tries a again"));
+    // The next turn re-probes the primary (no quota is known to be gone), and a serves it.
+    let events = d.turn(&session, d.chain(None), "again").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!((d.a_count(), d.b_count()), (3, 1));
+    assert_eq!(d.texts(&session).last().unwrap(), "a is back");
+    assert!(switch_notices(&events).is_empty());
+}
+
+#[tokio::test]
+async fn the_fallback_serves_the_rest_of_the_turn_after_a_tool_call() {
+    // a fails on its first request; b makes a tool call, then answers after the result. The
+    // second model call of the turn does not go back to a, and the tool ran once.
+    let d = duo(
+        Box::new(|_| error_status(503, "down")),
+        Box::new(|n| {
+            if n == 0 {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(tool_reply(&[(
+                        "c1",
+                        "write_file",
+                        json!({"path": "made-on-b.txt", "content": "hi"}),
+                    )]))
+            } else {
+                ok("done on b")
+            }
+        }),
+        0,
+    )
+    .await;
+    let session = d.session();
+    let events = d.turn(&session, d.chain(None), "plan it").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!((d.a_count(), d.b_count()), (1, 2));
+    assert_eq!(d.texts(&session).last().unwrap(), "done on b");
+    assert_eq!(std::fs::read_to_string(d.work.path().join("made-on-b.txt")).unwrap(), "hi");
+    // One notice: the move happened once, not at every model call.
+    assert_eq!(switch_notices(&events).len(), 1);
+    // b's second request carries the tool result the first one asked for.
+    assert!(d.b_log.lock()[1].1.to_string().contains("\"tool\""));
+}
+
+#[tokio::test]
+async fn a_missing_model_moves_on_to_the_fallback() {
+    for (status, body) in [
+        (
+            404,
+            json!({"error": {"message": "The model `model-a` does not exist", "code": "model_not_found"}}),
+        ),
+        (400, json!({"error": {"message": "model-a is not a valid model ID", "code": 400}})),
+    ] {
+        let reply = body.clone();
+        let d = duo(
+            Box::new(move |_| ResponseTemplate::new(status).set_body_json(reply.clone())),
+            Box::new(|_| ok("answered on b")),
+            3,
+        )
+        .await;
+        let session = d.session();
+        let events = d.turn(&session, d.chain(None), "hello").await;
+        assert_eq!(finished_status(&events), TurnStatus::Completed, "{status}");
+        assert_eq!((d.a_count(), d.b_count()), (1, 1), "{status}");
+        assert_eq!(d.texts(&session).last().unwrap(), "answered on b");
+        assert!(switch_notices(&events)[0].contains("does not serve the model"));
+    }
+}
+
+#[tokio::test]
+async fn ordinary_client_errors_never_move_to_the_fallback() {
+    let cases: Vec<(&str, ResponseTemplate)> = vec![
+        ("400 bad request", error_status(400, "messages: field required")),
+        ("401 wrong key", error_status(401, "Invalid API key")),
+        ("403 forbidden", error_status(403, "Forbidden")),
+        ("422", error_status(422, "temperature must be below 2")),
+        (
+            "per-minute 429",
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "2")
+                .set_body_json(json!({"error": {"message": "Rate limit exceeded: please try again in 2s"}})),
+        ),
+        ("a plain 404", error_status(404, "Not Found")),
+    ];
+    for (name, reply) in cases {
+        let d = duo(
+            Box::new({
+                let reply = reply.clone();
+                move |_| reply.clone()
+            }),
+            Box::new(|_| ok("must not be asked")),
+            0,
+        )
+        .await;
+        let session = d.session();
+        let events = d.turn(&session, d.chain(None), "hello").await;
+        // The turn ends with the provider's error in the chat, as it always did.
+        assert_eq!(finished_status(&events), TurnStatus::Completed, "{name}");
+        assert_eq!(d.a_count(), 1, "{name}");
+        assert_eq!(d.b_count(), 0, "{name}: the conversation must not leave for another provider");
+        assert!(switch_notices(&events).is_empty(), "{name}");
+        let last = d.runtime.messages(&session).unwrap().pop().unwrap();
+        assert!(last.content.iter().any(|c| c.as_error().is_some()), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_per_minute_429_is_backed_off_by_the_existing_retry_not_switched() {
+    // 429 with a one second Retry-After, then fine: the old back-off handles it in place.
+    let d = duo(
+        Box::new(|n| {
+            if n == 0 {
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "1")
+                    .set_body_json(json!({"error": {"message": "Rate limit exceeded: try again in 1s"}}))
+            } else {
+                ok("a answered")
+            }
+        }),
+        Box::new(|_| ok("must not be asked")),
+        2,
+    )
+    .await;
+    let session = d.session();
+    let events = d.turn(&session, d.chain(None), "hello").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!((d.a_count(), d.b_count()), (2, 0));
+    assert_eq!(d.texts(&session).last().unwrap(), "a answered");
+    assert!(switch_notices(&events).is_empty());
+}
+
+#[tokio::test]
+async fn a_used_up_local_limit_goes_to_the_fallback_without_asking_the_primary() {
+    let d = duo(
+        Box::new(|_| ok("must not be asked")),
+        Box::new(|_| ok("answered on b")),
+        3,
+    )
+    .await;
+    // The user capped a at 3 requests a day, and three are spent.
+    d.runtime.ledger().set_limit("a", Some(3));
+    for _ in 0..3 {
+        d.runtime.ledger().record("a", hermes_llm::observer::Purpose::Main);
+    }
+    wait_used(&d.runtime, "a", 3).await;
+    let session = d.session();
+    let events = d.turn(&session, d.chain(None), "hello").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!((d.a_count(), d.b_count()), (0, 1));
+    let notices = switch_notices(&events);
+    assert!(notices[0].starts_with("a has used up its daily request limit: switched to b"), "{notices:?}");
+    // b's own limit still applies: capped at 1 and spent, the turn is refused outright (no
+    // provider of the chain may take it) with the primary's message.
+    d.runtime.ledger().set_limit("b", Some(1));
+    wait_used(&d.runtime, "b", 1).await;
+    while d.runtime.ledger().usage("b").limit != Some(1) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let refused = d
+        .runtime
+        .start_turn(&session, &d.a, d.chain(None), "again")
+        .err()
+        .expect("every provider of the chain is used up");
+    assert!(format!("{refused:#}").contains("daily request limit of a"), "{refused:#}");
+    assert_eq!((d.a_count(), d.b_count()), (0, 1));
+}
+
+#[tokio::test]
+async fn a_used_up_fallback_is_skipped_for_the_next_one() {
+    let d = duo(
+        Box::new(|_| daily_429()),
+        Box::new(|_| ok("must not be asked")),
+        3,
+    )
+    .await;
+    let (_sc, c_cfg, c_log) = mock_provider("c", Box::new(|_| ok("answered on c"))).await;
+    d.runtime.ledger().set_limit("b", Some(1));
+    d.runtime.ledger().record("b", hermes_llm::observer::Purpose::Main);
+    wait_used(&d.runtime, "b", 1).await;
+    while d.runtime.ledger().usage("b").limit != Some(1) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut options = d.chain(None);
+    options.fallback.push(FallbackModel {
+        provider: c_cfg,
+        model: "model-c".into(),
+        context_length: None,
+        supports_vision: false,
+    });
+    let session = d.session();
+    let events = d.turn(&session, options, "hello").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!((d.a_count(), d.b_count(), c_log.lock().len()), (1, 0, 1));
+    assert_eq!(d.texts(&session).last().unwrap(), "answered on c");
+    let notices = switch_notices(&events);
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("switched to c (model-c)"));
+}
+
+#[tokio::test]
+async fn a_chain_that_runs_out_ends_with_the_original_error_and_a_summary() {
+    let d = duo(
+        Box::new(|_| daily_429()),
+        Box::new(|_| error_status(503, "b is down too")),
+        0,
+    )
+    .await;
+    let session = d.session();
+    let events = d.turn(&session, d.chain(None), "hello").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!((d.a_count(), d.b_count()), (1, 1));
+    let last = d.runtime.messages(&session).unwrap().pop().unwrap();
+    let error = last.content.iter().find_map(|c| c.as_error()).unwrap();
+    // The first provider's own error, then what happened at each position.
+    assert!(error.message.contains("daily request limit reached"), "{}", error.message);
+    assert!(error.message.contains("Fallback chain:"), "{}", error.message);
+    assert!(error.message.contains("b: "), "{}", error.message);
+    // Never an API key in what the user is shown.
+    assert!(!error.message.contains("key"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn an_auth_error_on_the_fallback_is_shown_not_hidden() {
+    // a is out of quota, b's key is wrong: the user must see b's 401 (and what happened at a).
+    let d = duo(
+        Box::new(|_| daily_429()),
+        Box::new(|_| error_status(401, "Invalid API key")),
+        0,
+    )
+    .await;
+    let session = d.session();
+    let events = d.turn(&session, d.chain(None), "hello").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let last = d.runtime.messages(&session).unwrap().pop().unwrap();
+    let error = last.content.iter().find_map(|c| c.as_error()).unwrap();
+    assert!(error.message.contains("Authentication failed"), "{}", error.message);
+    assert!(error.message.contains("Fallback chain:"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn a_response_that_breaks_half_way_is_never_repeated_on_the_fallback() {
+    // a streams some text, then garbage, or an in-stream server error (one that WOULD switch
+    // had it come first), instead of the rest of the stream.
+    for tail in ["{not json", r#"{"error":{"message":"upstream exploded"}}"#] {
+        breaks_half_way(tail).await;
+    }
+}
+
+async fn breaks_half_way(tail: &str) {
+    let partial = format!(
+        "data: {}\n\ndata: {tail}\n\n",
+        delta(json!({"role": "assistant", "content": "The answer begins"}), None)
+    );
+    let d = duo(
+        Box::new(move |_| {
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(partial.clone())
+        }),
+        Box::new(|_| ok("must not be asked")),
+        3,
+    )
+    .await;
+    let session = d.session();
+    let events = d.turn(&session, d.chain(None), "hello").await;
+    assert_eq!((d.a_count(), d.b_count()), (1, 0), "a half-delivered response is not re-asked");
+    assert!(switch_notices(&events).is_empty());
+    // What the page saw: the partial text once, never twice.
+    let shown: String = events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::Agent(AgentEvent::Message(m)) if m.role == rmcp::model::Role::Assistant => {
+                Some(m.as_concat_text())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(shown.matches("The answer begins").count(), 1, "{shown}");
+    // What was saved: the partial text once, then the error; nothing from b.
+    let texts = d.texts(&session);
+    assert_eq!(texts.iter().filter(|t| t.contains("The answer begins")).count(), 1, "{texts:?}");
+    assert!(!texts.iter().any(|t| t.contains("must not be asked")), "{tail}");
+}
+
+#[tokio::test]
+async fn an_in_stream_server_error_before_any_chunk_moves_to_the_fallback() {
+    // HTTP 200, but the stream's first frame is the error: nothing was delivered yet.
+    let d = duo(
+        Box::new(|_| {
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: {\"error\":{\"message\":\"upstream exploded\"}}\n\n")
+        }),
+        Box::new(|_| ok("answered on b")),
+        0,
+    )
+    .await;
+    let session = d.session();
+    let events = d.turn(&session, d.chain(None), "hello").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!((d.a_count(), d.b_count()), (1, 1));
+    assert_eq!(switch_notices(&events).len(), 1);
+    assert_eq!(d.texts(&session).last().unwrap(), "answered on b");
+    assert!(!d.texts(&session).iter().any(|t| t.contains("upstream exploded")));
+}
+
+#[tokio::test]
+async fn nothing_changes_when_the_primary_works() {
+    let reply = |text: &'static str| -> Handler { Box::new(move |_| ok(text)) };
+    let with = duo(reply("fine"), reply("never"), 3).await;
+    let without = duo(reply("fine"), reply("never"), 3).await;
+    let (s1, s2) = (with.session(), without.session());
+    let events = with.turn(&s1, with.chain(Some(8_192)), "hello").await;
+    without.turn(&s2, TurnOptions::default(), "hello").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    // Same request count, byte-identical request, no extra notice.
+    assert_eq!((with.a_count(), with.b_count()), (1, 0));
+    assert_eq!(without.a_count(), 1);
+    // (messages[0] is the system prompt, which names a different temp folder in each harness.)
+    assert_eq!(with.a_log.lock()[0].1["messages"][1], without.a_log.lock()[0].1["messages"][1]);
+    assert_eq!(
+        with.a_log.lock()[0].1["messages"].as_array().unwrap().len(),
+        without.a_log.lock()[0].1["messages"].as_array().unwrap().len()
+    );
+    assert_eq!(with.a_log.lock()[0].1["tools"], without.a_log.lock()[0].1["tools"]);
+    assert!(switch_notices(&events).is_empty());
+    assert!(events.iter().all(|e| !matches!(
+        e,
+        RuntimeEvent::Agent(AgentEvent::Status { .. }) | RuntimeEvent::Notice(_)
+    )));
+}
+
+#[tokio::test]
+async fn a_fallback_with_a_smaller_window_is_compressed_for_before_it_is_asked() {
+    let big = "word ".repeat(10_000); // about 12k tokens a reply
+    let a_big = big.clone();
+    // a answers the first four messages, then hits its quota; b has a 40k window (the system
+    // prompt and the tool list alone are about 12k tokens of it).
+    let d = duo(
+        Box::new(move |n| if n < 4 { ok(&a_big) } else { daily_429() }),
+        Box::new(|n| if n == 0 { ok("## Goal\nsummary written on b") } else { ok("answered on b") }),
+        3,
+    )
+    .await;
+    let session = d.session();
+    for text in ["first", "second", "third", "fourth"] {
+        d.turn(&session, TurnOptions::default(), text).await;
+    }
+    assert_eq!((d.a_count(), d.b_count()), (4, 0));
+    let events = d.turn(&session, d.chain(Some(40_000)), "fifth").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert!(events.iter().any(|e| matches!(e, RuntimeEvent::Agent(AgentEvent::Compacting))));
+    // b got the compression request first (written there: a is the provider out of quota), then
+    // the real one, and the real one fits b's window.
+    let b = d.b_log.lock().clone();
+    assert_eq!(b.len(), 2, "{:?}", b.iter().map(|(p, _)| p).collect::<Vec<_>>());
+    assert_eq!(b[0].0, "compress");
+    assert_eq!(b[1].0, "main");
+    assert!(b[1].1.to_string().len() / 4 < 40_000, "{} bytes", b[1].1.to_string().len());
+    assert_eq!(d.a_count(), 5, "one request to a: the one the quota refused");
+    assert_eq!(d.texts(&session).last().unwrap(), "answered on b");
+    assert_eq!(switch_notices(&events).len(), 1);
+}
+
+#[tokio::test]
+async fn a_fallback_the_request_cannot_fit_is_skipped_never_sent_an_over_limit_request() {
+    let d = duo(
+        Box::new(|_| daily_429()),
+        Box::new(|_| ok("must not be asked")),
+        3,
+    )
+    .await;
+    let (_sc, c_cfg, c_log) = mock_provider("c", Box::new(|_| ok("answered on c"))).await;
+    // One enormous message that no compression can shrink (it is the newest one), a 4k window.
+    let huge = "word ".repeat(20_000);
+    let mut options = d.chain(Some(4_096));
+    options.fallback.push(FallbackModel {
+        provider: c_cfg,
+        model: "model-c".into(),
+        context_length: None,
+        supports_vision: false,
+    });
+    let session = d.session();
+    let events = d.turn(&session, options, &huge).await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    // b was never sent the request (a compression attempt may have been tried, a real request
+    // never), c took it.
+    assert!(d.b_log.lock().iter().all(|(purpose, _)| purpose != "main"));
+    assert_eq!(c_log.lock().len(), 1);
+    assert_eq!(d.texts(&session).last().unwrap(), "answered on c");
+    let notices = switch_notices(&events);
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("switched to c"), "{notices:?}");
+}
+
+#[tokio::test]
+async fn when_nothing_fits_the_error_says_so() {
+    let d = duo(
+        Box::new(|_| daily_429()),
+        Box::new(|_| ok("must not be asked")),
+        3,
+    )
+    .await;
+    let huge = "word ".repeat(20_000);
+    let session = d.session();
+    let events = d.turn(&session, d.chain(Some(4_096)), &huge).await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert!(d.b_log.lock().iter().all(|(purpose, _)| purpose != "main"));
+    let last = d.runtime.messages(&session).unwrap().pop().unwrap();
+    let error = last.content.iter().find_map(|c| c.as_error()).unwrap();
+    assert!(error.message.contains("does not fit its window"), "{}", error.message);
+    assert!(error.message.contains("daily request limit reached"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn a_session_that_moved_to_the_fallback_resumes_on_the_primary() {
+    let d = duo(
+        Box::new(|n| if n == 0 { daily_429() } else { ok("a again") }),
+        Box::new(|_| ok("answered on b")),
+        3,
+    )
+    .await;
+    let session = d.session();
+    d.turn(&session, d.chain(None), "first").await;
+    assert_eq!(d.texts(&session).last().unwrap(), "answered on b");
+    // The process restarts: a new runtime on the same data folder opens the session. No quota
+    // is remembered across a restart, so a is asked, and it takes b's answer in the history.
+    let Duo { runtime, data, a, a_log, _servers, .. } = d;
+    drop(runtime);
+    let runtime = runtime_in(data.path());
+    let turn = runtime
+        .start_turn(&session, &a, TurnOptions::default(), "second")
+        .unwrap();
+    let events = collect(turn).await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!(a_log.lock().len(), 2);
+    let last = a_log.lock()[1].1.clone();
+    assert!(last.to_string().contains("answered on b"));
+    let messages = runtime.messages(&session).unwrap();
+    assert_eq!(messages.last().unwrap().as_concat_text(), "a again");
 }

@@ -85,6 +85,10 @@ fn config_defaults() -> Value {
             "tool_progress": "all",
         },
         "approvals": {"mode": "manual"},
+        // The providers a request moves to when the main one cannot serve it (daily quota used
+        // up, server down, unknown model): `[{provider, model}, ...]`, in order, at most three
+        // (`fallback.rs`). Empty: no fallback.
+        "fallback_providers": [],
         // How the agent spends model requests and tokens (`hermes_runtime::budget`): `requests`
         // (the default, also for a config without the key), `balanced` (how it worked before
         // profiles) or `tokens`. Per-knob overrides sit beside it (`budget.max_iterations`...).
@@ -307,6 +311,7 @@ fn config_schema() -> serde_json::Map<String, Value> {
                 "When the agent reviews a session to learn from it (memory, skills). Empty: the profile's choice. idle_once: one request when the chat has been idle 10 minutes or you switch away, only after corrections or other signals (the Requests profile's). nudges: the tool-using review every 10 turns, and after corrections (Balanced and Tokens). agentic: the tool-using review every 10 turns only, as before (kept for comparison).",
                 &["", "idle_once", "nudges", "agentic"],
             )),
+            "fallback_providers" => Some(json!({"description": "Providers to use, in order, when the main one cannot answer a request: its daily quota is used up, it is down, or it does not have the model. Each one you add receives your conversation when that happens, and you are told when it does. Pick providers you have set up under Providers; a wrong key on the main provider never moves to a fallback."})),
             "approvals.mode" => Some(select(
                 "Dangerous command approval mode",
                 &["manual", "smart", "off"],
