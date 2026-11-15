@@ -35,6 +35,9 @@ mod todo;
 pub mod vision;
 pub mod web;
 
+#[cfg(test)]
+mod blocking_tests;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -62,6 +65,101 @@ pub use skill_manage::{
 };
 pub use skills::{IndexStyle, SkillCommit, SkillEntry, SkillStore, SkillsConfig};
 pub use todo::{TodoItem, TodoStatus};
+
+/// Test hook for the "never block the async workers" tests: a session id registered here makes
+/// every blocking tool call of that session (memory, skills, session search) sleep first, as a
+/// slow disk would. Nothing in a release build.
+#[cfg(test)]
+pub(crate) mod slow {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+
+    fn table() -> &'static Mutex<HashMap<String, Duration>> {
+        static TABLE: OnceLock<Mutex<HashMap<String, Duration>>> = OnceLock::new();
+        TABLE.get_or_init(Default::default)
+    }
+
+    /// Makes `session_id`'s blocking tool work take `delay` longer.
+    pub(crate) fn set(session_id: &str, delay: Duration) {
+        table()
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), delay);
+    }
+
+    pub(crate) fn pause(session_id: &str) {
+        let delay = table().lock().unwrap().get(session_id).copied();
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+        }
+    }
+}
+
+/// Called first inside the blocking closures of the tools below (see [`slow`]); a no-op outside
+/// tests.
+#[inline]
+pub(crate) fn test_pause(session_id: &str) {
+    #[cfg(test)]
+    slow::pause(session_id);
+    #[cfg(not(test))]
+    let _ = session_id;
+}
+
+/// Runs `work` on a blocking thread, for the small follow-ups after a tool call (recording a
+/// write, a folder's context file, saving an over-long output), without losing the call's result
+/// to Stop.
+///
+/// The turn's step is raced against Stop with priority for the call (`agent/machine.rs`): a call
+/// that is still waiting when Stop fires is dropped, and the chat shows "interrupted" instead of
+/// what a stopped command printed. So once `cancel` fires, nothing here waits asynchronously
+/// any more: work that has not started runs inline, as it always did before Phase 13, and work
+/// already running on its thread is waited for on this thread (no longer than the inline run
+/// would have taken). Without Stop it never holds the async worker. `Err` only when the thread
+/// panicked.
+pub async fn off_worker_unless_stopped<T, F>(
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    work: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let Some(cancel) = cancel else {
+        return tokio::task::spawn_blocking(work)
+            .await
+            .map_err(|e| e.to_string());
+    };
+    if cancel.is_cancelled() {
+        return Ok(work());
+    }
+    // The job is taken by whichever side gets to it first: the blocking thread, or this one
+    // after Stop. The result comes back on a std channel, which this thread can wait on without
+    // the async runtime.
+    let job = Arc::new(parking_lot::Mutex::new(Some(work)));
+    let (sent, result) = std::sync::mpsc::channel();
+    let taken = job.clone();
+    let thread = tokio::task::spawn_blocking(move || {
+        let work = taken.lock().take();
+        if let Some(work) = work {
+            let _ = sent.send(work());
+        }
+    });
+    tokio::select! {
+        biased;
+        joined = thread => {
+            joined.map_err(|e| e.to_string())?;
+            result.try_recv().map_err(|_| "the work did not run".to_string())
+        }
+        _ = cancel.cancelled() => {
+            let not_started = job.lock().take();
+            match not_started {
+                Some(work) => Ok(work()),
+                None => result.recv().map_err(|_| "the work's thread stopped".to_string()),
+            }
+        }
+    }
+}
 
 /// The tool limits a budget profile sets (`hermes_runtime::budget`); one copy per turn. The
 /// default is today's behaviour (the `balanced` profile).
@@ -166,11 +264,11 @@ pub struct SessionTools {
     /// Patterns the user approved for this session.
     pub(crate) session_approved: parking_lot::Mutex<std::collections::HashSet<String>>,
     /// Directories whose AGENTS.md / CLAUDE.md the model has been shown.
-    hints: parking_lot::Mutex<hints::HintTracker>,
+    hints: Arc<parking_lot::Mutex<hints::HintTracker>>,
     checkpoints: Option<Arc<checkpoints::Checkpoints>>,
     web: Option<Arc<web::Web>>,
     /// Projects already checkpointed this turn (one snapshot per project per turn).
-    turn_checkpoints: parking_lot::Mutex<std::collections::HashSet<String>>,
+    turn_checkpoints: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// The mode picked for this session (`/yolo`, an editor's mode menu); `None` follows Settings.
     mode: parking_lot::Mutex<Option<ApprovalMode>>,
     /// The smart-approval reviewer for this turn's model.
@@ -213,7 +311,10 @@ impl SessionTools {
         let project = project_skills::find_root(&config.cwd);
         Self {
             project: parking_lot::Mutex::new(project),
-            hints: parking_lot::Mutex::new(hints::HintTracker::new(&config.cwd, &config.home)),
+            hints: Arc::new(parking_lot::Mutex::new(hints::HintTracker::new(
+                &config.cwd,
+                &config.home,
+            ))),
             shell: shell::ShellSession::new(config.shell, config.cwd, config.scratch_dir.clone()),
             processes: process::ProcessRegistry::default(),
             files: files::FileState::default(),
@@ -243,50 +344,71 @@ impl SessionTools {
     /// Hermes's checkpoint trigger: the project a `write_file` / `patch` touches, or the folder a
     /// destructive terminal command runs in, is snapshotted once per turn before the change.
     /// Returns the file a write targets, for the agent-write ledger.
-    fn checkpoint_before(&self, tool: &str, args: &Value) -> Option<PathBuf> {
-        let checkpoints = self.checkpoints.as_ref().filter(|c| c.enabled())?;
-        let mut taken = self.turn_checkpoints.lock();
-        match tool {
+    ///
+    /// The snapshot runs git (seconds in a big project), so it runs on a blocking thread; the call
+    /// waits for it, as before, so the snapshot is still taken before the change.
+    async fn checkpoint_before(&self, tool: &str, args: &Value) -> Option<PathBuf> {
+        let checkpoints = self.checkpoints.clone().filter(|c| c.enabled())?;
+        // What to snapshot, decided in memory: a file's project, or a folder.
+        enum Target {
+            Project(PathBuf, String),
+            Folder(PathBuf, String),
+        }
+        let (target, written) = match tool {
             "write_file" | "patch" => {
                 let path = self.resolve(args.get("path")?.as_str()?);
-                let workdir = checkpoints.working_dir_for(&path, &self.home);
-                checkpoints.ensure(&workdir, &format!("before {tool}"), &self.home, &mut taken);
-                Some(path)
+                (
+                    Target::Project(path.clone(), format!("before {tool}")),
+                    Some(path),
+                )
             }
             "terminal" => {
                 let command = args.get("command")?.as_str()?;
-                if checkpoints::is_destructive_command(command) {
-                    let cwd = match args.get("workdir").and_then(Value::as_str) {
-                        Some(dir) => self.resolve(dir),
-                        None => self.cwd(),
-                    };
-                    let short: String = command.chars().take(60).collect();
-                    checkpoints.ensure(
-                        &cwd,
-                        &format!("before terminal: {short}"),
-                        &self.home,
-                        &mut taken,
-                    );
+                if !checkpoints::is_destructive_command(command) {
+                    return None;
                 }
-                None
+                let cwd = match args.get("workdir").and_then(Value::as_str) {
+                    Some(dir) => self.resolve(dir),
+                    None => self.cwd(),
+                };
+                let short: String = command.chars().take(60).collect();
+                (
+                    Target::Folder(cwd, format!("before terminal: {short}")),
+                    None,
+                )
             }
             "run_script" => {
                 let language = script_guard::Language::parse(args.get("language")?.as_str()?)?;
                 let code = args.get("code")?.as_str()?;
-                if script_guard::may_change_files(language, code) {
-                    let cwd = self.cwd();
-                    let short: String = code.lines().next().unwrap_or("").chars().take(60).collect();
-                    checkpoints.ensure(
-                        &cwd,
-                        &format!("before run_script: {short}"),
-                        &self.home,
-                        &mut taken,
-                    );
+                if !script_guard::may_change_files(language, code) {
+                    return None;
                 }
-                None
+                let short: String = code.lines().next().unwrap_or("").chars().take(60).collect();
+                (
+                    Target::Folder(self.cwd(), format!("before run_script: {short}")),
+                    None,
+                )
             }
-            _ => None,
+            _ => return None,
+        };
+        let (home, taken) = (self.home.clone(), self.turn_checkpoints.clone());
+        let done = tokio::task::spawn_blocking(move || {
+            let mut taken = taken.lock();
+            match target {
+                Target::Project(path, reason) => {
+                    let workdir = checkpoints.working_dir_for(&path, &home);
+                    checkpoints.ensure(&workdir, &reason, &home, &mut taken);
+                }
+                Target::Folder(cwd, reason) => {
+                    checkpoints.ensure(&cwd, &reason, &home, &mut taken);
+                }
+            }
+        })
+        .await;
+        if let Err(e) = done {
+            tracing::warn!("the checkpoint before {tool} did not finish: {e}");
         }
+        written
     }
 
     /// `/yolo` for this session (off: the session follows Settings again).
@@ -556,7 +678,7 @@ impl SessionTools {
                 self.stage_skills(&args, WriteOrigin::Foreground).await
             }
             "memory" => self.memory_tool(&args).await,
-            "session_search" => self.session_search(&args),
+            "session_search" => self.session_search(&args).await,
             "skills_list" | "skill_view" | "skill_manage" => self.skills_tool(name, &args).await,
             "clarify" => clarify::clarify(self, args).await,
             "web_search" | "web_extract" => self.web_tool(name, &args).await,
@@ -774,18 +896,26 @@ impl SessionTools {
             return ToolOutput::error("Skills are not available in this session.");
         };
         let project = self.project_root();
-        let source = (name == "skill_manage").then(|| self.skill_source(WriteOrigin::Foreground));
+        let is_write = name == "skill_manage";
         let (tool, args) = (name.to_string(), args.clone());
+        let session_id = self.session_id.clone();
         // Reading a repository's skills is file-system work.
-        let result = tokio::task::spawn_blocking(move || match tool.as_str() {
-            "skills_list" => skills.list_tool_for(project.as_deref(), &args),
-            "skill_view" => skills.view_tool_for(project.as_deref(), &args),
-            _ => skills.manage_in(
-                project.as_deref(),
-                &args,
-                WriteOrigin::Foreground,
-                source.as_ref(),
-            ),
+        let result = tokio::task::spawn_blocking(move || {
+            test_pause(&session_id);
+            // The note's text goes through the threat scan (a first scan compiles its
+            // patterns): made here, off the async workers.
+            let source =
+                is_write.then(|| provenance::SourceNote::for_session(&session_id, false));
+            match tool.as_str() {
+                "skills_list" => skills.list_tool_for(project.as_deref(), &args),
+                "skill_view" => skills.view_tool_for(project.as_deref(), &args),
+                _ => skills.manage_in(
+                    project.as_deref(),
+                    &args,
+                    WriteOrigin::Foreground,
+                    source.as_ref(),
+                ),
+            }
         })
         .await
         .unwrap_or_else(|e| json!({"success": false, "error": format!("The skill tool stopped: {e}")}));
@@ -938,7 +1068,9 @@ impl SessionTools {
                 Ok(Some(key))
             }
             Ok(approval::ApprovalChoice::Always) => {
-                store.allow_always(&key);
+                // Saves the always-allowed list to its file: off the async workers.
+                let (store, saved) = (store.clone(), key.clone());
+                let _ = tokio::task::spawn_blocking(move || store.allow_always(&saved)).await;
                 Ok(Some(key))
             }
             Ok(approval::ApprovalChoice::Deny) => Err(blocked(approval::denied_message())),
@@ -1086,7 +1218,9 @@ impl SessionTools {
         };
         let store = staging::StagingStore::new(&self.data_dir);
         let (args, meta, root) = (args.clone(), self.staging_meta(), self.project_root());
+        let session_id = self.session_id.clone();
         let result = tokio::task::spawn_blocking(move || {
+            test_pause(&session_id);
             // Reads the worktree pointer files (if any): here, off the async workers.
             let scope = root.as_deref().map(project_skills::memory_scope_key);
             store.stage_memory_call_in(&memory, scope.as_deref(), &args, &meta)
@@ -1099,11 +1233,7 @@ impl SessionTools {
     /// The provenance entry for a skill write this session's agent (or its review) makes
     /// ([`provenance`]): the session and a fixed reason, since the agent gives none.
     pub fn skill_source(&self, origin: WriteOrigin) -> provenance::SourceNote {
-        let why = match origin {
-            WriteOrigin::Review => "a background review of this session",
-            _ => "the agent changed it during this session",
-        };
-        provenance::SourceNote::new(&self.session_id, why)
+        provenance::SourceNote::for_session(&self.session_id, origin == WriteOrigin::Review)
     }
 
     /// A `skill_manage` call from a tainted session (or a review of one): the same as
@@ -1114,9 +1244,13 @@ impl SessionTools {
         };
         let store = staging::StagingStore::new(&self.data_dir);
         let (args, meta) = (args.clone(), self.staging_meta());
-        let source = (origin != WriteOrigin::Curator).then(|| self.skill_source(origin));
+        let session_id = self.session_id.clone();
+        let with_source = origin != WriteOrigin::Curator;
         let project = self.project_root();
         let result = tokio::task::spawn_blocking(move || {
+            test_pause(&session_id);
+            let source = with_source
+                .then(|| provenance::SourceNote::for_session(&session_id, origin == WriteOrigin::Review));
             store.stage_skill_call_in(
                 &skills,
                 project.as_deref(),
@@ -1158,7 +1292,9 @@ impl SessionTools {
         let mut failures = hermes_memory::TurnFailures(before);
         let args = args.clone();
         let root = self.project_root();
+        let session_id = self.session_id.clone();
         let (result, failures) = tokio::task::spawn_blocking(move || {
+            test_pause(&session_id);
             // Reads the worktree pointer files (if any): here, off the async workers.
             let scope = root.as_deref().map(project_skills::memory_scope_key);
             let result = if unattended {
@@ -2130,18 +2266,36 @@ impl<S: Send + Sync + 'static> ToolProvider<S> for SessionTools {
         {
             return Ok(refused.into_result());
         }
-        let written = self.checkpoint_before(&call.name, &args);
+        let written = self.checkpoint_before(&call.name, &args).await;
         let mut result = self
             .dispatch_checked(&call.name, args.clone(), Some((request_id, emit)))
             .await
             .into_result();
-        if let (Some(path), Some(checkpoints)) = (written, &self.checkpoints)
+        // The two follow-ups below touch the disk, so they run on the blocking pool; after Stop
+        // they must not wait, or the call's result is lost ([`off_worker_unless_stopped`]).
+        let cancel = Some(emit.cancel_token());
+        if let (Some(path), Some(checkpoints)) = (written, self.checkpoints.clone())
             && result.is_error != Some(true)
         {
-            checkpoints.record_write(&path, &self.home);
+            // Hashes the file and updates the checkpoint store.
+            let home = self.home.clone();
+            let _ =
+                off_worker_unless_stopped(cancel, move || checkpoints.record_write(&path, &home))
+                    .await;
         }
-        // Hermes appends a newly visited subdirectory's context file to the result.
-        let hints = self.hints.lock().check(&call.name, &args, &self.cwd());
+        // Hermes appends a newly visited subdirectory's context file to the result (reads
+        // AGENTS.md / CLAUDE.md from disk).
+        let (tracker, name, cwd, hint_args) = (
+            self.hints.clone(),
+            call.name.to_string(),
+            self.cwd(),
+            args.clone(),
+        );
+        let hints = off_worker_unless_stopped(cancel, move || {
+            tracker.lock().check(&name, &hint_args, &cwd)
+        })
+        .await
+        .unwrap_or(None);
         if let Some(hints) = hints
             && let Some(ContentBlock::Text(text)) = result.content.first_mut()
         {

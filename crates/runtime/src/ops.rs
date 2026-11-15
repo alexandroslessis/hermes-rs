@@ -615,6 +615,37 @@ pub fn result_size_limit(context_length: Option<usize>, budget: &BudgetKnobs) ->
     base * budget.result_size_pct as usize / 100
 }
 
+/// [`spill_oversized`] for async code: the file is written on a blocking thread, and only when the
+/// result is over the limit (the check is in memory, so a normal result copies nothing).
+/// `cancel`: the turn's Stop; a stopped call's result must not be lost waiting for the save
+/// (`hermes_tools::off_worker_unless_stopped`).
+async fn spill_oversized_off_worker(
+    text: &str,
+    tool: &str,
+    call_id: &str,
+    limit: usize,
+    dir: &std::path::Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Option<String> {
+    if tool == "read_file" || text.chars().count() <= limit {
+        return None;
+    }
+    let (text, tool, call_id, dir) = (
+        text.to_string(),
+        tool.to_string(),
+        call_id.to_string(),
+        dir.to_path_buf(),
+    );
+    hermes_tools::off_worker_unless_stopped(Some(cancel), move || {
+        spill_oversized(&text, &tool, &call_id, limit, &dir)
+    })
+    .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("saving an oversized tool result failed: {e}");
+            None
+        })
+}
+
 /// `maybe_persist_tool_result`: an oversized result goes to a file in the session's scratch
 /// directory; the model gets a preview and the path to page through it with `read_file`.
 fn spill_oversized(
@@ -775,13 +806,17 @@ impl ToolProvider<TurnSession> for GuardedTools {
                 };
                 let spilled = match &observation.stub {
                     Some(_) => None,
-                    None => spill_oversized(
-                        &text,
-                        &name,
-                        request_id,
-                        self.result_limit,
-                        &self.scratch_dir,
-                    ),
+                    None => {
+                        spill_oversized_off_worker(
+                            &text,
+                            &name,
+                            request_id,
+                            self.result_limit,
+                            &self.scratch_dir,
+                            emit.cancel_token(),
+                        )
+                        .await
+                    }
                 };
                 // The chat shows the tool's own output; the model sees the guarded text.
                 if observation.stub.is_some() || spilled.is_some() || !observation.notes.is_empty()

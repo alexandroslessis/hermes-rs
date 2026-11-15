@@ -641,19 +641,18 @@ impl Web {
         for ((index, _), page) in to_fetch.iter().zip(fetched) {
             entries[*index] = Some(page);
         }
-        let results: Vec<Value> = entries
-            .into_iter()
-            .flatten()
-            .map(|mut page| {
-                if page.error.is_none() && !page.content.is_empty() {
-                    let clean = convert_base64_images(&page.content);
-                    page.content = self.truncate_with_footer(&clean, &page.url, char_limit);
-                } else if !page.content.is_empty() {
-                    page.content = self.truncate_with_footer(&convert_base64_images(&page.content), &page.url, char_limit);
-                }
-                json!({"url": page.url, "title": page.title, "content": page.content, "error": page.error})
-            })
-            .collect();
+        let mut results: Vec<Value> = Vec::new();
+        for mut page in entries.into_iter().flatten() {
+            if !page.content.is_empty() {
+                let clean = convert_base64_images(&page.content);
+                page.content = self
+                    .truncate_off_worker(clean, page.url.clone(), char_limit)
+                    .await;
+            }
+            results.push(
+                json!({"url": page.url, "title": page.title, "content": page.content, "error": page.error}),
+            );
+        }
         if results
             .iter()
             .all(|r| r["content"].as_str().unwrap_or("").is_empty() && r["error"].is_null())
@@ -663,104 +662,126 @@ impl Web {
         json!({"results": results})
     }
 
-    /// `_store_full_text`: the whole page under `cache/web`, for `read_file`.
-    fn store_full_text(&self, url: &str, content: &str) -> Option<PathBuf> {
-        std::fs::create_dir_all(&self.cache_dir).ok()?;
-        let host: String = url
-            .split("://")
-            .nth(1)
-            .unwrap_or(url)
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or("page")
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .take(60)
-            .collect();
-        // FNV-1a of the URL keeps the name stable for re-extraction.
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in url.bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0100_0000_01b3);
+    /// `_truncate_with_footer`, for async code: the full text is saved on a blocking thread, and
+    /// only when the page is over the limit (a short page is returned as it is).
+    async fn truncate_off_worker(&self, content: String, url: String, char_limit: usize) -> String {
+        if content.chars().count() <= char_limit {
+            return content;
         }
-        let path = self
-            .cache_dir
-            .join(format!("{host}-{:010x}.md", hash & 0xff_ffff_ffff));
-        let total = content.chars().count();
-        let stored = if total > MAX_STORED_TEXT_CHARS {
-            format!(
-                "{}\n\n[... stored copy truncated at {} chars of {}; re-extract a more specific URL for the rest ...]",
-                content
-                    .chars()
-                    .take(MAX_STORED_TEXT_CHARS)
-                    .collect::<String>(),
-                thousands(MAX_STORED_TEXT_CHARS),
-                thousands(total)
-            )
-        } else {
-            content.to_string()
-        };
-        std::fs::write(&path, stored).ok()?;
-        Some(path)
+        let cache_dir = self.cache_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            truncate_with_footer_in(&cache_dir, &content, &url, char_limit)
+        })
+        .await
+        .unwrap_or_else(|e| format!("[the page could not be shortened: {e}]"))
     }
 
-    /// `_truncate_with_footer`: a ~75% head / ~25% tail window cut on line boundaries, plus a
-    /// footer saying where the full text is and how to read the omitted middle.
+    #[cfg(test)]
     fn truncate_with_footer(&self, content: &str, url: &str, char_limit: usize) -> String {
-        let chars: Vec<char> = content.chars().collect();
-        if chars.len() <= char_limit {
-            return content.to_string();
-        }
-        let head_budget = char_limit * 3 / 4;
-        let tail_budget = char_limit - head_budget;
-        let mut head: String = chars[..head_budget].iter().collect();
-        let mut tail: String = chars[chars.len() - tail_budget..].iter().collect();
-        if let Some(newline) = head.rfind('\n')
-            && newline > head_budget / 2
-        {
-            head.truncate(newline);
-        }
-        if let Some(newline) = tail.find('\n')
-            && newline < tail_budget / 2
-        {
-            tail = tail[newline + 1..].to_string();
-        }
-        let rule = "─".repeat(8);
-        let mut footer = vec![
-            String::new(),
-            format!("{rule} [TRUNCATED] {rule}"),
-            format!(
-                "Showing {} chars (head) + {} chars (tail) of {} total clean characters.",
-                thousands(head.chars().count()),
-                thousands(tail.chars().count()),
-                thousands(chars.len())
-            ),
-        ];
-        match self.store_full_text(url, content) {
-            Some(path) => {
-                let path = crate::display_path(&path);
-                let middle_start = head.matches('\n').count() + 2;
-                footer.push(format!("Full text saved to: {path}"));
-                footer.push(format!(
-                    "To read the omitted middle: read_file path=\"{path}\" offset={middle_start} limit=200  (the file is the complete page; raise/lower offset to page through it)."
-                ));
-            }
-            None => footer.push(
-                "Full text could not be stored; re-run web_extract on a more specific URL for the complete page.".into(),
-            ),
-        }
-        footer.push("─".repeat(29));
-        format!(
-            "{head}\n\n[... middle omitted — see footer ...]\n\n{tail}\n{}",
-            footer.join("\n")
-        )
+        truncate_with_footer_in(&self.cache_dir, content, url, char_limit)
     }
+}
+
+/// `_store_full_text`: the whole page under `cache/web`, for `read_file`.
+fn store_full_text(cache_dir: &Path, url: &str, content: &str) -> Option<PathBuf> {
+    std::fs::create_dir_all(cache_dir).ok()?;
+    let host: String = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("page")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(60)
+        .collect();
+    // FNV-1a of the URL keeps the name stable for re-extraction.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in url.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    let path = cache_dir.join(format!("{host}-{:010x}.md", hash & 0xff_ffff_ffff));
+    let total = content.chars().count();
+    let stored = if total > MAX_STORED_TEXT_CHARS {
+        format!(
+            "{}\n\n[... stored copy truncated at {} chars of {}; re-extract a more specific URL for the rest ...]",
+            content
+                .chars()
+                .take(MAX_STORED_TEXT_CHARS)
+                .collect::<String>(),
+            thousands(MAX_STORED_TEXT_CHARS),
+            thousands(total)
+        )
+    } else {
+        content.to_string()
+    };
+    std::fs::write(&path, stored).ok()?;
+    Some(path)
+}
+
+/// `_truncate_with_footer`: a ~75% head / ~25% tail window cut on line boundaries, plus a
+/// footer saying where the full text is and how to read the omitted middle.
+fn truncate_with_footer_in(
+    cache_dir: &Path,
+    content: &str,
+    url: &str,
+    char_limit: usize,
+) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    if chars.len() <= char_limit {
+        return content.to_string();
+    }
+    let head_budget = char_limit * 3 / 4;
+    let tail_budget = char_limit - head_budget;
+    let mut head: String = chars[..head_budget].iter().collect();
+    let mut tail: String = chars[chars.len() - tail_budget..].iter().collect();
+    if let Some(newline) = head.rfind('\n')
+        && newline > head_budget / 2
+    {
+        head.truncate(newline);
+    }
+    if let Some(newline) = tail.find('\n')
+        && newline < tail_budget / 2
+    {
+        tail = tail[newline + 1..].to_string();
+    }
+    let rule = "─".repeat(8);
+    let mut footer = vec![
+        String::new(),
+        format!("{rule} [TRUNCATED] {rule}"),
+        format!(
+            "Showing {} chars (head) + {} chars (tail) of {} total clean characters.",
+            thousands(head.chars().count()),
+            thousands(tail.chars().count()),
+            thousands(chars.len())
+        ),
+    ];
+    match store_full_text(cache_dir, url, content) {
+        Some(path) => {
+            let path = crate::display_path(&path);
+            let middle_start = head.matches('\n').count() + 2;
+            footer.push(format!("Full text saved to: {path}"));
+            footer.push(format!(
+                "To read the omitted middle: read_file path=\"{path}\" offset={middle_start} limit=200  (the file is the complete page; raise/lower offset to page through it)."
+            ));
+        }
+        None => footer.push(
+            "Full text could not be stored; re-run web_extract on a more specific URL for the complete page.".into(),
+        ),
+    }
+    footer.push("─".repeat(29));
+    format!(
+        "{head}\n\n[... middle omitted — see footer ...]\n\n{tail}\n{}",
+        footer.join("\n")
+    )
 }
 
 /// The text of a page for an `@url:` reference: the extracted content (no truncation footer),

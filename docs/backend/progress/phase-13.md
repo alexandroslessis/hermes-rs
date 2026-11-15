@@ -390,3 +390,209 @@ the list above. Four defects fixed, each with a test where a test can show it.
 5. Edit an earlier message and resend (rewind): it continues from there; export the session (json/md): it matches.
 6. Negative case: not triggerable by hand (a database write failure shows as the turn failing with "This turn was not
    fully saved to the session database: ..."; covered by the turns test).
+
+## CP13c — `spawn_blocking` everywhere it's missing
+Worktree: C:\Users\alexandros\repos\hermes-rs-p13   Branch: backend/p13-perf   Model: Sonnet 5.5 (subagent)
+Not committed (an Opus reviewer commits). Phase 13 is not done (13d-13f remain).
+
+Why now: CP13b made every `Store` read wait for the writer's pending commit, so a store read in async code can hold a
+worker for a commit (before: only for a SELECT). The plan named `skills.rs:222` (git through `tokio::process::Command`:
+that is already non-blocking, nothing to do there) and the `memory` / `session_search` / `skill_*` dispatch
+(`tools/src/lib.rs`, which has moved). The audit found `memory` and `skill_*` already on `spawn_blocking`;
+`session_search` was not, and neither were many others (below).
+
+**Method.** A throw-away script (not committed) parsed every non-test `.rs` file under `crates/`, found each `async fn`
+and `async {}` block, removed the spans inside `spawn_blocking(..)` / `block_in_place(..)`, and listed what was left that
+matches `std::fs`, `File::`, `std::process`, `Command::new` (non-tokio), `thread::sleep`, `reqwest::blocking`,
+`std::net`, `.exists()/.is_dir()/.is_file()/.metadata()/canonicalize/read_dir`, every `Store` method, and the
+`SkillStore` / `MemoryStore` / checkpoint / staging methods; a second pass listed the sync helpers containing those
+patterns and their callers in async code. Each hit was then read in context (the script has false positives:
+`self.blocking(..)` calls, tokio's own `fs::read`, names like `.find` / `.take`). Also read by hand: the gateway's
+`dispatch` / `mutate` / `rest` / `session_route` / turn event loop, the ACP server, `ToolProvider::call` in
+`tools/src/lib.rs`, the runtime's turn task. The agent crate (`crates/agent`) had no hit. Not exhaustive for: a `std`
+mutex guard held across an `.await` (spot-checked, none found) and sync helpers reached through trait objects.
+
+**Inventory** (W = wrapped in `spawn_blocking` / the gateway's `blocking` helper, C = converted to tokio async,
+L = left, with the reason):
+
+| # | Where | What blocked | Decision |
+|---|---|---|---|
+| 1 | `tools/recall.rs` `session_search` (via `dispatch_unredacted`) | FTS search, `list_sessions`, `search_rows` | W: `Recall { session_id }` runs in `spawn_blocking`; a JoinError answers "Session search stopped: ..." |
+| 2 | `tools/lib.rs` `skills_tool`, `stage_skills`, `review.rs` skill_manage: the provenance note | the first threat scan compiles its regexes (~0.5 s in a debug build); found by the new test | W: the note is made inside the closure (new `SourceNote::for_session`) |
+| 3 | `tools/review.rs` skill_manage guard (`skills.find` walks the skills folders, `exists`, `canonicalize`) + `manage_with_source` (writes) | disk | W: `guard_skill_manage` is a free fn run in `spawn_blocking` over a copy of the read set; the write in `spawn_blocking` |
+| 4 | `tools/review.rs` `mark_read` (`canonicalize`), `viewed_path` (`skills.find`) | disk | W (both async now) |
+| 5 | `tools/lib.rs` `checkpoint_before` (git snapshot before `write_file` / `patch` / destructive terminal / `run_script`) | `git` child processes, seconds in a big repo | W: still awaited before the change; `hints` and `turn_checkpoints` are `Arc<Mutex<..>>` so the lock is taken inside the closure |
+| 6 | `tools/lib.rs` `call`: `checkpoints.record_write` | hash + checkpoint store | W |
+| 7 | `tools/lib.rs` `call`: `hints.check` (reads AGENTS.md / CLAUDE.md of a newly visited folder) | disk | W |
+| 8 | `tools/files.rs` `write_file`, `patch`: `lint::delta` | runs `python -m py_compile` / `node --check` and waits | W (`lint_off_worker`) |
+| 9 | `tools/shell.rs` `limit_output` (terminal, `run_script`) | writes the full output when over the cap | W only when over the cap (`limit_output_off_worker`; a normal output costs nothing) |
+| 10 | `tools/web.rs` `extract`: `truncate_with_footer` -> `store_full_text` | writes the page under `cache/web` | W only for a page over the limit (`truncate_off_worker`; the two fns are free fns over `cache_dir`) |
+| 11 | `tools/lib.rs` `check_command`: `ApprovalStore::allow_always` | saves the always-allowed file | W |
+| 12 | `tools/vision.rs` `load_source`, local path | `metadata` + `read` of an image up to 50 MB | C: `tokio::fs` |
+| 13 | `tools/process.rs` `spawn`, `shell.rs` `run`: `create_dir_all(scratch)` per call | mkdir | C: `tokio::fs::create_dir_all` |
+| 14 | `runtime/lib.rs` `delete_session`: `store.delete_session` + `remove_dir_all(scratch)` | a write that waits for its commit + a tree delete | W: one closure, order unchanged (store, scratch, taint file); the store's error is still returned |
+| 15 | `runtime/ops.rs` `spill_oversized` (an over-limit tool result is saved) | file write | W only over the limit (`spill_oversized_off_worker`) |
+| 16 | `runtime/lib.rs` turn task: `user_message` (`references::expand` reads `@file` references) | disk | W |
+| 17 | `runtime/lib.rs` turn task and `review_schedule.rs` `review_once`: `index::project_name` | stats up the folder tree for `.git` | W (the review's moved into its existing closure) |
+| 18 | `desktop/gateway.rs` `dispatch`: `projects.tree/list/create/update/delete`, `session.active_list`, `session.title`, `session.rewind`, `rollback.*`, `session.export`, `session.branch*`, `file.attach`, `image.attach` / `image.attach_bytes`, `insights.get` (all sessions + counts), `session.create` (builds the system prompt: skills, memory, files; store writes), `session.resume` / `session.history` (whole conversation), `prompt.submit` (+ its model-facts row), `complete.path`, `config.set model`, `commands.catalog`, `complete.slash`, `slash.exec` (`coding_command`, `commands::exec`), `command.dispatch`, `session.delete` (archive file) | SQLite, files, skills folder, git | W through the new `Gateway::blocking(\|g\| ..)` |
+| 19 | `gateway.rs` `mutate` (rename, model, rewind, archive), `builtin_command` (`/usage`, `/insights`, `/diff`), `status_text`, `context_text`, `window_for`, `context_breakdown`, `compress_session` | store reads, whole conversation, git | W (these take `self: &Arc<Self>` now) |
+| 20 | `gateway.rs` the turn's event loop (one task per turn): the heartbeat's `session_info` + `usage_snapshot` (every 5 s), `Usage` events (`note_generation` writes a file, `usage_snapshot` reads the store), `TurnFinished` (`messages()` loads the conversation, a session row, `usage_snapshot`), the end (`apply_pending_route` + `run_queued`, which reads settings and submits the next prompt), `title_session`'s `set_title` | store + file on the turn's own task | W |
+| 21 | `gateway.rs` `rest`: `session_list`, `stored_messages`, `session_route` (GET/PATCH: store + archive file; DELETE: the runtime's, then the archive file), the final `self.rest.handle(..)` (all generic routes: config, env, ...), `/api/logs` | store, config files | W; `/api/logs` C (`tokio::fs`) |
+| 22 | `llm/canonical/registry.rs` `fetch_remote_catalog`: etag file read | tiny read; the function is called nowhere | L: dead code, Phase 14 removes the canonical registry |
+| 23 | `Settings::load(data_dir)` at the top of every `dispatch` and in `model_facts`, `context_length`, `turn_options`, `known_context`, `rest`; `rest.config_value` / `set_config_value` (read / write `desktop-config.json`) | one small JSON file, read per request | L: short; a cache is a design change (CP13d/f, when `dispatch` is restructured). Flagged below |
+| 24 | `gateway.rs` single-row store reads left inline: `turn_options`, `session_info` (turn start, `route_session`, `title_session`), `session_provider` (`prompt.btw`, `prompt.background`), `model_options`, `model_facts`, `provider_for`, `file_path` | one keyed SELECT (waits for at most the open batch's commit) | L: short; the multi-row, writing and file ones are in 18-21 |
+| 25 | `Path::is_dir/exists/is_file` single stats: `files.rs` (`write_file`, `read_file`), `search.rs`, `shell.rs` (`workdir`), `script.rs` | one `stat` | L: short (a network drive is the only slow case) |
+| 26 | `runtime/curator/per_cluster.rs` `propose::remember` (the curator's "seen" file, once per job) | tiny file | L: a background pass, a few writes of a few hundred bytes |
+| 27 | `runtime/ledger.rs`, `signals.rs`, the store writer | own threads | L: already off the workers |
+| 28 | `desktop/acp/*` | `spawn_blocking` already around every store and file read; its calls into the gateway (`session.create` ...) go through `dispatch`, now off the workers | L (nothing to do) |
+| 29 | `tools/skills.rs`, `skill_manage.rs`, `memory`, `search.rs`, `script.rs`, `files.rs` reads, `curator.rs`, `staging.rs`, `index.rs` | already `spawn_blocking` / `tokio::fs` | L: already correct |
+
+Counts: wrapped: rows 1-11 (11 tool-side), 14-17 (4 runtime sites), 18-21 (the gateway: ~60 arms and helpers); converted
+to tokio async: 3 (rows 12, 13, 21's logs); left with a reason: 8 (rows 22-29, the last two are "already correct").
+Error-path behaviour only: a failed thread in the gateway answers an RPC error ("The request stopped: ..."); `complete.path`
+used to answer an empty list when its thread died, now an error; `spill_oversized` answers "not spilled" (the full text goes
+to the model) if its thread died.
+
+**The test** (`crates/tools/src/blocking_tests.rs`, `slow` hook in `tools/lib.rs`; see TESTING.md and PITFALLS.md). It
+found row 2: a skill write stalled the worker ~0.5 s in a debug build (the first threat scan compiles its patterns; in
+release it is shorter, but it is the same work on the same worker).
+
+Files: crates/tools/src/{lib,recall,review,files,shell,script,process,vision,web,provenance,blocking_tests}.rs,
+crates/runtime/src/{lib,ops,review_schedule}.rs, crates/desktop/src/gateway.rs, crates/llm/src/canonical/registry.rs (not
+changed: dead code), docs/{ARCHITECTURE,PITFALLS,TESTING}.md, docs/backend/progress/phase-13.md
+
+Tests (CARGO_TARGET_DIR=target/claude):
+- `hermes_agent` 45, `hermes_llm` 489 (+7 ignored) + 5 integration, `hermes_memory` 101, `hermes_prompts` 37, `hermes_store` 34,
+  `hermes_tools` **335** (329 + the 6 new `blocking_tests`): green. `hermes_runtime --lib` 213.
+- `turns` **258 passed / 7 ignored under the default, `HERMES_TEST_PROFILE=requests` and `tokens`** (counts as CP13b).
+  A first full run failed `stopping_mid_command_keeps_the_output_it_had_printed` in all three profiles (the chat got
+  "Tool call was interrupted before completing" instead of the printed output). Cause: the machine races the step against
+  Stop with `biased` priority for the call, so a call that still has an `.await` to get through when Stop fires is
+  dropped; my first version of `SessionTools::call` ended with two `spawn_blocking` hops (hints, `record_write`). Fixed:
+  once `emit.cancel_token().is_cancelled()`, the follow-ups (and `limit_output_off_worker`, `spill_oversized_off_worker`)
+  run inline as before (PITFALLS). Full suite re-run green after the fix, all three profiles.
+- `hermes-desktop` 183 + acp 68. `cargo build --workspace` OK (placeholder `target/hermes-src/apps/desktop/dist-webapp`
+  in the worktree and a `tools` junction to the main checkout's Node: both removed afterwards).
+- Live, own instance (debug exe, port 47810, data `target/perf`): as their own provider `staging-check` (memory staging),
+  `coding-commands-check` (`/review` subagent, `/plan`...), `attach-check` (`file.attach`, `image.attach*`; on a fresh
+  instance: after other checks it fails "model does not support vision" because the instance caches the model's facts once
+  asked, not a regression), `preinject-check` (skills attached, session search, resume, rewind), `review-check`
+  (skill_manage by the review), `side-and-branch-check`, `workspace-check`, `memory-check` (Star map: skills and memory
+  through the stores), `toolsets-check`, `archive-check`: all passed. With `mock_llm.py`: `smoke.mjs` (`session.create`,
+  rollback, `/status`, `/context`, `/usage`, `/diff`, `/tools`, `/memory`, `/insights`, `insights.get`, exports, `/undo`,
+  `session.compress`, curator), `rollback-check.mjs`, `stop-check.mjs`: all passed. No `The request stopped` / panic /
+  session-database line in the instance's log. No new check script (nothing new for the page); no perf or timing checks
+  (the user's rule); the one timing-sensitive test is `blocking_tests`. Cleanup slip: stopping `mock_llm.py` I
+  killed every process whose command line named it (3), which may have included another session's mock; nothing else outside
+  `target\claude` was stopped.
+- Caution for future live runs: `smoke.mjs` run with a working folder inside a repository makes `rollback.restore` act on
+  that repository's checkpoint (here the worktree itself; it restored the same state, nothing was lost). Use a folder
+  outside any repository, as `rollback-check.mjs` documents.
+
+
+For the reviewer:
+- **Order.** `checkpoint_before` is awaited before the call it guards. The gateway's `blocking` hops keep per-request
+  order (each request was already its own task); `prompt.submit` runs `submit` on a blocking thread, then the receipt
+  goes out and `release_admission` runs as before (`handle`). `run_queued` (the next queued prompt) now runs on the
+  blocking pool after `apply_pending_route`, in that order. The turn's `TurnFinished` handler awaits the store reads
+  before sending `message.complete`; the order of the events the page sees is the same.
+- **Locks.** No `std` / `parking_lot` guard crosses an `.await` or enters a closure; `hints` and `turn_checkpoints` became
+  `Arc<Mutex<..>>` and are locked inside the closure (nothing else used them). The conversation lock is taken only inside
+  the runtime's own sync methods that the closures call, as before.
+- **`session.create`, `session.resume`, `prompt.submit` on the blocking pool**: they call `Runtime::create_session`,
+  `messages`, `send` (conversation lock, `TurnLock::acquire`). `submit` `tokio::spawn`s the turn's task from inside the
+  closure (a runtime handle exists on blocking threads). Please check you agree.
+- The timer test is wall-clock based (300 ms delay, 150 ms tolerance).
+- **Stop** (found by `turns`): after Stop, a tool call must not wait (see Tests above and PITFALLS). The follow-ups after a
+  tool's own work check the cancel token and run inline. Still open, rare: a Stop landing exactly while `lint_off_worker`
+  or `truncate_off_worker` runs loses that call's result (the step is dropped at the hop). Say if you want those inline-on-Stop
+  too.
+- **Not audited**: `Mutex` guards held across `.await` (spot check only). The frozen GPUI app (`crates/app`) is untouched
+  and calls the sync runtime from its own executor.
+- Doubts: (a) row 23, `Settings::load` per request, is the largest remaining blocking-ish call on the workers, but each
+  read is a few hundred bytes; (b) row 24 leaves single-row store reads in async handlers, each of which can wait one
+  commit during a streaming turn (CP13b's barrier); (c) the new `gateway.rs` hunks are not rustfmt-formatted (the file has
+  older unformatted code; I did not reformat it; `cargo fmt -p hermes_tools` was run once by mistake and undone, so the
+  tools files are as they were apart from my hunks).
+
+**User checklist** (no visible change; the page should feel the same):
+1. Rebuild and start the app. Open the sidebar, switch between sessions and projects: the lists and histories show as before.
+2. Ask the agent to write a Python file with a syntax error: the result carries the lint warning as before; during a long
+   tool call the Stop button and the sidebar stay responsive.
+3. `/usage`, `/insights`, `/status`, `/context`, `/compress`, `/save json` and `/rollback` each answer as before.
+4. Rename a session, archive and unarchive it, delete another: each applies at once.
+5. Ask the agent to remember something and to save a skill (`memory`, `skill_manage`): both are saved; Settings ▸ Skills lists it.
+
+### Review (Opus, 2026-11-15)
+Read the whole diff, then made an audit of my own (not the implementer's script): every `async fn`, `async {}` and
+spawned task in `crates/desktop/src` (gateway, ACP, server, REST), `crates/runtime/src` and `crates/tools/src`, for
+`std::fs`, `std::process`, `Store`/`rusqlite`, `SkillStore`/`MemoryStore`, checkpoints/git, `thread::sleep`, lazily
+compiled regexes, and the sync helpers they call (`session_info`, `usage_snapshot`, `end_live`, `enqueue`,
+`Runtime::messages` / `open`). Findings:
+- **Fixed: the turn's own task still read the store on the worker** at four points the inventory missed:
+  `session.info` at the turn's start (right after the prompt was queued, so it waited for that commit), `end_live`
+  (twice: the event stream closing, and after `message.complete`), `enqueue` for an undelivered steer, and
+  `title_session`'s `session.info` after the title. Each `session_info` is two store reads (the row, the usage
+  totals). Now through `Gateway::blocking`, awaited in place, so the page sees the same events in the same order
+  (`end_live_off_worker` still marks the session settled if its thread dies).
+- **Fixed: a failed thread in a REST route answered Hermes's 404.** `rest()` mapped a `JoinError` with `.ok()` to
+  `None`, which is "No such API endpoint": the page reads it as "feature absent" (rule 5: a wrong answer is worse than
+  none). New `Gateway::rest_blocking` answers 500 `{"detail": "The request stopped: ..."}`; used for
+  `/api/profiles/sessions`, `/api/sessions/{id}/messages`, `/api/sessions/{id}` (GET/PATCH, and the DELETE lookup)
+  and the generic routes.
+- **Fixed: Stop could still lose a stopped command's output** (focus 3). The implementer's work-around checked
+  `is_cancelled()` once, before each follow-up hop; a Stop landing while the hop ran (hints, `record_write`,
+  `limit_output_off_worker`, `spill_oversized_off_worker`) still dropped the call. New
+  `hermes_tools::off_worker_unless_stopped(cancel, work)`: on the blocking pool, but once Stop fires the future
+  completes in that same poll: work not yet started runs inline, work already running is waited for through a std
+  channel (no `.await`; the same wait the pre-Phase-13 inline call had). Cancel stays immediate for everything else.
+  `lint_off_worker` / `truncate_off_worker` are left plain on purpose: `write_file`/`patch`/`web_extract` already
+  had real `.await`s (`tokio::fs`, the network) where Stop drops them, as at HEAD; only the terminal and `run_script`
+  are built to answer after Stop, and their follow-ups are all shielded now. Tests:
+  `stop_during_a_follow_up_keeps_the_calls_result` (raced like `agent/machine.rs`; its control shows a plain hop
+  losing the result) and `a_follow_up_without_stop_does_not_block_the_worker`.
+- Doc fix: `shell.rs`'s `limit_output` doc line had been moved onto the new wrapper.
+- **Rows left, re-checked against CP13b's read barrier**: `Settings::load` / `config_value` (row 23) read small JSON
+  files, never the store: unaffected by CP13b, left. Single-row store reads still inline (row 24): `model_options`
+  (`model.options`), `session_provider` (`/btw`, background prompt), `config.set` effort / `mutate` / compress /
+  queue edits' `session.info`, `file_path` (file serving), `Runtime::side_question`'s `messages` (`/btw`) — each a
+  keyed SELECT behind at most one open batch (≤5 ms plus a WAL commit), on a user action, not per turn or per
+  chunk: accepted. Every per-turn and periodic path (start, heartbeat, usage, finish, end, title, queued next
+  prompt) is now off the workers. `Runtime::review_once` opens the session inline but only tests call it.
+  Lazily compiled regexes: the threat scan was the only slow one found (row 2); the redaction patterns are small.
+- **Wrapping correctness (focus 2)**: no `std`/`parking_lot` guard crosses an `.await` or enters a closure
+  (`self.read.lock().clone()` is a temporary dropped at the end of its `let`); `checkpoint_before` is awaited before
+  the call it guards (a Stop during it drops the call before the change; the detached snapshot finishes and holds
+  `turn_checkpoints` only inside its thread); `JoinError`s become error values everywhere (RPC `-32000` "The request
+  stopped: ...", tool errors); `-32601` and every other shape unchanged. `submit` / `session.create` /
+  `session.resume` on the blocking pool: `spawn_blocking` threads run inside the runtime's context, so
+  `tokio::spawn` works there in the app, in ACP (same `dispatch`) and in the `current_thread` test runtimes; the
+  gateway uses no task-locals and no tracing spans (`instrument`/`info_span` absent), so nothing is lost by the hop.
+  The receipt-before-events order holds (`starts` is filled inside `submit`, released by `handle` after the reply).
+- **Timer test (focus 4)**: `slow` is `#[cfg(test)]` in `hermes_tools` only (absent from every other crate and from
+  release/debug builds); keyed by session id, each test its own id. Mutation check: making `session_search` run
+  inline fails `session_search_does_not_block_the_worker` ("stalled for 315 ms"). Ran `blocking_tests` 10 times alone
+  and 3 times inside the full `hermes_tools` suite (parallel tests as load): all green. `test_pause` is the first line
+  inside each blocking closure (memory, staged memory, staged skills, skills tools, session search).
+- **Process hygiene (focus 6)**: the worktree's `git status` lists only the CP13c files. **My own slip**: one of my
+  PowerShell commands used `[IO.File]::ReadAllText` with a relative path, which .NET resolved against the main
+  checkout, and wrote back five of my gateway edits there (`crates/desktop/src/gateway.rs` in
+  `C:\Users\alexandros\repos\hermes-rs`); found by `git status` there within minutes, it was only my hunks, restored
+  with `git checkout -- crates/desktop/src/gateway.rs`; the main checkout is clean again (nothing built from it).
+  Of the implementer's report: its `mock_llm.py` kills by name cannot be undone; nothing else outside the worktree
+  was found changed.
+- Tests after the review (CARGO_TARGET_DIR=target/claude): `hermes_store` 34, `hermes_llm` 489 (+7 ignored) + 5,
+  `hermes_agent` 45, `hermes_memory` 101, `hermes_prompts` 37, `hermes_tools` **337** (335 + 2 new);
+  `hermes_runtime --lib` 213; `turns` **258 passed / 7 ignored under the default, `requests` and `tokens`**;
+  `hermes-desktop` 183 + acp 68; `cargo build --workspace` OK (placeholder `target/hermes-src/apps/desktop/dist-webapp`,
+  deleted afterwards); `cargo clippy -W clippy::await_holding_lock` on tools/runtime/desktop: no hit.
+- Live, own instance (debug, port 47810, `target/perf`; the main checkout's `tools/node/node.exe` run in place; working
+  folders in my scratch folder, outside any repository): with `mock_llm.py` (started and stopped by its PID)
+  `smoke.mjs`, `rollback-check.mjs`, `stop-check.mjs` (both cases: stalled reply, slow command); as their own provider
+  `staging-check`, `memory-check`, `preinject-check` (skills, session search, resume, rewind), `review-check`,
+  `attach-check` (on a fresh instance: after other checks it fails "model does not support vision" because the
+  instance caches the model's facts, as the implementer noted), `side-and-branch-check`, `archive-check`,
+  `workspace-check`: all passed. No "The request stopped", panic or session-database line in the instance's log. One
+  false start of mine: `perf.ps1 -Do start` hung on its timing step (no `tools/node` in the worktree), so my first
+  `smoke.mjs` ran before its working folder existed and found no checkpoint; with the instance started directly
+  (perf.ps1's environment, no timing) every run passed. No perf or timing checks (the user's rule).

@@ -404,6 +404,11 @@ API keys are in Windows Credential Manager (`keyring`), never in a file.
   blocking calls in `tokio::task::spawn_blocking(move || …).await`. `Store::flush*` and
   `shutdown` wait for the writer thread: from async code always through `spawn_blocking` (as
   `flush_turn` does). `Store::queue` never blocks and may be called anywhere, even under a lock.
+  A `Store` read waits for the writer's pending commit, so it counts as blocking too. In the
+  gateway use `Gateway::blocking(|g| ...)`; in the tools, the skill/memory/`session_search`
+  dispatch, the checkpoint before a write, the post-write lint and the hint files all run on the
+  blocking pool (Phase 13c; the audit is in `docs/backend/progress/phase-13.md`, the test in
+  `crates/tools/src/blocking_tests.rs`).
 - Shared state in `Gateway` is `std::sync::Mutex` / `parking_lot::Mutex` held briefly, never across
   an `.await`. Poisoned locks: `lock().unwrap_or_else(|e| e.into_inner())`.
 - Long work started from an RPC (a turn, a background job) is `tokio::spawn`ed; the RPC answers at

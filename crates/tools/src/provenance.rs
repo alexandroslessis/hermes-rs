@@ -61,6 +61,17 @@ impl SourceNote {
         )
     }
 
+    /// The note for a skill write the agent made in `session`, or its background review
+    /// (`review`): a fixed reason, since the agent gives none.
+    pub fn for_session(session: &str, review: bool) -> Self {
+        let why = if review {
+            "a background review of this session"
+        } else {
+            "the agent changed it during this session"
+        };
+        Self::new(session, why)
+    }
+
     /// [`Self::new`] with the date given.
     pub fn dated(session: &str, date: &str, why: &str) -> Self {
         let session: String = session

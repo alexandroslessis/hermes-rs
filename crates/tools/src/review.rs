@@ -93,57 +93,30 @@ impl ReviewTools {
         ))
     }
 
-    fn mark_read(&self, path: &Path) {
-        self.read.lock().insert(read_key(path));
-    }
-
-    fn has_read(&self, path: &Path) -> bool {
-        self.read.lock().contains(&read_key(path))
-    }
-
-    /// The review guards on a `skill_manage` call: `Some(refusal)` stops it.
-    fn guard_skill_manage(&self, args: &Value) -> Option<ToolOutput> {
-        let skills = self.tools.skills.as_ref()?;
-        for op in requested_ops(args) {
-            let Some(skill) = skills.find(&op.name) else {
-                continue;
-            };
-            if op.action == "delete" && !self.curator {
-                return Some(ToolOutput::error(format!(
-                    "Refusing background review delete of skill '{}': a review never removes \
-                     skills. If two skills overlap, say so in your reply; consolidation is the \
-                     curator's job.",
-                    op.name
-                )));
-            }
-            let file = op
-                .file_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|p| !p.is_empty());
-            let (target, label) = match (op.action.as_str(), file) {
-                ("patch" | "edit", None) => (skill.skill_md(), "SKILL.md".to_string()),
-                ("patch" | "write_file" | "remove_file", Some(file)) => {
-                    (skill.dir.join(file), format!("supporting file '{file}'"))
-                }
-                _ => continue,
-            };
-            // A new supporting file needs no prior read.
-            if !target.exists() || self.has_read(&target) {
-                continue;
-            }
-            return Some(ToolOutput::error_with(
-                format!(
-                    "Refusing background curator {} for skill '{}': the current {label} content \
-                     has not been loaded in this review turn. Call skill_view(name) for \
-                     SKILL.md, or skill_view(name, file_path=...) for a supporting file, then \
-                     retry the write using the content just returned.",
-                    op.action, op.name
-                ),
-                json!({"_read_before_write_required": true}),
-            ));
+    /// Remembers that the review loaded `path`. The key resolves symlinks and `..` (disk work),
+    /// so it is made on a blocking thread.
+    async fn mark_read(&self, path: &Path) {
+        let path = path.to_path_buf();
+        if let Ok(key) = tokio::task::spawn_blocking(move || read_key(&path)).await {
+            self.read.lock().insert(key);
         }
-        None
+    }
+
+    /// The review guards on a `skill_manage` call: `Some(refusal)` stops it. It looks skills up
+    /// in their folders and resolves paths, so it runs on a blocking thread.
+    async fn guard_skill_manage(&self, args: &Value) -> Option<ToolOutput> {
+        let skills = self.tools.skills.clone()?;
+        let (args, read, curator) = (args.clone(), self.read.lock().clone(), self.curator);
+        match tokio::task::spawn_blocking(move || {
+            guard_skill_manage(&skills, &read, curator, &args)
+        })
+        .await
+        {
+            Ok(refusal) => refusal,
+            Err(e) => Some(ToolOutput::error(format!(
+                "The review's check of the skill change did not finish: {e}"
+            ))),
+        }
     }
 
     async fn dispatch(&self, name: &str, args: Value) -> ToolOutput {
@@ -152,10 +125,10 @@ impl ReviewTools {
         }
         match name {
             "skill_manage" => {
-                if let Some(refusal) = self.guard_skill_manage(&args) {
+                if let Some(refusal) = self.guard_skill_manage(&args).await {
                     return refusal;
                 }
-                let Some(skills) = &self.tools.skills else {
+                let Some(skills) = self.tools.skills.clone() else {
                     return self.tools.dispatch(name, args, None).await;
                 };
                 // The review reads the whole conversation, so a tainted session's review writes
@@ -163,8 +136,18 @@ impl ReviewTools {
                 if self.tools.taint().is_tainted() {
                     return self.tools.stage_skills(&args, self.origin()).await;
                 }
-                let source = (!self.curator).then(|| self.tools.skill_source(WriteOrigin::Review));
-                let result = skills.manage_with_source(&args, self.origin(), source.as_ref());
+                let (session_id, with_source) = (self.tools.session_id.clone(), !self.curator);
+                // Writes the skill folder: off the async workers.
+                let origin = self.origin();
+                let result = tokio::task::spawn_blocking(move || {
+                    let source = with_source
+                        .then(|| crate::provenance::SourceNote::for_session(&session_id, true));
+                    skills.manage_with_source(&args, origin, source.as_ref())
+                })
+                .await
+                .unwrap_or_else(
+                    |e| json!({"success": false, "error": format!("The skill tool stopped: {e}")}),
+                );
                 let failed = result.get("success") == Some(&Value::Bool(false));
                 ToolOutput {
                     value: result,
@@ -174,8 +157,8 @@ impl ReviewTools {
             "skill_view" => {
                 let output = self.tools.dispatch(name, args.clone(), None).await;
                 if !output.is_error {
-                    if let Some(path) = self.viewed_path(&args) {
-                        self.mark_read(&path);
+                    if let Some(path) = self.viewed_path(&args).await {
+                        self.mark_read(&path).await;
                     }
                 }
                 output
@@ -193,7 +176,7 @@ impl ReviewTools {
                 if let (false, Some(path), None) =
                     (output.is_error, &path, output.value.get("files"))
                 {
-                    self.mark_read(path);
+                    self.mark_read(path).await;
                 }
                 // `paths` (Phase 10): each file that was read, by the path its entry names.
                 if let Some(Value::Array(files)) = output.value.get("files") {
@@ -202,7 +185,7 @@ impl ReviewTools {
                             continue;
                         }
                         if let Some(read) = entry.get("path").and_then(Value::as_str) {
-                            self.mark_read(Path::new(read));
+                            self.mark_read(Path::new(read)).await;
                         }
                     }
                 }
@@ -223,9 +206,14 @@ impl ReviewTools {
     }
 
     /// The file a successful `skill_view` call loaded.
-    fn viewed_path(&self, args: &Value) -> Option<std::path::PathBuf> {
-        let name = args.get("name").and_then(Value::as_str)?.trim();
-        let skill = self.tools.skills.as_ref()?.find(name)?;
+    async fn viewed_path(&self, args: &Value) -> Option<std::path::PathBuf> {
+        let name = args.get("name").and_then(Value::as_str)?.trim().to_string();
+        let skills = self.tools.skills.clone()?;
+        // The catalog is read from the skill folders: off the async workers.
+        let skill = tokio::task::spawn_blocking(move || skills.find(&name))
+            .await
+            .ok()
+            .flatten()?;
         match args
             .get("file_path")
             .and_then(Value::as_str)
@@ -259,6 +247,56 @@ fn requested_ops(args: &Value) -> Vec<SkillOp> {
             .into_iter()
             .collect(),
     }
+}
+
+/// The review guards on a `skill_manage` call ([`ReviewTools::guard_skill_manage`]): `read` holds
+/// the keys of the files the review loaded.
+fn guard_skill_manage(
+    skills: &crate::SkillStore,
+    read: &HashSet<String>,
+    curator: bool,
+    args: &Value,
+) -> Option<ToolOutput> {
+    for op in requested_ops(args) {
+        let Some(skill) = skills.find(&op.name) else {
+            continue;
+        };
+        if op.action == "delete" && !curator {
+            return Some(ToolOutput::error(format!(
+                "Refusing background review delete of skill '{}': a review never removes \
+                 skills. If two skills overlap, say so in your reply; consolidation is the \
+                 curator's job.",
+                op.name
+            )));
+        }
+        let file = op
+            .file_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        let (target, label) = match (op.action.as_str(), file) {
+            ("patch" | "edit", None) => (skill.skill_md(), "SKILL.md".to_string()),
+            ("patch" | "write_file" | "remove_file", Some(file)) => {
+                (skill.dir.join(file), format!("supporting file '{file}'"))
+            }
+            _ => continue,
+        };
+        // A new supporting file needs no prior read.
+        if !target.exists() || read.contains(&read_key(&target)) {
+            continue;
+        }
+        return Some(ToolOutput::error_with(
+            format!(
+                "Refusing background curator {} for skill '{}': the current {label} content \
+                 has not been loaded in this review turn. Call skill_view(name) for \
+                 SKILL.md, or skill_view(name, file_path=...) for a supporting file, then \
+                 retry the write using the content just returned.",
+                op.action, op.name
+            ),
+            json!({"_read_before_write_required": true}),
+        ));
+    }
+    None
 }
 
 fn read_key(path: &Path) -> String {

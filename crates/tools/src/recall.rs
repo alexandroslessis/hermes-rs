@@ -148,11 +148,34 @@ fn anchored_view(
     }
 }
 
+/// What a search needs to know about its session: who is asking (the current session is left out
+/// of the results). Owned data only, so the search can run on a blocking thread.
+struct Recall<'a> {
+    session_id: &'a str,
+}
+
 impl SessionTools {
-    pub(crate) fn session_search(&self, args: &Value) -> ToolOutput {
+    /// The `session_search` tool. It reads the session database, which may wait for the store's
+    /// writer to commit, so it runs on a blocking thread (ground rule 7).
+    pub(crate) async fn session_search(&self, args: &Value) -> ToolOutput {
         let Some(store) = self.history.clone() else {
             return error("Session search is not available: the session database is not open.");
         };
+        let (session_id, args) = (self.session_id.clone(), args.clone());
+        tokio::task::spawn_blocking(move || {
+            crate::test_pause(&session_id);
+            Recall {
+                session_id: &session_id,
+            }
+            .search(&store, &args)
+        })
+        .await
+        .unwrap_or_else(|e| error(format!("Session search stopped: {e}.")))
+    }
+}
+
+impl Recall<'_> {
+    fn search(&self, store: &Store, args: &Value) -> ToolOutput {
         let session_id = args
             .get("session_id")
             .and_then(Value::as_str)
@@ -160,8 +183,8 @@ impl SessionTools {
             .filter(|s| !s.is_empty());
         if let Some(session_id) = session_id {
             return match args.get("around_message_id").filter(|v| !v.is_null()) {
-                Some(anchor) => self.scroll(&store, session_id, anchor, args.get("window")),
-                None => self.read_session(&store, session_id),
+                Some(anchor) => self.scroll(store, session_id, anchor, args.get("window")),
+                None => self.read_session(store, session_id),
             };
         }
         let limit = clamp(args.get("limit"), 3, 1, 10) as usize;
@@ -171,7 +194,7 @@ impl SessionTools {
             .map(str::trim)
             .unwrap_or_default();
         if query.is_empty() {
-            return self.browse(&store, limit);
+            return self.browse(store, limit);
         }
         let (after, before) = match (
             parse_bound(args.get("after")),
@@ -215,9 +238,9 @@ impl SessionTools {
             })
             .unwrap_or_default();
         // The current session is already in context.
-        excluded.push(self.session_id.clone());
+        excluded.push(self.session_id.to_string());
         self.discover(
-            &store, query, &roles, limit, sort, full, &excluded, after, before,
+            store, query, &roles, limit, sort, full, &excluded, after, before,
         )
     }
 
@@ -398,7 +421,7 @@ impl SessionTools {
         };
         let window = clamp(window, 5, 1, 20) as usize;
         let owner = store.search_row_session(anchor).ok().flatten();
-        if owner.as_deref() == Some(self.session_id.as_str()) {
+        if owner.as_deref() == Some(self.session_id) {
             return error(
                 "scroll rejected: anchor lives in the current session (already in your active context)",
             );

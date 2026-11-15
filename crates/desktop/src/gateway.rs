@@ -465,6 +465,19 @@ impl Gateway {
         result
     }
 
+    /// Runs `work` on a blocking thread: SQLite, file and repository work must not hold an async
+    /// worker (ground rule 7; a store read also waits for the writer's pending commit). A thread
+    /// that panicked or was cancelled answers as a failed request, never a panic here.
+    async fn blocking<T: Send + 'static>(
+        self: &Arc<Self>,
+        work: impl FnOnce(&Arc<Gateway>) -> T + Send + 'static,
+    ) -> Result<T, (i64, String)> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || work(&this))
+            .await
+            .map_err(|e| (SERVER_ERROR, format!("The request stopped: {e}")))
+    }
+
     async fn dispatch(self: Arc<Self>, method: &str, params: &Value, outbox: &Outbox) -> RpcResult {
         let settings = Settings::load(&self.data_dir);
         match method {
@@ -490,9 +503,15 @@ impl Gateway {
                 "provider": settings.provider,
             }]})),
             "projects.tree" | "projects.project_sessions" => {
-                let projects = self.runtime.store().list_projects().unwrap_or_default();
                 let preview = params["preview_limit"].as_u64().unwrap_or(3) as usize;
-                let rows = self.session_rows();
+                let (projects, rows) = self
+                    .blocking(|g| {
+                        (
+                            g.runtime.store().list_projects().unwrap_or_default(),
+                            g.session_rows(),
+                        )
+                    })
+                    .await?;
                 // The tree lists counts; one project's sessions come hydrated.
                 let single = params["project_id"].as_str().map(str::to_string);
                 let mut tree = tokio::task::spawn_blocking(move || {
@@ -513,7 +532,7 @@ impl Gateway {
                     }
                 }
             }
-            "projects.list" => Ok(self.project_list()),
+            "projects.list" => Ok(self.blocking(|g| g.project_list()).await?),
             "projects.create" => {
                 let name = params["name"]
                     .as_str()
@@ -533,9 +552,8 @@ impl Gateway {
                     folders.insert(0, primary.to_string());
                 }
                 let project = self
-                    .runtime
-                    .store()
-                    .create_project(&name, &folders)
+                    .blocking(move |g| g.runtime.store().create_project(&name, &folders))
+                    .await?
                     .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
                 if params["use"] == true {
                     self.rest
@@ -545,13 +563,17 @@ impl Gateway {
             }
             "projects.update" | "projects.add_folder" => {
                 let id = params["id"].as_str().unwrap_or_default();
+                let wanted = id.to_string();
                 let mut project = self
-                    .runtime
-                    .store()
-                    .list_projects()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|p| p.id == id)
+                    .blocking(move |g| {
+                        g.runtime
+                            .store()
+                            .list_projects()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .find(|p| p.id == wanted)
+                    })
+                    .await?
                     .ok_or((SERVER_ERROR, format!("No project {id}")))?;
                 if let Some(name) = params["name"].as_str().filter(|n| !n.trim().is_empty()) {
                     project.name = name.trim().to_string();
@@ -564,23 +586,27 @@ impl Gateway {
                         project.folders.push(path.to_string());
                     }
                 }
-                self.runtime
-                    .store()
-                    .update_project(&project.id, &project.name, &project.folders)
-                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
+                let changed = project.clone();
+                self.blocking(move |g| {
+                    g.runtime
+                        .store()
+                        .update_project(&changed.id, &changed.name, &changed.folders)
+                })
+                .await?
+                .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
                 Ok(json!({"project": crate::projects::record(&project)}))
             }
             "projects.delete" => {
                 let id = params["id"].as_str().unwrap_or_default();
-                self.runtime
-                    .store()
-                    .delete_project(id)
+                let gone = id.to_string();
+                self.blocking(move |g| g.runtime.store().delete_project(&gone))
+                    .await?
                     .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
                 if self.rest.config_value("projects.active_id") == id {
                     self.rest
                         .set_config_value("projects.active_id", Value::Null);
                 }
-                Ok(self.project_list())
+                Ok(self.blocking(|g| g.project_list()).await?)
             }
             "projects.set_active" => {
                 let id = params["id"].clone();
@@ -590,7 +616,9 @@ impl Gateway {
             // No scanning for repositories yet: the tree shows the ones sessions ran in.
             "projects.discover_repos" => Ok(json!({"repos": []})),
             "projects.record_repos" => Ok(json!({"repos": [], "accepted": true})),
-            "session.active_list" => Ok(json!({"sessions": self.active_sessions()})),
+            "session.active_list" => {
+                Ok(json!({"sessions": self.blocking(|g| g.active_sessions()).await?}))
+            }
             "model.options" => Ok(self
                 .model_options(&settings, params["session_id"].as_str())
                 .await),
@@ -628,7 +656,10 @@ impl Gateway {
                 "model": settings.model,
                 "provider": settings.provider,
             })),
-            "config.set" if params["key"] == "model" => self.switch_model(params, &settings),
+            "config.set" if params["key"] == "model" => {
+                let (p, s) = (params.clone(), settings.clone());
+                self.blocking(move |g| g.switch_model(&p, &s)).await?
+            }
             // A session's effort; any other key is a Settings value, kept in the config record.
             "config.set" => {
                 let key = params["key"].as_str().unwrap_or_default();
@@ -710,11 +741,16 @@ impl Gateway {
                 "sample_rate": 16000,
                 "frame_length": 512,
             })),
-            "commands.catalog" => Ok(commands::catalog(&self.runtime.skills())),
-            "complete.slash" => Ok(commands::complete(
-                &self.runtime.skills(),
-                params["text"].as_str().unwrap_or_default(),
-            )),
+            // The skills are read from their folders: off the async workers.
+            "commands.catalog" => Ok(self
+                .blocking(|g| commands::catalog(&g.runtime.skills()))
+                .await?),
+            "complete.slash" => {
+                let text = params["text"].as_str().unwrap_or_default().to_string();
+                Ok(self
+                    .blocking(move |g| commands::complete(&g.runtime.skills(), &text))
+                    .await?)
+            }
             // Hermes's wording for "not a command here": the page then tries `command.dispatch`,
             // and reports the slash.exec error when that finds nothing either.
             // The page polls each session's goal; there are no goals here.
@@ -732,60 +768,86 @@ impl Gateway {
                     .trim_start_matches('/')
                     .split_once(char::is_whitespace)
                     .unwrap_or((command.trim().trim_start_matches('/'), ""));
-                if let Some(answer) = self.coding_command(params, name, arg) {
+                let (p, n, a) = (params.clone(), name.to_string(), arg.to_string());
+                if let Some(answer) = self
+                    .blocking(move |g| g.coding_command(&p, &n, &a))
+                    .await?
+                {
                     return answer;
                 }
                 if let Some(answer) = self.builtin_command(params, command, &settings).await {
                     return answer;
                 }
-                commands::exec(&self.runtime, command).ok_or((
-                    SERVER_ERROR,
-                    "not a quick/plugin/bundle/skill command".to_string(),
-                ))
+                let command = command.to_string();
+                self.blocking(move |g| commands::exec(&g.runtime, &command))
+                    .await?
+                    .ok_or((
+                        SERVER_ERROR,
+                        "not a quick/plugin/bundle/skill command".to_string(),
+                    ))
             }
             "session.status" => {
                 let id = session_id(params)?;
                 let output = self.status_text(&id).await?;
                 Ok(json!({"output": output}))
             }
-            "command.dispatch"
-                if self
-                    .coding_command(params, params["name"].as_str().unwrap_or_default(), "")
-                    .is_some() =>
-            {
-                let name = params["name"].as_str().unwrap_or_default();
-                let arg = params["arg"].as_str().unwrap_or_default();
-                self.coding_command(params, name, arg)
-                    .expect("a coding command")
+            "command.dispatch" => {
+                let name = params["name"].as_str().unwrap_or_default().to_string();
+                let arg = params["arg"].as_str().unwrap_or_default().to_string();
+                let p = params.clone();
+                // A coding command (`/plan`...) or a skill's: both read the session or the
+                // skills folder, so off the async workers.
+                self.blocking(move |g| {
+                    // (`coding_command` answers `None` for any other name; asked once with an
+                    // empty argument first, as before, then with the real one.)
+                    if g.coding_command(&p, &name, "").is_some() {
+                        return g
+                            .coding_command(&p, &name, &arg)
+                            .expect("a coding command");
+                    }
+                    commands::dispatch(&g.runtime, &name, &arg).ok_or((
+                        SERVER_ERROR,
+                        "not a quick/plugin/bundle/skill command".to_string(),
+                    ))
+                })
+                .await?
             }
-            "command.dispatch" => commands::dispatch(
-                &self.runtime,
-                params["name"].as_str().unwrap_or_default(),
-                params["arg"].as_str().unwrap_or_default(),
-            )
-            .ok_or((
-                SERVER_ERROR,
-                "not a quick/plugin/bundle/skill command".to_string(),
-            )),
             "session.title" => {
                 let id = session_id(params)?;
-                if let Some(title) = params["title"].as_str() {
-                    self.rename(&id, title)?;
-                }
+                let new_title = params["title"].as_str().map(str::to_string);
+                let session = id.clone();
                 let title = self
-                    .runtime
-                    .store()
-                    .session(&id)
-                    .ok()
-                    .flatten()
-                    .and_then(|record| record.title)
-                    .unwrap_or_default();
+                    .blocking(move |g| {
+                        if let Some(title) = &new_title {
+                            g.rename(&session, title)?;
+                        }
+                        Ok::<_, (i64, String)>(
+                            g.runtime
+                                .store()
+                                .session(&session)
+                                .ok()
+                                .flatten()
+                                .and_then(|record| record.title)
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .await??;
                 Ok(json!({"title": title, "session_key": id}))
             }
             "session.mutate" => self.mutate(params, &settings).await,
-            "session.rewind" => self.rewind_turn(params),
-            "rollback.list" | "rollback.diff" | "rollback.restore" => self.rollback(method, params),
-            "session.export" => self.export_session(params),
+            // These read the stored conversation or the checkpoints on disk.
+            "session.rewind" => {
+                let p = params.clone();
+                self.blocking(move |g| g.rewind_turn(&p)).await?
+            }
+            "rollback.list" | "rollback.diff" | "rollback.restore" => {
+                let (m, p) = (method.to_string(), params.clone());
+                self.blocking(move |g| g.rollback(&m, &p)).await?
+            }
+            "session.export" => {
+                let p = params.clone();
+                self.blocking(move |g| g.export_session(&p)).await?
+            }
             // The Import screen: sessions from the original Hermes (`hermes_import.rs`).
             "session.foreign.list" => {
                 let source = params["source"].as_str().map(str::to_string);
@@ -823,9 +885,12 @@ impl Gateway {
                 .map_err(|e| (INVALID_PARAMS, e))
             }
             // `/branch` and the message menu's Branch (`branch.rs`).
-            "session.branch" => self.branch(params, &settings, outbox, false, false),
-            "session.branch_whole" => self.branch(params, &settings, outbox, true, true),
-            "session.branch_stored" => self.branch(params, &settings, outbox, true, true),
+            "session.branch" | "session.branch_whole" | "session.branch_stored" => {
+                let whole = method != "session.branch";
+                let (p, s, o) = (params.clone(), settings.clone(), outbox.clone());
+                self.blocking(move |g| g.branch(&p, &s, &o, whole, whole))
+                    .await?
+            }
             // `/btw`: a side question about the conversation, answered as `btw.complete`.
             "prompt.btw" => {
                 let id = session_id(params)?;
@@ -894,15 +959,20 @@ impl Gateway {
             // `@file:` in the prompt (`attachments.rs`).
             "file.attach" => {
                 let id = session_id(params)?;
-                let record = self
-                    .runtime
-                    .store()
-                    .session(&id)
-                    .ok()
-                    .flatten()
-                    .ok_or((INVALID_PARAMS, format!("No session {id}.")))?;
-                crate::attachments::attach_file(std::path::Path::new(&record.cwd), params)
-                    .map_err(|e| (INVALID_PARAMS, e))
+                let p = params.clone();
+                // Reads the session and copies the file: off the async workers.
+                self.blocking(move |g| {
+                    let record = g
+                        .runtime
+                        .store()
+                        .session(&id)
+                        .ok()
+                        .flatten()
+                        .ok_or((INVALID_PARAMS, format!("No session {id}.")))?;
+                    crate::attachments::attach_file(std::path::Path::new(&record.cwd), &p)
+                        .map_err(|e| (INVALID_PARAMS, e))
+                })
+                .await?
             }
             // Images held for the session's next prompt (the page's path when it doesn't upload
             // them with the prompt).
@@ -914,17 +984,23 @@ impl Gateway {
                         .unwrap_or_default()
                         .trim()
                         .to_string();
-                    let file = std::path::Path::new(&path);
-                    if !file.is_file() {
+                    let checked = path.clone();
+                    let found = self
+                        .blocking(move |_| std::path::Path::new(&checked).is_file())
+                        .await?;
+                    if !found {
                         return Err((INVALID_PARAMS, format!("image not found: {path}")));
                     }
-                    if !crate::attachments::is_image(file) {
+                    if !crate::attachments::is_image(std::path::Path::new(&path)) {
                         return Err((INVALID_PARAMS, format!("unsupported image: {path}")));
                     }
                     path
                 } else {
-                    let (status, saved) =
-                        crate::attachments::image_from_base64(&self.data_dir, params);
+                    // Decodes and saves the picture: off the async workers.
+                    let (dir, p) = (self.data_dir.clone(), params.clone());
+                    let (status, saved) = self
+                        .blocking(move |_| crate::attachments::image_from_base64(&dir, &p))
+                        .await?;
                     if status != 200 {
                         let detail = saved["detail"]
                             .as_str()
@@ -965,16 +1041,23 @@ impl Gateway {
                 let days = params["days"].as_i64().filter(|d| *d > 0).unwrap_or(30);
                 // (The store keeps milliseconds.)
                 let since = chrono::Utc::now().timestamp_millis() - days * 86_400_000;
-                let store = self.runtime.store();
-                let counts = store.message_counts().unwrap_or_default();
-                let recent: Vec<_> = store
-                    .list_sessions(100_000)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|s| s.updated_at >= since)
-                    .collect();
-                let messages: usize = recent.iter().filter_map(|s| counts.get(&s.id)).sum();
-                Ok(json!({"days": days, "sessions": recent.len(), "messages": messages}))
+                // Every session and its message count: off the async workers.
+                let (sessions, messages) = self
+                    .blocking(move |g| {
+                        let store = g.runtime.store();
+                        let counts = store.message_counts().unwrap_or_default();
+                        let recent: Vec<_> = store
+                            .list_sessions(100_000)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|s| s.updated_at >= since)
+                            .collect();
+                        let messages: usize =
+                            recent.iter().filter_map(|s| counts.get(&s.id)).sum();
+                        (recent.len(), messages)
+                    })
+                    .await?;
+                Ok(json!({"days": days, "sessions": sessions, "messages": messages}))
             }
             "session.compress" => self.compress_session(params, &settings).await,
             "session.delete" => {
@@ -983,14 +1066,21 @@ impl Gateway {
                     .delete_session(&id)
                     .await
                     .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
-                self.archive.forget(&id);
+                let session = id.clone();
+                self.blocking(move |g| g.archive.forget(&session)).await?;
                 Ok(json!({"deleted": id}))
             }
             // Nothing to release: a session lives in the store, not in a worker.
             "session.close" => Ok(json!({"closed": true})),
-            "session.create" => self.create_session(params, &settings, outbox),
+            // Creating builds the system prompt (skills, memory, files) and writes the store;
+            // resuming loads the whole conversation.
+            "session.create" => {
+                let (p, s, o) = (params.clone(), settings.clone(), outbox.clone());
+                self.blocking(move |g| g.create_session(&p, &s, &o)).await?
+            }
             "session.resume" | "session.history" => {
-                let resumed = self.resume_session(params, outbox);
+                let (p, o) = (params.clone(), outbox.clone());
+                let resumed = self.blocking(move |g| g.resume_session(&p, &o)).await?;
                 // Only a resume is the page showing the session (`session.history` reads it).
                 if method == "session.resume"
                     && resumed.is_ok()
@@ -1004,11 +1094,15 @@ impl Gateway {
                 // What the model takes (images, its window) is asked of the provider once, before
                 // the turn starts.
                 if let Ok(id) = session_id(params)
-                    && let Some(record) = self.runtime.store().session(&id).ok().flatten()
+                    && let Some(record) = self
+                        .blocking(move |g| g.runtime.store().session(&id).ok().flatten())
+                        .await?
                 {
                     self.model_facts(&record.provider, &record.model).await;
                 }
-                self.submit(params, &settings, outbox, true)
+                let (p, s, o) = (params.clone(), settings.clone(), outbox.clone());
+                self.blocking(move |g| g.clone().submit(&p, &s, &o, true))
+                    .await?
             }
             // The page's answer to an approval card (`choice`) or a clarify question (`answer`),
             // named by the prompt id it was shown with.
@@ -1155,22 +1249,25 @@ impl Gateway {
             }
             "complete.path" => {
                 let word = params["word"].as_str().unwrap_or_default().to_string();
-                let root = params["cwd"]
-                    .as_str()
-                    .filter(|cwd| !cwd.is_empty())
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        let id = params["session_id"].as_str()?;
-                        let record = self.runtime.store().session(id).ok().flatten()?;
-                        Some(PathBuf::from(record.cwd))
+                let (cwd, session) = (
+                    params["cwd"].as_str().filter(|c| !c.is_empty()).map(PathBuf::from),
+                    params["session_id"].as_str().map(str::to_string),
+                );
+                // The session's folder is read from the store and a name search walks the
+                // project: off the async workers.
+                let items = self
+                    .blocking(move |g| {
+                        let root = cwd
+                            .or_else(|| {
+                                let record =
+                                    g.runtime.store().session(session.as_deref()?).ok().flatten()?;
+                                Some(PathBuf::from(record.cwd))
+                            })
+                            .or_else(dirs::home_dir)
+                            .unwrap_or_default();
+                        crate::paths::complete(&word, &root)
                     })
-                    .or_else(dirs::home_dir)
-                    .unwrap_or_default();
-                // A name search walks the project: off the async workers.
-                let items =
-                    tokio::task::spawn_blocking(move || crate::paths::complete(&word, &root))
-                        .await
-                        .unwrap_or_default();
+                    .await?;
                 Ok(json!({"items": items}))
             }
             "session.steer" => {
@@ -1594,21 +1691,28 @@ impl Gateway {
     /// the frozen system prompt and the conversation, estimated at ~4 characters a token, against
     /// the model's window. How full it is comes from the last request's real input tokens when the
     /// session has made one, else from the estimate.
-    async fn context_breakdown(&self, id: &str) -> RpcResult {
-        let record = self
-            .runtime
-            .store()
-            .session(id)
-            .ok()
-            .flatten()
-            .ok_or((SERVER_ERROR, format!("Session not found: {id}")))?;
+    async fn context_breakdown(self: &Arc<Self>, id: &str) -> RpcResult {
+        // The session row and its whole conversation: store reads, off the async workers.
+        let session = id.to_string();
+        let (record, messages, (builtin, mcp)) = self
+            .blocking(move |g| {
+                let record = g
+                    .runtime
+                    .store()
+                    .session(&session)
+                    .ok()
+                    .flatten()
+                    .ok_or((SERVER_ERROR, format!("Session not found: {session}")))?;
+                let messages = g.runtime.messages(&session).unwrap_or_default();
+                // Every request also carries the tool definitions: the built-in tools and MCP
+                // servers' (a deferred session's, Phase 11: the ones it actually sends).
+                let tools = g.runtime.session_tool_definitions(&session);
+                Ok::<_, (i64, String)>((record, messages, tools))
+            })
+            .await??;
         let tokens = |chars: usize| chars.div_ceil(4);
         let system = tokens(record.system_prompt.len());
-        let messages = self.runtime.messages(id).unwrap_or_default();
         let conversation = tokens(serde_json::to_string(&messages).map_or(0, |json| json.len()));
-        // Every request also carries the tool definitions: the built-in tools and MCP servers'
-        // (a deferred session's, Phase 11: the ones it actually sends).
-        let (builtin, mcp) = self.runtime.session_tool_definitions(id);
         let json_tokens = |tools: &[Value]| {
             if tools.is_empty() {
                 0
@@ -1619,10 +1723,10 @@ impl Gateway {
         let (tool_definitions, mcp_tools) = (json_tokens(&builtin), json_tokens(&mcp));
         let estimated_total = system + tool_definitions + mcp_tools + conversation;
         let context_max = self.context_length(&record.provider, &record.model).await;
+        let session = id.to_string();
         let measured = self
-            .runtime
-            .store()
-            .usage_totals(id)
+            .blocking(move |g| g.runtime.store().usage_totals(&session))
+            .await?
             .map_or(0, |usage| usage.last_input_tokens.max(0) as usize);
         let (mut used, source) = if measured > 0 {
             (measured, "provider_usage")
@@ -1692,13 +1796,15 @@ impl Gateway {
 
     /// Hermes's canonical `session.mutate`: a session edit presenting the revision the page last
     /// saw. Edits here are one user's, so the revision is reported but not enforced.
-    async fn mutate(&self, params: &Value, settings: &Settings) -> RpcResult {
+    async fn mutate(self: &Arc<Self>, params: &Value, settings: &Settings) -> RpcResult {
         let id = session_id(params)?;
         let payload = &params["payload"];
         let mut receipt = match params["operation"].as_str().unwrap_or_default() {
             "rename" => {
-                let title = payload["title"].as_str().unwrap_or_default();
-                self.rename(&id, title)?;
+                let title = payload["title"].as_str().unwrap_or_default().to_string();
+                let (session, new_title) = (id.clone(), title.clone());
+                self.blocking(move |g| g.rename(&session, &new_title))
+                    .await??;
                 json!({"title": title.trim()})
             }
             "model" => {
@@ -1707,10 +1813,10 @@ impl Gateway {
                 // The canonical pick is session policy: it never rewrites the defaults.
                 // Picked mid-reply, it waits for the next turn, but shows as the session's model
                 // at once (no "applies next turn" notice).
-                self.switch_model(
-                    &json!({"session_id": id, "value": format!("{model} --provider {provider} --session")}),
-                    settings,
-                )?;
+                let pick = json!({"session_id": id, "value": format!("{model} --provider {provider} --session")});
+                let settings = settings.clone();
+                self.blocking(move |g| g.switch_model(&pick, &settings))
+                    .await??;
                 json!({"model": model, "provider": provider, "status": "applied"})
             }
             "reasoning" => {
@@ -1733,9 +1839,13 @@ impl Gateway {
                 if self.runtime.is_running(&id) {
                     return Err((SERVER_ERROR, BUSY.to_string()));
                 }
+                let session = id.clone();
                 let kept = self
-                    .runtime
-                    .rewind(&id, transcript::kept_before_row(row as usize))
+                    .blocking(move |g| {
+                        g.runtime
+                            .rewind(&session, transcript::kept_before_row(row as usize))
+                    })
+                    .await?
                     .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
                 json!({"status": "applied", "target_message_id": row, "message_count": kept.len()})
             }
@@ -1776,7 +1886,9 @@ impl Gateway {
             // The keyboard shortcut's `session.archive` (`canonical-protocol.ts`).
             "archive" => {
                 let archived = payload["archived"].as_bool().unwrap_or(true);
-                self.set_archived(&id, archived)?;
+                let session = id.clone();
+                self.blocking(move |g| g.set_archived(&session, archived))
+                    .await??;
                 json!({"archived": archived})
             }
             other => {
@@ -2020,7 +2132,7 @@ impl Gateway {
     }
 
     async fn builtin_command(
-        &self,
+        self: &Arc<Self>,
         params: &Value,
         command: &str,
         settings: &Settings,
@@ -2086,12 +2198,26 @@ impl Gateway {
             "usage" => match need_id() {
                 Ok(id) => {
                     let window = self.window_for(&id).await;
-                    self.runtime.usage_text(&id, window).map_err(error)
+                    self.blocking(move |g| g.runtime.usage_text(&id, window))
+                        .await
+                        .and_then(|text| text.map_err(error))
                 }
                 Err(e) => Err(e),
             },
-            "insights" => Ok(self.runtime.insights_text(arg)),
-            "diff" => need_id().and_then(|id| self.runtime.diff_report(&id, arg).map_err(error)),
+            // These read the store and run git: off the async workers.
+            "insights" => {
+                let arg = arg.to_string();
+                self.blocking(move |g| g.runtime.insights_text(&arg)).await
+            }
+            "diff" => match need_id() {
+                Ok(id) => {
+                    let arg = arg.to_string();
+                    self.blocking(move |g| g.runtime.diff_report(&id, &arg))
+                        .await
+                        .and_then(|report| report.map_err(error))
+                }
+                Err(e) => Err(e),
+            },
             "tools" => {
                 let (builtin, mcp) = self.runtime.tool_definitions();
                 let line = |t: &Value| {
@@ -2198,26 +2324,38 @@ impl Gateway {
     }
 
     /// The session model's context window, as the gauge shows it.
-    async fn window_for(&self, id: &str) -> Option<usize> {
-        let record = self.runtime.store().session(id).ok().flatten()?;
+    async fn window_for(self: &Arc<Self>, id: &str) -> Option<usize> {
+        let session = id.to_string();
+        let record = self
+            .blocking(move |g| g.runtime.store().session(&session).ok().flatten())
+            .await
+            .ok()
+            .flatten()?;
         Some(self.context_length(&record.provider, &record.model).await)
     }
 
     /// `/status`: the session, its model and folder, tokens so far, the context in use.
-    async fn status_text(&self, id: &str) -> Result<String, (i64, String)> {
-        let store = self.runtime.store();
-        let record = store
-            .session(id)
-            .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?
-            .ok_or((SERVER_ERROR, format!("Session {id} not found")))?;
-        let totals = store.usage_totals(id).unwrap_or_default();
-        let messages = store.message_count(id).unwrap_or(0);
+    async fn status_text(self: &Arc<Self>, id: &str) -> Result<String, (i64, String)> {
+        // The session's rows and the size of its request: store reads, off the async workers.
+        let session = id.to_string();
+        let (record, totals, messages, used) = self
+            .blocking(move |g| {
+                let store = g.runtime.store();
+                let record = store
+                    .session(&session)
+                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?
+                    .ok_or((SERVER_ERROR, format!("Session {session} not found")))?;
+                let totals = store.usage_totals(&session).unwrap_or_default();
+                let messages = store.message_count(&session).unwrap_or(0);
+                let used = g
+                    .runtime
+                    .context_breakdown(&session)
+                    .map(|b| b.total())
+                    .unwrap_or(0);
+                Ok::<_, (i64, String)>((record, totals, messages, used))
+            })
+            .await??;
         let window = self.context_length(&record.provider, &record.model).await;
-        let used = self
-            .runtime
-            .context_breakdown(id)
-            .map(|b| b.total())
-            .unwrap_or(0);
         Ok([
             format!(
                 "Session: {} ({})",
@@ -2240,10 +2378,11 @@ impl Gateway {
     }
 
     /// `/context`: what the next request is made of, by part, against the model's window.
-    async fn context_text(&self, id: &str) -> Result<String, (i64, String)> {
+    async fn context_text(self: &Arc<Self>, id: &str) -> Result<String, (i64, String)> {
+        let session = id.to_string();
         let b = self
-            .runtime
-            .context_breakdown(id)
+            .blocking(move |g| g.runtime.context_breakdown(&session))
+            .await?
             .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?;
         let window = self.window_for(id).await.unwrap_or(FALLBACK_CONTEXT);
         let total = b.total();
@@ -2271,26 +2410,38 @@ impl Gateway {
     /// `/compress [focus]` (`session.compress`): summarizes the conversation now, as Hermes's
     /// context compression does when the window fills, and answers with the shorter transcript
     /// the page shows from then on.
-    async fn compress_session(&self, params: &Value, settings: &Settings) -> RpcResult {
+    async fn compress_session(self: &Arc<Self>, params: &Value, settings: &Settings) -> RpcResult {
         let id = session_id(params)?;
         let error = |e: anyhow::Error| (SERVER_ERROR, format!("{e:#}"));
-        let record = self
-            .runtime
-            .store()
-            .session(&id)
-            .map_err(error)?
-            .ok_or((SERVER_ERROR, format!("Session {id} not found")))?;
+        // The row, the conversation and the size of the request: store reads, off the async
+        // workers.
+        let session = id.clone();
+        let (record, before_messages, before_tokens) = self
+            .blocking(move |g| {
+                let record = g
+                    .runtime
+                    .store()
+                    .session(&session)
+                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?
+                    .ok_or((SERVER_ERROR, format!("Session {session} not found")))?;
+                let messages = g
+                    .runtime
+                    .messages(&session)
+                    .map_err(|e| (SERVER_ERROR, format!("{e:#}")))?
+                    .len();
+                let tokens = g
+                    .runtime
+                    .context_breakdown(&session)
+                    .map(|b| b.total())
+                    .unwrap_or(0);
+                Ok::<_, (i64, String)>((record, messages, tokens))
+            })
+            .await??;
         let provider = settings
             .provider(&record.provider)
             .or(settings.active())
             .ok_or((SERVER_ERROR, "No provider is configured".to_string()))?
             .runtime();
-        let before_messages = self.runtime.messages(&id).map_err(error)?.len();
-        let before_tokens = self
-            .runtime
-            .context_breakdown(&id)
-            .map(|b| b.total())
-            .unwrap_or(0);
         let focus = params["focus_topic"]
             .as_str()
             .map(str::trim)
@@ -2311,12 +2462,19 @@ impl Gateway {
         if failed.as_deref() == Some("Nothing to compress yet.") {
             failed = None;
         }
-        let after = self.runtime.messages(&id).map_err(error)?;
-        let after_tokens = self
-            .runtime
-            .context_breakdown(&id)
-            .map(|b| b.total())
-            .unwrap_or(0);
+        let session = id.clone();
+        let (after, after_tokens) = self
+            .blocking(move |g| {
+                let after = g.runtime.messages(&session)?;
+                let tokens = g
+                    .runtime
+                    .context_breakdown(&session)
+                    .map(|b| b.total())
+                    .unwrap_or(0);
+                Ok::<_, anyhow::Error>((after, tokens))
+            })
+            .await?
+            .map_err(error)?;
         let compressed = failed.is_none() && after.len() < before_messages;
         let headline = match (&failed, compressed) {
             (Some(e), _) => format!("Compression failed: {e}"),
@@ -3013,7 +3171,12 @@ impl Gateway {
                 "message.start",
                 json!({"turn_id": admission, "admission_id": admission}),
             );
-            this.emit(&id, "session.info", this.session_info(&id));
+            // The session's row and usage: store reads (the prompt was just queued), off the
+            // async workers.
+            let session = id.clone();
+            if let Ok(info) = this.blocking(move |g| g.session_info(&session)).await {
+                this.emit(&id, "session.info", info);
+            }
             // While the turn runs, a `running: true` heartbeat (Hermes's backend sends one, and
             // `gateway.ready` says it does) keeps the page holding the turn as live through quiet
             // stretches: a long think, a retry, a wait on the provider.
@@ -3033,13 +3196,22 @@ impl Gateway {
                 let event = tokio::select! {
                     event = turn.events.recv() => event,
                     _ = heartbeat.tick() => {
-                        this.emit(&id, "session.info", this.session_info(&id));
-                        this.emit(&id, "session.usage", json!({"usage": this.usage_snapshot(&id, last_input)}));
+                        // Store reads: off the async workers.
+                        let session = id.clone();
+                        if let Ok((info, usage)) = this
+                            .blocking(move |g| {
+                                (g.session_info(&session), g.usage_snapshot(&session, last_input))
+                            })
+                            .await
+                        {
+                            this.emit(&id, "session.info", info);
+                            this.emit(&id, "session.usage", json!({"usage": usage}));
+                        }
                         continue;
                     }
                 };
                 let Some(event) = event else {
-                    this.end_live(&id);
+                    this.end_live_off_worker(&id).await;
                     break;
                 };
                 match event {
@@ -3054,17 +3226,23 @@ impl Gateway {
                                 || call_started.elapsed().as_secs_f64(),
                                 |ms| ms as f64 / 1000.0,
                             );
-                        this.note_generation(&id, output, seconds);
                         last_input = usage
                             .usage
                             .input_tokens
                             .map(|tokens| tokens.max(0) as usize);
                         call_started = std::time::Instant::now();
-                        this.emit(
-                            &id,
-                            "session.usage",
-                            json!({"usage": this.usage_snapshot(&id, last_input)}),
-                        );
+                        // `note_generation` saves a file and the snapshot reads the store: off
+                        // the async workers (in this order, as before).
+                        let session = id.clone();
+                        if let Ok(snapshot) = this
+                            .blocking(move |g| {
+                                g.note_generation(&session, output, seconds);
+                                g.usage_snapshot(&session, last_input)
+                            })
+                            .await
+                        {
+                            this.emit(&id, "session.usage", json!({"usage": snapshot}));
+                        }
                     }
                     // A subagent's activity: the page's live subagent rows.
                     RuntimeEvent::Agent(AgentEvent::Subagent { kind, payload }) => {
@@ -3151,7 +3329,13 @@ impl Gateway {
                     }
                     // A steer the turn ended before reading: it runs next, as Hermes does.
                     RuntimeEvent::SteerUndelivered(text) => {
-                        this.enqueue(&id, json!({"text": text, "shown": true}), true);
+                        // `enqueue` sends the session's info (store reads): off the async workers.
+                        let session = id.clone();
+                        let _ = this
+                            .blocking(move |g| {
+                                g.enqueue(&session, json!({"text": text, "shown": true}), true)
+                            })
+                            .await;
                     }
                     RuntimeEvent::TurnFinished(status) => {
                         let (mut status, mut error) = match status {
@@ -3159,7 +3343,22 @@ impl Gateway {
                             TurnStatus::Cancelled => ("interrupted", None),
                             TurnStatus::Failed(error) => ("error", Some(error)),
                         };
-                        let stored = this.runtime.messages(&id).unwrap_or_default();
+                        // The stored conversation, and the failed session's provider: store reads,
+                        // off the async workers.
+                        let session = id.clone();
+                        let completed = status == "complete";
+                        let (stored, failed_route) = this
+                            .blocking(move |g| {
+                                let stored = g.runtime.messages(&session).unwrap_or_default();
+                                let route = (completed
+                                    && crate::transcript::message_error(&stored).is_some())
+                                .then(|| g.runtime.store().session(&session).ok().flatten())
+                                .flatten()
+                                .map(|record| (record.provider, record.model));
+                                (stored, route)
+                            })
+                            .await
+                            .unwrap_or_default();
                         // A turn that ended on a provider error carries it as the conversation's
                         // last message (ops::ExitOnError yields it). The page's error card keys
                         // off the failure status, so the turn is reported like Hermes's failed
@@ -3173,11 +3372,7 @@ impl Gateway {
                             error = Some(text.clone());
                         }
                         // Which provider and model failed: the card names them.
-                        let (provider, model) = failure
-                            .as_ref()
-                            .and_then(|_| this.runtime.store().session(&id).ok().flatten())
-                            .map(|record| (record.provider, record.model))
-                            .unwrap_or_default();
+                        let (provider, model) = failed_route.unwrap_or_default();
                         let surface = failure.as_ref().map(|(kind, text)| {
                             crate::transcript::error_surface(*kind, text, &provider, &model)
                         });
@@ -3195,6 +3390,11 @@ impl Gateway {
                             _ => stream.text().to_string(),
                         };
                         let partial = status == "error" && !stream.text().trim().is_empty();
+                        let session = id.clone();
+                        let usage = this
+                            .blocking(move |g| g.usage_snapshot(&session, last_input))
+                            .await
+                            .unwrap_or(Value::Null);
                         this.emit(
                             &id,
                             "message.complete",
@@ -3206,13 +3406,13 @@ impl Gateway {
                                 "partial": partial,
                                 // The rows this turn wrote, so the page can restore or edit them.
                                 "persisted_turn": transcript::persisted_turn(&stored, first_row, &admission),
-                                "usage": this.usage_snapshot(&id, last_input),
+                                "usage": usage,
                             }),
                         );
                         // With a prompt queued, the session stays live into its turn: a
                         // `running: false` in between would end the turn on the page.
                         if !this.has_queued(&id) {
-                            this.end_live(&id);
+                            this.end_live_off_worker(&id).await;
                         }
                         if let Some((Some((provider, model, effort)), opening)) = titling {
                             if status == "complete" {
@@ -3230,8 +3430,15 @@ impl Gateway {
                     }
                 }
             }
-            this.apply_pending_route(&id);
-            this.run_queued(&id, &outbox);
+            // Both read the store (and the next prompt's submit writes it): off the async
+            // workers.
+            let (session, queued_outbox) = (id.clone(), outbox.clone());
+            let _ = this
+                .blocking(move |g| {
+                    g.apply_pending_route(&session);
+                    g.run_queued(&session, &queued_outbox);
+                })
+                .await;
         });
         // The canonical protocol's admission receipt: which session took the prompt, under the
         // id the page gave this send (it drops its optimistic bubble on any other id or status).
@@ -3291,10 +3498,19 @@ impl Gateway {
         self.emit(id, "session.info", info);
     }
 
+    /// [`Self::end_live`] from async code: `session_info` reads the store. Should the thread die,
+    /// the session is still marked as settled.
+    async fn end_live_off_worker(self: &Arc<Self>, id: &str) {
+        let session = id.to_string();
+        if self.blocking(move |g| g.end_live(&session)).await.is_err() {
+            self.set_live(id, false);
+        }
+    }
+
     /// Hermes's auto-title: the title model names the session from its opening message, and the
     /// page hears the new title through `session.info`.
     async fn title_session(
-        &self,
+        self: &Arc<Self>,
         id: &str,
         provider: &hermes_runtime::ProviderConfig,
         model: &str,
@@ -3315,13 +3531,19 @@ impl Gateway {
         );
         match titled.await {
             Ok(Some(title)) => {
-                let _ = self.runtime.store().set_title(id, &title);
+                let (session, new_title) = (id.to_string(), title.clone());
+                let _ = self
+                    .blocking(move |g| g.runtime.store().set_title(&session, &new_title))
+                    .await;
                 self.emit(
                     id,
                     "session.title",
                     json!({"session_id": id, "title": title}),
                 );
-                self.emit(id, "session.info", self.session_info(id));
+                let session = id.to_string();
+                if let Ok(info) = self.blocking(move |g| g.session_info(&session)).await {
+                    self.emit(id, "session.info", info);
+                }
             }
             Ok(None) => {}
             Err(error) => tracing::warn!("titling {id}: {error:#}"),
@@ -3356,16 +3578,31 @@ impl Gateway {
             .is_some_and(|issued| issued == file)
     }
 
+    /// [`Self::blocking`] for a REST route: a thread that died answers 500 with the reason, never
+    /// `None` (that is Hermes's 404 "No such API endpoint", which the page reads as "feature
+    /// absent", rule 5).
+    async fn rest_blocking(
+        self: &Arc<Self>,
+        work: impl FnOnce(&Arc<Gateway>) -> Option<(u16, Value)> + Send + 'static,
+    ) -> Option<(u16, Value)> {
+        self.blocking(work)
+            .await
+            .unwrap_or_else(|(_, error)| Some((500, json!({"detail": error}))))
+    }
+
     /// REST routes this backend serves: `(status, body)`, or `None` for Hermes's 404.
     pub async fn rest(
-        &self,
+        self: &Arc<Self>,
         method: &str,
         path: &str,
         query: Option<&str>,
         body: &[u8],
     ) -> Option<(u16, Value)> {
         if (method, path) == ("GET", "/api/profiles/sessions") {
-            return Some((200, self.session_list(query)));
+            let query = query.map(str::to_string);
+            return self
+                .rest_blocking(move |g| Some((200, g.session_list(query.as_deref()))))
+                .await;
         }
         // Settings ▸ Providers ▸ Custom endpoints (`endpoints.rs`).
         if let Some(rest) = path.strip_prefix("/api/providers/custom-endpoints") {
@@ -3619,7 +3856,7 @@ impl Gateway {
                 .and_then(|l| l.parse().ok())
                 .unwrap_or(200usize);
             let file = self.data_dir.join("logs").join("desktop.log");
-            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            let text = tokio::fs::read_to_string(&file).await.unwrap_or_default();
             let all: Vec<&str> = text.lines().collect();
             let tail: Vec<&str> = all[all.len().saturating_sub(lines)..].to_vec();
             return Some((
@@ -3888,7 +4125,10 @@ impl Gateway {
             .and_then(|rest| rest.strip_suffix("/messages"))
         {
             if method == "GET" {
-                return Some(self.stored_messages(&crate::rest::percent_decode(id), query));
+                let (id, query) = (crate::rest::percent_decode(id), query.map(str::to_string));
+                return self
+                    .rest_blocking(move |g| Some(g.stored_messages(&id, query.as_deref())))
+                    .await;
             }
         }
         if let Some(id) = path.strip_prefix("/api/sessions/") {
@@ -3897,47 +4137,81 @@ impl Gateway {
                 return self.session_route(method, &id, body).await;
             }
         }
-        self.rest.handle(method, path, query, body)
+        // The generic routes read and write the settings and other small files: off the async
+        // workers.
+        let (method, path, query, body) = (
+            method.to_string(),
+            path.to_string(),
+            query.map(str::to_string),
+            body.to_vec(),
+        );
+        self.rest_blocking(move |g| g.rest.handle(&method, &path, query.as_deref(), &body))
+            .await
     }
 
     /// `/api/sessions/{id}`: a session's row, its sidebar flags (`PATCH`), deleting it.
-    async fn session_route(&self, method: &str, id: &str, body: &[u8]) -> Option<(u16, Value)> {
-        let store = self.runtime.store();
-        let Some(record) = store.session(id).ok().flatten() else {
-            return Some((404, json!({"detail": format!("Session {id} not found")})));
-        };
-        match method {
-            "GET" => {
-                let count = store.message_count(id).unwrap_or(0);
-                Some((200, self.session_row(&record, count)))
+    async fn session_route(
+        self: &Arc<Self>,
+        method: &str,
+        id: &str,
+        body: &[u8],
+    ) -> Option<(u16, Value)> {
+        // The store and the archive file: off the async workers (the delete goes through the
+        // runtime, which does its own).
+        let (method, session, body) = (method.to_string(), id.to_string(), body.to_vec());
+        if method == "DELETE" {
+            let looked_up = session.clone();
+            let exists = match self
+                .blocking(move |g| g.runtime.store().session(&looked_up).ok().flatten().is_some())
+                .await
+            {
+                Ok(exists) => exists,
+                Err((_, error)) => return Some((500, json!({"detail": error}))),
+            };
+            if !exists {
+                return Some((404, json!({"detail": format!("Session {id} not found")})));
             }
-            "PATCH" => {
-                let changes: Value = serde_json::from_slice(body).unwrap_or_default();
-                if let Some(archived) = changes["archived"].as_bool()
-                    && let Err((_, error)) = self.set_archived(id, archived)
-                {
-                    return Some((500, json!({"detail": error})));
-                }
-                if let Some(pinned) = changes["pinned"].as_bool() {
-                    if let Err(error) = store.set_pinned(id, pinned) {
-                        return Some((500, json!({"detail": format!("{error:#}")})));
-                    }
-                }
-                if let Some(title) = changes["title"].as_str() {
-                    let _ = store.set_title(id, title.trim());
-                }
-                // `unread` is the page's own bookkeeping; nothing to keep for it.
-                Some((200, json!({"ok": true})))
-            }
-            "DELETE" => match self.runtime.delete_session(id).await {
+            return match self.runtime.delete_session(id).await {
                 Ok(()) => {
-                    self.archive.forget(id);
+                    let _ = self.blocking(move |g| g.archive.forget(&session)).await;
                     Some((200, json!({"ok": true})))
                 }
                 Err(error) => Some((500, json!({"detail": format!("{error:#}")}))),
-            },
-            _ => None,
+            };
         }
+        self.rest_blocking(move |g| {
+            let id = session.as_str();
+            let store = g.runtime.store();
+            let Some(record) = store.session(id).ok().flatten() else {
+                return Some((404, json!({"detail": format!("Session {id} not found")})));
+            };
+            match method.as_str() {
+                "GET" => {
+                    let count = store.message_count(id).unwrap_or(0);
+                    Some((200, g.session_row(&record, count)))
+                }
+                "PATCH" => {
+                    let changes: Value = serde_json::from_slice(&body).unwrap_or_default();
+                    if let Some(archived) = changes["archived"].as_bool()
+                        && let Err((_, error)) = g.set_archived(id, archived)
+                    {
+                        return Some((500, json!({"detail": error})));
+                    }
+                    if let Some(pinned) = changes["pinned"].as_bool() {
+                        if let Err(error) = store.set_pinned(id, pinned) {
+                            return Some((500, json!({"detail": format!("{error:#}")})));
+                        }
+                    }
+                    if let Some(title) = changes["title"].as_str() {
+                        let _ = store.set_title(id, title.trim());
+                    }
+                    // `unread` is the page's own bookkeeping; nothing to keep for it.
+                    Some((200, json!({"ok": true})))
+                }
+                _ => None,
+            }
+        })
+        .await
     }
 
     /// `/api/sessions/{id}/messages`: the stored transcript, a page of it (`SessionMessagesResponse`).

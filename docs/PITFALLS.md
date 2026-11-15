@@ -1360,3 +1360,52 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **An in-memory store has one connection** (two `:memory:` connections are two databases): the writer locks it per
   batch, so a test that holds `store.writer.write.lock()` keeps the writer from starting (the writer tests use that to
   fill a batch on purpose).
+
+## Never block an async worker (Phase 13c, `crates/tools/src/blocking_tests.rs`)
+
+- **The rule is old (AGENTS.md rule 7); CP13b made it matter more.** A `Store` read now waits for the writer's pending
+  commit, so a store read from async code can hold a worker for a commit, not just for a SELECT. The runtime has 4
+  workers: four blocked ones stop the heartbeat, every other request and the turns' event loops. A blocked worker is
+  invisible in a test that runs on many threads.
+- **What counts as blocking in an `async fn` / `async {}`**: `std::fs`, `Path::exists/is_dir/metadata` on a path that may
+  be slow (a network drive), `std::process::Command` (the linters, git), any `Store::*` / `rusqlite` call, a
+  `SkillStore` / `MemoryStore` / `LocalIndex` method (they read their folders; `SkillStore::find` and `catalog*` walk
+  the skills folders every time), a threat scan the first time (`hermes_memory::threats` compiles its patterns lazily:
+  ~0.5 s in a debug build; `provenance::SourceNote::new` goes through it), `thread::sleep`, `reqwest::blocking`, a
+  `Mutex` guard held while doing any of these. Also the sync helpers an async fn calls.
+- **The fix**: `tokio::task::spawn_blocking(move || ...).await` with owned data moved in (clone the `Arc`s and `String`s
+  first), a `JoinError` turned into an error value (`unwrap_or_else`, never `unwrap`), or a tokio equivalent
+  (`tokio::fs`, `tokio::process`). Never move a `std` mutex guard into the closure and never hold one across the
+  `.await`: take the lock inside the closure, from an `Arc<Mutex<..>>` you cloned (`SessionTools::hints`,
+  `turn_checkpoints`). Do the cheap in-memory check first and spawn only when there is work (`limit_output_off_worker`,
+  `spill_oversized_off_worker`, `Web::truncate_off_worker` copy nothing for a short result).
+- **The gateway has a helper for it**: `Gateway::blocking(|g| ...)` (`gateway.rs`) runs a closure with the `Arc<Gateway>`
+  on the blocking pool and answers a failed thread as an RPC error. `dispatch`, `mutate`, `rest`, `session_route`, the
+  turn's event loop use it for every store read, file read and repository call. A method that needs it must take
+  `self: &Arc<Self>`. In a REST route use `Gateway::rest_blocking`: a failed thread answers 500, never `None` (that
+  is the 404 "No such API endpoint" the page reads as "feature absent"). What is left on the workers is listed in the CP13c table of
+  `docs/backend/progress/phase-13.md` (single-file reads of the small settings files, `is_file` stats).
+- **After Stop, a tool call must finish without waiting.** The machine races a step against Stop with `biased` priority for
+  the call (`agent/machine.rs`): when Stop fires, the call is polled once more and, if it still has an `.await` to
+  get through (a `spawn_blocking` hop), it is dropped and the chat gets "Tool call was interrupted before completing"
+  instead of the output a stopped command had printed (`stopping_mid_command_keeps_the_output_it_had_printed` caught
+  this when the hints and checkpoint follow-ups of `SessionTools::call` first became `spawn_blocking`). So follow-up
+  work after a tool's own work (hints, `record_write`, `limit_output_off_worker`, `spill_oversized_off_worker`) goes
+  through `hermes_tools::off_worker_unless_stopped(cancel, ..)`: on the blocking pool normally; after Stop, inline
+  if it has not started, else waited for on this thread (a std channel, no `.await`), so the call completes in the poll
+  that follows Stop. Checking `is_cancelled()` once before the hop is not enough: Stop can land while the hop is running
+  (`stop_during_a_follow_up_keeps_the_calls_result` shows a plain hop losing the result). Work before the call may hop
+  freely. Not shielded, on purpose: `lint_off_worker` (`write_file` / `patch`) and `truncate_off_worker`
+  (`web_extract`): those tools already had real `.await`s (`tokio::fs`, the network) where Stop drops them, as before
+  Phase 13; only the terminal and `run_script` are built to answer after Stop.
+- **Order still holds**: a tool that must run before another call (a checkpoint before a write) is awaited, not
+  fire-and-forget; a blocking closure takes the conversation lock like any other caller (it is a `parking_lot` mutex,
+  not held across an `.await`).
+- **The test**: `blocking_tests.rs` runs the memory, staged-memory, `session_search`, `skills_list` / `skill_manage` /
+  `skill_view` tools on a `current_thread` runtime (one thread: a blocked worker stops everything) next to a timer that
+  ticks every 20 ms. A test-only hook (`crate::slow::set(session_id, delay)`, called by `test_pause` inside each
+  blocking closure) makes the work take 300 ms; the longest gap between ticks must stay under 150 ms. The control test
+  (`a_blocked_worker_is_seen_by_the_timer`) sleeps inline and must see the stall. Use a session id of your own per test:
+  the hook table is global. To cover a new tool, call `test_pause(&session_id)` first in its closure and add a case.
+  It measures wall-clock time: under a heavily loaded machine the 150 ms tolerance can in principle fail; a real block
+  shows 300 ms or more, so re-run before suspecting the code.

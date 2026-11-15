@@ -82,13 +82,16 @@ pub async fn load_source(source: &str, cwd: &Path, home: &Path) -> Result<Vec<u8
             .map_err(|e| format!("Could not download the image: {e}"));
     }
     let path = crate::paths::resolve(source, cwd, home);
-    let size = std::fs::metadata(&path)
+    let size = tokio::fs::metadata(&path)
+        .await
         .map_err(|_| format!("Image not found: {}", crate::display_path(&path)))?
         .len();
     if size > MAX_SOURCE_BYTES {
         return Err("The image is larger than 50 MB.".into());
     }
-    std::fs::read(&path).map_err(|e| format!("Could not read {}: {e}", crate::display_path(&path)))
+    tokio::fs::read(&path)
+        .await
+        .map_err(|e| format!("Could not read {}: {e}", crate::display_path(&path)))
 }
 
 fn mime_of(format: ImageFormat) -> Option<&'static str> {

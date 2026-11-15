@@ -309,7 +309,7 @@ impl ShellSession {
         cancel: Option<&CancellationToken>,
         on_chunk: &(dyn Fn(&str) + Send + Sync),
     ) -> RunResult {
-        let _ = std::fs::create_dir_all(&self.scratch_dir);
+        let _ = tokio::fs::create_dir_all(&self.scratch_dir).await;
         match &self.kind {
             ShellKind::GitBash(bash) => {
                 self.run_bash(bash, command, workdir, timeout, cancel, on_chunk)
@@ -700,6 +700,29 @@ pub(crate) fn encode_powershell(script: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(utf16)
 }
 
+/// [`limit_output`] for async code: the full output is saved on a blocking thread, and only when
+/// it is over the limit (the check is in memory, so a normal output costs nothing). `cancel`:
+/// the turn's Stop; a stopped command's output must not be lost waiting for the save
+/// ([`crate::off_worker_unless_stopped`]).
+pub(crate) async fn limit_output_off_worker(
+    output: String,
+    scratch_dir: &Path,
+    cancel: Option<&CancellationToken>,
+) -> (String, Option<PathBuf>) {
+    if output.chars().count() <= MAX_OUTPUT_CHARS {
+        return (output, None);
+    }
+    let dir = scratch_dir.to_path_buf();
+    match crate::off_worker_unless_stopped(cancel, move || limit_output(output, &dir)).await {
+        Ok(limited) => limited,
+        // The output went with the thread; say so rather than pretend it was empty.
+        Err(e) => (
+            format!("[the output could not be saved or shown: {e}]"),
+            None,
+        ),
+    }
+}
+
 /// Keeps the head and tail of long output and saves the whole text to the scratch dir.
 pub(crate) fn limit_output(output: String, scratch_dir: &Path) -> (String, Option<PathBuf>) {
     let total = output.chars().count();
@@ -839,7 +862,8 @@ pub async fn terminal(
         .await;
     // Secrets are masked before the output is trimmed or saved (Hermes redacts the spill too).
     let output = crate::redact::redact_terminal_output(&result.output, &args.command);
-    let (output, saved) = limit_output(output, tools.shell.scratch_dir());
+    let cancel = live.map(|(_, emit)| emit.cancel_token());
+    let (output, saved) = limit_output_off_worker(output, tools.shell.scratch_dir(), cancel).await;
     let cwd = display_path(&tools.shell.cwd());
     let mut value = json!({
         "output": output,

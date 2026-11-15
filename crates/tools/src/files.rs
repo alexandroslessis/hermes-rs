@@ -385,25 +385,35 @@ pub async fn write_file(tools: &SessionTools, args: Value) -> ToolOutput {
         }
         _ => false,
     };
-    write_verified(tools, &path, args.content.as_bytes())
+    if let Err(error) = write_verified(tools, &path, args.content.as_bytes()).await {
+        return ToolOutput::error(error);
+    }
+    let mut result = json!({
+        "success": true,
+        "path": tools.shown(&path),
+        "bytes_written": args.content.len(),
+        "verified": true,
+    });
+    if dirs_created {
+        result["dirs_created"] = json!(true);
+    }
+    // Hermes's post-write syntax check.
+    if let Some(lint) = lint_off_worker(path.clone(), previous, args.content.clone()).await {
+        result["lint"] = lint;
+    }
+    ToolOutput::ok(result)
+}
+
+/// [`crate::lint::delta`] for async code: a shell linter (`python -m py_compile`, `node --check`)
+/// runs as a child process we wait for, so this is a blocking thread's work.
+async fn lint_off_worker(
+    path: std::path::PathBuf,
+    before: Option<String>,
+    after: String,
+) -> Option<Value> {
+    tokio::task::spawn_blocking(move || crate::lint::delta(&path, before.as_deref(), &after))
         .await
-        .map(|()| {
-            let mut result = json!({
-                "success": true,
-                "path": tools.shown(&path),
-                "bytes_written": args.content.len(),
-                "verified": true,
-            });
-            if dirs_created {
-                result["dirs_created"] = json!(true);
-            }
-            // Hermes's post-write syntax check.
-            if let Some(lint) = crate::lint::delta(&path, previous.as_deref(), &args.content) {
-                result["lint"] = lint;
-            }
-            ToolOutput::ok(result)
-        })
-        .unwrap_or_else(ToolOutput::error)
+        .unwrap_or(None)
 }
 
 async fn write_verified(tools: &SessionTools, path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -712,7 +722,8 @@ pub async fn patch(tools: &SessionTools, args: Value) -> ToolOutput {
     if strategy != Strategy::Exact {
         result["match"] = json!(strategy.name());
     }
-    if let Some(lint) = crate::lint::delta(&path, Some(&content), &updated) {
+    if let Some(lint) = lint_off_worker(path.clone(), Some(content.clone()), updated.clone()).await
+    {
         result["lint"] = lint;
     }
     ToolOutput::ok(result)

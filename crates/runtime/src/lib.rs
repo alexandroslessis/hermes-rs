@@ -1538,22 +1538,25 @@ impl Runtime {
                         if let Some(source) = hermes_tools::taint::reference_source(&pages) {
                             runtime.session.tools.mark_tainted(source).await;
                         }
-                        attachments.and_then(|attachments| {
-                            user_message(
-                                &runtime.session,
-                                &text,
-                                context_length,
-                                &pages,
-                                &attachments,
-                            )
-                        })
+                        match attachments {
+                            // `@file` references are read from disk: off the async workers.
+                            Ok(attachments) => {
+                                let (session, text) = (runtime.session.clone(), text.clone());
+                                tokio::task::spawn_blocking(move || {
+                                    user_message(&session, &text, context_length, &pages, &attachments)
+                                })
+                                .await
+                                .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")))
+                            }
+                            Err(error) => Err(error),
+                        }
                     }
                     None => held.take().context("the message to add is missing"),
                 };
                 // What the index finds for this message; any trouble means no block.
                 let block = match index_for_turn.filter(|_| built.is_ok()) {
                     Some(index) => {
-                        let (query, attached) = {
+                        let (mut query, attached, query_cwd) = {
                             let session = &runtime.session;
                             // One lock at a time (the record's is released first).
                             let cwd = PathBuf::from(session.record.lock().cwd.clone());
@@ -1564,14 +1567,22 @@ impl Runtime {
                                     last_assistant: preinject::last_assistant_text(
                                         conversation.messages(),
                                     ),
-                                    project: hermes_tools::index::project_name(&cwd),
+                                    // Looked up below, off the async workers.
+                                    project: None,
                                     // This session's repository: its skills join the user's
                                     // own in the search, no other repository's.
                                     project_root: session.tools.project_root(),
                                 },
                                 preinject::already_attached(conversation.messages()),
+                                cwd,
                             )
                         };
+                        // Looks for the repository's `.git` up the folder tree (a few stats).
+                        query.project = tokio::task::spawn_blocking(move || {
+                            hermes_tools::index::project_name(&query_cwd)
+                        })
+                        .await
+                        .unwrap_or_default();
                         let limits = preinject::limits(
                             &query.message,
                             budget.skills_preload as usize,
@@ -2651,12 +2662,19 @@ impl Runtime {
         // No review for a deleted session: its timer and a review in flight stop.
         self.scheduler.forget(session_id);
         self.close_quietly(session_id).await;
-        self.store.delete_session(session_id)?;
-        let _ = std::fs::remove_dir_all(self.scratch_dir(session_id));
+        // The store write waits for its commit and the folders are removed from disk: off the
+        // async workers. The store's error is returned; the leftovers are best effort.
+        let (store, scratch) = (self.store.clone(), self.scratch_dir(session_id));
         let data_dir = self.config.data_dir.clone();
         let id = session_id.to_string();
-        let _ =
-            tokio::task::spawn_blocking(move || hermes_tools::taint::forget(&data_dir, &id)).await;
+        tokio::task::spawn_blocking(move || {
+            store.delete_session(&id)?;
+            let _ = std::fs::remove_dir_all(scratch);
+            hermes_tools::taint::forget(&data_dir, &id);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("deleting the session did not finish: {e}"))??;
         self.signals.forget(session_id);
         // A cancelled turn's end may have armed a timer meanwhile.
         self.scheduler.forget(session_id);

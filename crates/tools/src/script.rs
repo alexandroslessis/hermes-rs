@@ -623,7 +623,7 @@ pub(crate) async fn run_script(
         ));
     }
     let output = redact_output(&out_text, &code);
-    let (output, saved) = shell::limit_output(output, tools.scratch_dir());
+    let (output, saved) = shell::limit_output_off_worker(output, tools.scratch_dir(), cancel).await;
     let mut stderr_text = redact_output(&err_text, &code);
     if err_dropped > 0 {
         stderr_text.push_str(&format!(

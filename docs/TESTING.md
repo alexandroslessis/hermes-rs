@@ -157,6 +157,16 @@ Read the existing tests near the area you change before writing a new one; the h
   `HERMES_STORE_CRASH_DB` set, flushes, queues more and exits without destructors). To fill a batch on purpose a
   test holds `store.writer.write.lock()` while it queues. `turns.rs` (after the `CP13b` banner): a finished turn is
   readable from another connection, and a write the database refuses (a test trigger) fails the turn with the reason.
+- No blocking work on an async worker (Phase 13 CP13c): `crates/tools/src/blocking_tests.rs`. One-thread
+  (`current_thread`) runtime, a timer task ticking every 20 ms beside the tool call, a test-only hook
+  (`slow::set(session_id, delay)`, honoured by `test_pause` inside each blocking closure) making the tool's
+  disk/database work take 300 ms; the longest tick gap must stay under 150 ms (generous: a blocked worker shows
+  300 ms or more) and the call must have taken at least the delay (the hook really ran in the tool). Covers
+  `memory`, a staged `memory` write, `session_search` (discover and browse), `skills_list`, `skill_manage`,
+  `skill_view`; `a_blocked_worker_is_seen_by_the_timer` is the control. It measures time: if it fails only on
+  a very loaded machine, re-run alone before suspecting the code. The same file checks
+  `off_worker_unless_stopped` (the tool follow-ups' hop): raced against Stop as `agent/machine.rs` races a
+  step, it keeps the result where a plain `spawn_blocking` hop loses it, and without Stop it leaves the worker free.
 - Known flaky under heavy load: `an_exhausted_budget_ends_with_a_toolless_summary` (timing).
   Re-run it alone before suspecting your change.
 

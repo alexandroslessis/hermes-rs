@@ -214,7 +214,7 @@ pub async fn spawn(
 ) -> ToolOutput {
     let cwd = workdir.unwrap_or_else(|| tools.cwd());
     let scratch = tools.scratch_dir.clone();
-    let _ = std::fs::create_dir_all(&scratch);
+    let _ = tokio::fs::create_dir_all(&scratch).await;
     let mut builder = match tools.shell.kind() {
         ShellKind::GitBash(bash) => {
             let mut builder = command(bash, &cwd, &scratch);

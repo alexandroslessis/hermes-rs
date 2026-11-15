@@ -266,7 +266,8 @@ impl Env {
         let query = hermes_tools::index::IndexQuery {
             message: review_once::topic(&view.messages, &evidence),
             last_assistant: None,
-            project: hermes_tools::index::project_name(&view.cwd),
+            // Filled in below, on the blocking thread (it looks for `.git` up the folder tree).
+            project: None,
             project_root: view.project.clone(),
         };
         let (memory, skills, index) =
@@ -279,6 +280,8 @@ impl Env {
         );
         // Both resolve paths and read files: off the async workers.
         let (input, default_scope) = tokio::task::spawn_blocking(move || {
+            let mut query = query;
+            query.project = hermes_tools::index::project_name(&cwd);
             let scope =
                 review_once::evidence_scope(&messages, &cwd, project.as_deref(), &scratch);
             let input = review_once::gather(&messages, &memory, &skills, index.as_deref(), query);
