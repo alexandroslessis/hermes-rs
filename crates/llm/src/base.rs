@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::{
@@ -546,7 +547,7 @@ pub trait Provider: MaybeSend + MaybeSync {
         &self,
         model_config: &ModelConfig,
         system: &str,
-        messages: &[Message],
+        messages: &[Arc<Message>],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError>;
 
@@ -554,7 +555,7 @@ pub trait Provider: MaybeSend + MaybeSync {
         &self,
         model_config: &ModelConfig,
         system: &str,
-        messages: &[Message],
+        messages: &[Arc<Message>],
         tools: &[Tool],
     ) -> Result<(Message, ProviderUsage), ProviderError> {
         let stream = self.stream(model_config, system, messages, tools).await?;
@@ -824,7 +825,7 @@ mod tests {
             &self,
             _model_config: &ModelConfig,
             _system: &str,
-            _messages: &[Message],
+            _messages: &[Arc<Message>],
             _tools: &[Tool],
         ) -> Result<MessageStream, ProviderError> {
             unimplemented!()

@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         .stream(
             &ModelConfig::new(&model),
             "You are a helpful assistant.",
-            &[Message::user().with_text(prompt)],
+            &[Message::user().with_text(prompt).into()],
             &[],
         )
         .await?;

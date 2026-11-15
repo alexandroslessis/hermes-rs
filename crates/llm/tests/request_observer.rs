@@ -61,7 +61,7 @@ async fn ask(provider: &OpenAiCompatibleProvider) -> Result<(), hermes_llm::erro
         .complete(
             &ModelConfig::new("test-model"),
             "system",
-            &[Message::user().with_text("hello")],
+            &[Message::user().with_text("hello").into()],
             &[],
         )
         .await

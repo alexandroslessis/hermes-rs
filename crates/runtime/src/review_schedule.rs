@@ -147,7 +147,7 @@ pub(crate) struct Env {
 
 /// A session as the review reads it: from its open state, else from the store.
 struct View {
-    messages: Vec<Message>,
+    messages: Vec<Arc<Message>>,
     model: String,
     cwd: PathBuf,
     taint: Taint,
@@ -168,7 +168,7 @@ impl Env {
 
     async fn view(&self, session_id: &str) -> Result<View> {
         if let Some(open) = self.open_session(session_id) {
-            let messages = open.conversation.lock().messages().clone();
+            let messages = open.conversation.lock().messages().to_vec();
             let model = open.record.lock().model.clone();
             return Ok(View {
                 messages,
@@ -188,7 +188,11 @@ impl Env {
             let record = store
                 .session(&id)?
                 .with_context(|| format!("no session {id}"))?;
-            let messages = store.load_messages(&id)?;
+            let messages: Vec<Arc<Message>> = store
+                .load_messages(&id)?
+                .into_iter()
+                .map(Arc::new)
+                .collect();
             let taint = hermes_tools::taint::load(&data_dir, &id)
                 .map(|sources| Taint {
                     turn: false,

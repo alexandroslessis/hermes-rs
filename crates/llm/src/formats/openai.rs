@@ -22,7 +22,7 @@ use regex::Regex;
 use rmcp::model::{object, CallToolRequestParams, ContentBlock, ErrorCode, ErrorData, Role, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -228,7 +228,10 @@ struct OpenAiFunctionCall {
     arguments: String,
 }
 
-pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<Value> {
+pub fn format_messages<M: Borrow<Message>>(
+    messages: &[M],
+    image_format: &ImageFormat,
+) -> Vec<Value> {
     format_messages_with_options(
         messages,
         image_format,
@@ -239,8 +242,8 @@ pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<
     )
 }
 
-pub fn format_messages_with_options(
-    messages: &[Message],
+pub fn format_messages_with_options<M: Borrow<Message>>(
+    messages: &[M],
     image_format: &ImageFormat,
     options: OpenAiFormatOptions,
 ) -> Vec<Value> {
@@ -252,6 +255,7 @@ pub fn format_messages_with_options(
     let mut saw_tool_response = false;
 
     for message in messages {
+        let message: &Message = message.borrow();
         if options.preserve_thinking_context && message.role != Role::Assistant {
             pending_assistant_reasoning.clear();
         }
@@ -1694,10 +1698,10 @@ where
     }
 }
 
-pub fn create_request(
+pub fn create_request<M: Borrow<Message>>(
     model_config: &ModelConfig,
     system: &str,
-    messages: &[Message],
+    messages: &[M],
     tools: &[Tool],
     image_format: &ImageFormat,
     for_streaming: bool,
@@ -1717,10 +1721,10 @@ pub fn create_request(
     )
 }
 
-pub fn create_request_with_options(
+pub fn create_request_with_options<M: Borrow<Message>>(
     model_config: &ModelConfig,
     system: &str,
-    messages: &[Message],
+    messages: &[M],
     tools: &[Tool],
     image_format: &ImageFormat,
     for_streaming: bool,
@@ -1741,12 +1745,12 @@ pub fn create_request_with_options(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn create_request_for_model_with_options(
+pub fn create_request_for_model_with_options<M: Borrow<Message>>(
     model_config: &ModelConfig,
     wire_model_name: &str,
     capability_model_name: &str,
     system: &str,
-    messages: &[Message],
+    messages: &[M],
     tools: &[Tool],
     image_format: &ImageFormat,
     for_streaming: bool,
@@ -3296,7 +3300,7 @@ mod tests {
         let request = create_request(
             &model_config,
             "system",
-            &[],
+            &[] as &[Message],
             &[],
             &ImageFormat::OpenAi,
             false,
@@ -3329,7 +3333,7 @@ mod tests {
         let request = create_request(
             &model_config,
             "system",
-            &[],
+            &[] as &[Message],
             &[],
             &ImageFormat::OpenAi,
             false,
@@ -3377,7 +3381,7 @@ mod tests {
         let request = create_request(
             &model_config,
             "system",
-            &[],
+            &[] as &[Message],
             &[],
             &ImageFormat::OpenAi,
             true,
@@ -3410,7 +3414,7 @@ mod tests {
         let request = create_request(
             &model_config,
             "system",
-            &[],
+            &[] as &[Message],
             &[],
             &ImageFormat::OpenAi,
             false,
@@ -3446,7 +3450,7 @@ mod tests {
         let request = create_request(
             &model_config,
             "system",
-            &[],
+            &[] as &[Message],
             &[],
             &ImageFormat::OpenAi,
             false,
@@ -3467,7 +3471,7 @@ mod tests {
         let request = create_request(
             &model_config,
             "system",
-            &[],
+            &[] as &[Message],
             &[],
             &ImageFormat::OpenAi,
             false,
@@ -3592,7 +3596,7 @@ mod tests {
         let request = create_request(
             &model_config,
             "system",
-            &[],
+            &[] as &[Message],
             &[],
             &ImageFormat::OpenAi,
             false,
@@ -3613,7 +3617,7 @@ mod tests {
         let request = create_request(
             &model_config,
             "system",
-            &[],
+            &[] as &[Message],
             &[],
             &ImageFormat::OpenAi,
             false,
@@ -5690,7 +5694,7 @@ data: [DONE]"#;
         let payload = create_request(
             &model_config,
             "system prompt",
-            &[],
+            &[] as &[Message],
             &[],
             &ImageFormat::OpenAi,
             false,
@@ -5708,7 +5712,7 @@ data: [DONE]"#;
             let payload = create_request(
                 &model_config,
                 "system prompt",
-                &[],
+                &[] as &[Message],
                 &[],
                 &ImageFormat::OpenAi,
                 false,
@@ -5732,7 +5736,7 @@ data: [DONE]"#;
         let payload = create_request(
             &model_config,
             "system prompt",
-            &[],
+            &[] as &[Message],
             &[],
             &ImageFormat::OpenAi,
             false,

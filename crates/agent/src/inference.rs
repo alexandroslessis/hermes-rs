@@ -10,8 +10,8 @@ use hermes_llm::base::{MessageStream, Provider};
 use hermes_llm::conversation::message::{InferenceMetadata, Message, MessageContent};
 use hermes_llm::conversation::token_usage::ProviderUsage;
 use hermes_llm::conversation::{
-    effective_role, fix_conversation, merge_consecutive_messages_for_request, Conversation,
-    EffectiveRole,
+    agent_visible_arc, effective_role, fix_conversation, merge_consecutive_messages_for_request,
+    Conversation, EffectiveRole,
 };
 use hermes_llm::errors::ProviderError;
 use hermes_llm::model::ModelConfig;
@@ -120,7 +120,7 @@ fn drop_repeated_tool_call_thinking(accumulator: &Conversation, chunk: &mut Mess
         .retain(|content| !(is_thinking(content) && prior.contains(&content)));
 }
 
-fn pending_operation_logs(messages: &[Message]) -> Vec<String> {
+fn pending_operation_logs(messages: &[Arc<Message>]) -> Vec<String> {
     let mut seen = messages
         .iter()
         .flat_map(|message| message.metadata.operation_logs.iter().cloned())
@@ -191,7 +191,7 @@ fn is_empty_response(message: &Message) -> bool {
     })
 }
 
-pub fn ends_with_successful_tool_response(messages: &[Message]) -> bool {
+pub fn ends_with_successful_tool_response(messages: &[Arc<Message>]) -> bool {
     let Some(message) = messages.last() else {
         return false;
     };
@@ -326,11 +326,15 @@ fn brief(error: &ProviderError) -> String {
 
 /// The agent-visible conversation as the provider sees it: tool requests left
 /// unanswered by an earlier turn are dropped, since nothing will answer them now.
+///
+/// hermes-rs (Phase 13a): the list holds the conversation's own messages (`Arc` clones) and
+/// copies one only when something has to be taken out of it: a part meant for the user only,
+/// or a tool request nothing answered.
 fn messages_for_provider(
     conversation: &Conversation,
-    turn: &[Message],
+    turn: &[Arc<Message>],
     keep_empty_messages: bool,
-) -> Vec<Message> {
+) -> Vec<Arc<Message>> {
     let answered: HashSet<&str> = conversation
         .messages()
         .iter()
@@ -343,12 +347,15 @@ fn messages_for_provider(
         .enumerate()
         .filter(|(_, message)| message.is_agent_visible())
         .map(|(index, message)| {
-            let mut message = message.agent_visible_content();
-            if index < start {
-                message.content.retain(|content| match content {
-                    MessageContent::ToolRequest(request) => answered.contains(request.id.as_str()),
-                    _ => true,
-                });
+            let mut message = agent_visible_arc(message);
+            let unanswered = |content: &MessageContent| match content {
+                MessageContent::ToolRequest(request) => !answered.contains(request.id.as_str()),
+                _ => false,
+            };
+            if index < start && message.content.iter().any(unanswered) {
+                Arc::make_mut(&mut message)
+                    .content
+                    .retain(|content| !unanswered(content));
             }
             message
         })
@@ -357,30 +364,34 @@ fn messages_for_provider(
 }
 
 /// The messages as one provider takes them: signed reasoning of another provider dropped, the
-/// conversation projected, repaired and merged.
-fn finalize_request(mut messages: Vec<Message>, provider: &str) -> Conversation {
+/// conversation projected, repaired and merged. Messages that need none of that stay shared
+/// with the conversation.
+fn finalize_request(mut messages: Vec<Arc<Message>>, provider: &str) -> Conversation {
     drop_foreign_signed_thinking(&mut messages, provider);
-    let projected = Conversation::new_unvalidated(messages).agent_visible_messages();
-    let (fixed, _) = fix_conversation(Conversation::new_unvalidated(projected));
-    Conversation::new_unvalidated(merge_consecutive_messages_for_request(
-        fixed.messages().clone(),
+    let projected = Conversation::from_arcs(messages).agent_visible_messages();
+    let (fixed, _) = fix_conversation(Conversation::from_arcs(projected));
+    Conversation::from_arcs(merge_consecutive_messages_for_request(
+        fixed.messages().to_vec(),
     ))
 }
 
 /// Signed reasoning only verifies with the provider account that produced it.
-fn drop_foreign_signed_thinking(messages: &mut [Message], provider: &str) {
+fn drop_foreign_signed_thinking(messages: &mut [Arc<Message>], provider: &str) {
+    let dropped = |content: &MessageContent| match content {
+        MessageContent::Thinking(thinking) => !thinking.signature.is_empty(),
+        MessageContent::RedactedThinking(_) => true,
+        _ => false,
+    };
     for message in messages {
-        if message
+        let foreign = message
             .metadata
             .inference
             .as_ref()
-            .is_some_and(|inference| inference.provider != provider)
-        {
-            message.content.retain(|content| match content {
-                MessageContent::Thinking(thinking) => thinking.signature.is_empty(),
-                MessageContent::RedactedThinking(_) => false,
-                _ => true,
-            });
+            .is_some_and(|inference| inference.provider != provider);
+        if foreign && message.content.iter().any(dropped) {
+            Arc::make_mut(message)
+                .content
+                .retain(|content| !dropped(content));
         }
     }
 }
@@ -398,7 +409,7 @@ fn latest_provider_session_id<'a>(
         .and_then(|inference| inference.provider_session_id.as_deref())
 }
 
-fn ends_with_provider_turn(messages: &[Message]) -> bool {
+fn ends_with_provider_turn(messages: &[Arc<Message>]) -> bool {
     messages.last().is_some_and(|message| {
         matches!(
             effective_role(message),
@@ -407,15 +418,19 @@ fn ends_with_provider_turn(messages: &[Message]) -> bool {
     })
 }
 
-fn should_infer(conversation: &Conversation, turn: &[Message]) -> bool {
-    let projected = messages_for_provider(conversation, turn, true);
+/// The messages the next request starts from, or `None` when no request should be made. The
+/// projection is built once (with empty messages kept) and the version without them is taken
+/// from it, so a request costs one pass over the conversation.
+fn request_base(conversation: &Conversation, turn: &[Arc<Message>]) -> Option<Vec<Arc<Message>>> {
+    let mut projected = messages_for_provider(conversation, turn, true);
     if projected
         .last()
         .is_some_and(|message| message.content.is_empty())
     {
-        return false;
+        return None;
     }
-    ends_with_provider_turn(&messages_for_provider(conversation, turn, false))
+    projected.retain(|message| !message.content.is_empty());
+    ends_with_provider_turn(&projected).then_some(projected)
 }
 
 fn inference_span(provider: &dyn Provider, model_config: &ModelConfig) -> tracing::Span {
@@ -485,7 +500,7 @@ impl<'a, S: MaybeSync, E: InferenceEffect> InferenceRunner<'a, S, E> {
         max_tokens: Option<i32>,
         system_prompt: &str,
         request: &Conversation,
-        base: Option<&[Message]>,
+        base: Option<&[Arc<Message>]>,
         tools: &[rmcp::model::Tool],
         emit: &Emitter,
     ) -> Opened {
@@ -815,7 +830,7 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
         let Ok(turn) = messages_since_kickoff(conversation) else {
             return false;
         };
-        trailing_error(conversation).is_none() && should_infer(conversation, turn)
+        trailing_error(conversation).is_none() && request_base(conversation, turn).is_some()
     }
 
     async fn prepare_session(&self, session: &S) -> Result<Option<S>> {
@@ -834,11 +849,10 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
             return not_applicable();
         }
 
-        if !should_infer(conversation, messages) {
+        let Some(mut messages_for_provider) = request_base(conversation, messages) else {
             return not_applicable();
-        }
+        };
         let mut operation_logs = pending_operation_logs(messages);
-        let mut messages_for_provider = messages_for_provider(conversation, messages, false);
 
         let model_config = session
             .thinking_effort()
@@ -861,7 +875,7 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
                 .await?;
 
             for message in &additional_messages {
-                messages_for_provider.push(message.clone());
+                messages_for_provider.push(Arc::new(message.clone()));
             }
             self.output().additional_messages = additional_messages;
 
@@ -959,7 +973,10 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
                     .accumulator
                     .iter()
                     .any(|message| message.metadata.output_token_limit_reached)
-                    && output.accumulator.iter().all(is_empty_response)
+                    && output
+                        .accumulator
+                        .iter()
+                        .all(|message| is_empty_response(message))
             };
             if !empty_output || successful_tool_response || emit.cancel_token().is_cancelled() {
                 break empty_output;
@@ -1054,5 +1071,155 @@ mod tests {
     #[test]
     fn whitespace_only_text_is_an_empty_response() {
         assert!(is_empty_response(&Message::assistant().with_text(" \n\t ")));
+    }
+
+    /// The projection as it was before Phase 13a: every agent-visible message copied.
+    fn copying_messages_for_provider(
+        conversation: &Conversation,
+        turn: &[Arc<Message>],
+        keep_empty_messages: bool,
+    ) -> Vec<Message> {
+        let answered: HashSet<&str> = conversation
+            .messages()
+            .iter()
+            .flat_map(|message| message.get_tool_response_ids())
+            .collect();
+        let start = conversation.len() - turn.len();
+        conversation
+            .messages()
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.is_agent_visible())
+            .map(|(index, message)| {
+                let mut message = message.agent_visible_content();
+                if index < start {
+                    message.content.retain(|content| match content {
+                        MessageContent::ToolRequest(request) => {
+                            answered.contains(request.id.as_str())
+                        }
+                        _ => true,
+                    });
+                }
+                message
+            })
+            .filter(|message| keep_empty_messages || !message.content.is_empty())
+            .collect()
+    }
+
+    fn user_only_text(text: &str) -> MessageContent {
+        use rmcp::model::{Annotations, Role, TextContent};
+        MessageContent::Text(
+            TextContent::new(text)
+                .with_annotations(Annotations::default().with_audience(vec![Role::User])),
+        )
+    }
+
+    fn history() -> Conversation {
+        use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
+        let call = |id: &str| {
+            Ok(CallToolRequestParams::new("terminal")
+                .with_arguments(rmcp::object!({"command": id})))
+        };
+        Conversation::new_unvalidated([
+            Message::user().with_text("first question"),
+            // An earlier turn's request nothing answered: dropped from what the model sees.
+            Message::assistant()
+                .with_text("trying")
+                .with_tool_request("lost", call("lost")),
+            Message::user().with_content(user_only_text("shown to the user only")),
+            Message::user().with_text("second question"),
+            Message::assistant()
+                .with_text("running")
+                .with_tool_request("c1", call("c1")),
+            Message::user().with_tool_response(
+                "c1",
+                Ok(CallToolResult::success(vec![ContentBlock::text("done")])),
+            ),
+            Message::assistant().with_text("answer").agent_only(),
+            Message::assistant().user_only(),
+            Message::user().with_text("third question"),
+        ])
+    }
+
+    #[test]
+    fn the_request_projection_matches_the_copying_one_and_shares_what_it_can() {
+        let conversation = history();
+        let turn = messages_since_kickoff(&conversation).unwrap();
+        for keep_empty in [true, false] {
+            let shared = messages_for_provider(&conversation, turn, keep_empty);
+            let copied = copying_messages_for_provider(&conversation, turn, keep_empty);
+            assert_eq!(shared.len(), copied.len());
+            for (shared, copied) in shared.iter().zip(&copied) {
+                assert_eq!(&**shared, copied);
+            }
+        }
+        // Messages that needed no change are the conversation's own, not copies.
+        let shared = messages_for_provider(&conversation, turn, false);
+        let own = |text: &str| {
+            conversation
+                .iter()
+                .find(|message| message.as_concat_text() == text)
+                .unwrap()
+        };
+        let projected = |text: &str| {
+            shared
+                .iter()
+                .find(|message| message.as_concat_text() == text)
+                .unwrap()
+        };
+        for text in [
+            "first question",
+            "second question",
+            "third question",
+            "running",
+        ] {
+            assert!(Arc::ptr_eq(own(text), projected(text)), "{text} was copied");
+        }
+        // The one whose unanswered request was taken out is a copy; the original is untouched.
+        let trying = projected("trying");
+        assert!(!Arc::ptr_eq(own("trying"), trying));
+        assert!(trying.content.iter().all(|c| c.as_tool_request().is_none()));
+        assert!(own("trying")
+            .content
+            .iter()
+            .any(|c| c.as_tool_request().is_some()));
+    }
+
+    #[test]
+    fn a_request_is_made_only_when_the_model_is_next() {
+        let conversation = history();
+        let turn = messages_since_kickoff(&conversation).unwrap();
+        assert!(request_base(&conversation, turn).is_some());
+        let mut answered = conversation.clone();
+        answered.push(Message::assistant().with_text("done"));
+        let turn = messages_since_kickoff(&answered).unwrap();
+        assert!(request_base(&answered, turn).is_none());
+    }
+
+    #[test]
+    fn reasoning_signed_elsewhere_is_dropped_from_a_copy_only() {
+        let signed = |provider: &str| {
+            Message::assistant()
+                .with_thinking("thought", "sig")
+                .with_text("reply")
+                .with_inference(InferenceMetadata {
+                    provider: provider.to_string(),
+                    requested_model: "m".to_string(),
+                    resolved_model: None,
+                    provider_session_id: None,
+                })
+        };
+        let own = Arc::new(signed("a"));
+        let foreign = Arc::new(signed("b"));
+        let mut messages = vec![own.clone(), foreign.clone()];
+        drop_foreign_signed_thinking(&mut messages, "a");
+        assert!(Arc::ptr_eq(&messages[0], &own));
+        assert!(!Arc::ptr_eq(&messages[1], &foreign));
+        assert_eq!(messages[1].content.len(), 1);
+        assert_eq!(
+            foreign.content.len(),
+            2,
+            "the conversation's message is untouched"
+        );
     }
 }

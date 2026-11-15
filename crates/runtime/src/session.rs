@@ -274,7 +274,7 @@ impl TurnRuntime {
                 .iter()
                 .rposition(|m| m.id.as_deref() == Some(message_id))
                 .with_context(|| format!("message {message_id} not found"))?;
-            change(&mut messages[index]);
+            change(Arc::make_mut(&mut messages[index]));
             (index, messages[index].clone())
         };
         if !self.persist {
@@ -429,5 +429,147 @@ fn merge_json(target: &mut serde_json::Value, patch: &serde_json::Value) {
             }
         }
         (target, patch) => *target = patch.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hermes_store::NewSession;
+    use hermes_tools::{
+        ClarifyOutcome, ClarifyRequest, ProcessNotice, SessionToolsConfig, UserBridge,
+    };
+
+    struct NoBridge;
+
+    #[async_trait]
+    impl UserBridge for NoBridge {
+        async fn clarify(&self, _session_id: &str, _request: ClarifyRequest) -> ClarifyOutcome {
+            ClarifyOutcome::Undelivered
+        }
+        fn process_finished(&self, _session_id: &str, _notice: ProcessNotice) {}
+    }
+
+    /// An open session over an in-memory store, with a user message and a short reply stored.
+    fn open_session(dir: &std::path::Path) -> (TurnRuntime, Arc<OpenSession>) {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let record = store
+            .create_session(NewSession {
+                cwd: dir.display().to_string(),
+                provider: "p".into(),
+                model: "m".into(),
+                system_prompt: "system".into(),
+            })
+            .unwrap();
+        let tools = Arc::new(SessionTools::new(SessionToolsConfig {
+            session_id: record.id.clone(),
+            cwd: dir.to_path_buf(),
+            home: dir.to_path_buf(),
+            data_dir: dir.join("data"),
+            scratch_dir: dir.join("scratch"),
+            shell: hermes_tools::detect_shell(),
+            bridge: Arc::new(NoBridge),
+            todos: Vec::new(),
+            memory: None,
+            history: None,
+            skills: None,
+            approvals: None,
+            checkpoints: None,
+            web: None,
+        }));
+        let conversation = Conversation::new_unvalidated([
+            Message::user()
+                .with_text("question")
+                .with_generated_id_if_missing(),
+            Message::assistant()
+                .with_text("answer")
+                .with_generated_id_if_missing(),
+        ]);
+        let session = Arc::new(OpenSession {
+            record: Mutex::new(record),
+            conversation: Mutex::new(conversation),
+            tools,
+            running: Mutex::new(None),
+            turn_state: Mutex::new(None),
+            review: Mutex::new(None),
+            nudges: Mutex::new(Default::default()),
+            context: Mutex::new(None),
+        });
+        let runtime = TurnRuntime {
+            session: session.clone(),
+            store,
+            state: Arc::default(),
+            persist: false,
+            record_usage: false,
+        };
+        (runtime, session)
+    }
+
+    #[test]
+    fn a_snapshot_shares_the_messages_and_does_not_see_later_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, session) = open_session(dir.path());
+        let snapshot = session.snapshot();
+        for (live, seen) in session
+            .conversation
+            .lock()
+            .iter()
+            .zip(snapshot.conversation.iter())
+        {
+            assert!(Arc::ptr_eq(live, seen), "the snapshot copied a message");
+        }
+
+        // A message added, and a message edited, after the snapshot was taken.
+        runtime
+            .append(
+                Message::user()
+                    .with_text("later")
+                    .with_generated_id_if_missing(),
+            )
+            .unwrap();
+        let id = snapshot.conversation.messages()[1].id.clone().unwrap();
+        runtime
+            .update_message(&id, |message| message.metadata.agent_visible = false)
+            .unwrap();
+
+        assert_eq!(snapshot.conversation.len(), 2);
+        assert!(snapshot.conversation.messages()[1].metadata.agent_visible);
+        let live = session.conversation.lock();
+        assert_eq!(live.len(), 3);
+        assert!(!live.messages()[1].metadata.agent_visible);
+        // What the edit did not touch is still shared.
+        assert!(Arc::ptr_eq(
+            &live.messages()[0],
+            &snapshot.conversation.messages()[0]
+        ));
+        assert!(!Arc::ptr_eq(
+            &live.messages()[1],
+            &snapshot.conversation.messages()[1]
+        ));
+    }
+
+    #[test]
+    fn dropping_trailing_errors_leaves_a_snapshot_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, session) = open_session(dir.path());
+        let error = hermes_llm::errors::ProviderError::RequestFailed("boom".into());
+        session
+            .conversation
+            .lock()
+            .push(Message::from_provider_error(&error).with_generated_id_if_missing());
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.conversation.len(), 3);
+        let after = runtime
+            .drop_trailing_errors()
+            .unwrap()
+            .expect("an error was last");
+        assert_eq!(after.len(), 2);
+        assert_eq!(session.conversation.lock().len(), 2);
+        assert_eq!(
+            snapshot.conversation.len(),
+            3,
+            "the snapshot still has what it saw"
+        );
+        assert!(snapshot.conversation.last().unwrap().error_kind().is_some());
     }
 }

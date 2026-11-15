@@ -364,7 +364,11 @@ impl Store {
     }
 
     /// Replaces the whole stored conversation (compaction, undo).
-    pub fn replace_messages(&self, session_id: &str, messages: &[Message]) -> Result<()> {
+    pub fn replace_messages<M: std::borrow::Borrow<Message>>(
+        &self,
+        session_id: &str,
+        messages: &[M],
+    ) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM messages WHERE session_id = ?1", [session_id])?;
@@ -373,6 +377,7 @@ impl Store {
             [session_id],
         )?;
         for (seq, message) in messages.iter().enumerate() {
+            let message: &Message = message.borrow();
             let id = message
                 .id
                 .as_deref()

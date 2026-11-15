@@ -46,8 +46,9 @@ impl CompactionModel for ProviderModel {
         system: &str,
         messages: &[Message],
     ) -> Result<(Message, ProviderUsage), ProviderError> {
+        let messages: Vec<Arc<Message>> = messages.iter().cloned().map(Arc::new).collect();
         self.provider
-            .complete(&self.model_config, system, messages, &[])
+            .complete(&self.model_config, system, &messages, &[])
             .await
     }
 }

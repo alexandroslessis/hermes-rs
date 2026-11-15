@@ -8,6 +8,7 @@ use reqwest::Response;
 #[cfg(test)]
 use reqwest::StatusCode;
 use serde_json::Value;
+use std::sync::Arc;
 use tokio::pin;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
@@ -79,7 +80,7 @@ impl OpenAiCompatibleProvider {
         wire_model: &str,
         capability_model: &str,
         system: &str,
-        messages: &[Message],
+        messages: &[Arc<Message>],
         tools: &[Tool],
         for_streaming: bool,
     ) -> Result<Value, ProviderError> {
@@ -107,7 +108,7 @@ impl OpenAiCompatibleProvider {
         wire_model: &str,
         capability_model: &str,
         system: &str,
-        messages: &[Message],
+        messages: &[Arc<Message>],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
         let payload = self.build_request_for_model(
@@ -177,7 +178,7 @@ impl OpenAiCompatibleProvider {
         &self,
         model_config: &ModelConfig,
         system: &str,
-        messages: &[Message],
+        messages: &[Arc<Message>],
         tools: &[Tool],
         for_streaming: bool,
     ) -> Result<Value, ProviderError> {
@@ -248,7 +249,7 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         model_config: &ModelConfig,
         system: &str,
-        messages: &[Message],
+        messages: &[Arc<Message>],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
         let payload = self.build_request(

@@ -4,6 +4,7 @@
 //! started (and can be put back); otherwise with git's HEAD.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use hermes_llm::conversation::message::{Message, MessageContent};
 use hermes_tools::checkpoints::Checkpoints;
@@ -20,7 +21,7 @@ pub struct SessionScope {
 }
 
 /// The files the session's `write_file` and `patch` calls wrote, as absolute paths.
-pub fn session_files(messages: &[Message], cwd: &Path) -> Vec<PathBuf> {
+pub fn session_files(messages: &[Arc<Message>], cwd: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut add = |path: &str| {
         let path = path.trim();
@@ -331,7 +332,7 @@ mod tests {
             ),
         ];
         let cwd = Path::new(r"C:\proj");
-        let files = session_files(&messages, cwd);
+        let files = session_files(&hermes_llm::conversation::arcs(messages.clone()), cwd);
         assert_eq!(
             files,
             vec![

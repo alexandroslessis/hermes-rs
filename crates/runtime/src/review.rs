@@ -71,7 +71,7 @@ impl Nudges {
 
     /// Counts a finished turn's model calls toward the skill review, resetting on every call that
     /// used `skill_manage` (and the memory counter on `memory`). `true` when skills are due.
-    pub fn finish_turn(&mut self, turn: &[Message]) -> bool {
+    pub fn finish_turn(&mut self, turn: &[Arc<Message>]) -> bool {
         for message in turn {
             if message.role != rmcp::model::Role::Assistant || !message.is_agent_visible() {
                 continue;
@@ -291,13 +291,13 @@ async fn review(job: ReviewJob) -> Result<(Vec<String>, Option<u64>)> {
     drop(emit);
     let _ = drain.await;
     result?;
-    let messages = fork.conversation.lock().messages().clone();
+    let messages = fork.conversation.lock().messages().to_vec();
     // A review that ended on an error (the provider refused or broke off: `ExitOnError` ends the
     // run normally, with the error as the last message) covered nothing: its signals stay
     // unreviewed (`Scheduler::nudge_due` keeps the score from restarting it after every turn).
     let failed = messages
         .get(reviewed..)
-        .and_then(<[Message]>::last)
+        .and_then(|messages| messages.last())
         .is_some_and(|last| last.error_kind().is_some());
     let covered = covered.filter(|_| !failed);
     Ok((summarize(messages.get(reviewed..).unwrap_or_default()), covered))
@@ -305,7 +305,7 @@ async fn review(job: ReviewJob) -> Result<(Vec<String>, Option<u64>)> {
 
 /// Hermes's `summarize_background_review_actions`: one line per change the review's memory and
 /// skill calls made, without repeats.
-pub fn summarize(messages: &[Message]) -> Vec<String> {
+pub fn summarize(messages: &[Arc<Message>]) -> Vec<String> {
     let mut calls: HashMap<String, (String, Value)> = HashMap::new();
     for request in messages
         .iter()
@@ -445,7 +445,7 @@ mod tests {
             result("e", json!({"success": false, "error": "no"})),
         ];
         assert_eq!(
-            summarize(&messages),
+            summarize(&hermes_llm::conversation::arcs(messages)),
             vec![
                 "Skill 'deploy' patched",
                 "Skill 'deploy' written (references/ci.md)",
@@ -462,20 +462,24 @@ mod tests {
         assert!(nudges.tick_memory());
         assert_eq!(nudges.turns_since_memory, 0);
 
-        let calls: Vec<Message> = (0..9)
-            .map(|i| call(&i.to_string(), "terminal", json!({})))
-            .collect();
+        let calls = hermes_llm::conversation::arcs(
+            (0..9).map(|i| call(&i.to_string(), "terminal", json!({}))),
+        );
         assert!(!nudges.finish_turn(&calls));
         assert_eq!(nudges.iters_since_skill, 9);
         // A skill_manage call resets the count.
-        assert!(!nudges.finish_turn(&[call("s", "skill_manage", json!({}))]));
+        assert!(!nudges.finish_turn(&hermes_llm::conversation::arcs([call(
+            "s",
+            "skill_manage",
+            json!({})
+        )])));
         assert_eq!(nudges.iters_since_skill, 0);
         assert!(
-            nudges.finish_turn(
-                &(0..10)
-                    .map(|i| call(&i.to_string(), "read_file", json!({})))
-                    .collect::<Vec<_>>()
-            )
+            nudges.finish_turn(&hermes_llm::conversation::arcs((0..10).map(|i| call(
+                &i.to_string(),
+                "read_file",
+                json!({})
+            ))))
         );
         assert_eq!(nudges.iters_since_skill, 0);
     }

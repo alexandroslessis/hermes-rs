@@ -200,7 +200,10 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **Prompt caching:** changing the system prompt, tools or earlier messages mid-session breaks the
   provider's cache and costs the user money/time. Apply such settings from the next turn/session.
 - **Timing-flaky test:** `an_exhausted_budget_ends_with_a_toolless_summary` fails under heavy
-  machine load; re-run alone.
+  machine load; re-run alone. An idle-review test's idle time has to outlast the gap between one
+  turn's end (which arms the timer) and the next turn's start on a loaded machine running the whole
+  suite: `s4_requests_two_corrections_make_exactly_one_review_at_idle` failed once under heavy
+  disk I/O at 1.5 s (the review firing between two of its ten turns) and now uses 4 s.
 
 ## Live checks
 
@@ -1296,3 +1299,35 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   `fallback.rs` matches) and the ordinary config autosave. `scripts/perf/fallback-check.mjs` writes the key
   through `config.set` like the page's autosave. If the editor misbehaves in the app, re-add
   `nav-config:model:fallbacks` to `hide.css`; the key still works from the file.
+
+## Shared messages (Phase 13a, `Conversation(Vec<Arc<Message>>)`)
+
+- **Change a message through `Arc::make_mut`, never by assigning through the list.** `messages_mut()` gives
+  `&mut Vec<Arc<Message>>`: `Arc::make_mut(&mut messages[i]).metadata... = ..` copies the message when a snapshot
+  (the state machine's `TurnSession`, a review's view, a `HistoryReplaced` event) still holds it, and edits it in
+  place otherwise. `session::tests::a_snapshot_shares_the_messages_and_does_not_see_later_changes` is the
+  contract.
+- **`make_mut` on a message you just cloned an `Arc` of copies it.** `TurnRuntime::append` keeps an `Arc` clone only
+  while it reads the stored message, and drops it before the next chunk merges, so a streamed message is edited in
+  place; keep that order if you touch `append`/`push` (holding the clone across the next `push` would copy the whole
+  growing message per chunk).
+- **A projection must give back the very same `Arc` when it changes nothing**: `agent_visible_arc`,
+  `messages_for_provider`, the repair passes. If you add a pass that rebuilds every message (a `.map(|m|
+  m.clone())` or `agent_visible_content()` unconditionally) the request path is deep-copying again and nothing
+  fails, so each pass has a "needs work" test first (`has_content_hidden_from_agent`, `has_mergeable_text`, the
+  `unanswered` check) and `inference::tests::the_request_projection_matches_the_copying_one_and_shares_what_it_can`
+  checks with `Arc::ptr_eq`. `has_content_hidden_from_agent` must stay in step with `filter_for_audience`.
+- **`Conversation::to_vec()` and `into_iter()` copy.** `to_vec()` is for the page's transcript functions and the
+  store import (a user's click); `into_iter()` moves a message nobody else holds and copies a shared one. Not for
+  per-request code. Mind the name clash: `conversation.to_vec()` is a deep copy (`Vec<Message>`), but
+  `conversation.messages().to_vec()` is the slice's own `to_vec`, a pointer copy (`Vec<Arc<Message>>`); the type
+  of the binding tells you which one you got.
+- **The repair passes are pinned to Goose's copying originals.** `conversation/pre13a_repair.rs` (test only) is
+  the pre-13a `fix_conversation` over plain messages; `conversation::tests::
+  copy_on_write_repair_matches_the_copying_passes` runs both over 4,000 generated conversations and wants the same
+  messages, the same issues in the same order, an unchanged input, and every issue kind exercised (it also checks
+  `has_content_hidden_from_agent` against `agent_visible_content` and the request-side merge). If you change a pass
+  on purpose, change its copy in `pre13a_repair.rs` the same way.
+- **Byte-identical requests are the contract** (prompt caching, ground rule 8). The turns suite under the default,
+  `requests` and `tokens` profiles was compared request by request with the pre-13a output (see
+  `docs/backend/progress/phase-13.md`); repeat that comparison when you touch a repair pass.

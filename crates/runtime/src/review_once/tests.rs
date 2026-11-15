@@ -401,7 +401,10 @@ fn used_skills_come_from_views_injection_and_invocations_in_order() {
         injected,
         view("c", json!({"name": "github"})),
     ];
-    assert_eq!(used_skills(&messages), vec!["deploy", "arxiv", "github"]);
+    assert_eq!(
+        used_skills(&hermes_llm::conversation::arcs(messages)),
+        vec!["deploy", "arxiv", "github"]
+    );
 }
 
 // ---- project scope -------------------------------------------------------------------------
@@ -426,7 +429,12 @@ fn the_default_scope_is_project_only_when_every_file_is_in_the_one_repository() 
     let repo = root.join("repo");
     let scratch = root.join("data/scratch");
     let scope = |calls: Vec<Message>, project: Option<&std::path::Path>| {
-        evidence_scope(&calls, &repo, project, &scratch)
+        evidence_scope(
+            &hermes_llm::conversation::arcs(calls),
+            &repo,
+            project,
+            &scratch,
+        )
     };
     let inside = tool_call("read_file", json!({"path": "src/main.rs"}));
     let inside_abs = tool_call("write_file", json!({"path": repo.join("src/new.rs").display().to_string()}));

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -31,7 +32,7 @@ pub struct SlashCommand<'a> {
     pub params_str: &'a str,
 }
 
-pub fn messages_since_kickoff(conversation: &Conversation) -> Result<&[Message]> {
+pub fn messages_since_kickoff(conversation: &Conversation) -> Result<&[Arc<Message>]> {
     let messages = conversation.messages();
     let is_kickoff = |msg: &Message| msg.role == rmcp::model::Role::User && !msg.is_tool_response();
     let start = messages
@@ -50,14 +51,14 @@ pub fn trailing_error(conversation: &Conversation) -> Option<MessageErrorKind> {
     conversation.last().and_then(Message::error_kind)
 }
 
-pub fn last_effective_role(messages: &[Message]) -> Result<EffectiveRole> {
+pub fn last_effective_role(messages: &[Arc<Message>]) -> Result<EffectiveRole> {
     messages
         .last()
-        .map(effective_role)
+        .map(|message| effective_role(message))
         .ok_or_else(|| anyhow!("cannot determine the role of an empty conversation"))
 }
 
-pub fn assistant_turn_count(messages: &[Message]) -> u32 {
+pub fn assistant_turn_count(messages: &[Arc<Message>]) -> u32 {
     let mut turns = 0;
     let mut in_assistant_block = false;
     for message in messages.iter().rev() {
@@ -73,7 +74,7 @@ pub fn assistant_turn_count(messages: &[Message]) -> u32 {
     turns
 }
 
-pub fn ends_turn(messages: &[Message]) -> bool {
+pub fn ends_turn(messages: &[Arc<Message>]) -> bool {
     messages.last().is_some_and(|last| {
         last.role == rmcp::model::Role::Assistant
             && last.error_kind().is_none()
@@ -250,7 +251,12 @@ impl MachineEffect for ConversationEffect {
         let messages = match self {
             ConversationEffect::AppendMessage(message) => std::slice::from_mut(message),
             ConversationEffect::ReplaceConversation(conversation) => {
-                conversation.messages_mut().as_mut_slice()
+                for message in conversation.messages_mut() {
+                    if message.id.is_none() {
+                        Arc::make_mut(message).id = Some(format!("msg_{}", uuid::Uuid::new_v4()));
+                    }
+                }
+                return;
             }
             _ => return,
         };

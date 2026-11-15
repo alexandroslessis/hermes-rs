@@ -57,7 +57,7 @@ pub trait FallbackGate: MaybeSend + MaybeSync {
     fn estimate(
         &self,
         system_prompt: &str,
-        messages: &[Message],
+        messages: &[Arc<Message>],
         tools: &[rmcp::model::Tool],
     ) -> usize;
 }

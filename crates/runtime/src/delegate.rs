@@ -703,8 +703,8 @@ impl Delegator {
             }
         }
 
-        let messages = child.conversation.lock().messages().clone();
-        let replies: Vec<&Message> = messages
+        let messages = child.conversation.lock().messages().to_vec();
+        let replies: Vec<&Arc<Message>> = messages
             .iter()
             .filter(|m| m.role == Role::Assistant && m.is_agent_visible())
             .collect();

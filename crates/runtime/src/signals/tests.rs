@@ -412,7 +412,10 @@ fn result(id: &str, text: &str) -> Message {
 }
 
 fn base(history: &[Message], typed: &str) -> TurnBase {
-    TurnBase::before(history, Some(typed))
+    TurnBase::before(
+        &hermes_llm::conversation::arcs(history.to_vec()),
+        Some(typed),
+    )
 }
 
 fn outcome(calls: Vec<CallRecord>) -> TurnOutcome {
@@ -689,6 +692,7 @@ fn rewinding_past_an_answer_is_a_strong_signal() {
         result("c1", "x"),
         assistant("answer two"),
     ];
+    let messages = hermes_llm::conversation::arcs(messages);
     let signal = rewind_signal(&messages, 2, "undo", |_| false).unwrap();
     assert_eq!(signal.weight, REWIND_WEIGHT);
     assert_eq!(
@@ -708,11 +712,23 @@ fn rewinding_past_an_answer_is_a_strong_signal() {
 
     // Nothing the agent did is dropped: no signal.
     assert!(rewind_signal(&messages, 6, "rewind", |_| false).is_none());
-    assert!(rewind_signal(&[user("only a question")], 0, "rewind", |_| false).is_none());
+    assert!(
+        rewind_signal(
+            &hermes_llm::conversation::arcs([user("only a question")]),
+            0,
+            "rewind",
+            |_| false
+        )
+        .is_none()
+    );
     let report = assistant("Undid 1 turn.");
     assert!(
-        rewind_signal(&[user("x"), report.clone()], 0, "rewind", |m| m.id
-            == report.id)
+        rewind_signal(
+            &hermes_llm::conversation::arcs([user("x"), report.clone()]),
+            0,
+            "rewind",
+            |m| m.id == report.id
+        )
         .is_none()
     );
 }

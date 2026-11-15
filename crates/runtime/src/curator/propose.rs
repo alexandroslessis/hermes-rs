@@ -488,7 +488,7 @@ pub async fn ask(
     message: &str,
 ) -> (Answer, usize) {
     let system = hermes_prompts::curator::curator_job_prompt();
-    let mut messages = vec![Message::user().with_text(message.to_string())];
+    let mut messages = vec![Arc::new(Message::user().with_text(message.to_string()))];
     let mut requests = 0usize;
     let mut repaired = false;
     loop {
@@ -518,15 +518,17 @@ pub async fn ask(
                 tracing::info!("curator: reply unreadable ({why}); one repair request");
                 repaired = true;
                 let shown = cut_to_tokens(&text, REPAIR_QUOTE_TOKENS);
-                messages.push(Message::assistant().with_text(if shown.trim().is_empty() {
-                    "(empty reply)".to_string()
-                } else {
-                    shown.to_string()
-                }));
+                messages.push(Arc::new(Message::assistant().with_text(
+                    if shown.trim().is_empty() {
+                        "(empty reply)".to_string()
+                    } else {
+                        shown.to_string()
+                    },
+                )));
                 let why: String = why.chars().take(MAX_REPAIR_REASON).collect();
-                messages.push(
+                messages.push(Arc::new(
                     Message::user().with_text(hermes_prompts::curator::curator_job_repair(&why)),
-                );
+                ));
             }
             Err(why) => {
                 tracing::warn!("curator: reply unreadable after the repair request ({why}); giving up");

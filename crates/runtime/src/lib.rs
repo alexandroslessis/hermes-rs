@@ -197,8 +197,9 @@ impl hermes_tools::approval::ApprovalGuard for SmartGuard {
             tracing::info!("smart approval skipped: {why}");
             return Verdict::Escalate;
         }
-        let request =
-            [Message::user().with_text(approval::smart_user_prompt(command, description))];
+        let request = [Arc::new(
+            Message::user().with_text(approval::smart_user_prompt(command, description)),
+        )];
         let reply = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             hermes_llm::observer::with_purpose(
@@ -322,7 +323,7 @@ pub async fn generate_title_with_effort(
         .complete(
             &config,
             titles::TITLE_PROMPT,
-            &[Message::user().with_text(snippet)],
+            &[Arc::new(Message::user().with_text(snippet))],
             &[],
         )
         .await
@@ -985,12 +986,7 @@ impl Runtime {
     }
 
     pub fn messages(&self, session_id: &str) -> Result<Vec<Message>> {
-        Ok(self
-            .open_fresh(session_id)?
-            .conversation
-            .lock()
-            .messages()
-            .clone())
+        Ok(self.open_fresh(session_id)?.conversation.lock().to_vec())
     }
 
     /// Hermes's edit-and-resend: drops message `keep` and everything after it, so the next
@@ -1040,7 +1036,7 @@ impl Runtime {
         }
         // Activity: the idle clock starts again (a rewind may be what made the review due).
         self.scheduler.idle_from_now(session_id);
-        Ok(conversation.messages().clone())
+        Ok(conversation.to_vec())
     }
 
     /// The tool definitions every request carries, as sent: the built-in tools and the
@@ -2317,7 +2313,7 @@ impl Runtime {
         let (index, messages) = {
             let mut conversation = open.conversation.lock();
             conversation.push(message.clone());
-            (conversation.len() - 1, conversation.messages().clone())
+            (conversation.len() - 1, conversation.to_vec())
         };
         self.store.upsert_message(&session_id, index, &message)?;
         Ok(messages)
@@ -2491,8 +2487,10 @@ impl Runtime {
                 llm.complete(
                     &config,
                     side::INSTRUCTIONS,
-                    &[Message::user()
-                        .with_text(side::user_input(&side::transcript(&lines), question))],
+                    &[Arc::new(Message::user().with_text(side::user_input(
+                        &side::transcript(&lines),
+                        question,
+                    )))],
                     &[],
                 ),
             )

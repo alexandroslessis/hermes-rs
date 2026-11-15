@@ -218,6 +218,34 @@ child agents (at most the budget profile's `delegate_max_children`), registers t
 payload}` → `subagent.*` events. `/bg` (`Runtime::background`) is a detached child; `/btw`
 (`Runtime::side_question`) is one tool-less request over a snapshot.
 
+### The conversation is a list of shared messages (Phase 13a)
+
+`hermes_llm::conversation::Conversation` is `Vec<Arc<Message>>` (Python: a list of references, so a
+copy of the list is a shallow copy; C++: a `vector<shared_ptr<const Message>>`). The live
+conversation of an `OpenSession` (`conversation: Mutex<Conversation>`) and everything derived from it
+share the same messages:
+
+- `OpenSession::snapshot()` (what each state-machine pass sees), a review's or the compressor's view,
+  `HistoryReplaced` events and `Conversation::clone()` copy pointers only.
+- Changing a message goes through `Arc::make_mut`: copy-on-write. `Conversation::push` (a streamed
+  chunk merging into the last message), `TurnRuntime::update_message`, `ConversationEffect::
+  ensure_message_ids`, `compress::undo` and the repair passes of `fix_conversation` copy a message only
+  if a snapshot or projection still holds it; a message nobody else holds is changed in place. A
+  snapshot never sees a later change.
+- The request is built as `Vec<Arc<Message>>` (`inference.rs`: `request_base` -> `messages_for_provider`
+  -> `finalize_request`; `applies` builds the same pointer list once more to decide whether the model is
+  next, without copying a message); a message with nothing to hide, repair or merge is the
+  conversation's own `Arc` all the way to `Provider::stream(.., &[Arc<Message>])`, where the OpenAI
+  formatter turns it into JSON (the one copy the wire needs). `Message::has_content_hidden_from_agent`
+  decides whether `agent_visible_content` would change anything.
+- Plain `Vec<Message>` is still what the store loads, what the page's transcript functions take
+  (`Runtime::messages`, `rewind`, `/diff`... return `Conversation::to_vec()`, a deep copy: these run
+  on a user's click, not per request) and what a one-message request is built from.
+- `messages()` is `&[Arc<Message>]` and `messages_mut()` is `&mut Vec<Arc<Message>>`: never assign through
+  an element (`make_mut` it), or a snapshot would see the change. Helpers over a conversation's list take
+  `&[Arc<Message>]` (`hermes_llm::conversation::arcs(vec)` wraps plain messages, mostly for tests);
+  `Store::replace_messages` and the OpenAI formatter are generic over `Borrow<Message>`.
+
 ## Settings and data
 
 Two settings files, with different owners — don't mix them up:

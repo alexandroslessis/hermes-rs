@@ -334,7 +334,7 @@ where
         let turn = messages_since_kickoff(conversation)?;
         let answered: HashSet<&str> = turn
             .iter()
-            .flat_map(Message::get_tool_response_ids)
+            .flat_map(|message| message.get_tool_response_ids())
             .collect();
         // hermes-rs: a message hidden from the model was withdrawn (a retried malformed or
         // truncated tool call); its calls must never run.

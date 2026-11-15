@@ -335,7 +335,7 @@ impl Operation<TurnSession, HermesEffect> for ValidateToolCalls {
         // look answered, so make duplicates unique before anything else reads them.
         let mut taken: HashSet<String> = conversation.messages()[..conversation.len() - 1]
             .iter()
-            .flat_map(tool_requests)
+            .flat_map(|message| tool_requests(message))
             .map(|request| request.id.clone())
             .collect();
         let mut repaired = last.clone();
@@ -504,12 +504,12 @@ impl Operation<TurnSession, HermesEffect> for UnhandledToolCalls {
         let turn = messages_since_kickoff(conversation)?;
         let answered: HashSet<&str> = turn
             .iter()
-            .flat_map(Message::get_tool_response_ids)
+            .flat_map(|message| message.get_tool_response_ids())
             .collect();
         let unanswered: Vec<_> = turn
             .iter()
             .filter(|message| message.is_agent_visible())
-            .flat_map(tool_requests)
+            .flat_map(|message| tool_requests(message))
             .filter(|request| {
                 !request.was_executed_externally() && !answered.contains(request.id.as_str())
             })
@@ -972,7 +972,7 @@ impl Operation<TurnSession, HermesEffect> for EmptyResponseRecovery {
         if !marker && !empty_reply {
             return not_applicable();
         }
-        let previous: Vec<&Message> = turn[..turn.len() - 1]
+        let previous: Vec<&Arc<Message>> = turn[..turn.len() - 1]
             .iter()
             .rev()
             .filter(|message| message.is_agent_visible())
@@ -1004,7 +1004,7 @@ impl Operation<TurnSession, HermesEffect> for EmptyResponseRecovery {
         if after_tools && !state.post_tool_nudged && !has_thinking(last) {
             state.post_tool_nudged = true;
             tracing::info!("empty response after tool calls — nudging the model to continue");
-            let mut placeholder = last.clone();
+            let mut placeholder = (**last).clone();
             placeholder.content = vec![MessageContent::text("(empty)")];
             return applied([
                 HermesEffect::UpdateMessage(placeholder.with_visibility(false, true)),

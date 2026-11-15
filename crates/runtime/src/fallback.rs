@@ -83,7 +83,7 @@ impl FallbackGate for RuntimeGate {
     fn estimate(
         &self,
         system_prompt: &str,
-        messages: &[Message],
+        messages: &[Arc<Message>],
         tools: &[rmcp::model::Tool],
     ) -> usize {
         let tools: usize = tools

@@ -75,10 +75,10 @@ fn empty_result<E>(status: RunStatus) -> StepResult<E> {
     }
 }
 
-fn interrupted_response(messages: &[Message]) -> Option<Message> {
+fn interrupted_response(messages: &[Arc<Message>]) -> Option<Message> {
     let answered = messages
         .iter()
-        .flat_map(Message::get_tool_response_ids)
+        .flat_map(|message| message.get_tool_response_ids())
         .collect::<HashSet<_>>();
     let mut request_ids = HashSet::new();
     let mut response = Message::user();

@@ -171,7 +171,7 @@ pub fn eligible(text: &str) -> bool {
 /// The skill names and memory ids already attached somewhere in `messages`, counting only the
 /// messages the model still sees: a compaction hides the summarized ones (they stay in the
 /// conversation for the page), and a skill attached there is gone from the model's view.
-pub fn already_attached(messages: &[Message]) -> (HashSet<String>, HashSet<String>) {
+pub fn already_attached(messages: &[Arc<Message>]) -> (HashSet<String>, HashSet<String>) {
     let mut skills = HashSet::new();
     let mut memory = HashSet::new();
     for message in messages
@@ -192,12 +192,12 @@ pub fn already_attached(messages: &[Message]) -> (HashSet<String>, HashSet<Strin
 }
 
 /// The text of the last assistant message that has any (the query's second source).
-pub fn last_assistant_text(messages: &[Message]) -> Option<String> {
+pub fn last_assistant_text(messages: &[Arc<Message>]) -> Option<String> {
     messages
         .iter()
         .rev()
         .filter(|m| m.role == Role::Assistant)
-        .map(Message::as_concat_text)
+        .map(|m| m.as_concat_text())
         .find(|text| !text.trim().is_empty())
 }
 
@@ -714,6 +714,7 @@ mod tests {
             Message::assistant().with_text("ok"),
             Message::user().with_text("y"),
         ];
+        let messages = hermes_llm::conversation::arcs(messages);
         let (skills, memory) = already_attached(&messages);
         assert!(skills.contains("deploy") && memory.contains("memory:abc"));
         // Rewound past it: gone.
@@ -721,7 +722,8 @@ mod tests {
         assert!(skills.is_empty() && memory.is_empty());
         // Summarized by a compaction (kept for the page, hidden from the model): gone too.
         let mut compacted = messages.clone();
-        compacted[0] = compacted[0].clone().with_visibility(true, false);
+        compacted[0] =
+            std::sync::Arc::new(compacted[0].as_ref().clone().with_visibility(true, false));
         let (skills, memory) = already_attached(&compacted);
         assert!(skills.is_empty() && memory.is_empty());
         assert_eq!(last_assistant_text(&messages).as_deref(), Some("ok"));

@@ -290,7 +290,7 @@ pub(crate) async fn run_review_once(job: OnceJob, evidence: Vec<Signal>) -> Revi
         ReplyFormat::JsonSchema => true,
         ReplyFormat::Text => false,
     };
-    let mut messages = vec![Message::user().with_text(packet.text.clone())];
+    let mut messages = vec![Arc::new(Message::user().with_text(packet.text.clone()))];
     let (mut fell_back, mut repaired) = (false, false);
     let parsed = loop {
         let system =
@@ -349,15 +349,17 @@ pub(crate) async fn run_review_once(job: OnceJob, evidence: Vec<Signal>) -> Revi
                 tracing::info!("review: reply unreadable ({why}); one repair request");
                 repaired = true;
                 let shown = packet::cut_to_tokens(&text, REPAIR_QUOTE_TOKENS);
-                messages.push(Message::assistant().with_text(if shown.trim().is_empty() {
-                    "(empty reply)".to_string()
-                } else {
-                    shown.to_string()
-                }));
+                messages.push(Arc::new(Message::assistant().with_text(
+                    if shown.trim().is_empty() {
+                        "(empty reply)".to_string()
+                    } else {
+                        shown.to_string()
+                    },
+                )));
                 let why: String = why.chars().take(MAX_REPAIR_REASON).collect();
-                messages.push(
+                messages.push(Arc::new(
                     Message::user().with_text(hermes_prompts::review::evidence_review_repair(&why)),
-                );
+                ));
             }
             Err(why) => {
                 tracing::warn!(
@@ -413,7 +415,7 @@ async fn record_usage(
 /// The skills a session used, in the order first used: loaded with `skill_view` (SKILL.md, not a
 /// supporting file), attached by pre-injection (the `preinject` note), or invoked as
 /// `/skill-name`. Compacted-away messages count too: the session used them all the same.
-pub fn used_skills(messages: &[Message]) -> Vec<String> {
+pub fn used_skills(messages: &[Arc<Message>]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut add = |name: &str| {
         let name = name.trim();
@@ -465,7 +467,7 @@ pub fn used_skills(messages: &[Message]) -> Vec<String> {
 
 /// What the related-skills lookup asks the index: the user's words in the signals (what the
 /// lessons are about) and the session's first message, as one query.
-pub fn topic(messages: &[Message], evidence: &[Signal]) -> String {
+pub fn topic(messages: &[Arc<Message>], evidence: &[Signal]) -> String {
     let mut parts: Vec<String> = evidence
         .iter()
         .flat_map(|s| &s.evidence)
@@ -512,7 +514,7 @@ fn read_skill(skills: &SkillStore, project: Option<&Path>, name: &str) -> Option
 /// terminal commands; relative paths are the session's working folder `cwd`; the scratch folder
 /// (where long tool output is saved) doesn't count.
 pub fn evidence_scope(
-    messages: &[Message],
+    messages: &[Arc<Message>],
     cwd: &Path,
     project: Option<&Path>,
     scratch_root: &Path,
@@ -598,7 +600,7 @@ pub fn evidence_scope(
 
 /// The packet's skills and memory, read from disk and the index. Blocking.
 pub(crate) fn gather(
-    messages: &[Message],
+    messages: &[Arc<Message>],
     memory: &MemoryStore,
     skills: &SkillStore,
     index: Option<&LocalIndex>,

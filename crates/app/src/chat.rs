@@ -998,7 +998,7 @@ impl ChatView {
             .iter()
             .rev()
             .filter(|m| m.role == Role::User && m.is_user_visible() && !m.is_tool_response())
-            .map(shown_user_text)
+            .map(|m| shown_user_text(m))
             .filter(|text| !text.trim().is_empty())
             .collect();
         sent.dedup();

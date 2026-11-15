@@ -35,7 +35,10 @@ next diff can be read side by side.
 Not from Hermes, so not in the map:
 
 - `crates/llm` and `crates/agent`: from [Goose](https://github.com/block/goose) (provider, messages,
-  agent loop); see `THIRD_PARTY_NOTICES.md`.
+  agent loop); see `THIRD_PARTY_NOTICES.md`. **Diverged from Goose** (Phase 13a): `Conversation` holds
+  `Arc<Message>` (snapshots and request projections share messages; the repair passes of
+  `fix_conversation`, `Provider::stream` and `Conversation::{messages, pop, remove}` changed types
+  accordingly). A Goose update must not re-port those signatures.
 - `crates/app`, `crates/themes`, `crates/highlight`, `crates/markdown`, `vendor/zed`: the GPUI app
   and Zed's UI code. The GPUI app is frozen (kept as a fallback, no new features).
 

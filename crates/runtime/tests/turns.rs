@@ -6569,14 +6569,16 @@ const CORRECTION_2: &str = "No, use pnpm instead.";
 
 /// S4 under `requests` with two corrections: no review during the ten turns, exactly one review
 /// request once the session goes quiet, its reply applied and reported, the signals reviewed, and
-/// no second review at the next idle.
+/// no second review at the next idle. The idle time is 4 s (it was 1.5 s): it has to outlast the
+/// gap between one turn's end (which arms the timer) and the next turn's start; at 1.5 s the test
+/// failed once on a machine loaded by the whole suite and heavy disk I/O.
 #[tokio::test]
 async fn s4_requests_two_corrections_make_exactly_one_review_at_idle() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let h = scheduled_harness(
         (0..10).map(|i| text_reply(&format!("answer {i}"))).collect(),
         vec![json_reply(good_reply())],
-        idle_once(Duration::from_millis(1500)),
+        idle_once(Duration::from_millis(4000)),
         None,
         Arc::new(ReviewBridge(tx)),
     )
@@ -6617,7 +6619,7 @@ async fn s4_requests_two_corrections_make_exactly_one_review_at_idle() {
     assert_eq!(status.last.unwrap().status, ReviewStatus::Done);
     // Another quiet period: the signals are reviewed, so nothing more.
     h.runtime.note_session_viewed(&session);
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    tokio::time::sleep(Duration::from_millis(5500)).await;
     assert_requests(&h, Purpose::Review, 1..=1);
     assert_requests(&h, Purpose::Main, 10..=10);
 }

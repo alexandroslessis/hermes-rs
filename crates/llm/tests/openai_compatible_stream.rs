@@ -75,7 +75,7 @@ async fn streams_text_and_reassembles_a_tool_call() {
         .complete(
             &ModelConfig::new("test-model"),
             "You are a test agent.",
-            &[Message::user().with_text("What's in the README?")],
+            &[Message::user().with_text("What's in the README?").into()],
             &[tool],
         )
         .await

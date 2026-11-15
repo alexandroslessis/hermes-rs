@@ -166,9 +166,12 @@ pub fn estimate_message(message: &Message) -> usize {
 }
 
 /// Tokens of the messages the model sees.
-pub fn estimate_messages<'a>(messages: impl IntoIterator<Item = &'a Message>) -> usize {
+pub fn estimate_messages<'a, M: std::borrow::Borrow<Message> + 'a>(
+    messages: impl IntoIterator<Item = &'a M>,
+) -> usize {
     messages
         .into_iter()
+        .map(|message| message.borrow())
         .filter(|message| message.is_agent_visible())
         .map(estimate_message)
         .sum()
@@ -436,7 +439,7 @@ fn demoted_stub(name: &str, chars: usize) -> String {
 
 /// The tool name and arguments of every tool call, by call id.
 fn tool_calls_by_id(
-    messages: &[Message],
+    messages: &[Arc<Message>],
 ) -> std::collections::HashMap<String, (String, serde_json::Map<String, Value>)> {
     messages
         .iter()
@@ -536,7 +539,7 @@ fn bounded(text: &str) -> String {
 }
 
 /// `_serialize_records_for_summary`: one labeled, redacted record per message or tool result.
-fn serialize(messages: &[Message]) -> Vec<String> {
+fn serialize(messages: &[Arc<Message>]) -> Vec<String> {
     let mut records = Vec::new();
     for message in messages {
         if is_tool_results(message) {
@@ -646,7 +649,7 @@ struct Plan {
     previous_summary: Option<String>,
 }
 
-fn plan(messages: &[Message], budget: &Budget) -> Option<Plan> {
+fn plan(messages: &[Arc<Message>], budget: &Budget) -> Option<Plan> {
     let visible: Vec<usize> = (0..messages.len())
         .filter(|&i| messages[i].is_agent_visible())
         .collect();
@@ -818,19 +821,21 @@ pub async fn compact(
         )
     };
     // The summarizer reads the middle with old results already stubbed.
-    let turns: Vec<Message> = plan
+    let turns: Vec<Arc<Message>> = plan
         .middle
         .iter()
         .map(|&i| {
             if plan.stub_old.contains(&i) {
-                prune(i).unwrap_or_else(|| messages[i].clone())
+                prune(i)
+                    .map(Arc::new)
+                    .unwrap_or_else(|| messages[i].clone())
             } else {
                 messages[i].clone()
             }
         })
         .collect();
     // Whether the session has a user at all (the summarized slice may hold only replies).
-    let has_user_turn = messages.iter().any(is_real_user_turn);
+    let has_user_turn = messages.iter().any(|m| is_real_user_turn(m));
     let records = serialize(&turns);
     let summary_budget = budget.summary(estimate_messages(&turns));
     let focus = focus.map(|f| redact(f, Source::Output));
@@ -868,7 +873,8 @@ pub async fn compact(
     handoff
         .metadata
         .set_operation_note(NOTE, "handoff", Value::Bool(true));
-    let mut out: Vec<Message> = Vec::with_capacity(messages.len() + 4);
+    let handoff = Arc::new(handoff);
+    let mut out: Vec<Arc<Message>> = Vec::with_capacity(messages.len() + 4);
     for (index, message) in messages.iter().enumerate() {
         if index == plan.tail_start {
             out.push(handoff.clone());
@@ -892,17 +898,17 @@ pub async fn compact(
         };
         match stub {
             Some(mut copy) => {
-                out.push(hidden(message));
+                out.push(Arc::new(hidden(message)));
                 copy.id = None;
                 copy = copy
                     .with_visibility(false, true)
                     .with_generated_id_if_missing();
                 copy.metadata
                     .set_operation_note(NOTE, "copy", Value::Bool(true));
-                out.push(copy);
+                out.push(Arc::new(copy));
             }
             None if middle.contains(&index) => {
-                out.push(hidden(message));
+                out.push(Arc::new(hidden(message)));
             }
             None => out.push(message.clone()),
         }
@@ -931,9 +937,9 @@ pub async fn compact(
         .and_then(|message| message.id.as_deref())
         .and_then(|id| out.iter().position(|m| m.id.as_deref() == Some(id)))
         .unwrap_or(out.len());
-    out.insert(at, marker);
+    out.insert(at, Arc::new(marker));
     Ok(Some(Compacted {
-        conversation: Conversation::new_unvalidated(out),
+        conversation: Conversation::from_arcs(out),
         notice,
     }))
 }
@@ -958,12 +964,13 @@ pub fn undo(conversation: &mut Conversation) -> bool {
         m.metadata.operation_note(NOTE, "hidden").is_some()
             || m.metadata.operation_note(NOTE, "copy").is_some()
     });
-    if !compacted || messages.iter().any(is_handoff) {
+    if !compacted || messages.iter().any(|m| is_handoff(m)) {
         return false;
     }
     messages.retain(|m| m.metadata.operation_note(NOTE, "copy").is_none() && notice(m).is_none());
     for message in messages.iter_mut() {
         if message.metadata.operation_note(NOTE, "hidden").is_some() {
+            let message = Arc::make_mut(message);
             message.metadata.agent_visible = true;
             if let Some(notes) = message.metadata.operations.as_mut()
                 && let Some(note) = notes.get_mut(NOTE)
@@ -1002,7 +1009,7 @@ async fn summarize_with(summarizer: &Summarizer, prompt: &str) -> Result<String>
     if let Some(params) = &summarizer.request_params {
         config = config.with_merged_request_params(params.clone());
     }
-    let request = [Message::user().with_text(prompt)];
+    let request = [Arc::new(Message::user().with_text(prompt))];
     // A compression summary is a `compress` request even when it is made inside a turn.
     let (reply, _) = hermes_llm::observer::with_purpose(
         hermes_llm::observer::Purpose::Compress,
@@ -1266,6 +1273,7 @@ mod tests {
             messages.extend(tool_round(&format!("c{n}"), "dir", &big));
         }
         messages.push(Message::user().with_text("latest"));
+        let messages = hermes_llm::conversation::arcs(messages);
         let plan = plan(&messages, &Budget::new(Some(100_000))).unwrap();
         // Head: the first two messages plus the first round's call needs its result.
         assert!(!plan.middle.contains(&0) && !plan.middle.contains(&1));
@@ -1281,13 +1289,23 @@ mod tests {
             Message::user().with_text("hi"),
             Message::assistant().with_text("hello"),
         ];
-        assert!(plan(&messages, &Budget::new(Some(100_000))).is_none());
+        assert!(
+            plan(
+                &hermes_llm::conversation::arcs(messages),
+                &Budget::new(Some(100_000))
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn serialized_turns_are_labeled_and_bounded() {
         let [call, result] = tool_round("c1", "dir", &"y".repeat(10_000));
-        let records = serialize(&[Message::user().with_text("do it"), call, result]);
+        let records = serialize(&hermes_llm::conversation::arcs([
+            Message::user().with_text("do it"),
+            call,
+            result,
+        ]));
         assert_eq!(records[0], "[USER]: do it");
         assert!(
             records[1]
@@ -1306,6 +1324,9 @@ mod tests {
             project_skills: vec![],
         };
         let user = block.attach(Message::user().with_text("ship the release"));
-        assert_eq!(serialize(&[user]), ["[USER]: ship the release"]);
+        assert_eq!(
+            serialize(&hermes_llm::conversation::arcs([user])),
+            ["[USER]: ship the release"]
+        );
     }
 }

@@ -89,7 +89,7 @@
 //! CP7.3 runs it at most once per idle period.
 
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, mpsc};
+use std::sync::{Arc, LazyLock, mpsc};
 
 use hermes_llm::conversation::message::{Message, MessageContent};
 use regex::Regex;
@@ -487,7 +487,7 @@ pub struct TurnBase {
 }
 
 impl TurnBase {
-    pub fn before(messages: &[Message], typed: Option<&str>) -> Self {
+    pub fn before(messages: &[Arc<Message>], typed: Option<&str>) -> Self {
         let users: Vec<usize> = messages
             .iter()
             .enumerate()
@@ -499,7 +499,7 @@ impl TurnBase {
             .iter()
             .rev()
             .filter(|m| m.role == Role::Assistant && m.is_agent_visible())
-            .map(Message::as_concat_text)
+            .map(|m| m.as_concat_text())
             .find(|text| !text.trim().is_empty());
         let previous_turn_denied = messages[last_user.map_or(0, |i| i + 1)..]
             .iter()
@@ -769,7 +769,7 @@ pub fn analyze(base: &TurnBase, outcome: &TurnOutcome) -> Analysis {
 /// The signal a rewind gives: the turns from message `keep` on are about to be dropped. `None`
 /// when nothing the agent did is among them (a failed message, or only command reports).
 pub fn rewind_signal(
-    messages: &[Message],
+    messages: &[Arc<Message>],
     keep: usize,
     via: &str,
     is_command_report: impl Fn(&Message) -> bool,
@@ -792,7 +792,7 @@ pub fn rewind_signal(
         .iter()
         .rev()
         .filter(|m| m.role == Role::Assistant && !is_command_report(m))
-        .map(Message::as_concat_text)
+        .map(|m| m.as_concat_text())
         .find(|t| !t.trim().is_empty());
     let base = TurnBase::before(&messages[..keep], None);
     let evidence = base
@@ -817,7 +817,7 @@ pub fn rewind_signal(
 }
 
 /// The answer a turn ended with: its last message, when the model wrote text there.
-pub fn final_answer(messages: &[Message]) -> Option<String> {
+pub fn final_answer(messages: &[Arc<Message>]) -> Option<String> {
     let last = messages.last()?;
     (last.role == Role::Assistant && last.is_agent_visible() && last.error_kind().is_none())
         .then(|| last.as_concat_text())

@@ -2,16 +2,25 @@ use crate::conversation::message::{Message, MessageContentBlock, MessageMetadata
 use crate::mcp_utils::extract_text_from_resource;
 use rmcp::model::{ContentBlock, Role};
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::collections::HashSet;
+use std::sync::Arc;
 use thiserror::Error;
 
 pub mod message;
+#[cfg(test)]
+mod pre13a_repair;
 pub mod token_usage;
 mod tool_request;
 mod tool_result_serde;
 
+/// The messages of a conversation, each behind an `Arc` (hermes-rs, Phase 13a). Cloning a
+/// conversation, taking a snapshot of it for a turn step or a review, or projecting it for a
+/// request copies pointers, not messages (like a shallow copy of a Python list). A message is
+/// copied only when someone changes it while another holder still has it
+/// (`Arc::make_mut`: copy-on-write).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Conversation(Vec<Message>);
+pub struct Conversation(Vec<Arc<Message>>);
 
 #[derive(Error, Debug)]
 #[error("invalid conversation: {reason}")]
@@ -32,19 +41,32 @@ impl Conversation {
     where
         I: IntoIterator<Item = Message>,
     {
-        Self(messages.into_iter().collect())
+        Self(messages.into_iter().map(Arc::new).collect())
+    }
+
+    /// A conversation over messages that are already shared (no copy).
+    pub fn from_arcs(messages: Vec<Arc<Message>>) -> Self {
+        Self(messages)
     }
 
     pub fn empty() -> Self {
         Self::new_unvalidated([])
     }
 
-    pub fn messages(&self) -> &Vec<Message> {
+    pub fn messages(&self) -> &[Arc<Message>] {
         &self.0
     }
 
-    pub fn messages_mut(&mut self) -> &mut Vec<Message> {
+    /// The list itself, for removing, reordering or truncating. Change a message in place
+    /// only through `Arc::make_mut`, so a snapshot that shares it keeps what it saw.
+    pub fn messages_mut(&mut self) -> &mut Vec<Arc<Message>> {
         &mut self.0
+    }
+
+    /// Plain copies of every message, for the places that hand the history to something that
+    /// owns it (the page's transcript, the store's import). A deep copy: not for the request path.
+    pub fn to_vec(&self) -> Vec<Message> {
+        self.0.iter().map(|message| (**message).clone()).collect()
     }
 
     pub fn push(&mut self, message: Message) {
@@ -59,6 +81,7 @@ impl Conversation {
                         || (message.id.is_some()
                             && existing.id.as_deref() == message.id.as_deref()))
             }) {
+                let existing = Arc::make_mut(existing);
                 if let Some(inference) = message.metadata.inference.clone() {
                     existing.metadata.inference = Some(inference);
                 }
@@ -67,7 +90,7 @@ impl Conversation {
             }
 
             if output_token_limit_reached {
-                self.0.push(message.with_visibility(true, false));
+                self.0.push(Arc::new(message.with_visibility(true, false)));
             }
             return;
         }
@@ -77,6 +100,7 @@ impl Conversation {
             .last_mut()
             .filter(|m| m.id.is_some() && m.id == message.id)
         {
+            let last = Arc::make_mut(last);
             if message.metadata.inference.is_some() {
                 last.metadata.inference = message.metadata.inference.clone();
             }
@@ -115,16 +139,16 @@ impl Conversation {
                 }
             }
         } else {
-            self.0.push(message);
+            self.0.push(Arc::new(message));
         }
     }
 
     pub fn last(&self) -> Option<&Message> {
-        self.0.last()
+        self.0.last().map(|message| &**message)
     }
 
     pub fn first(&self) -> Option<&Message> {
-        self.0.first()
+        self.0.first().map(|message| &**message)
     }
 
     pub fn len(&self) -> usize {
@@ -144,15 +168,15 @@ impl Conversation {
         }
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, Message> {
+    pub fn iter(&self) -> std::slice::Iter<'_, Arc<Message>> {
         self.0.iter()
     }
 
-    pub fn pop(&mut self) -> Option<Message> {
+    pub fn pop(&mut self) -> Option<Arc<Message>> {
         self.0.pop()
     }
 
-    pub fn remove(&mut self, index: usize) -> Message {
+    pub fn remove(&mut self, index: usize) -> Arc<Message> {
         self.0.remove(index)
     }
 
@@ -164,7 +188,7 @@ impl Conversation {
         self.0.clear();
     }
 
-    pub fn filtered_messages<F>(&self, filter: F) -> Vec<Message>
+    pub fn filtered_messages<F>(&self, filter: F) -> Vec<Arc<Message>>
     where
         F: Fn(&MessageMetadata) -> bool,
     {
@@ -175,11 +199,13 @@ impl Conversation {
             .collect()
     }
 
-    pub fn agent_visible_messages(&self) -> Vec<Message> {
+    /// What the model may see of each agent-visible message. A message with nothing hidden
+    /// from the model is shared, not copied.
+    pub fn agent_visible_messages(&self) -> Vec<Arc<Message>> {
         self.0
             .iter()
             .filter(|message| message.metadata.agent_visible)
-            .map(Message::agent_visible_content)
+            .map(agent_visible_arc)
             .filter(|message| !message.content.is_empty())
             .collect()
     }
@@ -188,7 +214,7 @@ impl Conversation {
         self.0
             .iter()
             .filter(|message| message.metadata.user_visible)
-            .map(Message::user_visible_content)
+            .map(|message| message.user_visible_content())
             .filter(|message| !message.content.is_empty())
             .collect()
     }
@@ -207,23 +233,39 @@ impl Conversation {
     }
 }
 
+/// Plain messages as shared ones, for the helpers that read a conversation's list (and for tests).
+pub fn arcs<I: IntoIterator<Item = Message>>(messages: I) -> Vec<Arc<Message>> {
+    messages.into_iter().map(Arc::new).collect()
+}
+
+/// `Message::agent_visible_content`, sharing the message when that would change nothing.
+pub fn agent_visible_arc(message: &Arc<Message>) -> Arc<Message> {
+    if message.has_content_hidden_from_agent() {
+        Arc::new(message.agent_visible_content())
+    } else {
+        message.clone()
+    }
+}
+
 impl Default for Conversation {
     fn default() -> Self {
         Self::empty()
     }
 }
 
+/// Consumes the conversation into plain messages (a message nobody else holds moves out
+/// without a copy; a shared one is copied).
 impl IntoIterator for Conversation {
     type Item = Message;
-    type IntoIter = std::vec::IntoIter<Message>;
+    type IntoIter = std::iter::Map<std::vec::IntoIter<Arc<Message>>, fn(Arc<Message>) -> Message>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
+        self.0.into_iter().map(Arc::unwrap_or_clone)
     }
 }
 impl<'a> IntoIterator for &'a Conversation {
-    type Item = &'a Message;
-    type IntoIter = std::slice::Iter<'a, Message>;
+    type Item = &'a Arc<Message>;
+    type IntoIter = std::slice::Iter<'a, Arc<Message>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter()
@@ -237,8 +279,8 @@ pub fn fix_conversation(conversation: Conversation) -> (Conversation, Vec<String
 
     // Create a shadow map: track each message as either Visible or NonVisible with its index
     enum MessageSlot {
-        Visible(usize),      // Index into agent_visible_messages
-        NonVisible(Message), // Non-visible messages pass through unchanged
+        Visible(usize),           // Index into agent_visible_messages
+        NonVisible(Arc<Message>), // Non-visible messages pass through unchanged
     }
 
     let mut agent_visible_messages = Vec::new();
@@ -259,7 +301,7 @@ pub fn fix_conversation(conversation: Conversation) -> (Conversation, Vec<String
     let (fixed_visible, issues) = fix_messages(agent_visible_messages);
 
     // Reconstruct using shadow map: replace Visible slots with fixed messages
-    let final_messages: Vec<Message> = shadow_map
+    let final_messages: Vec<Arc<Message>> = shadow_map
         .into_iter()
         .filter_map(|slot| match slot {
             MessageSlot::Visible(idx) => fixed_visible.get(idx).cloned(),
@@ -267,10 +309,13 @@ pub fn fix_conversation(conversation: Conversation) -> (Conversation, Vec<String
         })
         .collect();
 
-    (Conversation::new_unvalidated(final_messages), issues)
+    (Conversation::from_arcs(final_messages), issues)
 }
 
-fn fix_messages(messages: Vec<Message>) -> (Vec<Message>, Vec<String>) {
+/// The repair passes. Each one changes a message only when it has something to repair
+/// (`Arc::make_mut`), so the messages of an already-valid conversation stay shared with the
+/// conversation they came from.
+fn fix_messages(messages: Vec<Arc<Message>>) -> (Vec<Arc<Message>>, Vec<String>) {
     [
         merge_text_content_items,
         trim_assistant_text_whitespace,
@@ -293,32 +338,47 @@ fn fix_messages(messages: Vec<Message>) -> (Vec<Message>, Vec<String>) {
     )
 }
 
-fn merge_text_content_in_message(mut msg: Message) -> Message {
-    if msg.role != Role::Assistant {
+fn same_audience(a: &rmcp::model::TextContent, b: &rmcp::model::TextContent) -> bool {
+    a.annotations.as_ref().and_then(|a| a.audience.as_ref())
+        == b.annotations.as_ref().and_then(|a| a.audience.as_ref())
+}
+
+/// Whether `merge_text_content_in_message` would join two text blocks of this message. Chains
+/// merge into the first block's audience, so one equal adjacent pair is the test.
+fn has_mergeable_text(msg: &Message) -> bool {
+    msg.role == Role::Assistant
+        && msg.content.windows(2).any(|pair| {
+            matches!(
+                (&pair[0], &pair[1]),
+                (MessageContentBlock::Text(a), MessageContentBlock::Text(b)) if same_audience(a, b)
+            )
+        })
+}
+
+fn merge_text_content_in_message(mut msg: Arc<Message>) -> Arc<Message> {
+    if !has_mergeable_text(&msg) {
         return msg;
     }
-    msg.content = msg
-        .content
-        .into_iter()
-        .fold(Vec::new(), |mut content, item| {
-            match item {
-                MessageContentBlock::Text(text) => match content.last_mut() {
-                    Some(MessageContentBlock::Text(last))
-                        if last.annotations.as_ref().and_then(|a| a.audience.as_ref())
-                            == text.annotations.as_ref().and_then(|a| a.audience.as_ref()) =>
-                    {
-                        last.text.push_str(&text.text);
-                    }
-                    _ => content.push(MessageContentBlock::Text(text)),
-                },
-                other => content.push(other),
-            }
-            content
-        });
+    let message = Arc::make_mut(&mut msg);
+    message.content =
+        std::mem::take(&mut message.content)
+            .into_iter()
+            .fold(Vec::new(), |mut content, item| {
+                match item {
+                    MessageContentBlock::Text(text) => match content.last_mut() {
+                        Some(MessageContentBlock::Text(last)) if same_audience(last, &text) => {
+                            last.text.push_str(&text.text);
+                        }
+                        _ => content.push(MessageContentBlock::Text(text)),
+                    },
+                    other => content.push(other),
+                }
+                content
+            });
     msg
 }
 
-fn merge_text_content_items(messages: Vec<Message>) -> (Vec<Message>, Vec<String>) {
+fn merge_text_content_items(messages: Vec<Arc<Message>>) -> (Vec<Arc<Message>>, Vec<String>) {
     messages.into_iter().fold(
         (Vec::new(), Vec::new()),
         |(mut messages, mut issues), message| {
@@ -333,14 +393,19 @@ fn merge_text_content_items(messages: Vec<Message>) -> (Vec<Message>, Vec<String
     )
 }
 
-fn trim_assistant_text_whitespace(messages: Vec<Message>) -> (Vec<Message>, Vec<String>) {
+fn trim_assistant_text_whitespace(messages: Vec<Arc<Message>>) -> (Vec<Arc<Message>>, Vec<String>) {
     let mut issues = Vec::new();
 
     let fixed_messages = messages
         .into_iter()
         .map(|mut message| {
-            if message.role == Role::Assistant {
-                for content in &mut message.content {
+            let needs_trim = message.role == Role::Assistant
+                && message.content.iter().any(|content| {
+                    matches!(content, MessageContentBlock::Text(text)
+                        if text.text.trim_end().len() != text.text.len())
+                });
+            if needs_trim {
+                for content in &mut Arc::make_mut(&mut message).content {
                     if let MessageContentBlock::Text(text) = content {
                         let trimmed = text.text.trim_end();
                         if trimmed.len() != text.text.len() {
@@ -359,7 +424,7 @@ fn trim_assistant_text_whitespace(messages: Vec<Message>) -> (Vec<Message>, Vec<
     (fixed_messages, issues)
 }
 
-fn remove_empty_messages(messages: Vec<Message>) -> (Vec<Message>, Vec<String>) {
+fn remove_empty_messages(messages: Vec<Arc<Message>>) -> (Vec<Arc<Message>>, Vec<String>) {
     let mut issues = Vec::new();
     let filtered_messages = messages
         .into_iter()
@@ -396,13 +461,21 @@ fn has_tool_result_content(content: &[ContentBlock]) -> bool {
 /// Fix tool results that would be empty when formatted for LLM APIs.
 /// Some APIs (like Anthropic) reject tool_result blocks with empty content.
 /// This adds a placeholder message for tool results that have no extractable text.
-fn fix_empty_tool_results(messages: Vec<Message>) -> (Vec<Message>, Vec<String>) {
+fn fix_empty_tool_results(messages: Vec<Arc<Message>>) -> (Vec<Arc<Message>>, Vec<String>) {
     let mut issues = Vec::new();
+
+    let is_empty_result = |content: &MessageContentBlock| {
+        matches!(content, MessageContentBlock::ToolResponse(response)
+            if response.tool_result.as_ref().is_ok_and(|result| !has_tool_result_content(&result.content)))
+    };
 
     let fixed_messages = messages
         .into_iter()
         .map(|mut message| {
-            for content in &mut message.content {
+            if !message.content.iter().any(is_empty_result) {
+                return message;
+            }
+            for content in &mut Arc::make_mut(&mut message).content {
                 if let MessageContentBlock::ToolResponse(ref mut tool_response) = content {
                     if let Ok(ref mut result) = tool_response.tool_result {
                         if !has_tool_result_content(&result.content) {
@@ -423,7 +496,7 @@ fn fix_empty_tool_results(messages: Vec<Message>) -> (Vec<Message>, Vec<String>)
     (fixed_messages, issues)
 }
 
-fn fix_tool_calling(mut messages: Vec<Message>) -> (Vec<Message>, Vec<String>) {
+fn fix_tool_calling(mut messages: Vec<Arc<Message>>) -> (Vec<Arc<Message>>, Vec<String>) {
     let mut issues = Vec::new();
     let mut pending_tool_requests: HashSet<String> = HashSet::new();
 
@@ -485,8 +558,11 @@ fn fix_tool_calling(mut messages: Vec<Message>) -> (Vec<Message>, Vec<String>) {
             }
         }
 
-        for &idx in content_to_remove.iter().rev() {
-            message.content.remove(idx);
+        if !content_to_remove.is_empty() {
+            let message = Arc::make_mut(message);
+            for &idx in content_to_remove.iter().rev() {
+                message.content.remove(idx);
+            }
         }
     }
 
@@ -501,8 +577,11 @@ fn fix_tool_calling(mut messages: Vec<Message>) -> (Vec<Message>, Vec<String>) {
                     }
                 }
             }
-            for &idx in content_to_remove.iter().rev() {
-                message.content.remove(idx);
+            if !content_to_remove.is_empty() {
+                let message = Arc::make_mut(message);
+                for &idx in content_to_remove.iter().rev() {
+                    message.content.remove(idx);
+                }
             }
         }
     }
@@ -513,22 +592,22 @@ fn fix_tool_calling(mut messages: Vec<Message>) -> (Vec<Message>, Vec<String>) {
 
 /// Never merges across visibility or turn-context boundaries, so the result
 /// is safe to persist.
-pub fn merge_consecutive_messages(messages: Vec<Message>) -> (Vec<Message>, Vec<String>) {
+pub fn merge_consecutive_messages(messages: Vec<Arc<Message>>) -> (Vec<Arc<Message>>, Vec<String>) {
     merge_consecutive(messages, false)
 }
 
 /// Merges regardless of visibility, for providers that require strict role
 /// alternation. Never persist the result.
-pub fn merge_consecutive_messages_for_request(messages: Vec<Message>) -> Vec<Message> {
+pub fn merge_consecutive_messages_for_request(messages: Vec<Arc<Message>>) -> Vec<Arc<Message>> {
     merge_consecutive(messages, true).0
 }
 
 fn merge_consecutive(
-    messages: Vec<Message>,
+    messages: Vec<Arc<Message>>,
     across_visibility: bool,
-) -> (Vec<Message>, Vec<String>) {
+) -> (Vec<Arc<Message>>, Vec<String>) {
     let mut issues = Vec::new();
-    let mut merged_messages: Vec<Message> = Vec::new();
+    let mut merged_messages: Vec<Arc<Message>> = Vec::new();
 
     for message in messages {
         if let Some(last) = merged_messages.last_mut() {
@@ -538,7 +617,12 @@ fn merge_consecutive(
                     || (last.metadata.user_visible == message.metadata.user_visible
                         && last.metadata.turn_context == message.metadata.turn_context))
             {
-                last.content.extend(message.content);
+                // Only the first of a run of messages is copied (when shared); the rest append to it.
+                let last = Arc::make_mut(last);
+                match Arc::try_unwrap(message) {
+                    Ok(message) => last.content.extend(message.content),
+                    Err(message) => last.content.extend(message.content.iter().cloned()),
+                }
                 issues.push(format!("Merged consecutive {} messages", effective));
                 continue;
             }
@@ -579,39 +663,45 @@ fn is_signed_thinking(content: &MessageContentBlock) -> bool {
 ///
 /// This runs before any provider formatter, so it covers every Claude transport
 /// (direct Anthropic, Bedrock, Databricks, Vertex) in one place.
-fn dedupe_signed_thinking(messages: Vec<Message>) -> (Vec<Message>, Vec<String>) {
+///
+/// hermes-rs: two passes, so blocks are compared by reference and only a message that
+/// loses a block is copied (the Goose version cloned every signed block into `seen`).
+fn dedupe_signed_thinking(mut messages: Vec<Arc<Message>>) -> (Vec<Arc<Message>>, Vec<String>) {
     let mut issues = Vec::new();
-    let mut seen: Vec<MessageContentBlock> = Vec::new();
-
-    let fixed_messages = messages
-        .into_iter()
-        .map(|mut message| {
+    // (message index, which blocks to keep) for each message that loses one.
+    let mut plans: Vec<(usize, Vec<bool>)> = Vec::new();
+    {
+        let mut seen: Vec<&MessageContentBlock> = Vec::new();
+        for (index, message) in messages.iter().enumerate() {
             if message.role != Role::Assistant {
-                return message;
+                continue;
             }
-
-            let original_len = message.content.len();
-            let mut deduped: Vec<MessageContentBlock> = Vec::with_capacity(original_len);
-            for content in &message.content {
+            let mut keep = vec![true; message.content.len()];
+            let mut dropped = false;
+            for (i, content) in message.content.iter().enumerate() {
                 let is_signed = is_signed_thinking(content);
-                if is_signed && seen.contains(content) {
+                if is_signed && seen.contains(&content) {
+                    keep[i] = false;
+                    dropped = true;
                     continue;
                 }
                 if is_signed {
-                    seen.push(content.clone());
+                    seen.push(content);
                 }
-                deduped.push(content.clone());
             }
-
-            if deduped.len() != original_len {
-                issues.push("Removed duplicate signed thinking block".to_string());
-                message.content = deduped;
+            if dropped {
+                plans.push((index, keep));
             }
-            message
-        })
-        .collect();
+        }
+    }
+    for (index, keep) in plans {
+        let message = Arc::make_mut(&mut messages[index]);
+        let mut flags = keep.into_iter();
+        message.content.retain(|_| flags.next().unwrap_or(true));
+        issues.push("Removed duplicate signed thinking block".to_string());
+    }
 
-    (fixed_messages, issues)
+    (messages, issues)
 }
 
 fn has_tool_response(message: &Message) -> bool {
@@ -653,7 +743,7 @@ pub fn effective_role(message: &Message) -> EffectiveRole {
     }
 }
 
-fn fix_lead_trail(mut messages: Vec<Message>) -> (Vec<Message>, Vec<String>) {
+fn fix_lead_trail(mut messages: Vec<Arc<Message>>) -> (Vec<Arc<Message>>, Vec<String>) {
     let mut issues = Vec::new();
 
     if let Some(first) = messages.first() {
@@ -675,19 +765,21 @@ fn fix_lead_trail(mut messages: Vec<Message>) -> (Vec<Message>, Vec<String>) {
 
 const PLACEHOLDER_USER_MESSAGE: &str = "Hello";
 
-fn populate_if_empty(mut messages: Vec<Message>) -> (Vec<Message>, Vec<String>) {
+fn populate_if_empty(mut messages: Vec<Arc<Message>>) -> (Vec<Arc<Message>>, Vec<String>) {
     let mut issues = Vec::new();
 
     if messages.is_empty() {
         issues.push("Added placeholder user message to empty conversation".to_string());
-        messages.push(Message::user().with_text(PLACEHOLDER_USER_MESSAGE));
+        messages.push(Arc::new(
+            Message::user().with_text(PLACEHOLDER_USER_MESSAGE),
+        ));
     }
     (messages, issues)
 }
 
-pub fn debug_conversation_fix(
-    messages: &[Message],
-    fixed: &[Message],
+pub fn debug_conversation_fix<A: Borrow<Message>, B: Borrow<Message>>(
+    messages: &[A],
+    fixed: &[B],
     issues: &[String],
 ) -> String {
     let mut output = String::new();
@@ -696,7 +788,7 @@ pub fn debug_conversation_fix(
 
     output.push_str("BEFORE:\n");
     for (i, msg) in messages.iter().enumerate() {
-        output.push_str(&format!("  [{}] {}\n", i, msg.debug()));
+        output.push_str(&format!("  [{}] {}\n", i, msg.borrow().debug()));
     }
 
     output.push_str("\nISSUES FOUND:\n");
@@ -710,7 +802,7 @@ pub fn debug_conversation_fix(
 
     output.push_str("\nAFTER:\n");
     for (i, msg) in fixed.iter().enumerate() {
-        output.push_str(&format!("  [{}] {}\n", i, msg.debug()));
+        output.push_str(&format!("  [{}] {}\n", i, msg.borrow().debug()));
     }
 
     output.push_str("\n==============================\n");
@@ -759,7 +851,7 @@ mod tests {
             issues_with_fixed,
             debug_conversation_fix(&messages, fixed.messages(), &issues)
         );
-        (fixed.messages().clone(), issues)
+        (fixed.to_vec(), issues)
     }
 
     #[test]
@@ -871,7 +963,7 @@ mod tests {
         assert!(!fixed.messages()[1].is_user_visible());
 
         let merged =
-            crate::conversation::merge_consecutive_messages_for_request(fixed.messages().clone());
+            crate::conversation::merge_consecutive_messages_for_request(fixed.messages().to_vec());
         assert_eq!(
             merged.len(),
             1,
@@ -902,7 +994,7 @@ mod tests {
         assert!(fixed.messages()[1].is_turn_context());
 
         let merged =
-            crate::conversation::merge_consecutive_messages_for_request(fixed.messages().clone());
+            crate::conversation::merge_consecutive_messages_for_request(fixed.messages().to_vec());
         assert_eq!(
             merged.len(),
             1,
@@ -2011,6 +2103,345 @@ mod tests {
                 assert_eq!(c.text, "and now text");
             }
             other => panic!("unexpected content shape: {:?}", other),
+        }
+    }
+
+    // ---- Phase 13a: messages are shared, copied only when changed ----
+
+    fn sample() -> Conversation {
+        Conversation::new_unvalidated([
+            Message::user().with_text("question"),
+            Message::assistant().with_id("a1").with_text("par"),
+            Message::user().with_text("follow-up"),
+        ])
+    }
+
+    #[test]
+    fn a_clone_shares_the_messages_and_keeps_what_it_saw() {
+        let mut live = sample();
+        let snapshot = live.clone();
+        for (a, b) in live.iter().zip(snapshot.iter()) {
+            assert!(std::sync::Arc::ptr_eq(a, b));
+        }
+
+        // A streamed chunk merges into the last message of the live conversation only.
+        live.push(Message::assistant().with_id("a2").with_text("one"));
+        let before = live.clone();
+        live.push(Message::assistant().with_id("a2").with_text(" two"));
+        assert_eq!(live.last().unwrap().as_concat_text(), "one two");
+        assert_eq!(before.last().unwrap().as_concat_text(), "one");
+        assert_eq!(snapshot.len(), 3);
+
+        // An edit through make_mut copies that message; the others stay shared.
+        let before = live.clone();
+        std::sync::Arc::make_mut(&mut live.messages_mut()[1])
+            .metadata
+            .user_visible = false;
+        assert!(before.messages()[1].metadata.user_visible);
+        assert!(!live.messages()[1].metadata.user_visible);
+        assert!(std::sync::Arc::ptr_eq(
+            &before.messages()[0],
+            &live.messages()[0]
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &before.messages()[1],
+            &live.messages()[1]
+        ));
+    }
+
+    #[test]
+    fn a_message_nobody_else_holds_is_changed_in_place() {
+        let mut live = Conversation::new_unvalidated([
+            Message::user().with_text("question"),
+            Message::assistant().with_id("a1").with_text("par"),
+        ]);
+        let address = std::sync::Arc::as_ptr(&live.messages()[1]);
+        live.push(Message::assistant().with_id("a1").with_text("tial"));
+        assert_eq!(live.messages()[1].as_concat_text(), "partial");
+        assert_eq!(std::sync::Arc::as_ptr(&live.messages()[1]), address);
+    }
+
+    #[test]
+    fn repairing_a_valid_conversation_copies_nothing() {
+        let conversation = sample();
+        let (fixed, issues) = fix_conversation(conversation.clone());
+        assert!(issues.is_empty());
+        for (a, b) in conversation.iter().zip(fixed.iter()) {
+            assert!(std::sync::Arc::ptr_eq(a, b));
+        }
+    }
+
+    #[test]
+    fn repairing_copies_only_the_messages_it_changes() {
+        let conversation = Conversation::new_unvalidated([
+            Message::user().with_text("question"),
+            Message::assistant().with_text("trailing   "),
+            Message::user().with_text("follow-up"),
+        ]);
+        let (fixed, issues) = fix_conversation(conversation.clone());
+        assert_has_issues_unordered!(
+            fixed,
+            issues,
+            "Trimmed trailing whitespace from assistant message"
+        );
+        assert_eq!(fixed.messages()[1].as_concat_text(), "trailing");
+        assert_eq!(conversation.messages()[1].as_concat_text(), "trailing   ");
+        assert!(std::sync::Arc::ptr_eq(
+            &conversation.messages()[0],
+            &fixed.messages()[0]
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &conversation.messages()[2],
+            &fixed.messages()[2]
+        ));
+    }
+
+    #[test]
+    fn merging_consecutive_messages_leaves_the_originals_alone() {
+        let conversation = Conversation::new_unvalidated([
+            Message::user().with_text("one"),
+            Message::user().with_text("two"),
+        ]);
+        let merged = crate::conversation::merge_consecutive_messages_for_request(
+            conversation.messages().to_vec(),
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].content.len(), 2);
+        assert_eq!(conversation.messages()[0].content.len(), 1);
+    }
+
+    #[test]
+    fn the_agent_view_shares_a_message_with_nothing_hidden() {
+        use rmcp::model::{Annotations, TextContent};
+        let user_only = MessageContentBlock::Text(
+            TextContent::new("for the user")
+                .with_annotations(Annotations::default().with_audience(vec![Role::User])),
+        );
+        let both = MessageContentBlock::Text(TextContent::new("for both").with_annotations(
+            Annotations::default().with_audience(vec![Role::User, Role::Assistant]),
+        ));
+        let hidden = std::sync::Arc::new(Message::assistant().with_content(user_only));
+        let shown = std::sync::Arc::new(
+            Message::assistant()
+                .with_content(both)
+                .with_text("plain")
+                .with_thinking("t", "sig"),
+        );
+        // The shortcut agrees with the projection it stands for.
+        for message in [&hidden, &shown] {
+            assert_eq!(
+                message.has_content_hidden_from_agent(),
+                message.agent_visible_content() != **message,
+            );
+        }
+        assert!(hidden.has_content_hidden_from_agent());
+        assert!(!shown.has_content_hidden_from_agent());
+        assert!(std::sync::Arc::ptr_eq(
+            &crate::conversation::agent_visible_arc(&shown),
+            &shown
+        ));
+        let projected = crate::conversation::agent_visible_arc(&hidden);
+        assert!(projected.content.is_empty());
+        assert_eq!(hidden.content.len(), 1);
+    }
+
+    #[test]
+    fn a_tool_result_part_for_the_user_only_counts_as_hidden() {
+        use rmcp::model::{Annotations, CallToolResult, ContentBlock, TextContent};
+        let private = ContentBlock::Text(
+            TextContent::new("secret")
+                .with_annotations(Annotations::default().with_audience(vec![Role::User])),
+        );
+        let message = Message::user().with_tool_response(
+            "c",
+            Ok(CallToolResult::success(vec![
+                private,
+                ContentBlock::text("ok"),
+            ])),
+        );
+        assert!(message.has_content_hidden_from_agent());
+        assert_ne!(message.agent_visible_content(), message);
+        let plain = Message::user().with_tool_response(
+            "c",
+            Ok(CallToolResult::success(vec![ContentBlock::text("ok")])),
+        );
+        assert!(!plain.has_content_hidden_from_agent());
+        assert_eq!(plain.agent_visible_content(), plain);
+    }
+
+    /// Phase 13a review: the copy-on-write repair passes against HEAD's copying ones
+    /// (`pre13a_repair`), over thousands of generated conversations mixing every shape the
+    /// passes look at (audiences, empty and whitespace text, images, tool calls with answered,
+    /// orphaned and misplaced results, empty and error results, signed / unsigned / redacted
+    /// thinking, hidden messages, turn context). Same messages, same issues in the same order,
+    /// and the input conversation is left as it was.
+    #[test]
+    fn copy_on_write_repair_matches_the_copying_passes() {
+        use crate::conversation::{merge_consecutive, pre13a_repair};
+        use rmcp::model::{
+            Annotations, CallToolResult, ContentBlock, ErrorCode, ErrorData, TextContent,
+        };
+
+        // xorshift: deterministic, no dependency.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |n: usize| -> usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let audiences: [Option<Vec<Role>>; 5] = [
+            None,
+            Some(vec![]),
+            Some(vec![Role::User]),
+            Some(vec![Role::Assistant]),
+            Some(vec![Role::User, Role::Assistant]),
+        ];
+        let annotations = |audience: &Option<Vec<Role>>| {
+            audience
+                .clone()
+                .map(|roles| Annotations::default().with_audience(roles))
+        };
+        let texts = ["", " ", "a", "b ", "x\n", "same"];
+        let ids = ["c1", "c2", "c3"];
+
+        let mut generated = 0;
+        let mut kinds = std::collections::BTreeSet::new();
+        for _ in 0..4000 {
+            let mut messages = Vec::new();
+            for _ in 0..next(7) {
+                let mut message = if next(2) == 0 {
+                    Message::user()
+                } else {
+                    Message::assistant()
+                };
+                for _ in 0..next(5) {
+                    let block = match next(9) {
+                        0 | 1 => {
+                            let mut text = TextContent::new(texts[next(texts.len())]);
+                            text.annotations = annotations(&audiences[next(audiences.len())]);
+                            MessageContentBlock::Text(text)
+                        }
+                        2 => {
+                            let mut image = MessageContentBlock::image("aGk=", "image/png");
+                            if let MessageContentBlock::Image(image) = &mut image {
+                                image.annotations = annotations(&audiences[next(audiences.len())]);
+                            }
+                            image
+                        }
+                        3 => MessageContentBlock::tool_request(
+                            ids[next(ids.len())],
+                            Ok(CallToolRequestParams::new("terminal")),
+                        ),
+                        4 => {
+                            let result = match next(6) {
+                                0 => Err(ErrorData::new(ErrorCode::INTERNAL_ERROR, "boom", None)),
+                                1 => Ok(CallToolResult::success(vec![])),
+                                2 => Ok(CallToolResult::success(vec![ContentBlock::text("")])),
+                                3 => {
+                                    let mut private = TextContent::new("secret");
+                                    private.annotations =
+                                        annotations(&audiences[next(audiences.len())]);
+                                    Ok(CallToolResult::success(vec![
+                                        ContentBlock::Text(private),
+                                        ContentBlock::text("ok"),
+                                    ]))
+                                }
+                                4 => Ok(CallToolResult::success(vec![ContentBlock::image(
+                                    "aGk=",
+                                    "image/png",
+                                )])),
+                                _ => Ok(CallToolResult::success(vec![ContentBlock::text("ok")])),
+                            };
+                            MessageContentBlock::tool_response(ids[next(ids.len())], result)
+                        }
+                        5 => {
+                            let (text, signature) =
+                                [("t", "sig"), ("t", "sig"), ("u", "sig2"), ("t", "")][next(4)];
+                            MessageContentBlock::thinking(text, signature)
+                        }
+                        6 => MessageContentBlock::redacted_thinking(["r", "s"][next(2)]),
+                        _ => MessageContentBlock::text(texts[next(texts.len())]),
+                    };
+                    message = message.with_content(block);
+                }
+                message = match next(8) {
+                    0 => message.agent_only(),
+                    1 => message.user_only(),
+                    2 => {
+                        message.metadata.turn_context = true;
+                        message
+                    }
+                    _ => message,
+                };
+                messages.push(message);
+            }
+            generated += messages.len();
+
+            // The shortcut agrees with the projection it stands for, message by message.
+            for message in &messages {
+                assert_eq!(
+                    message.has_content_hidden_from_agent(),
+                    message.agent_visible_content() != *message,
+                    "{message:?}"
+                );
+            }
+
+            let input = Conversation::new_unvalidated(messages.clone());
+            let (fixed, issues) = fix_conversation(input.clone());
+            let (old_fixed, old_issues) = pre13a_repair::fix_conversation(&messages);
+            assert_eq!(issues, old_issues, "{messages:#?}");
+            kinds.extend(
+                issues
+                    .iter()
+                    .map(|issue| issue.split(" '").next().unwrap().to_string()),
+            );
+            assert_eq!(fixed.to_vec(), old_fixed, "{messages:#?}");
+            assert_eq!(input.to_vec(), messages, "the repair changed its input");
+
+            // The request-side helpers too.
+            let visible = input.agent_visible_messages();
+            let old_visible: Vec<Message> = messages
+                .iter()
+                .filter(|m| m.metadata.agent_visible)
+                .map(Message::agent_visible_content)
+                .filter(|m| !m.content.is_empty())
+                .collect();
+            assert_eq!(
+                Conversation::from_arcs(visible.clone()).to_vec(),
+                old_visible
+            );
+            for across in [false, true] {
+                let merged = merge_consecutive(visible.clone(), across);
+                let old = pre13a_repair::merge_consecutive(old_visible.clone(), across);
+                assert_eq!(merged.1, old.1);
+                assert_eq!(Conversation::from_arcs(merged.0).to_vec(), old.0);
+            }
+            assert_eq!(input.to_vec(), messages, "merging changed its input");
+        }
+        assert!(generated > 10_000);
+        // Every pass had work to do somewhere in the sample.
+        for kind in [
+            "Merged text content",
+            "Trimmed trailing whitespace from assistant message",
+            "Removed empty message",
+            "Added placeholder to empty tool result",
+            "Removed tool request",
+            "Removed thinking content from user message",
+            "Removed orphaned tool response",
+            "Removed tool response",
+            "Removed orphaned tool request",
+            "Merged consecutive user messages",
+            "Merged consecutive assistant messages",
+            "Removed duplicate signed thinking block",
+            "Removed leading assistant message",
+            "Removed trailing assistant message",
+            "Added placeholder user message to empty conversation",
+        ] {
+            assert!(
+                kinds.contains(kind),
+                "no case exercised {kind:?}: {kinds:?}"
+            );
         }
     }
 }

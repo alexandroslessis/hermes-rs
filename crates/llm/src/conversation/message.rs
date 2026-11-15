@@ -1001,6 +1001,28 @@ impl Message {
         format!("{:?}", self)
     }
 
+    /// Whether `agent_visible_content` would change anything: a text, image or tool-result
+    /// part addressed to the user only. When false the projection equals the message itself,
+    /// so a shared message can be used as it is (Phase 13a).
+    pub fn has_content_hidden_from_agent(&self) -> bool {
+        let hides = |audience: Option<&Vec<Role>>| {
+            audience.is_some_and(|roles| !roles.contains(&Role::Assistant))
+        };
+        self.content.iter().any(|block| match block {
+            MessageContentBlock::Text(text) => {
+                hides(text.annotations.as_ref().and_then(|a| a.audience.as_ref()))
+            }
+            MessageContentBlock::Image(image) => {
+                hides(image.annotations.as_ref().and_then(|a| a.audience.as_ref()))
+            }
+            MessageContentBlock::ToolResponse(response) => match &response.tool_result {
+                Ok(result) => result.content.iter().any(|c| hides(content_audience(c))),
+                Err(_) => false,
+            },
+            _ => false,
+        })
+    }
+
     pub fn agent_visible_content(&self) -> Message {
         let filtered_content = self
             .content

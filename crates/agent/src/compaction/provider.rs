@@ -36,13 +36,15 @@ impl CompactingProvider {
     async fn compacted_messages(
         &self,
         model_config: &ModelConfig,
-        messages: &[Message],
-    ) -> Result<Vec<Message>, ProviderError> {
+        messages: &[Arc<Message>],
+    ) -> Result<Vec<Arc<Message>>, ProviderError> {
         let model = ProviderModel::new(self.inner.clone(), model_config.clone());
-        let summary = crate::compaction::summarize(&model, None, &self.templates, messages)
+        // Only on a context overflow: the summarizer takes plain messages.
+        let plain: Vec<Message> = messages.iter().map(|m| (**m).clone()).collect();
+        let summary = crate::compaction::summarize(&model, None, &self.templates, &plain)
             .await
             .map_err(|error| ProviderError::ExecutionError(error.to_string()))?;
-        Ok(vec![summary.message])
+        Ok(vec![Arc::new(summary.message)])
     }
 }
 
@@ -56,7 +58,7 @@ impl Provider for CompactingProvider {
         &self,
         model_config: &ModelConfig,
         system: &str,
-        messages: &[Message],
+        messages: &[Arc<Message>],
         tools: &[rmcp::model::Tool],
     ) -> Result<MessageStream, ProviderError> {
         match self
@@ -78,7 +80,7 @@ impl Provider for CompactingProvider {
         &self,
         model_config: &ModelConfig,
         system: &str,
-        messages: &[Message],
+        messages: &[Arc<Message>],
         tools: &[rmcp::model::Tool],
     ) -> Result<(Message, ProviderUsage), ProviderError> {
         match self
@@ -125,7 +127,7 @@ mod tests {
             &self,
             _model_config: &ModelConfig,
             _system: &str,
-            _messages: &[Message],
+            _messages: &[Arc<Message>],
             _tools: &[rmcp::model::Tool],
         ) -> Result<MessageStream, ProviderError> {
             unreachable!()
