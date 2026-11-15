@@ -27,7 +27,6 @@ use std::sync::atomic::Ordering;
 use anyhow::{Context as _, Result};
 use chrono::Utc;
 use hermes_agent::inference::InferenceRunner;
-use hermes_agent::machine::{StateMachine, Step};
 use hermes_agent::operation::Emitter;
 use hermes_agent::tool::{ToolOperation, ToolProvider};
 use hermes_llm::conversation::Conversation;
@@ -41,7 +40,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::budget::CuratorMode;
-use crate::session::{HermesEffect, OpenSession, TurnRuntime, TurnSession};
+use crate::session::{OpenSession, TurnRuntime, TurnSession};
 use crate::{ProviderConfig, Runtime, TurnOptions, effort_request_params, ops};
 
 /// The model the consolidation pass runs on.
@@ -247,42 +246,34 @@ impl Runtime {
                 effort,
             ));
         }
-        let steps: Vec<Step<'_, TurnSession, HermesEffect>> = vec![
-            Step::Operation(Arc::new(ops::FrozenPrompt)),
-            Step::Operation(Arc::new(ops::IterationBudget {
+        // No `/steer` and no compression: the curator never had them.
+        let agent = crate::agent_loop::AgentLoop {
+            budget: ops::IterationBudget {
                 state: state.clone(),
                 max_iterations: budget.curator_max_iterations,
-            })),
-            Step::Operation(Arc::new(ops::ValidateToolCalls::new(
-                state.clone(),
-                tool_names.clone(),
-                &budget,
-            ))),
-            Step::Operation(Arc::new(ToolOperation::new().with_provider(provider_tools))),
-            Step::Operation(Arc::new(ops::UnhandledToolCalls {
+            },
+            validate: ops::ValidateToolCalls::new(state.clone(), tool_names.clone(), &budget),
+            tools: ToolOperation::new().with_provider(provider_tools),
+            unhandled: ops::UnhandledToolCalls {
                 tool_names,
                 disabled: Default::default(),
                 deferred: None,
-            })),
-            Step::Operation(Arc::new(ops::LengthContinuation::new(
-                state.clone(),
-                &budget,
-            ))),
-            Step::Operation(Arc::new(ops::EmptyResponseRecovery {
+            },
+            steer: None,
+            length: ops::LengthContinuation::new(state.clone(), &budget),
+            empty: ops::EmptyResponseRecovery {
                 state: state.clone(),
-            })),
-            Step::Operation(Arc::new(ops::ExitOnError)),
-            Step::Inference(Arc::new(
-                InferenceRunner::new(
-                    model.provider.provider_with(budget.http_retries)?,
-                    model_config,
-                )
-                .with_empty_response_retries(budget.empty_response_retries),
-            )),
-        ];
-        let machine = StateMachine::new(steps, cancel);
-        let result = machine.run(&runtime, "curator", &emit).await;
-        drop(machine);
+            },
+            compress: None,
+            inference: InferenceRunner::new(
+                model.provider.provider_with(budget.http_retries)?,
+                model_config,
+            )
+            .with_empty_response_retries(budget.empty_response_retries),
+            cancel,
+        };
+        let result = agent.run(&runtime, &emit).await;
+        drop(agent);
         drop(emit);
         let _ = drain.await;
         tools.shutdown().await;

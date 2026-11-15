@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 publish.workspace = true
 license.workspace = true
-description = "Agent state machine, operations, skills discovery and compaction (adapted from goose-agent and goose-context-management)"
+description = "Agent steps (inference, tools), operations, skills discovery and compaction (adapted from goose-agent and goose-context-management)"
 
 [lints]
 workspace = true

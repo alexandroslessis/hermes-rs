@@ -11,9 +11,8 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use async_trait::async_trait;
 use hermes_agent::events::AgentEvent;
-use hermes_agent::operation::{Emitter, Operation, OperationResult, applied, not_applicable};
+use hermes_agent::operation::Emitter;
 use hermes_llm::base::Provider;
 use hermes_llm::conversation::Conversation;
 use hermes_llm::conversation::message::{Message, MessageContent};
@@ -23,6 +22,7 @@ use hermes_tools::redact::{Source, redact};
 use rmcp::model::{CallToolResult, ContentBlock, Role};
 use serde_json::Value;
 
+use crate::agent_loop::{Checked, proceed};
 use crate::budget::{BudgetKnobs, CompressAt};
 use crate::ops::SharedTurnState;
 use crate::session::{HermesEffect, TurnSession};
@@ -1071,18 +1071,13 @@ impl Summarizer {
     }
 }
 
-#[async_trait]
-impl Operation<TurnSession, HermesEffect> for AutoCompress {
-    fn name(&self) -> &'static str {
-        "compress"
-    }
-
-    async fn run(
+impl AutoCompress {
+    pub async fn check(
         &self,
         session: &TurnSession,
         conversation: &Conversation,
         emit: &Emitter,
-    ) -> Result<OperationResult<HermesEffect>> {
+    ) -> Checked {
         // Only right before a model call: the last message the model sees is from the user side.
         let next_is_inference = conversation
             .messages()
@@ -1097,7 +1092,7 @@ impl Operation<TurnSession, HermesEffect> for AutoCompress {
                 || state.compression_failed
                 || state.compacted_at == Some(conversation.len())
             {
-                return not_applicable();
+                return Ok(None);
             }
         }
         let bound_summarizer = self
@@ -1115,7 +1110,7 @@ impl Operation<TurnSession, HermesEffect> for AutoCompress {
             tokens = tokens.max(fixed + estimate_messages(conversation.messages()));
         }
         if tokens < budget.threshold {
-            return not_applicable();
+            return Ok(None);
         }
         tracing::info!(tokens, threshold = budget.threshold, "compressing context");
         emit.emit(AgentEvent::Compacting);
@@ -1130,18 +1125,18 @@ impl Operation<TurnSession, HermesEffect> for AutoCompress {
             Ok(None) => {
                 self.state.lock().compacted_at = Some(conversation.len());
                 emit.emit(AgentEvent::CompactionFailed(None));
-                return not_applicable();
+                return Ok(None);
             }
             Err(error) => {
                 tracing::warn!("context compression failed: {error:#}");
                 self.state.lock().compression_failed = true;
                 emit.emit(AgentEvent::CompactionFailed(Some(format!("{error:#}"))));
-                return not_applicable();
+                return Ok(None);
             }
         };
         self.state.lock().compacted_at = Some(compacted.conversation.len());
         let system_prompt = (self.rebuild_prompt)().ok();
-        applied([HermesEffect::Compacted {
+        proceed([HermesEffect::Compacted {
             conversation: compacted.conversation,
             system_prompt,
             notice: compacted.notice,

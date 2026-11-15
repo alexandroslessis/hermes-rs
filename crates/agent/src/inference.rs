@@ -21,10 +21,9 @@ use crate::events::AgentEvent;
 use crate::fallback::{
     switch_notice, Bound, ChainRun, FallbackChain, FallbackTarget, Pending,
 };
-use crate::machine::MachineSession;
 use crate::operation::{
     applied, messages_since_kickoff, not_applicable, trailing_error, Emitter, Inference,
-    InferenceInput, Operation, OperationResult, CLIENT_LOG,
+    InferenceInput, MachineSession, Operation, OperationResult, CLIENT_LOG,
 };
 use hermes_llm::maybe_send::{MaybeSend, MaybeSync};
 

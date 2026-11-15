@@ -1,6 +1,7 @@
 //! The agent runtime the desktop app talks to: create and open sessions, start a turn and
 //! receive its events, cancel it, list a provider's models.
 
+pub mod agent_loop;
 pub mod budget;
 pub mod changes;
 mod commands;
@@ -36,7 +37,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context as _, Result};
 use hermes_agent::events::AgentEvent;
 use hermes_agent::inference::InferenceRunner;
-use hermes_agent::machine::{StateMachine, Step};
 use hermes_agent::operation::Emitter;
 use hermes_agent::tool::{ToolOperation, ToolProvider};
 use hermes_llm::api_client::{ApiClient, AuthMethod};
@@ -65,7 +65,7 @@ pub use hermes_tools::{
 pub const COMMAND_NOTE: &str = "command";
 
 pub use ops::{EMPTY_TERMINAL_MESSAGE, SUMMARY_REQUEST, TRUNCATED_MESSAGE};
-use session::{HermesEffect, OpenSession, TurnRuntime, TurnSession};
+use session::{OpenSession, TurnRuntime, TurnSession};
 
 /// An OpenAI-compatible endpoint, e.g. OpenRouter at `https://openrouter.ai/api/v1`.
 #[derive(Debug, Clone)]
@@ -1697,52 +1697,43 @@ impl Runtime {
             if let Some(params) = effort_params {
                 model_config = model_config.with_merged_request_params(params);
             }
-            let steps: Vec<Step<'_, TurnSession, HermesEffect>> = vec![
-                Step::Operation(Arc::new(ops::FrozenPrompt)),
-                Step::Operation(Arc::new(ops::IterationBudget {
+            let agent = agent_loop::AgentLoop {
+                budget: ops::IterationBudget {
                     state: state.clone(),
                     max_iterations: budget.max_iterations,
-                })),
-                Step::Operation(Arc::new(ops::ValidateToolCalls::new(
-                    state.clone(),
-                    tool_names.clone(),
-                    &budget,
-                ))),
-                Step::Operation(Arc::new(ToolOperation::new().with_provider(tools))),
-                Step::Operation(Arc::new(ops::UnhandledToolCalls {
+                },
+                validate: ops::ValidateToolCalls::new(state.clone(), tool_names.clone(), &budget),
+                tools: ToolOperation::new().with_provider(tools),
+                unhandled: ops::UnhandledToolCalls {
                     tool_names: unhandled_names,
                     disabled: disabled.clone(),
                     deferred: Some(deferral),
-                })),
-                Step::Operation(Arc::new(ops::DeliverSteer {
+                },
+                steer: Some(ops::DeliverSteer {
                     state: state.clone(),
-                })),
-                Step::Operation(Arc::new(ops::LengthContinuation::new(
-                    state.clone(),
-                    &budget,
-                ))),
-                Step::Operation(Arc::new(ops::EmptyResponseRecovery {
+                }),
+                length: ops::LengthContinuation::new(state.clone(), &budget),
+                empty: ops::EmptyResponseRecovery {
                     state: state.clone(),
-                })),
-                Step::Operation(Arc::new(ops::ExitOnError)),
-                Step::Operation(Arc::new(compress::AutoCompress {
+                },
+                compress: Some(compress::AutoCompress {
                     state: state.clone(),
                     summarizer: summarizer.clone(),
                     rebuild_prompt,
                     fallback: fallback_shared,
-                })),
-                Step::Inference(Arc::new({
+                }),
+                inference: {
                     let runner = InferenceRunner::new(llm, model_config)
                         .with_empty_response_retries(budget.empty_response_retries);
                     match fallback_chain {
                         Some(chain) => runner.with_fallback(chain),
                         None => runner,
                     }
-                })),
-            ];
-            let machine = StateMachine::new(steps, turn_cancel.clone());
-            let result = machine.run(&runtime, &session_id, &emit).await;
-            drop(machine);
+                },
+                cancel: turn_cancel.clone(),
+            };
+            let result = agent.run(&runtime, &emit).await;
+            drop(agent);
             drop(emit);
             let _ = forward.await;
             // The turn boundary: everything it queued is committed while it still holds the

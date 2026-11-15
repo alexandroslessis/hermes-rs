@@ -1,5 +1,5 @@
-//! Open sessions: the live conversation, its tools, and how state-machine effects are applied
-//! to memory, the database and the event stream.
+//! Open sessions: the live conversation, its tools, and how the agent loop's effects
+//! (`agent_loop.rs`) are applied to memory, the database and the event stream.
 //!
 //! Effects reach the database through the store's writer (Phase 13 CP13b): `apply_effects`
 //! queues each write ([`Store::queue`]) and goes on; the writer commits them in batches. A
@@ -9,11 +9,9 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use async_trait::async_trait;
 use hermes_agent::events::AgentEvent;
 use hermes_agent::inference::InferenceEffect;
-use hermes_agent::machine::{EffectHandler, MachineSession, SessionLoader};
-use hermes_agent::operation::{ConversationEffect, Emitter, MachineEffect};
+use hermes_agent::operation::{ConversationEffect, Emitter, MachineEffect, MachineSession};
 use hermes_llm::conversation::Conversation;
 use hermes_llm::conversation::message::{Message, MessageContent};
 use hermes_llm::conversation::token_usage::ProviderUsage;
@@ -67,7 +65,7 @@ impl InferenceEffect for HermesEffect {
     }
 }
 
-/// What one state-machine pass sees: a snapshot of the conversation plus the frozen prompt.
+/// What one pass of the agent loop sees: a snapshot of the conversation plus the frozen prompt.
 pub struct TurnSession {
     pub id: String,
     pub system_prompt: String,
@@ -261,7 +259,7 @@ impl OpenSession {
     }
 }
 
-/// Bridges one open session to the state machine: loads snapshots, applies effects.
+/// Bridges one open session to the agent loop (`agent_loop.rs`): loads snapshots, applies effects.
 pub struct TurnRuntime {
     pub session: Arc<OpenSession>,
     pub store: Arc<Store>,
@@ -353,23 +351,17 @@ impl TurnRuntime {
     }
 }
 
-#[async_trait]
-impl SessionLoader<TurnSession> for TurnRuntime {
-    async fn load(&self, _session_id: &str) -> Result<TurnSession> {
+impl TurnRuntime {
+    /// What the next pass of the agent loop sees: a snapshot of the session, with the one-shot
+    /// output cap a retry asked for (taken: the pass after it no longer has it).
+    pub fn load(&self) -> TurnSession {
         let mut session = self.session.snapshot();
         session.max_tokens = self.state.lock().max_tokens.take();
-        Ok(session)
+        session
     }
-}
 
-#[async_trait]
-impl EffectHandler<TurnSession, HermesEffect> for TurnRuntime {
-    async fn apply_effects(
-        &self,
-        _session: &TurnSession,
-        effects: &mut [HermesEffect],
-        emit: &Emitter,
-    ) -> Result<()> {
+    /// Applies one pass's effects in order: memory, the store's queue, the event stream.
+    pub fn apply_effects(&self, effects: &mut [HermesEffect], emit: &Emitter) -> Result<()> {
         for effect in effects.iter_mut() {
             effect.ensure_message_ids();
             match effect {
@@ -510,6 +502,7 @@ fn merge_json(target: &mut serde_json::Value, patch: &serde_json::Value) {
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
+    use async_trait::async_trait;
     use hermes_store::NewSession;
     use hermes_tools::{
         ClarifyOutcome, ClarifyRequest, ProcessNotice, SessionToolsConfig, UserBridge,

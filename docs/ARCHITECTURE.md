@@ -40,8 +40,8 @@ it calls into. Everything runs in one process.
 | Crate | Package | Role | Notes |
 |---|---|---|---|
 | `crates/desktop` | `hermes-desktop` | The app: Tauri window, axum server, the protocol layer | The main app. Most feature work lands here. |
-| `crates/runtime` | `hermes_runtime` | Sessions and turns over the agent: `Runtime` | `lib.rs` (API), `session.rs`, `session_actor.rs` (each session's actor: run slot, review slot, the page's state; Phase 13d), `ops.rs` (per-turn tool guards), `delegate.rs` + `subagents.rs`, `compress.rs`, `review.rs` (background review), `signals.rs` (learning signals: what each turn says is worth learning, scored locally into `signals/<id>.json`), `skill_outcomes.rs` (how the turns a skill was used in went, into `.usage.json`), `review_once.rs` (the evidence review: one request with a packet of signals, skills and memory; a JSON reply validated and applied or staged), `review_schedule.rs` (when it runs: per-session idle timers, switched-away/closed, one review at a time, back-off, hourly cap), `curator.rs` + `curator/` (the curator: the agent loop of `balanced`, and per-cluster proposals under `requests`), `mcp.rs`, `commands.rs` (`/diff`, `/usage`…), `guards.rs`, `changes.rs` |
-| `crates/agent` | `hermes_agent` | The agent state machine (from Goose): stream a reply, run tool calls, repeat | `events.rs` has `AgentEvent` |
+| `crates/runtime` | `hermes_runtime` | Sessions and turns over the agent: `Runtime` | `lib.rs` (API), `session.rs`, `session_actor.rs` (each session's actor: run slot, review slot, the page's state; Phase 13d), `agent_loop.rs` (the agent loop: passes over the checks, Stop, `Next`; Phase 13e), `ops.rs` (the loop's checks: retry and continuation rules, per-turn tool guards), `delegate.rs` + `subagents.rs`, `compress.rs`, `review.rs` (background review), `signals.rs` (learning signals: what each turn says is worth learning, scored locally into `signals/<id>.json`), `skill_outcomes.rs` (how the turns a skill was used in went, into `.usage.json`), `review_once.rs` (the evidence review: one request with a packet of signals, skills and memory; a JSON reply validated and applied or staged), `review_schedule.rs` (when it runs: per-session idle timers, switched-away/closed, one review at a time, back-off, hourly cap), `curator.rs` + `curator/` (the curator: the agent loop of `balanced`, and per-cluster proposals under `requests`), `mcp.rs`, `commands.rs` (`/diff`, `/usage`…), `guards.rs`, `changes.rs` |
+| `crates/agent` | `hermes_agent` | The agent's steps (from Goose): stream a reply (`inference.rs`, with the fallback chain), run tool calls (`tool.rs`); the loop that drives them is the runtime's `agent_loop.rs` since Phase 13e | `events.rs` has `AgentEvent` |
 | `crates/llm` | `hermes_llm` | Messages, the OpenAI-compatible provider, retries (from Goose) | `conversation::message::{Message, MessageContent}`; `observer.rs` is where every model POST is reported (purpose, session, provider) to the request ledger |
 | `crates/tools` | `hermes_tools` | Every agent tool + `SessionTools` (the per-session tool set) | One module per tool family; `paths.rs` resolves paths; `path_policy.rs` classifies where file edits and terminal commands may go (workspace, app data, skills/memory, persistence places, outside); `approval.rs` the dangerous-command check; `script.rs` + `script_guard.rs` the `run_script` tool (a script in PowerShell, Python through uv, or bash, run from a per-run scratch folder; `script_guard` reads the whole script for the approval, see PITFALLS.md "run_script"); `taint.rs` what the session has read that the user didn't write (see Taint in PITFALLS.md); `staging.rs` the writes a tainted session's `memory` / `skill_manage` calls leave for the user (`staging/<id>.json`, applied through the stores' own write paths); `index.rs` the local FTS5 index (`index.db`) over skills and memory, kept fresh by write hooks on `SkillStore` / `MemoryStore` |
 | `crates/memory` | `hermes_memory` | The memory store and tool (`§`-separated entries, char limits, drift guard) | `store.rs` (the API every caller uses), `tool.rs`, `threats.rs`; since Phase 9: `db.rs` (`memory.db`: entries with tier/scope/kind/links; the agent's removals kept as marked rows, the user's erased), `tiers.rs` (CP9.2: the `project` tier per git root and the `archive` tier, tags/links/notes validation, the project block of the system prompt, `mutate_tier`), `notes.rs` (long-form notes in `memories/notes/`), `similar.rs` (dedupe on add), `retrieval.rs` (CP9.3: what the index, the map and the curator read: indexable rows, the generation, batched hits, hygiene candidates, `demote_core`) and `sync.rs` (the files as the exported view of the database: migration with a backup copy, re-import of manual edits, the write step under the database's lock, fallback to the files alone) |
@@ -191,8 +191,8 @@ Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`
    prompt once per session (`hermes_prompts`, kept for caching), builds `SessionTools` minus
    disabled toolsets, wraps them in the per-turn ops (`ops.rs`: `GuardedTools` checks paths,
    approvals and disabled tools; `UnhandledToolCalls` answers unknown/disabled tool names;
-   `DeliverSteer` injects `/steer` text), and runs the Goose agent loop on a task. Returns a
-   `Turn` with an `events` channel and a cancel handle.
+   `DeliverSteer` injects `/steer` text), and runs the agent loop (`agent_loop.rs`, below) on a
+   task. Returns a `Turn` with an `events` channel and a cancel handle.
 4. The agent streams from `hermes_llm`'s OpenAI-compatible provider, runs tool calls
    (`hermes_tools`), queues each message for the store's writer (committed in ~5 ms batches, and
    flushed before `TurnFinished`), and emits `AgentEvent`s.
@@ -226,7 +226,7 @@ copy of the list is a shallow copy; C++: a `vector<shared_ptr<const Message>>`).
 conversation of an `OpenSession` (`conversation: Mutex<Conversation>`) and everything derived from it
 share the same messages:
 
-- `OpenSession::snapshot()` (what each state-machine pass sees), a review's or the compressor's view,
+- `OpenSession::snapshot()` (what each pass of the agent loop sees), a review's or the compressor's view,
   `HistoryReplaced` events and `Conversation::clone()` copy pointers only.
 - Changing a message goes through `Arc::make_mut`: copy-on-write. `Conversation::push` (a streamed
   chunk merging into the last message), `TurnRuntime::update_message`, `ConversationEffect::
@@ -304,6 +304,34 @@ one at a time in the order sent:
   one-thread runtime). A stopped actor or a panicking handler answers `Gone`, never hangs.
 - Lifecycle: started on first use (no IO), kept across a close or a workspace move, removed on delete; it ends when
   its last handle (a turn or a review still ending) lets go. Rules for new code: PITFALLS "The session actor".
+
+### The agent loop (Phase 13e)
+
+`crates/runtime/src/agent_loop.rs` runs a turn, a `delegate_task` child, the agentic review and the curator.
+It replaced Goose's `StateMachine` (a `Vec` of `Step` trait objects) with the same rules written out; Python:
+a `while True:` over a fixed list of `if`s.
+
+- **Passes.** Each pass takes a snapshot (`TurnRuntime::load`, which also takes a one-shot output cap a retry
+  set), then asks the checks in a fixed order; the first that acts ends the pass, its effects are applied
+  (`TurnRuntime::apply_effects`: memory, the store's queue, events), and its `Next` decides:
+  `Continue` / `Retry(reason)` start another pass, `Done` ends the run; a pass where nothing acts ends it too.
+  Order: iteration budget, validate tool calls, run tools, unanswered calls, `/steer`, length continuation,
+  empty response, provider error, compression, inference (`AgentLoop::check`). One pass is one action, and
+  every pass starts again at the top (after tools ran the budget is asked before the next request).
+- **Checks** are plain methods (`ops.rs`, `AutoCompress::check` in `compress.rs`) returning
+  `Checked = Result<Option<Outcome>>`: `None` = nothing to do here; else effects plus `Next`. `Reason` names
+  every retry rule (`TruncatedToolCall`, `InvalidToolName`, `InvalidJson`, `LengthContinuation`,
+  `EmptyAfterTools`, `ThinkingOnly`, `IterationLimit`, `EmptySummary`...); counters live in `TurnState`.
+  The agent crate's `ToolOperation` and `InferenceRunner` keep their Goose `Operation` / `Inference` traits; the
+  loop maps their result (`Applied` + `Continuing` -> `Continue`). The inference step's own empty-reply retries
+  and the fallback chain stay inside `InferenceRunner` (one model call's business).
+- **Stop.** The token is checked before each check, and each check is raced against Stop with `biased`
+  priority for the check: one that finishes in the poll that sees Stop keeps its result (tools rely on it), one
+  still waiting is dropped. `finalize` then saves the interrupted step's leftovers (the inference step's
+  streamed text and usage), answers the turn's unanswered tool calls ("Tool call was interrupted before
+  completing"), then the other steps' leftovers. An error from a check ends the run without that, unless Stop
+  came first.
+- A review and the curator have no `/steer` and no compression (`steer: None`, `compress: None`), as before.
 
 ## Settings and data
 
@@ -591,7 +619,7 @@ provider of the chain may take it.
 **Context length is checked before switching.** Per target, `fit_limit` is the compression threshold of its
 window (`Budget::with_compress_at`); the runner estimates the request (`FallbackGate::estimate`, chars / 4).
 If it does not fit, the runner asks for compression once per target and turn: it records a `Pending` and returns
-an empty `applied`, the machine loops, and `AutoCompress` (which reads `FallbackShared`) compresses for that
+an empty `applied` (`Next::Continue`), the agent loop starts another pass, and `AutoCompress` (which reads `FallbackShared`) compresses for that
 window, writing the summary on the target's provider instead of the session's (an auxiliary compression model
 keeps its own provider, with the target behind it in place of the session model); then the runner re-checks. Still too big: the target is skipped, never sent an over-limit request.
 Compression is the one allowed exception to prompt caching. A target with an unknown window is not checked.

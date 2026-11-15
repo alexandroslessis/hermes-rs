@@ -27,6 +27,22 @@ pub type OperationStream<'a, T> = Pin<Box<dyn Stream<Item = T> + 'a>>;
 
 pub const CLIENT_LOG: &str = "client_log";
 
+/// What an inference step reads from the session it runs in. hermes-rs: kept from Goose's
+/// `machine.rs` when the `StateMachine` was replaced by the runtime's explicit loop
+/// (`crates/runtime/src/agent_loop.rs`, Phase 13 CP13e).
+pub trait MachineSession: MaybeSend + MaybeSync {
+    fn id(&self) -> &str;
+    fn conversation(&self) -> Option<&Conversation>;
+    fn thinking_effort(&self) -> Option<hermes_llm::thinking::ThinkingEffort> {
+        None
+    }
+    /// hermes-rs: a one-shot output cap for the next request (Hermes boosts `max_tokens` when
+    /// retrying a tool call the output limit cut off).
+    fn max_tokens_override(&self) -> Option<i32> {
+        None
+    }
+}
+
 pub struct SlashCommand<'a> {
     pub command: &'a str,
     pub params_str: &'a str,

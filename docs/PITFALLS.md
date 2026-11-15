@@ -1304,7 +1304,7 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 
 - **Change a message through `Arc::make_mut`, never by assigning through the list.** `messages_mut()` gives
   `&mut Vec<Arc<Message>>`: `Arc::make_mut(&mut messages[i]).metadata... = ..` copies the message when a snapshot
-  (the state machine's `TurnSession`, a review's view, a `HistoryReplaced` event) still holds it, and edits it in
+  (the agent loop's `TurnSession`, a review's view, a `HistoryReplaced` event) still holds it, and edits it in
   place otherwise. `session::tests::a_snapshot_shares_the_messages_and_does_not_see_later_changes` is the
   contract.
 - **`make_mut` on a message you just cloned an `Arc` of copies it.** `TurnRuntime::append` hands an `Arc` clone of
@@ -1385,8 +1385,8 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   `self: &Arc<Self>`. In a REST route use `Gateway::rest_blocking`: a failed thread answers 500, never `None` (that
   is the 404 "No such API endpoint" the page reads as "feature absent"). What is left on the workers is listed in the CP13c table of
   `docs/backend/progress/phase-13.md` (single-file reads of the small settings files, `is_file` stats).
-- **After Stop, a tool call must finish without waiting.** The machine races a step against Stop with `biased` priority for
-  the call (`agent/machine.rs`): when Stop fires, the call is polled once more and, if it still has an `.await` to
+- **After Stop, a tool call must finish without waiting.** The agent loop races a check against Stop with `biased` priority for
+  the call (`runtime/agent_loop.rs`, `AgentLoop::pass`; `agent/machine.rs` before Phase 13e): when Stop fires, the call is polled once more and, if it still has an `.await` to
   get through (a `spawn_blocking` hop), it is dropped and the chat gets "Tool call was interrupted before completing"
   instead of the output a stopped command had printed (`stopping_mid_command_keeps_the_output_it_had_printed` caught
   this when the hints and checkpoint follow-ups of `SessionTools::call` first became `spawn_blocking`). So follow-up
@@ -1462,3 +1462,34 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   when the thread ends, re-entrancy, lifecycle, the one-thread runtime, the run slot and Stop's priority path, the
   review pause and the review pair raced 300 times, the page state). A test that needs an `OpenSession` uses
   `session::testing::open_session`.
+
+## The agent loop (Phase 13e, `crates/runtime/src/agent_loop.rs`)
+
+- **One pass, one action, and every pass starts at the top.** The checks are asked in a fixed order
+  (budget, validate, tools, unanswered calls, `/steer`, length, empty, provider error, compression, inference) and the
+  first that acts ends the pass. Do not "fall through" to the next check after one acted, or skip back to the middle:
+  after tools ran the iteration budget must be asked again before the next request, a repaired tool call is
+  re-validated against a fresh snapshot, and so on. A new rule is a new check in `PASS` (and in `AgentLoop::check`)
+  at the place its condition must be judged, returning `Ok(None)` when it has nothing to do.
+- **`Some(Outcome)` with no effects is not `None`.** `ValidateToolCalls` returns `Retry(InvalidToolName)` with no
+  effects to end the pass so that `UnhandledToolCalls` answers the invented names in the next one; turning that into
+  `None` would let tools / unhandled run in the same pass with the old snapshot.
+- **Each pass loads a fresh snapshot, and `load` takes the one-shot output cap** (`TurnState::max_tokens`, set by the
+  truncated-tool-call retry). A pass that does something else first (a compression) consumes it; that is how it has
+  always been: keep it, or the request bytes change.
+- **Counters live in `TurnState`, not in message metadata.** The one note on a message the loop reads is the inference
+  step's empty-response marker (`operations.inference.empty_response` on a hidden assistant row); it is stored in
+  `sessions.db`, so do not drop or rename it. Other operation notes (`preinject`, `compress`, `command`, `references`,
+  `foreground_subagent`) are data other code reads (search, transcripts, compaction), not loop plumbing.
+- **Stop**: see "After Stop, a tool call must finish without waiting" (Phase 13c section). A check that finishes in the
+  poll that sees Stop keeps its effects (they are applied), the pass ends as cancelled, and `finalize` runs; a check
+  still waiting is dropped and named as the interrupted one, whose leftovers (`finalize_cancellation`: the inference
+  step's streamed text and usage) are saved first. An error from a check after Stop is a Stop, not a failure.
+- **Tool names are unique in a request.** `ToolOperation::available_tools` refuses a name two providers (or one provider
+  twice) offer ("multiple tool providers registered 'x'"); Goose's machine had a second check across its steps, gone
+  with them. Keep the one in `tool.rs` (`a_tool_name_offered_twice_is_refused`): a provider rejects a duplicated tool.
+- **Tests**: `agent_loop_tests.rs` checks each rule's `Next` at its boundary under the three profiles' knobs, and its
+  `whole_loop` module the pass order and Stop over a real `TurnRuntime`; the turn
+  behaviour is `turns.rs` (unchanged by CP13e). A change to the loop should be compared with a golden trace (every
+  request body, agent event and queued store write per test, before and after): the method is in
+  `docs/backend/progress/phase-13.md`, CP13e.

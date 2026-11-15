@@ -50,7 +50,7 @@ For another OpenAI-compatible server set `HERMES_BASE_URL` (e.g. `http://localho
 | `crates/tools` | Agent tools: terminal, background processes, files, patch, search, todo, clarify |
 | `crates/prompts` | System-prompt builder and tool schemas (`prompts/tools`) |
 | `crates/store` | SQLite sessions, messages, usage |
-| `crates/agent` | Agent state machine, skills discovery, compaction (from Goose) |
+| `crates/agent` | Agent steps (streaming a reply, running tool calls), skills discovery, compaction (from Goose); the loop is `crates/runtime/src/agent_loop.rs` |
 | `crates/llm` | Messages, OpenAI-compatible provider, model catalog and discovery (from Goose) |
 | `vendor/zed` | GPUI, `ui`, `theme` and support crates copied from Zed (`scripts/vendor_zed.py`) |
 | `HERMES_COMMIT` | The Hermes commit this tree ports ([PORTING.md](PORTING.md)) |

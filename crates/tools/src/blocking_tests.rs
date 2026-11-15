@@ -161,7 +161,7 @@ async fn the_skill_tools_do_not_block_the_worker() {
     assert!(!output.is_error, "{}", output.value);
 }
 
-/// The turn's step as `agent/machine.rs` races it: Stop wins only when the call is still waiting.
+/// The turn's step as `runtime/agent_loop.rs` races it: Stop wins only when the call is still waiting.
 async fn raced_against_stop<T>(
     call: impl Future<Output = T>,
     cancel: &tokio_util::sync::CancellationToken,

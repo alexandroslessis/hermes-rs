@@ -38,7 +38,13 @@ Not from Hermes, so not in the map:
   agent loop); see `THIRD_PARTY_NOTICES.md`. **Diverged from Goose** (Phase 13a): `Conversation` holds
   `Arc<Message>` (snapshots and request projections share messages; the repair passes of
   `fix_conversation`, `Provider::stream` and `Conversation::{messages, pop, remove}` changed types
-  accordingly). A Goose update must not re-port those signatures.
+  accordingly). A Goose update must not re-port those signatures. **Diverged from Goose** (Phase 13e):
+  Goose's `StateMachine` (`agents/state_machine/machine.rs`, our `crates/agent/src/machine.rs`) is
+  gone; `crates/runtime/src/agent_loop.rs` runs the same passes, Stop race and cancellation finalize as
+  a plain loop, and the runtime's checks (`ops.rs`, `AutoCompress`) are plain methods returning
+  `Next::{Continue, Retry(reason), Done}` instead of Goose `Operation`s. `MachineSession` moved to
+  `operation.rs`; `ToolOperation` and `InferenceRunner` keep Goose's `Operation` / `Inference` traits.
+  A Goose update must not bring the state machine back.
 - `crates/app`, `crates/themes`, `crates/highlight`, `crates/markdown`, `vendor/zed`: the GPUI app
   and Zed's UI code. The GPUI app is frozen (kept as a fallback, no new features).
 
@@ -82,7 +88,7 @@ A row marked `diverged` is backend behaviour we deliberately changed (AGENTS.md 
 | `staging.rs` | **diverged**: not from Hermes. `staging.list` / `staging.apply` / `staging.reject` and `GET/POST /api/staging*`: the writes a tainted session's agent left for the user to review. Ours, outside Hermes's contract (the Memory and Skills screens call them through patches 0024-0026); the logic is `hermes_tools::staging` |
 | **Runtime** (`crates/runtime`) | |
 | `commands.rs` | `hermes_cli/cli_commands_mixin.py`, `tools/working_diff.py` |
-| `compress.rs`, `ops.rs` | `agent/context_compressor.py`, `agent/turn_tool_validation.py`, `tools/budget_config.py`. **`Summarizer.fallback` diverged** (Phase 4 CP4.2): Hermes's compressor has `summary_model_fallback` only on a model-not-found error; here a failed summary from the auxiliary compression model (server down, error, empty reply) is retried once on the session's own model, and the aux provider itself retries at most once (`summarizer_for`) within a 300 s deadline (`AUX_SUMMARY_DEADLINE`; Hermes: 120 s idle / 600 s total, `agent/conversation_compression_deadline.py`) |
+| `compress.rs`, `ops.rs` | `agent/context_compressor.py`, `agent/turn_tool_validation.py`, `tools/budget_config.py`. **Plumbing diverged** (Phase 13e): Hermes's rules are kept as they were, but each is a plain check in `agent_loop.rs`'s pass returning `Next` (with a `Reason` per retry), not a Goose `Operation`; the loop is ours (`agent_loop.rs`, not from Hermes or Goose). **`Summarizer.fallback` diverged** (Phase 4 CP4.2): Hermes's compressor has `summary_model_fallback` only on a model-not-found error; here a failed summary from the auxiliary compression model (server down, error, empty reply) is retried once on the session's own model, and the aux provider itself retries at most once (`summarizer_for`) within a 300 s deadline (`AUX_SUMMARY_DEADLINE`; Hermes: 120 s idle / 600 s total, `agent/conversation_compression_deadline.py`) |
 | `guards.rs` | `agent/repetition_guard.py`, `agent/tool_guardrails.py` |
 | `review.rs` | `agent/background_review.py` |
 | `curator.rs` | `agent/curator.py` |

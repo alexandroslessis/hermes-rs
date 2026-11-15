@@ -140,7 +140,7 @@ via `~/.local/bin/uv.exe run --no-project ...` (`python` on PATH is the Microsof
 | `crates/memory/` | MEMORY.md / USER.md store and the memory tool |
 | `crates/store/` | SQLite: sessions, messages, usage, projects |
 | `crates/prompts/` + `prompts/` | Prompt text and tool schemas (`prompts/hermes/` is extracted from Hermes) |
-| `crates/llm`, `crates/agent` | From Goose: messages, OpenAI-compatible provider, the agent state machine |
+| `crates/llm`, `crates/agent` | From Goose: messages, OpenAI-compatible provider, the agent's inference and tool steps (the loop is `crates/runtime/src/agent_loop.rs`) |
 | `scripts/perf/` | Your instance (`perf.ps1`), mock providers, live checks (`*-check.mjs`), perf tools |
 | `target/hermes-src/` | Hermes exported at `HERMES_COMMIT` (+ patches): read the frontend source here |
 | `../hermes-agent` | The Hermes clone (read-only reference) |

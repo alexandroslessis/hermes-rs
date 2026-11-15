@@ -17,7 +17,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use hermes_agent::inference::InferenceRunner;
-use hermes_agent::machine::{StateMachine, Step};
 use hermes_agent::operation::Emitter;
 use hermes_agent::tool::{ToolOperation, ToolProvider};
 use hermes_llm::base::Provider;
@@ -29,7 +28,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::ops;
-use crate::session::{HermesEffect, OpenSession, ReviewHandle, TurnRuntime, TurnSession};
+use crate::session::{OpenSession, ReviewHandle, TurnRuntime, TurnSession};
 use crate::session_actor::{Command, SessionHandle};
 
 /// How often a paused review checks whether the turn that paused it has ended.
@@ -242,7 +241,6 @@ async fn review(job: ReviewJob) -> Result<(Vec<String>, Option<u64>)> {
         conversation,
         session.tools.clone(),
     ));
-    let session_id = fork.record.lock().id.clone();
     let state: ops::SharedTurnState = Arc::default();
     let runtime = TurnRuntime {
         session: fork.clone(),
@@ -272,36 +270,31 @@ async fn review(job: ReviewJob) -> Result<(Vec<String>, Option<u64>)> {
     if let Some(params) = effort_params {
         model_config = model_config.with_merged_request_params(params);
     }
-    let steps: Vec<Step<'_, TurnSession, HermesEffect>> = vec![
-        Step::Operation(Arc::new(ops::FrozenPrompt)),
-        Step::Operation(Arc::new(ops::IterationBudget {
+    // No `/steer` and no compression: a review never had them.
+    let agent = crate::agent_loop::AgentLoop {
+        budget: ops::IterationBudget {
             state: state.clone(),
             max_iterations: REVIEW_MAX_ITERATIONS,
-        })),
-        Step::Operation(Arc::new(ops::ValidateToolCalls::new(
-            state.clone(),
-            tool_names.clone(),
-            &budget,
-        ))),
-        Step::Operation(Arc::new(ToolOperation::new().with_provider(tools))),
-        Step::Operation(Arc::new(ops::UnhandledToolCalls {
+        },
+        validate: ops::ValidateToolCalls::new(state.clone(), tool_names.clone(), &budget),
+        tools: ToolOperation::new().with_provider(tools),
+        unhandled: ops::UnhandledToolCalls {
             tool_names,
             disabled: Default::default(),
             deferred: None,
-        })),
-        Step::Operation(Arc::new(ops::LengthContinuation::new(state.clone(), &budget))),
-        Step::Operation(Arc::new(ops::EmptyResponseRecovery {
+        },
+        steer: None,
+        length: ops::LengthContinuation::new(state.clone(), &budget),
+        empty: ops::EmptyResponseRecovery {
             state: state.clone(),
-        })),
-        Step::Operation(Arc::new(ops::ExitOnError)),
-        Step::Inference(Arc::new(
-            InferenceRunner::new(llm, model_config)
-                .with_empty_response_retries(budget.empty_response_retries),
-        )),
-    ];
-    let machine = StateMachine::new(steps, cancel.clone());
-    let result = machine.run(&runtime, &session_id, &emit).await;
-    drop(machine);
+        },
+        compress: None,
+        inference: InferenceRunner::new(llm, model_config)
+            .with_empty_response_retries(budget.empty_response_retries),
+        cancel: cancel.clone(),
+    };
+    let result = agent.run(&runtime, &emit).await;
+    drop(agent);
     drop(emit);
     let _ = drain.await;
     result?;

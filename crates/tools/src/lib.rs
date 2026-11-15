@@ -110,7 +110,7 @@ pub(crate) fn test_pause(session_id: &str) {
 /// write, a folder's context file, saving an over-long output), without losing the call's result
 /// to Stop.
 ///
-/// The turn's step is raced against Stop with priority for the call (`agent/machine.rs`): a call
+/// The turn's step is raced against Stop with priority for the call (`runtime/agent_loop.rs`): a call
 /// that is still waiting when Stop fires is dropped, and the chat shows "interrupted" instead of
 /// what a stopped command printed. So once `cancel` fires, nothing here waits asynchronously
 /// any more: work that has not started runs inline, as it always did before Phase 13, and work

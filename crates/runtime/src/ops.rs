@@ -1,10 +1,12 @@
-//! The operations a Hermes turn runs, in pipeline order. The plumbing is adapted from Goose's
-//! `goose/src/agents/state_machine/ops_*.rs` (Apache-2.0); the behavior is Hermes's turn loop
+//! The checks a Hermes turn runs, in pass order (the loop is `agent_loop.rs`). The plumbing was
+//! adapted from Goose's `goose/src/agents/state_machine/ops_*.rs` (Apache-2.0) and, since Phase 13
+//! CP13e, is our own: each check is a plain method returning [`Checked`] (`None`: nothing to do;
+//! else effects and a [`crate::agent_loop::Next`]). The behavior is Hermes's turn loop
 //! (`agent/turn_tool_validation.py`, `turn_truncation.py`, `turn_empty_response.py`,
-//! `iteration_budget.py`, `tool_guardrails.py`; MIT), one operation per behavior.
+//! `iteration_budget.py`, `tool_guardrails.py`; MIT), one check per behavior.
 //!
 //! Hermes keeps its retry counters on the agent object; here they live in [`TurnState`], shared
-//! by the operations of one turn. "Withdrawing" a model response (Hermes simply doesn't append
+//! by the checks of one turn. "Withdrawing" a model response (Hermes simply doesn't append
 //! it) hides the stored message from both the model and the user.
 
 use std::collections::HashSet;
@@ -13,10 +15,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use hermes_agent::inference::is_empty_response_marker;
-use hermes_agent::operation::{
-    Emitter, Operation, OperationResult, applied, assistant_turn_count, ends_turn,
-    messages_since_kickoff, not_applicable, yielded, yielded_with,
-};
+use hermes_agent::operation::{Emitter, assistant_turn_count, ends_turn, messages_since_kickoff};
 use hermes_agent::tool::ToolProvider;
 use hermes_llm::conversation::Conversation;
 use hermes_llm::conversation::message::{Message, MessageContent, ToolRequest};
@@ -24,6 +23,7 @@ use parking_lot::Mutex;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Role, Tool};
 use serde_json::Value;
 
+use crate::agent_loop::{Checked, Reason, done, proceed, retry};
 use crate::budget::BudgetKnobs;
 use crate::guards::{ToolGuardrails, classify_failure, is_repetition_dominated, repair_tool_name};
 use crate::session::{HermesEffect, TurnSession};
@@ -188,27 +188,6 @@ fn boosted_output_cap(current: Option<i32>, n: u32) -> i32 {
     (base.saturating_mul(1 << n.min(8))).min(32768.max(base * 2))
 }
 
-// ---- prompt -------------------------------------------------------------------------------------
-
-/// Contributes the session's frozen system prompt. It never changes mid-session, so the
-/// provider's prompt cache stays valid (Hermes's central invariant).
-pub struct FrozenPrompt;
-
-#[async_trait]
-impl Operation<TurnSession, HermesEffect> for FrozenPrompt {
-    fn name(&self) -> &'static str {
-        "prompt"
-    }
-
-    async fn prompt_parts(
-        &self,
-        session: &TurnSession,
-        _conversation: &Conversation,
-    ) -> Result<Vec<(String, String)>> {
-        Ok(vec![("system".into(), session.system_prompt.clone())])
-    }
-}
-
 // ---- iteration budget ---------------------------------------------------------------------------
 
 /// Hermes's iteration budget (`iteration_budget.py` + `handle_max_iterations`): after
@@ -218,33 +197,23 @@ pub struct IterationBudget {
     pub max_iterations: u32,
 }
 
-#[async_trait]
-impl Operation<TurnSession, HermesEffect> for IterationBudget {
-    fn name(&self) -> &'static str {
-        "iteration_budget"
-    }
-
-    async fn run(
-        &self,
-        _session: &TurnSession,
-        conversation: &Conversation,
-        emit: &Emitter,
-    ) -> Result<OperationResult<HermesEffect>> {
+impl IterationBudget {
+    pub fn check(&self, conversation: &Conversation, emit: &Emitter) -> Checked {
         let turn = messages_since_kickoff(conversation)?;
         if self.state.lock().summary_requested {
             let Some(last) = last_response(conversation) else {
-                return not_applicable();
+                return Ok(None);
             };
             if !visible_text(last).trim().is_empty() {
-                return yielded();
+                return done([]);
             }
             // One retry on an empty summary, then the canned copy.
             let mut state = self.state.lock();
             if !state.summary_retried {
                 state.summary_retried = true;
-                return applied([hidden(last)]);
+                return retry(Reason::EmptySummary, [hidden(last)]);
             }
-            return yielded_with([assistant_notice(
+            return done([assistant_notice(
                 &no_summary_message(self.max_iterations),
                 emit,
             )]);
@@ -258,14 +227,14 @@ impl Operation<TurnSession, HermesEffect> for IterationBudget {
             .is_some_and(|message| message.role == Role::User);
         if ends_turn(turn) || !next_is_inference || assistant_turn_count(turn) < self.max_iterations
         {
-            return not_applicable();
+            return Ok(None);
         }
         self.state.lock().summary_requested = true;
         tracing::warn!(
             "iteration budget exhausted ({}) — requesting a summary",
             self.max_iterations
         );
-        applied([nudge(SUMMARY_REQUEST, emit)])
+        retry(Reason::IterationLimit, [nudge(SUMMARY_REQUEST, emit)])
     }
 }
 
@@ -294,26 +263,16 @@ impl ValidateToolCalls {
     }
 }
 
-#[async_trait]
-impl Operation<TurnSession, HermesEffect> for ValidateToolCalls {
-    fn name(&self) -> &'static str {
-        "validate_tool_calls"
-    }
-
-    async fn run(
-        &self,
-        _session: &TurnSession,
-        conversation: &Conversation,
-        emit: &Emitter,
-    ) -> Result<OperationResult<HermesEffect>> {
+impl ValidateToolCalls {
+    pub fn check(&self, conversation: &Conversation, emit: &Emitter) -> Checked {
         let Some(last) = last_response(conversation) else {
-            return not_applicable();
+            return Ok(None);
         };
         let Some(id) = last.id.clone() else {
-            return not_applicable();
+            return Ok(None);
         };
         if tool_requests(last).next().is_none() || !self.state.lock().validated.insert(id) {
-            return not_applicable();
+            return Ok(None);
         }
         let mut state = self.state.lock();
 
@@ -324,10 +283,10 @@ impl Operation<TurnSession, HermesEffect> for ValidateToolCalls {
                 let n = state.truncated_tool_retries;
                 state.max_tokens = Some(boosted_output_cap(state.max_tokens, n));
                 tracing::warn!("truncated tool call — retrying ({n}/{})", self.truncated_tool_retries);
-                return applied([hidden(last)]);
+                return retry(Reason::TruncatedToolCall { attempt: n }, [hidden(last)]);
             }
             state.truncated_tool_retries = 0;
-            return yielded_with([hidden(last), assistant_notice(TRUNCATED_MESSAGE, emit)]);
+            return done([hidden(last), assistant_notice(TRUNCATED_MESSAGE, emit)]);
         }
         state.truncated_tool_retries = 0;
 
@@ -390,6 +349,7 @@ impl Operation<TurnSession, HermesEffect> for ValidateToolCalls {
         if !invalid_names.is_empty() && !any_valid {
             // Strikes only advance when a batch has no valid call at all.
             state.invalid_tool_retries += 1;
+            let strike = state.invalid_tool_retries;
             if state.invalid_tool_retries >= self.invalid_tool_retries {
                 state.invalid_tool_retries = 0;
                 let mut answers = Message::user();
@@ -416,10 +376,10 @@ impl Operation<TurnSession, HermesEffect> for ValidateToolCalls {
                     &format!("Model generated invalid tool call: {preview}"),
                     emit,
                 ));
-                return yielded_with(effects);
+                return done(effects);
             }
             // UnhandledToolCalls answers each invented name with the tool list.
-            return applied(effects);
+            return retry(Reason::InvalidToolName { strike }, effects);
         }
         state.invalid_tool_retries = 0;
 
@@ -435,16 +395,16 @@ impl Operation<TurnSession, HermesEffect> for ValidateToolCalls {
         if malformed.is_empty() {
             state.invalid_json_retries = 0;
             return if effects.is_empty() {
-                not_applicable()
+                Ok(None)
             } else {
-                applied(effects)
+                proceed(effects)
             };
         }
         if tool_requests(&repaired).any(
             |request| matches!(&request.tool_call, Err(error) if is_truncated_args_error(error)),
         ) {
             state.invalid_json_retries = 0;
-            return yielded_with([
+            return done([
                 hidden(&repaired),
                 assistant_notice(TRUNCATED_UNREPORTED_MESSAGE, emit),
             ]);
@@ -455,7 +415,12 @@ impl Operation<TurnSession, HermesEffect> for ValidateToolCalls {
                 "invalid JSON in tool call arguments — retrying ({}/{MAX_INVALID_JSON_RETRIES})",
                 state.invalid_json_retries
             );
-            return applied([hidden(&repaired)]);
+            return retry(
+                Reason::InvalidJson {
+                    attempt: state.invalid_json_retries,
+                },
+                [hidden(&repaired)],
+            );
         }
         // Third time: answer every call so the model can recover from the error itself.
         state.invalid_json_retries = 0;
@@ -474,7 +439,7 @@ impl Operation<TurnSession, HermesEffect> for ValidateToolCalls {
             );
         }
         effects.push(emit.message(answers).into());
-        applied(effects)
+        retry(Reason::InvalidJsonAnswered, effects)
     }
 }
 
@@ -489,18 +454,13 @@ pub struct UnhandledToolCalls {
     pub deferred: Option<Arc<crate::deferred::DeferredTools>>,
 }
 
-#[async_trait]
-impl Operation<TurnSession, HermesEffect> for UnhandledToolCalls {
-    fn name(&self) -> &'static str {
-        "unhandled_tool_calls"
-    }
-
-    async fn run(
+impl UnhandledToolCalls {
+    pub async fn check(
         &self,
         session: &TurnSession,
         conversation: &Conversation,
         emit: &Emitter,
-    ) -> Result<OperationResult<HermesEffect>> {
+    ) -> Checked {
         let turn = messages_since_kickoff(conversation)?;
         let answered: HashSet<&str> = turn
             .iter()
@@ -515,7 +475,7 @@ impl Operation<TurnSession, HermesEffect> for UnhandledToolCalls {
             })
             .collect();
         if unanswered.is_empty() {
-            return not_applicable();
+            return Ok(None);
         }
         let mut response = Message::user();
         for request in unanswered {
@@ -547,7 +507,7 @@ impl Operation<TurnSession, HermesEffect> for UnhandledToolCalls {
                 request.metadata.as_ref(),
             );
         }
-        applied([emit.message(response).into()])
+        proceed([emit.message(response).into()])
     }
 }
 
@@ -560,23 +520,13 @@ pub struct DeliverSteer {
     pub state: SharedTurnState,
 }
 
-#[async_trait]
-impl Operation<TurnSession, HermesEffect> for DeliverSteer {
-    fn name(&self) -> &'static str {
-        "steer"
-    }
-
-    async fn run(
-        &self,
-        _session: &TurnSession,
-        conversation: &Conversation,
-        emit: &Emitter,
-    ) -> Result<OperationResult<HermesEffect>> {
+impl DeliverSteer {
+    pub fn check(&self, conversation: &Conversation, emit: &Emitter) -> Checked {
         if !conversation.last().is_some_and(Message::is_tool_response) {
-            return not_applicable();
+            return Ok(None);
         }
         let Some(text) = self.state.lock().pending_steer.take() else {
-            return not_applicable();
+            return Ok(None);
         };
         tracing::info!(
             "delivering /steer after the tool batch ({} chars)",
@@ -588,7 +538,7 @@ impl Operation<TurnSession, HermesEffect> for DeliverSteer {
             hermes_prompts::text::STEER_MARKER_OPEN.trim_end(),
             hermes_prompts::text::STEER_MARKER_CLOSE
         );
-        applied([
+        proceed([
             emit.message(
                 Message::user()
                     .with_text(&text)
@@ -887,38 +837,28 @@ impl LengthContinuation {
     }
 }
 
-#[async_trait]
-impl Operation<TurnSession, HermesEffect> for LengthContinuation {
-    fn name(&self) -> &'static str {
-        "length_continuation"
-    }
-
-    async fn run(
-        &self,
-        _session: &TurnSession,
-        conversation: &Conversation,
-        emit: &Emitter,
-    ) -> Result<OperationResult<HermesEffect>> {
+impl LengthContinuation {
+    pub fn check(&self, conversation: &Conversation, emit: &Emitter) -> Checked {
         let Some(last) = conversation.last().filter(|message| {
             message.role == Role::Assistant
                 && message.metadata.output_token_limit_reached
                 && tool_requests(message).next().is_none()
         }) else {
-            return not_applicable();
+            return Ok(None);
         };
         let Some(id) = last.id.clone() else {
-            return not_applicable();
+            return Ok(None);
         };
         let mut state = self.state.lock();
         if state.length_trail.contains(&id) {
-            return not_applicable();
+            return Ok(None);
         }
         let text = visible_text(last);
         if is_repetition_dominated(&text) {
             tracing::warn!("response dominated by repeated text — not continuing it");
             state.length_trail.clear();
             state.length_continuations = 0;
-            return yielded_with([hidden(last), assistant_notice(REPETITION_MESSAGE, emit)]);
+            return done([hidden(last), assistant_notice(REPETITION_MESSAGE, emit)]);
         }
         let mut effects = Vec::new();
         if text.trim().is_empty() {
@@ -938,7 +878,7 @@ impl Operation<TurnSession, HermesEffect> for LengthContinuation {
                 .with_generated_id_if_missing();
             state.length_trail.extend(message.id.clone());
             effects.push(emit.message(message).into());
-            return applied(effects);
+            return retry(Reason::LengthContinuation { attempt: n }, effects);
         }
 
         // Ceiling: collapse the trail into one answer.
@@ -968,7 +908,7 @@ impl Operation<TurnSession, HermesEffect> for LengthContinuation {
             joined
         };
         effects.push(assistant_notice(&answer, emit));
-        yielded_with(effects)
+        done(effects)
     }
 }
 
@@ -981,21 +921,11 @@ pub struct EmptyResponseRecovery {
     pub state: SharedTurnState,
 }
 
-#[async_trait]
-impl Operation<TurnSession, HermesEffect> for EmptyResponseRecovery {
-    fn name(&self) -> &'static str {
-        "empty_response"
-    }
-
-    async fn run(
-        &self,
-        _session: &TurnSession,
-        conversation: &Conversation,
-        emit: &Emitter,
-    ) -> Result<OperationResult<HermesEffect>> {
+impl EmptyResponseRecovery {
+    pub fn check(&self, conversation: &Conversation, emit: &Emitter) -> Checked {
         let turn = messages_since_kickoff(conversation)?;
         let Some(last) = turn.last() else {
-            return not_applicable();
+            return Ok(None);
         };
         let marker = is_empty_response_marker(last) && !last.is_user_visible();
         let empty_reply = last.role == Role::Assistant
@@ -1005,7 +935,7 @@ impl Operation<TurnSession, HermesEffect> for EmptyResponseRecovery {
             && tool_requests(last).next().is_none()
             && visible_text(last).trim().is_empty();
         if !marker && !empty_reply {
-            return not_applicable();
+            return Ok(None);
         }
         let previous: Vec<&Arc<Message>> = turn[..turn.len() - 1]
             .iter()
@@ -1031,7 +961,7 @@ impl Operation<TurnSession, HermesEffect> for EmptyResponseRecovery {
                 });
             if beside.is_some() {
                 state.post_tool_nudged = false;
-                return yielded_with([hidden(last)]);
+                return done([hidden(last)]);
             }
         }
 
@@ -1041,10 +971,13 @@ impl Operation<TurnSession, HermesEffect> for EmptyResponseRecovery {
             tracing::info!("empty response after tool calls — nudging the model to continue");
             let mut placeholder = (**last).clone();
             placeholder.content = vec![MessageContent::text("(empty)")];
-            return applied([
-                HermesEffect::UpdateMessage(placeholder.with_visibility(false, true)),
-                nudge(EMPTY_AFTER_TOOLS_NUDGE, emit),
-            ]);
+            return retry(
+                Reason::EmptyAfterTools,
+                [
+                    HermesEffect::UpdateMessage(placeholder.with_visibility(false, true)),
+                    nudge(EMPTY_AFTER_TOOLS_NUDGE, emit),
+                ],
+            );
         }
 
         // Reasoning but no answer: ask for the answer.
@@ -1054,7 +987,12 @@ impl Operation<TurnSession, HermesEffect> for EmptyResponseRecovery {
                 "thinking-only response — asking for the answer ({}/{MAX_THINKING_PREFILLS})",
                 state.thinking_prefills
             );
-            return applied([nudge(THINKING_ONLY_NUDGE, emit)]);
+            return retry(
+                Reason::ThinkingOnly {
+                    attempt: state.thinking_prefills,
+                },
+                [nudge(THINKING_ONLY_NUDGE, emit)],
+            );
         }
 
         // Out of recoveries.
@@ -1063,30 +1001,16 @@ impl Operation<TurnSession, HermesEffect> for EmptyResponseRecovery {
             effects.push(hidden(last));
         }
         effects.push(assistant_notice(EMPTY_TERMINAL_MESSAGE, emit));
-        yielded_with(effects)
+        done(effects)
     }
 }
 
 /// Ends the turn when a provider error is the last message.
-pub struct ExitOnError;
-
-#[async_trait]
-impl Operation<TurnSession, HermesEffect> for ExitOnError {
-    fn name(&self) -> &'static str {
-        "exit_on_error"
+pub fn exit_on_error(conversation: &Conversation) -> Checked {
+    if conversation.last().and_then(Message::error_kind).is_some() {
+        return done([]);
     }
-
-    async fn run(
-        &self,
-        _session: &TurnSession,
-        conversation: &Conversation,
-        _emit: &Emitter,
-    ) -> Result<OperationResult<HermesEffect>> {
-        if conversation.last().and_then(Message::error_kind).is_some() {
-            return yielded();
-        }
-        not_applicable()
-    }
+    Ok(None)
 }
 
 #[cfg(test)]

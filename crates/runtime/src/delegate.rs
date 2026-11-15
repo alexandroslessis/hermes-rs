@@ -13,7 +13,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use hermes_agent::events::AgentEvent;
 use hermes_agent::inference::InferenceRunner;
-use hermes_agent::machine::{StateMachine, Step};
 use hermes_agent::operation::Emitter;
 use hermes_agent::tool::{ToolOperation, ToolProvider};
 use hermes_llm::base::Provider;
@@ -31,7 +30,7 @@ use tokio::sync::mpsc;
 
 use crate::compress;
 use crate::ops;
-use crate::session::{HermesEffect, OpenSession, TurnRuntime, TurnSession};
+use crate::session::{OpenSession, TurnRuntime, TurnSession};
 
 /// `DEFAULT_MAX_SUMMARY_CHARS`.
 const MAX_SUMMARY_CHARS: usize = 24_000;
@@ -638,50 +637,38 @@ impl Delegator {
             model_config = model_config.with_merged_request_params(params);
         }
         let child_prompt = child.record.lock().system_prompt.clone();
-        let steps: Vec<Step<'_, TurnSession, HermesEffect>> = vec![
-            Step::Operation(Arc::new(ops::FrozenPrompt)),
-            Step::Operation(Arc::new(ops::IterationBudget {
+        let agent = crate::agent_loop::AgentLoop {
+            budget: ops::IterationBudget {
                 state: state.clone(),
                 max_iterations: self.budget.delegate_child_iterations,
-            })),
-            Step::Operation(Arc::new(ops::ValidateToolCalls::new(
-                state.clone(),
-                tool_names.clone(),
-                &self.budget,
-            ))),
-            Step::Operation(Arc::new(ToolOperation::new().with_provider(provider))),
-            Step::Operation(Arc::new(ops::UnhandledToolCalls {
+            },
+            validate: ops::ValidateToolCalls::new(state.clone(), tool_names.clone(), &self.budget),
+            tools: ToolOperation::new().with_provider(provider),
+            unhandled: ops::UnhandledToolCalls {
                 tool_names,
                 disabled: self.disabled.clone(),
                 deferred: None,
-            })),
+            },
             // A steer from the page's subagent row, after the child's next tool results.
-            Step::Operation(Arc::new(ops::DeliverSteer {
+            steer: Some(ops::DeliverSteer {
                 state: state.clone(),
-            })),
-            Step::Operation(Arc::new(ops::LengthContinuation::new(
-                state.clone(),
-                &self.budget,
-            ))),
-            Step::Operation(Arc::new(ops::EmptyResponseRecovery {
+            }),
+            length: ops::LengthContinuation::new(state.clone(), &self.budget),
+            empty: ops::EmptyResponseRecovery {
                 state: state.clone(),
-            })),
-            Step::Operation(Arc::new(ops::ExitOnError)),
-            Step::Operation(Arc::new(compress::AutoCompress {
+            },
+            compress: Some(compress::AutoCompress {
                 state: state.clone(),
                 summarizer: self.summarizer.clone(),
                 rebuild_prompt: Arc::new(move || Ok(child_prompt.clone())),
                 fallback: None,
-            })),
-            Step::Inference(Arc::new(
-                InferenceRunner::new(self.llm.clone(), model_config)
-                    .with_empty_response_retries(self.budget.empty_response_retries),
-            )),
-        ];
-        let machine = StateMachine::new(steps, cancel.clone());
-        let session_id = child.record.lock().id.clone();
-        let outcome = machine.run(&runtime, &session_id, &emit).await;
-        drop(machine);
+            }),
+            inference: InferenceRunner::new(self.llm.clone(), model_config)
+                .with_empty_response_retries(self.budget.empty_response_retries),
+            cancel: cancel.clone(),
+        };
+        let outcome = agent.run(&runtime, &emit).await;
+        drop(agent);
         drop(emit);
         let relay = relay.await.unwrap_or_default();
         self.subagents.finish(&subagent_id);

@@ -1009,3 +1009,287 @@ green), `hermes_store` 34, `hermes_llm` 489 (+7 ign) + 5, `hermes_agent` 45, `he
 
 **Commit.** One commit for CP13d (the stage patches each build, but the review fixes cut across stages 1, 6 and the
 module; one commit listing the stages is the honest history).
+
+## CP13e — explicit agent loop
+Worktree: C:\Users\alexandros\repos\hermes-rs-p13   Branch: backend/p13-perf   Model: Opus 5.5 (subagent)
+On top of acad3ca (CP13a-d). Not committed (an Opus reviewer reviews and commits). Phase 13 is not done (13f remains).
+
+### Inventory (before CP13e)
+Goose's `StateMachine` (`crates/agent/src/machine.rs`) ran a `Vec<Step>` of `Operation` / `Inference` trait objects. Four
+users built one: the main turn (`lib.rs` `begin_turn`), a `delegate_task` child (`delegate.rs`), the agentic review
+(`review.rs`), the curator's agent loop (`curator.rs`). Nothing outside `hermes_runtime` used `machine.rs` (the desktop
+crate, ACP and the GPUI app use only `hermes_agent::events::AgentEvent`; `hermes_tools` only `Emitter`).
+
+**Steps, in order** (S = only where there is `/steer` and compression: the main turn and a child; the review and the
+curator have neither):
+
+| # | Step (`name()`) | Reads | Acts when -> result | Events |
+|---|---|---|---|---|
+| 0 | `FrozenPrompt` ("prompt") | `session.system_prompt` | never acts; contributes `("system", prompt)` to every request | — |
+| 1 | `IterationBudget` | `TurnState.summary_requested/summary_retried`, `assistant_turn_count` since kickoff | count >= `max_iterations`, the model next, the turn not ended: summary nudge (continue). During the summary: text -> yield; empty -> hidden once (continue), then the canned "I ran out of steps" (yield) | `Message` per new message |
+| 2 | `ValidateToolCalls` | the last agent-visible reply with tool calls, once per id (`TurnState.validated`) | output limit hit: hidden + `max_tokens` boosted (continue) up to `truncated_tool_retries`, then hidden + `TRUNCATED_MESSAGE` (yield). Duplicate call ids made unique, invented names repaired (`UpdateMessage`). An all-invalid batch: a strike (continue, possibly no effects) up to `invalid_tool_retries`, then error answers + "Model generated invalid tool call: X" (yield). Malformed JSON cut in transit: hidden + `TRUNCATED_UNREPORTED_MESSAGE` (yield); else hidden (continue) twice, the third (`MAX_INVALID_JSON_RETRIES` 3) gets error answers (continue) | `Message`; `HistoryReplaced` when an `UpdateMessage` is applied |
+| 3 | `ToolOperation` ("tools") | unanswered, agent-visible tool requests since kickoff | any with an offered tool: run concurrently (`join_all`), one message of responses (continue) | the tools' own (`Status` taint, `ToolProgress`, `Subagent*`), then `Message` |
+| 4 | `UnhandledToolCalls` | the same, after tools | a request nothing answered (invented, disabled, deferred not loaded): error answers (continue); awaits `DeferredTools::unavailable_reply` | `Message` |
+| 5 | `DeliverSteer` (S) | last message a tool response, `TurnState.pending_steer` | a steer waits: the user's text (user-only) + the marked nudge (agent-only) (continue) | 2 x `Message` |
+| 6 | `LengthContinuation` | the last reply cut by the output limit, no tool calls, not in `length_trail` | repetition: hidden + `REPETITION_MESSAGE` (yield); nudge (continue) while n < `length_continuations`; at the ceiling the trail hidden and stitched into one answer or `CEILING_NO_TEXT` (yield) | `Message`, `HistoryReplaced` |
+| 7 | `EmptyResponseRecovery` | the last message since kickoff: the inference empty marker, or an agent-visible empty reply | text beside housekeeping-only calls: hidden (yield); after tools, once (`post_tool_nudged`): "(empty)" placeholder + nudge (continue); thinking only: nudge (continue), `MAX_THINKING_PREFILLS` 2; else the marker hidden + `EMPTY_TERMINAL_MESSAGE` (yield) | `Message`, `HistoryReplaced` |
+| 8 | `ExitOnError` | the last message an error | yield | — |
+| 9 | `AutoCompress` (S) | model next, no summary under way, no failed summary this turn, `compacted_at`, the estimate vs the (fallback-bound) threshold | over it: the summary (awaits `compact`) -> `Compacted` (continue); nothing to summarize: `compacted_at` set, not applicable; error: `compression_failed`, not applicable | `Compacting` first, `CompactionFailed(None/Some)`; on apply `HistoryReplaced` + `Compacted` |
+| 10 | `InferenceRunner` ("llm") | `prepare_session` (identity), `applies` (no trailing error and the model next), the tools (`ToolOperation::inference_tools` -> `GuardedTools::tools`: none during the summary), `max_tokens_override()` | the model next: additional messages, usage, the streamed reply (continue). Inside: `empty_response_retries` re-asks of an empty reply, then the hidden marker; the fallback chain in `open_stream` (Phase 12); `Opened::Compress` -> empty `applied` (continue) | `Status{fallback}`, `Message` per chunk; `Usage` on apply |
+
+**The loop** (`StateMachine::run`): per pass `runtime.load()` (a snapshot; `TurnState.max_tokens.take()`), `step()`,
+the effects applied (`ensure_message_ids`, `TurnRuntime::apply_effects`); `Continuing` -> another pass,
+`Yielded` / `Cancelled` -> `finalize`. `step()`: for each step, `is_cancelled()` -> `Cancelled` (no interrupted step);
+else the step's future raced in `tokio::select! { biased; step, cancel.cancelled() }`; `Err` without Stop -> the run's
+error (no finalize); `Err` after Stop, or Stop won -> `Cancelled` with that step remembered as interrupted;
+`NotApplicable` -> the next step; `Applied` -> ids ensured, status `Cancelled` if Stop came meanwhile (its effects are
+still applied). No step acted -> `Yielded`. `finalize`: load; nothing unless cancelled; the interrupted step's
+`finalize_cancellation` (saved = applied + reloaded), then one "Tool call was interrupted before completing" answer
+per unanswered tool request since kickoff (ids deduplicated; emitted as `Message`), then every other step's
+`finalize_cancellation` in order. Only two steps keep leftovers: `InferenceRunner` (`take_output`: additional
+messages, usage, the accumulated chunks) and `ToolOperation` (its `response` slot, in practice always empty: filled
+and taken with no `.await` between).
+
+**Cancellation points** (an `.await` Stop can drop): `UnhandledToolCalls` (`unavailable_reply` -> the deferred
+wrapper's `tools()`), `ToolOperation` (every call; CP13c's `off_worker_unless_stopped` lets a stopped call finish in
+the poll that sees Stop), `AutoCompress` (`compact`: the summary request; a dropped one leaves `TurnState` as it was,
+`Compacting` already sent), `InferenceRunner` (`inference_tools`, `resume`, `open_stream` with the chain's `stream` +
+peek, `fetch_model_info`, every `stream.next()`; a dropped one leaves its output for `finalize`). The other steps
+never wait (their `async fn`s had no `.await`), so they always finished in the first poll. `load` and `apply` are not
+raced.
+
+**Limits and their log lines** (unchanged): `budget.max_iterations` (main turn), `REVIEW_MAX_ITERATIONS` 16,
+`budget.delegate_child_iterations`, `budget.curator_max_iterations`; `budget.truncated_tool_retries` ("truncated tool
+call — retrying (n/N)", cap `boosted_output_cap`); `budget.invalid_tool_retries`; `MAX_INVALID_JSON_RETRIES` 3
+("invalid JSON in tool call arguments — retrying"); `budget.length_continuations` ("requesting continuation (n/N)");
+`MAX_THINKING_PREFILLS` 2; one post-tool nudge; `budget.empty_response_retries` inside the runner ("Provider returned an
+empty response; retrying (n/N)"); `budget.http_retries` in the provider; the fallback chain. Values per profile:
+`budget.rs`.
+
+**Metadata notes.** Producers of `metadata.operations` notes: `inference.empty_response` (the runner's hidden empty
+marker; read by `EmptyResponseRecovery` via `is_empty_response_marker`, nowhere else), `preinject.*`,
+`compress.{handoff,copy,notice,hidden}`, `command.command` (`COMMAND_NOTE`), `references.typed`,
+`foreground_subagent.{delivered,cancelled}` (Goose's `SubagentOperation`, unused). Only the first is loop plumbing; all
+are stored with their message in `sessions.db`, and the others are read by search, transcripts, compaction and the
+GPUI app. `Operation::set_message_meta` / `message_meta` and `ConversationEffect::SetMessageOperationNote` had no
+producer. No retry counter was ever kept in metadata (they are `TurnState` fields), so the plan's "instead of string
+notes in message metadata" means the step-result plumbing; nothing stored changes.
+
+### Design
+`crates/runtime/src/agent_loop.rs` (tests in `agent_loop_tests.rs`):
+- `pub enum Next { Continue, Retry(Reason), Done }`; `pub enum Reason { IterationLimit, EmptySummary,
+  TruncatedToolCall{attempt}, InvalidToolName{strike}, InvalidJson{attempt}, InvalidJsonAnswered,
+  LengthContinuation{attempt}, EmptyAfterTools, ThinkingOnly{attempt} }`; `pub struct Outcome { effects, next }`;
+  `pub type Checked = Result<Option<Outcome>>` (`None` = Goose's `NotApplicable`); helpers `proceed` / `retry` / `done`.
+  Old to new: `applied` -> `Continue` or `Retry(reason)`; `yielded` / `yielded_with` -> `Done`. `Continue` and `Retry`
+  both start another pass (`Retry` names why; logged with the step at debug).
+- `pub struct AgentLoop { budget, validate, tools: ToolOperation, unhandled, steer: Option, length, empty,
+  compress: Option, inference: InferenceRunner, cancel }`: concrete fields instead of `Vec<Arc<dyn ...>>`.
+- `run` / `pass` / `check` / `finalize` are the old `run` / `step` / the step bodies / `finalize`: same snapshot per
+  pass, same order (`PASS`; `FrozenPrompt` dropped, it only supplied the system prompt, now built in
+  `inference_input`), same `is_cancelled` check and `biased` race per check, the interrupted check returned from `pass`
+  (was a `Mutex` on the machine), same finalize order (only tools and inference have leftovers).
+- `ops.rs` / `compress.rs`: each check is an inherent `check` method (sync where it never awaited: `IterationBudget`,
+  `ValidateToolCalls`, `DeliverSteer`, `LengthContinuation`, `EmptyResponseRecovery`; async: `UnhandledToolCalls`,
+  `AutoCompress`); `ExitOnError` became the fn `exit_on_error`. Bodies unchanged apart from their return values. A sync
+  check called inside the raced `async` block behaves as before: an `async fn` without `.await` finished in its first
+  poll.
+- `TurnRuntime::load` / `apply_effects` are inherent methods (were `SessionLoader` / `EffectHandler` impls whose bodies
+  never awaited; the unused `session_id` / `&TurnSession` parameters are gone).
+- Agent crate: `machine.rs` deleted (`StateMachine`, `Step`, `SessionLoader`, `EffectHandler`, `EffectUsage`, and its one
+  test `rejects_duplicate_tools_across_operations`: with one tool step nothing can collide across steps;
+  `ToolOperation::available_tools` still refuses two providers with one name). `MachineSession` moved to `operation.rs`.
+  `ToolOperation`, `InferenceRunner`, `SubagentOperation` and the `Operation` / `Inference` traits stay (Goose code,
+  used; Phase 14 trims).
+- Why the plan's "prepare -> infer -> validate -> run tools -> post-checks -> maybe compress" is not one loop
+  iteration: every pass re-reads the conversation and starts at the top (after tools the budget is asked before the
+  next request; a repaired call is validated against a new snapshot; compression is judged right before the request).
+  A fall-through cycle would change which check sees which snapshot, and so the requests. The module doc maps the
+  plan's words onto the pass.
+
+### Golden trace (before / after, byte for byte)
+Method: a throw-away patch (not kept; `git apply -R` restored the three files) added `hermes_llm::golden::record`,
+which, with `HERMES_GOLDEN_DIR` set, appends one line per event to `<dir>/<thread name>.log`: `R <purpose> <request
+JSON>` in `ApiRequestBuilder::response_post` (every HTTP attempt, the exact body sent), `E <AgentEvent:?>` in
+`Emitter::emit` (all but `ToolProgress`, which is timing), `S <op>` in `Store::queue` (upsert with seq and the
+message's stored JSON, replace, usage, prompt). Every `turns` test is `#[tokio::test]` (`current_thread`), so its
+spawned tasks run on the test's own thread and log under the test's name. The suite was run with the patch at
+acad3ca (HEAD: the default profile twice, `requests`, `tokens`) and on this tree (the three profiles), then compared
+per test and per kind as sequences after normalising what differs between any two runs: uuids, `resp_N`, session ids
+and other hex, `created` stamps, temp folder names, ports, durations (`duration_ms`, `duration_seconds`, "N s"),
+clock times in session search, subagent / delegation ids. Noise floor: HEAD default run 1 vs run 2 differ in nothing
+after that normalisation (with a weaker first normaliser, 25 tests differed, all in durations and random ids).
+
+Result: **no difference** in any test, any kind, any profile.
+
+| Profile | Requests | Agent events | Queued store writes | Tests differing |
+|---|---|---|---|---|
+| default (`balanced`) | 987 = 987 | 2129 = 2129 | 2572 = 2572 | 0 |
+| `requests` | 987 = 987 | 2129 = 2129 | 2572 = 2572 | 0 |
+| `tokens` | 987 = 987 | 2129 = 2129 | 2572 = 2572 | 0 |
+
+(244 tests log something; the other 14 make no request, event or queued write. The counts are equal across profiles
+because the harness pins `max_iterations` and the full tool list, and a test that depends on a profile names it.)
+The patch and the comparer are in the implementer's scratchpad (`golden/instrument.patch`, `golden/compare.py`), not
+in the repository; TESTING.md describes how to redo it.
+
+### Tests (final tree, instrumentation removed, CARGO_TARGET_DIR=target/claude)
+- `turns` **258 passed / 7 ignored under the default, `HERMES_TEST_PROFILE=requests` and `tokens`** (file unchanged;
+  also green with the instrumentation, 6 more runs).
+- `hermes_runtime --lib` **259** (245 + 14 new in `agent_loop_tests.rs`: the truncated-tool-call retry up to
+  `truncated_tool_retries` with the cap growing as `boosted_output_cap` and the count restarting after the refusal,
+  under each profile's knobs; a reply validated once; invented names striking out at `invalid_tool_retries` (a batch
+  with a real call not striking); malformed JSON withdrawn twice then answered, then counting from 1 again; arguments
+  cut in transit ending at once; a cut-off answer continued up to `length_continuations` then stitched; repetition
+  not continued; the empty-after-tools nudge once; thinking-only asked twice; text beside housekeeping tools; the
+  iteration budget's summary, its one retry and the canned text; a provider error; the agent-crate mapping; Stop's
+  interrupted answers deduplicated).
+- `hermes_agent` **44** (45 minus `rejects_duplicate_tools_across_operations`, deleted with `machine.rs`), `hermes_llm`
+  489 + 5, `hermes_store` 34, `hermes_tools` 337, `hermes_memory` 101, `hermes_prompts` 37, `hermes-desktop` 183 +
+  acp 68; `cargo build --workspace` OK, no warning (placeholder `target/hermes-src`, removed). No perf or timing
+  check (the user's rule).
+
+### Live checks
+Own instance: the debug exe of this tree, port 47810, a fresh `target/perf/home`, started with `perf.ps1`'s
+environment without its timing step; the main checkout's `tools/node/node.exe` run in place; working folders in my
+scratchpad (outside any repository). With `mock_llm.py` (started by me, stopped by its PID's tree): `smoke.mjs` all
+checks passed, `rollback-check.mjs` (restored, the file gone), `stop-check.mjs` (stalled reply and slow command both
+interrupted, `running: false`). As their own provider: `queue-check.mjs`, `provider-error-check.mjs`,
+`fallback-check.mjs` all passed; the instance was restarted after it (fallback-check leaves `mock`'s quota marked
+used up in memory); then `side-and-branch-check.mjs`, `coding-commands-check.mjs` (the `/review` subagent: a child
+loop), `review-check.mjs` (the evidence review; given the home folder), `staging-check.mjs`, `subagents-check.mjs`
+(a child's steer after its tool results, stop) all passed. No panic, "turn crashed", "The request stopped" or "not
+fully saved" line in the instance's logs. Only processes under `target\claude` and the mock I started were stopped.
+
+### Deviations from the plan
+- The loop iterates **passes** (one action each, from the top), not the plan's linear "prepare -> infer -> validate
+  -> run tools -> post-checks -> maybe compress" per iteration; see Design for why. The order inside a pass is
+  Goose's step order, unchanged.
+- "Instead of string notes in message metadata": no retry or continuation state was in metadata; the one note the
+  loop reads (the empty-response marker) is stored data and stays. What changed is the step-result plumbing
+  (`OperationResult` / `RunStatus` -> `Option<Outcome>` / `Next`).
+- `ToolOperation` and `InferenceRunner` keep Goose's `Operation` / `Inference` traits (the loop calls them through the
+  traits and maps the result). Rewriting them as plain methods would touch the fallback chain and the tool runner for
+  no behaviour gain; Phase 14 trims the agent crate.
+- `Next::Retry` and `Continue` behave the same in the loop; `Reason` is for logs and tests.
+
+### For the reviewer
+- **Semantics to check against the deleted `machine.rs`** (`git show acad3ca:crates/agent/src/machine.rs`): `pass` =
+  `step` (cancel check before each check; the `biased` race; `Err` after Stop is a Stop; an acting check's effects
+  applied even when Stop came meanwhile; no check acting = `Done`); `run` = `run` (load per pass, `ensure_message_ids`
+  in `pass` and before apply, as before; break on not-continuing); `finalize` = `finalize` (load even when not
+  cancelled, the interrupted check first, the unanswered answers, the others; `save` reloads only when it applied
+  something). Absent checks (`steer` / `compress` = `None`) are skipped before the cancel check, as absent steps were.
+- `Some(Outcome)` with no effects (`Retry(InvalidToolName)` below the strike limit, the inference `Opened::Compress`
+  path) must stay `Some`: it ends the pass. The unit test asserts the first; the second is `from_operation`.
+- `inference_input` builds `InferenceInput` directly: tools from `ToolOperation::inference_tools`, the system prompt as
+  the one prompt part (the identity preparer joins parts with "\n\n"; one part = the prompt as is), no moim parts. The
+  duplicate-tool check across steps went with the steps (one tool step).
+- Sync checks run inside the raced `async` block: same as the old `async fn`s without `.await` (finished at the first
+  poll). The async ones (`UnhandledToolCalls`, `AutoCompress`, tools, inference) are the cancellation points listed in
+  the inventory.
+- `TurnRuntime::load` keeps taking `TurnState.max_tokens` on every load, including finalize's and `save`'s reloads.
+- Docs: ARCHITECTURE (crates table, "A turn" step 3, "The agent loop (Phase 13e)", the fallback paragraph), PITFALLS
+  (new section; the Stop bullet points at `agent_loop.rs`), TESTING (agent loop tests, the golden-trace method),
+  PORTING (Goose divergence; the `compress.rs`, `ops.rs` row: plumbing diverged).
+- `cargo fmt`: the new files are formatted; the touched runtime files have exactly as many rustfmt differences as at
+  HEAD (none added).
+- My slip: one shell command meant to loop over file names ran `git stash` in the worktree; I popped it at once
+  (`git stash list` empty, every change back, the untracked new files were never stashed). The main checkout was not
+  touched (`git status` there clean).
+
+### Doubts
+- The golden trace covers what `turns.rs` drives. Paths it does not reach are covered by reading only: a Stop during
+  `UnhandledToolCalls`' deferred lookup, a check's error after Stop. Both go through the same `pass` code as every check.
+- `Reason` granularity (`InvalidJsonAnswered` is a `Retry`; unanswered calls, steer and compaction are `Continue`) is a
+  naming choice; nothing branches on it.
+
+**User checklist** (no visible change; one sanity pass in the rebuilt app):
+1. Rebuild and start the app. Send "list the files here": the reply streams, the tool card shows, the answer ends the
+   turn as before.
+2. Ask for something long and press Stop while a command runs: the turn stops at once, the tool card keeps the output
+   it had.
+3. Type a steer while a tool runs: it appears after the tool result and the model follows it.
+4. In a long session run `/compress`, then send a message: the summary notice shows and the reply works.
+5. Ask the agent to delegate a small task: the subagent row runs and its summary comes back.
+
+### Review (Opus, 2026-11-15)
+Reviewed against `git show acad3ca:crates/agent/src/machine.rs`, the old `ops.rs` / `compress.rs` operation impls and the
+four step chains (`lib.rs`, `delegate.rs`, `review.rs`, `curator.rs`), line by line.
+
+**1. Step order and conditions: same action in every state.** `PASS` is the old `Vec<Step>` minus `FrozenPrompt`, in
+the same order for all four users (review and curator: `steer` / `compress` `None`, skipped before the cancel check
+exactly as an absent step was). `FrozenPrompt` only had `prompt_parts`; no other step overrode `prompt_parts`,
+`moim_parts` or `inference_tools` except `ToolOperation::inference_tools` (grep of every trait method at acad3ca), so
+`inference_input` (tools from `ToolOperation`, one `("system", prompt)` part of the *prepared* session, no moim) is
+what `collect_inference_input` built. Each check body is the old `run` with `not_applicable` -> `Ok(None)`,
+`applied` -> `proceed` / `retry` (both `Continuing`), `yielded` / `yielded_with` -> `done` (`Yielded`); no condition,
+counter or reset moved (the diff touches only return expressions plus one `let strike` read after the increment);
+no constant changed (`MAX_INVALID_JSON_RETRIES` 3, `MAX_THINKING_PREFILLS` 2, `boosted_output_cap`, `budget.rs`
+untouched, `REVIEW_MAX_ITERATIONS` 16). `from_operation` maps `Applied{Continuing}` -> `Continue`,
+`Yielded`/`Cancelled` -> `Done`; a `Cancelled` status from a step ended the old run too, and `finalize` reads the token,
+not the status, so it is the same. The inference `Opened::Compress` path (empty `applied`) stays `Some` -> another pass
+-> `AutoCompress` reads `FallbackShared` (Phase 12) as before. The states `turns.rs` does not reach follow from the
+same order: budget spent with calls pending (budget needs the model next, so tools run first, then the summary
+nudge), steer with unhandled calls (unhandled answers first, the steer the pass after), length + tool call (length
+skips replies with calls; validation's truncated path handles them), empty after tools vs thinking-only (one body,
+unchanged), provider error + compress (exit-on-error comes first, as before). `TurnRuntime::load` takes
+`max_tokens` once per load, called at the same points (each pass, finalize's load, each `save` reload): a pass that
+acts on something else first consumes it, as before.
+
+**2. Stop.** `pass` = `step`: `is_cancelled` before each present check, `biased` race, `Err` after Stop -> cancelled with
+that check interrupted, `Err` without Stop -> the run's error with no finalize, an acting check's ids ensured and
+effects applied even when Stop came meanwhile (`Cancelled(None)`); `finalize` = interrupted check's leftovers, the
+deduplicated "interrupted" answers, then the others in `PASS` order (only tools and inference have
+`finalize_cancellation`; the default for the others returned nothing, as did `AutoCompress` / `FrozenPrompt`).
+The two paths verified only by reading now have tests (below), and mutating the `if !self.cancel.is_cancelled()`
+guard fails one.
+
+**3. Stored and visible state.** `inference.rs` changed only an import: the `inference.empty_response` note is produced
+byte for byte as before. `ensure_message_ids` runs at the same two points, `apply_effects` is the same body (now sync;
+the old `async fn` never awaited). The duplicate-tool guard: the machine's cross-step check could not fire any more
+(one tool step, and `ToolOperation::available_tools` already bailed on a name offered twice by two providers or by one
+provider, before the machine's check ran; `register` replaces a same-named registered tool). It stays the guard; it
+had no test, so `tool::tests::a_tool_name_offered_twice_is_refused` now pins it (two providers, one provider twice).
+MCP tools reach the turn through the one `GuardedTools` provider, so a colliding name fails the request with that
+error instead of reaching the provider, as before.
+
+**4. Consumers.** Nothing outside `hermes_runtime` used `machine.rs` (desktop, ACP and the GPUI app only use
+`AgentEvent`; `cargo build --workspace` passes). Fallback: `InferenceRunner` / `ChainRun` / `FallbackShared` untouched;
+`AutoCompress` unchanged apart from returns. Stale "state machine" / `agent/machine.rs` references fixed in
+`AGENTS.md`, `README.md`, both crates' `Cargo.toml` descriptions, `hermes_tools` (`lib.rs`, `blocking_tests.rs`,
+`shell.rs` comments) and PITFALLS (the `Arc<Message>` section). `PLAN.md` (history) and the Goose attribution in
+`THIRD_PARTY_NOTICES.md` left as they are. PORTING rows say `diverged`.
+
+**5. Passes.** Justified: a fall-through cycle would judge later checks on a stale snapshot and change requests.
+Per-pass cost is what it was (one snapshot of `Arc` pointers per pass since CP13a, as the machine loaded per pass);
+the trait objects and boxed `async_trait` futures of the sync checks are gone. Nothing measured (the user's rule).
+
+**6. Tests.** `turns.rs` unchanged (`git diff` empty). The implementer's 14 check-level tests are meaningful: mutating
+`MAX_THINKING_PREFILLS` 2 -> 3 or the truncated-retry `<` -> `<=` fails them. Added `whole_loop` (6 tests, running
+`AgentLoop` over a real `TurnRuntime` with a counting test provider): Stop during `UnhandledToolCalls`' deferred lookup
+(the call answered "interrupted", no request sent); an error after Stop is a Stop (answered); an error without Stop
+ends the run with no finalize (call left unanswered); unanswered calls are answered a pass before a waiting steer
+(swapping `Unhandled` / `Steer` in `PASS` fails it); a spent budget lets pending calls run, then one summary request
+ends the turn; `load` takes the one-shot cap once. Mutating the error-after-Stop guard fails its test.
+
+**Golden trace, redone independently** (`requests`): a throw-away `git worktree` at acad3ca with `instrument.patch`
+applied, `turns` built and run (HEAD), then this tree's diff applied on top in the same throw-away copy, rebuilt and run
+(new); worktree removed afterwards, nothing instrumented left in this tree. `compare.py`: 244 tests, requests 987 = 987,
+events 2129 = 2129, store writes 2572 = 2572, no content difference; one test differs in event *order*
+(`delegation_width_follows_the_profile`, parallel children): my HEAD run differs from the implementer's HEAD run in
+the same way and my new run equals the implementer's HEAD run exactly, so it is the noise floor (concurrent subagents),
+not the change.
+
+**Results** (final tree, CARGO_TARGET_DIR=target/claude): `turns` 258 passed / 7 ignored under default, `requests` and
+`tokens` (file unchanged); `hermes_runtime --lib` 265 (259 + 6 `whole_loop`); `hermes_agent` 45 (44 + the duplicate-tool
+test); `hermes_llm` 489 + 5, `hermes_store` 34, `hermes_tools` 337, `hermes_memory` 101, `hermes_prompts` 37;
+`hermes-desktop` lib 183, acp 68 three runs in a row; `cargo build --workspace` OK, no warning (placeholder
+`target/hermes-src`, removed). Live, own instance (debug exe of this tree, port 47810, fresh `target/perf/home`, the
+main checkout's `tools/node/node.exe` in place, working folders in my scratchpad): with `mock_llm.py` (started and
+stopped by its PID): `smoke.mjs` all passed (in a folder with a file in it, as `scripts/perf/README.md` says: an empty
+folder gets no first checkpoint), `stop-check.mjs` (stalled reply and slow command, both interrupted, `running:
+false`), `rollback-check.mjs` (restored, file gone); as their own provider: `queue-check`, `provider-error-check`,
+`fallback-check` all passed, instance restarted, then `side-and-branch-check`, `review-check`, `staging-check`,
+`coding-commands-check` all passed; no panic / "turn crashed" / "The request stopped" / "not fully saved" line in the
+restarted instance's logs. No perf or timing check (the user's rule). Phase 13 not done (13f follows).

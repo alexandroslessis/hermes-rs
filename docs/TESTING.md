@@ -165,8 +165,8 @@ Read the existing tests near the area you change before writing a new one; the h
   `memory`, a staged `memory` write, `session_search` (discover and browse), `skills_list`, `skill_manage`,
   `skill_view`; `a_blocked_worker_is_seen_by_the_timer` is the control. It measures time: if it fails only on
   a very loaded machine, re-run alone before suspecting the code. The same file checks
-  `off_worker_unless_stopped` (the tool follow-ups' hop): raced against Stop as `agent/machine.rs` races a
-  step, it keeps the result where a plain `spawn_blocking` hop loses it, and without Stop it leaves the worker free.
+  `off_worker_unless_stopped` (the tool follow-ups' hop): raced against Stop as `runtime/agent_loop.rs` races a
+  check, it keeps the result where a plain `spawn_blocking` hop loses it, and without Stop it leaves the worker free.
 - The session actor (Phase 13 CP13d): `crates/runtime/src/session_actor/tests.rs` (unit tests over a real actor
   thread: order from one and many senders, a barrier, answers from a panicking handler and a stopped actor,
   commands queued when its thread ends, re-entrancy refused, the thread ending with its last handle, the registry,
@@ -177,6 +177,21 @@ Read the existing tests near the area you change before writing a new one; the h
   one it left, a dead actor is replaced and its turn stopped, a losing load gets its copy back).
   `session::testing::open_session` makes an `OpenSession`. The `turns` suite and the desktop / ACP tests run
   unchanged on top.
+- The agent loop (Phase 13 CP13e): `crates/runtime/src/agent_loop_tests.rs` asks each check of `ops.rs` at its
+  retry / continuation boundary under the `balanced`, `requests` and `tokens` knobs and checks the `Next` it returns
+  (truncated tool call with the growing output cap, invented tool names, malformed JSON, cut-off text and its
+  stitching, the empty-reply ladder, the iteration budget's summary), plus Stop's "interrupted" answers; its
+  `whole_loop` module runs `AgentLoop` itself over `session::testing::open_session` with a counting test provider
+  and test tool providers (pass order: unanswered calls before a steer, a spent budget after pending calls; Stop
+  during the deferred lookup; an error after Stop is a Stop, one without Stop skips finalize). Whole turns:
+  `turns.rs`, unchanged. **Golden trace** for a change to the loop's plumbing: a throw-away patch that appends every
+  provider request body (`ApiRequestBuilder::response_post`), every `AgentEvent` (`Emitter::emit`, minus
+  `ToolProgress`) and every queued store write (`Store::queue`) to a file named after the current thread (a test's
+  name; all `turns` tests are `current_thread`, so their spawned tasks log there too) when an env var names a
+  folder; run the suite under each profile before and after, normalise ids, timestamps, temp names, ports and
+  durations, and compare per test. Run the "before" twice: the tests whose order differs between two identical runs
+  are the noise floor (concurrent tool calls, background reviews). CP13e's patch and comparer are described in
+  `docs/backend/progress/phase-13.md`.
 - ACP tests must not count on a background job being late: `/retry` and `/undo` are learning signals, so under
   `balanced` a review may follow the turn (the desktop app ignores the test config's `background_review: false`),
   with the turn's tools and system prompt; filter its requests out (its last message is the review prompt). A test

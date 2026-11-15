@@ -894,7 +894,7 @@ pub async fn terminal(
         );
     }
     // The turn was stopped while the command ran; the output is what it had printed. The tool
-    // response is kept (the state machine saves it), so the row shows the partial output too.
+    // response is kept (the agent loop saves it), so the row shows the partial output too.
     if result.interrupted {
         value["interrupted"] = json!(true);
         value["note"] = json!(

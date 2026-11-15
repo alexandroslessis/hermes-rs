@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
-description = "Runs agent sessions: assembles the state machine, persists effects, streams events"
+description = "Runs agent sessions: the agent loop, persists effects, streams events"
 
 [lints]
 workspace = true

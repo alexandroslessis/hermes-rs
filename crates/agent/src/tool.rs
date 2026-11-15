@@ -406,3 +406,64 @@ where
         applied([E::from(message)])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Lists(Vec<&'static str>);
+
+    #[async_trait]
+    impl ToolProvider<()> for Lists {
+        async fn tools(&self, _session: &()) -> Result<Vec<Tool>> {
+            Ok(self
+                .0
+                .iter()
+                .map(|name| Tool::new(*name, "test", Arc::new(serde_json::Map::new())))
+                .collect())
+        }
+
+        async fn call(
+            &self,
+            _session: &(),
+            _request_id: &str,
+            _call: CallToolRequestParams,
+            _emit: &Emitter,
+        ) -> Result<CallToolResult, ErrorData> {
+            unreachable!()
+        }
+    }
+
+    fn tools(providers: Vec<Vec<&'static str>>) -> ToolOperation<()> {
+        providers
+            .into_iter()
+            .fold(ToolOperation::new(), |operation, names| {
+                operation.with_provider(Arc::new(Lists(names)))
+            })
+    }
+
+    async fn listed(operation: &ToolOperation<()>) -> Result<Vec<String>> {
+        Ok(Operation::<(), Message>::inference_tools(operation, &())
+            .await?
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect())
+    }
+
+    /// hermes-rs: the request's tool list never names a tool twice. (Goose's state machine also
+    /// checked this across its steps; since Phase 13e there is one tool step, and this is the
+    /// check: a duplicate fails the request instead of reaching the provider, which would reject it.)
+    #[tokio::test]
+    async fn a_tool_name_offered_twice_is_refused() {
+        assert_eq!(
+            listed(&tools(vec![vec!["a", "b"], vec!["c"]]))
+                .await
+                .unwrap(),
+            ["a", "b", "c"]
+        );
+        for providers in [vec![vec!["a"], vec!["a"]], vec![vec!["a", "b", "a"]]] {
+            let error = listed(&tools(providers)).await.unwrap_err();
+            assert_eq!(error.to_string(), "multiple tool providers registered 'a'");
+        }
+    }
+}
