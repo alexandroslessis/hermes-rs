@@ -227,7 +227,7 @@ impl crate::Store {
     /// FTS5 search (BM25 ranking, optionally biased by session age). Hermes's query syntax
     /// works: `alpha OR beta`, quoted phrases, `NOT`, `deploy*`.
     pub fn search(&self, query: &SearchQuery<'_>) -> Result<Vec<SearchHit>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let run = |fts_query: &str| -> rusqlite::Result<Vec<SearchHit>> {
             let roles = query
                 .roles
@@ -284,7 +284,7 @@ impl crate::Store {
 
     /// Every searchable message of a session, in order.
     pub fn search_rows(&self, session_id: &str) -> Result<Vec<SearchRow>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut statement = conn.prepare(
             "SELECT id, session_id, role, content, tool_calls, created FROM search_rows
              WHERE session_id = ?1 ORDER BY seq",
@@ -296,8 +296,7 @@ impl crate::Store {
     /// The session holding search row `id`.
     pub fn search_row_session(&self, id: i64) -> Result<Option<String>> {
         Ok(self
-            .conn
-            .lock()
+            .read()
             .query_row(
                 "SELECT session_id FROM search_rows WHERE id = ?1",
                 [id],
@@ -309,8 +308,7 @@ impl crate::Store {
     /// A session whose title equals `title` (case-insensitive), newest first.
     pub fn session_by_title(&self, title: &str) -> Result<Option<String>> {
         Ok(self
-            .conn
-            .lock()
+            .read()
             .query_row(
                 "SELECT id FROM sessions WHERE lower(title) = lower(?1) ORDER BY updated_at DESC LIMIT 1",
                 [title],
@@ -484,7 +482,7 @@ impl crate::Store {
         if text.is_empty() {
             return Ok(found);
         }
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut titles =
             conn.prepare("SELECT id FROM sessions WHERE title LIKE '%' || ?1 || '%'")?;
         for id in titles.query_map([text], |row| row.get::<_, String>(0))? {
@@ -572,7 +570,7 @@ pub struct Insights {
 
 impl crate::Store {
     pub fn insights(&self, since_ms: i64) -> Result<Insights> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut insights = Insights::default();
         (insights.sessions, insights.first_ms, insights.last_ms) = conn.query_row(
             "SELECT COUNT(*), MIN(created_at), MAX(updated_at) FROM sessions WHERE updated_at >= ?1",

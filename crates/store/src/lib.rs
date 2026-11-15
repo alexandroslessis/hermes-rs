@@ -3,24 +3,33 @@
 //! Messages are stored as the JSON of `hermes_llm`'s `Message`, keyed by message id and ordered
 //! by their position in the conversation. The caller owns merging streamed chunks (through
 //! `Conversation::push`) and upserts the merged message here.
+//!
+//! Writes go through one writer thread (Phase 13 CP13b, `writer.rs`): the turn path queues its
+//! writes ([`Store::queue`]) and they are committed in batches; every other write method waits
+//! until its write is committed, as before. Reads use a connection of their own and first wait
+//! for the writes sent before them, so they always see them. [`Store::flush`] /
+//! [`Store::flush_session`] commit now and report a queued write that failed.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use hermes_llm::conversation::message::Message;
 use hermes_llm::conversation::token_usage::ProviderUsage;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use rmcp::model::Role;
 use rusqlite::{Connection, OptionalExtension, params};
 
 mod projects;
 mod search;
+mod writer;
 
 pub use projects::{Project, is_under, project_for_path};
 pub use search::{
     Insights, PREINJECT_NOTE, SearchHit, SearchQuery, SearchRow, SearchSort,
     without_attached_context,
 };
+pub use writer::{BATCH_WINDOW, MAX_BATCH, StoreOp};
 
 /// v2 added the session-search index, v3 projects, v4 pinned sessions.
 const SCHEMA_VERSION: i32 = 4;
@@ -94,8 +103,12 @@ pub struct UsageTotals {
     pub last_input_tokens: i64,
 }
 
+/// The session database. Shared (`Arc<Store>`) by the runtime, its tools and the gateway.
 pub struct Store {
-    conn: Mutex<Connection>,
+    /// The read connection. For an in-memory database it is the write connection itself (two
+    /// connections to `:memory:` would be two databases); the writer then locks it per batch.
+    read: Arc<Mutex<Connection>>,
+    writer: writer::Writer,
 }
 
 fn now_ms() -> i64 {
@@ -114,14 +127,31 @@ impl Store {
         // a crash, and a power cut can lose only the last commits. Per connection, so the GPUI
         // app sharing this database is unaffected; not a schema change.
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        Self::init(conn)
+        let write = Self::init(conn)?;
+        // WAL lets this connection read the last commit while the writer writes the next one.
+        let read = Connection::open(path)
+            .with_context(|| format!("opening session database {}", path.display()))?;
+        read.busy_timeout(std::time::Duration::from_secs(5))?;
+        read.pragma_update(None, "query_only", true)?;
+        Ok(Self::with(
+            Arc::new(Mutex::new(read)),
+            Arc::new(Mutex::new(write)),
+        ))
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+        let conn = Arc::new(Mutex::new(Self::init(Connection::open_in_memory()?)?));
+        Ok(Self::with(conn.clone(), conn))
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn with(read: Arc<Mutex<Connection>>, write: Arc<Mutex<Connection>>) -> Self {
+        Self {
+            read,
+            writer: writer::Writer::start(write),
+        }
+    }
+
+    fn init(conn: Connection) -> Result<Connection> {
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -147,9 +177,74 @@ impl Store {
                 "session database has schema version {version}, expected {SCHEMA_VERSION}"
             );
         }
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        Ok(conn)
+    }
+
+    /// The read connection, once every write sent before this call is committed: whatever the
+    /// caller (or anyone) queued or wrote before is visible. Every read method goes through it.
+    pub(crate) fn read(&self) -> MutexGuard<'_, Connection> {
+        self.writer.settle();
+        self.read.lock()
+    }
+
+    /// A write that returns once committed, with its own result (the synchronous API the
+    /// gateway and the GPUI app use). Ordered after everything queued before it.
+    pub(crate) fn write(
+        &self,
+        session: Option<&str>,
+        write: impl Fn(&Connection) -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        self.writer.submit(
+            session.map(str::to_string),
+            writer::Work::Call(Box::new(write)),
+            true,
+        )
+    }
+
+    /// [`StoreOp`] as a write that waits for its commit.
+    fn write_op(&self, op: StoreOp) -> Result<()> {
+        op.check()?;
+        let session = op.session_id().to_string();
+        self.writer
+            .submit(Some(session), writer::Work::Op(op), true)
+    }
+
+    /// Queues a write without waiting for it (the turn path: a streamed chunk, token usage). It
+    /// is committed within [`BATCH_WINDOW`], or sooner by a read, a flush or a waiting write.
+    ///
+    /// `Err` is either this write refused before queueing (a message without an id), or an
+    /// EARLIER queued write for the same session that failed (this one is queued all the same):
+    /// the caller stops as it did when every write was synchronous. Each failure is reported
+    /// once, to this or to [`Store::flush_session`].
+    pub fn queue(&self, op: StoreOp) -> Result<()> {
+        op.check()?;
+        let session = op.session_id().to_string();
+        self.writer
+            .submit(Some(session.clone()), writer::Work::Op(op), false)?;
+        self.writer.take_failures(Some(&session))
+    }
+
+    /// Commits everything queued so far and reports the queued writes of any session that
+    /// failed since they were last reported. Blocks for at most one commit: from async code, call
+    /// it through `spawn_blocking`.
+    pub fn flush(&self) -> Result<()> {
+        self.writer.settle();
+        self.writer.take_failures(None)
+    }
+
+    /// [`Store::flush`], reporting only `session_id`'s failures (another session's stay for its
+    /// own turn). The runtime calls it at every turn boundary, before the page hears the turn
+    /// ended, so a finished turn is committed.
+    pub fn flush_session(&self, session_id: &str) -> Result<()> {
+        self.writer.settle();
+        self.writer.take_failures(Some(session_id))
+    }
+
+    /// Commits what is queued and stops the writer thread (the app is exiting; `Drop` does the
+    /// same). Writes after this still work, on the caller's thread. Returns the failures nobody
+    /// collected.
+    pub fn shutdown(&self) -> Result<()> {
+        self.writer.shutdown()
     }
 
     pub fn create_session(&self, new: NewSession) -> Result<SessionRecord> {
@@ -165,18 +260,21 @@ impl Store {
             updated_at: now,
             pinned: false,
         };
-        self.conn.lock().execute(
-            "INSERT INTO sessions (id, title, cwd, provider, model, system_prompt, created_at, updated_at)
-             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?6)",
-            params![record.id, record.cwd, record.provider, record.model, record.system_prompt, now],
-        )?;
+        let row = record.clone();
+        self.write(Some(&record.id), move |conn| {
+            conn.execute(
+                "INSERT INTO sessions (id, title, cwd, provider, model, system_prompt, created_at, updated_at)
+                 VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?6)",
+                params![row.id, row.cwd, row.provider, row.model, row.system_prompt, now],
+            )?;
+            Ok(())
+        })?;
         Ok(record)
     }
 
     pub fn session(&self, id: &str) -> Result<Option<SessionRecord>> {
         Ok(self
-            .conn
-            .lock()
+            .read()
             .query_row(
                 "SELECT id, title, cwd, provider, model, system_prompt, created_at, updated_at, pinned
                  FROM sessions WHERE id = ?1",
@@ -200,7 +298,7 @@ impl Store {
 
     /// Most recently updated first.
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionRecord>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut statement = conn.prepare(
             "SELECT id, title, cwd, provider, model, system_prompt, created_at, updated_at, pinned
              FROM sessions ORDER BY updated_at DESC LIMIT ?1",
@@ -223,7 +321,7 @@ impl Store {
 
     /// How many messages one session has stored (a range of the primary key, not a table scan).
     pub fn message_count(&self, session_id: &str) -> Result<usize> {
-        let count: i64 = self.conn.lock().query_row(
+        let count: i64 = self.read().query_row(
             "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
             params![session_id],
             |row| row.get(0),
@@ -234,7 +332,7 @@ impl Store {
     /// The id of the session's last stored message (with the count, tells whether another process
     /// has written to the conversation since it was loaded).
     pub fn last_message_id(&self, session_id: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut statement = conn
             .prepare("SELECT id FROM messages WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1")?;
         let mut rows = statement.query([session_id])?;
@@ -246,7 +344,7 @@ impl Store {
 
     /// How many messages each session has stored (sessions without any are absent).
     pub fn message_counts(&self) -> Result<std::collections::HashMap<String, usize>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut statement =
             conn.prepare("SELECT session_id, COUNT(*) FROM messages GROUP BY session_id")?;
         let rows = statement.query_map([], |row| {
@@ -255,30 +353,39 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Pins or unpins a session (its place in the list by time is kept).
     /// A session's start and last activity (milliseconds): an imported session keeps its own.
     pub fn set_times(&self, id: &str, created_at: i64, updated_at: i64) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE sessions SET created_at = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, created_at, updated_at],
-        )?;
-        Ok(())
+        let id_owned = id.to_string();
+        self.write(Some(id), move |conn| {
+            conn.execute(
+                "UPDATE sessions SET created_at = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id_owned, created_at, updated_at],
+            )?;
+            Ok(())
+        })
     }
 
+    /// Pins or unpins a session (its place in the list by time is kept).
     pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE sessions SET pinned = ?2 WHERE id = ?1",
-            params![id, pinned],
-        )?;
-        Ok(())
+        let id_owned = id.to_string();
+        self.write(Some(id), move |conn| {
+            conn.execute(
+                "UPDATE sessions SET pinned = ?2 WHERE id = ?1",
+                params![id_owned, pinned],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn set_title(&self, id: &str, title: &str) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE sessions SET title = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, title, now_ms()],
-        )?;
-        Ok(())
+        let (id_owned, title) = (id.to_string(), title.to_string());
+        self.write(Some(id), move |conn| {
+            conn.execute(
+                "UPDATE sessions SET title = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id_owned, title, now_ms()],
+            )?;
+            Ok(())
+        })
     }
 
     /// Move to project: the stored workspace is replaced, never merged (Hermes's
@@ -286,20 +393,27 @@ impl Store {
     /// (branch / repo root) lives beside it in a side file (`crates/desktop/src/workspace.rs`),
     /// not in this shared schema.
     pub fn set_session_cwd(&self, id: &str, cwd: &str) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE sessions SET cwd = ?2 WHERE id = ?1",
-            params![id, cwd],
-        )?;
-        Ok(())
+        let (id_owned, cwd) = (id.to_string(), cwd.to_string());
+        self.write(Some(id), move |conn| {
+            conn.execute(
+                "UPDATE sessions SET cwd = ?2 WHERE id = ?1",
+                params![id_owned, cwd],
+            )?;
+            Ok(())
+        })
     }
 
     /// Switching models rebuilds the frozen prompt too; see `Runtime::set_session_model`.
     pub fn set_model(&self, id: &str, model: &str, system_prompt: &str) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE sessions SET model = ?2, system_prompt = ?3, updated_at = ?4 WHERE id = ?1",
-            params![id, model, system_prompt, now_ms()],
-        )?;
-        Ok(())
+        let (id_owned, model, prompt) =
+            (id.to_string(), model.to_string(), system_prompt.to_string());
+        self.write(Some(id), move |conn| {
+            conn.execute(
+                "UPDATE sessions SET model = ?2, system_prompt = ?3, updated_at = ?4 WHERE id = ?1",
+                params![id_owned, model, prompt, now_ms()],
+            )?;
+            Ok(())
+        })
     }
 
     /// Moves a session to another provider and model (the prompt is rebuilt as for a model switch).
@@ -310,31 +424,43 @@ impl Store {
         model: &str,
         system_prompt: &str,
     ) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE sessions SET provider = ?2, model = ?3, system_prompt = ?4, updated_at = ?5 WHERE id = ?1",
-            params![id, provider, model, system_prompt, now_ms()],
-        )?;
-        Ok(())
+        let (id_owned, provider, model, prompt) = (
+            id.to_string(),
+            provider.to_string(),
+            model.to_string(),
+            system_prompt.to_string(),
+        );
+        self.write(Some(id), move |conn| {
+            conn.execute(
+                "UPDATE sessions SET provider = ?2, model = ?3, system_prompt = ?4, updated_at = ?5 WHERE id = ?1",
+                params![id_owned, provider, model, prompt, now_ms()],
+            )?;
+            Ok(())
+        })
     }
 
     /// Only compaction may rewrite the frozen system prompt (the prompt-cache invariant).
     pub fn set_system_prompt(&self, id: &str, system_prompt: &str) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE sessions SET system_prompt = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, system_prompt, now_ms()],
-        )?;
-        Ok(())
+        self.write_op(StoreOp::SetSystemPrompt {
+            session_id: id.to_string(),
+            system_prompt: system_prompt.to_string(),
+        })
     }
 
     pub fn delete_session(&self, id: &str) -> Result<()> {
-        self.conn
-            .lock()
-            .execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+        let id_owned = id.to_string();
+        self.write(Some(id), move |conn| {
+            conn.execute("DELETE FROM sessions WHERE id = ?1", [&id_owned])?;
+            Ok(())
+        })?;
+        // A queued write of the deleted session that failed is moot now.
+        // (A failure of the writer itself stays, for the next caller.)
+        self.writer.discard_failures(id);
         Ok(())
     }
 
     pub fn load_messages(&self, session_id: &str) -> Result<Vec<Message>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut statement =
             conn.prepare("SELECT json FROM messages WHERE session_id = ?1 ORDER BY seq")?;
         let rows = statement.query_map([session_id], |row| row.get::<_, String>(0))?;
@@ -342,25 +468,14 @@ impl Store {
     }
 
     /// Inserts or replaces the message at position `seq` in the conversation. Rows are keyed by
-    /// position, not message id: providers may reuse completion ids across responses.
+    /// position, not message id: providers may reuse completion ids across responses. Waits for
+    /// the commit; the turn path queues the same write instead ([`StoreOp::UpsertMessage`]).
     pub fn upsert_message(&self, session_id: &str, seq: usize, message: &Message) -> Result<()> {
-        let id = message
-            .id
-            .as_deref()
-            .context("messages must have an id before they are stored")?;
-        let json = serde_json::to_string(message)?;
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO messages (session_id, id, seq, role, json) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(session_id, seq) DO UPDATE SET id = excluded.id, role = excluded.role, json = excluded.json",
-            params![session_id, id, seq as i64, role_name(message), json],
-        )?;
-        search::index_message(&conn, session_id, seq, message)?;
-        conn.execute(
-            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
-            params![session_id, now_ms()],
-        )?;
-        Ok(())
+        self.write_op(StoreOp::UpsertMessage {
+            session_id: session_id.to_string(),
+            seq,
+            message: Arc::new(message.clone()),
+        })
     }
 
     /// Replaces the whole stored conversation (compaction, undo).
@@ -369,55 +484,24 @@ impl Store {
         session_id: &str,
         messages: &[M],
     ) -> Result<()> {
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM messages WHERE session_id = ?1", [session_id])?;
-        tx.execute(
-            "DELETE FROM search_rows WHERE session_id = ?1",
-            [session_id],
-        )?;
-        for (seq, message) in messages.iter().enumerate() {
-            let message: &Message = message.borrow();
-            let id = message
-                .id
-                .as_deref()
-                .context("messages must have an id before they are stored")?;
-            tx.execute(
-                "INSERT INTO messages (session_id, id, seq, role, json) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![session_id, id, seq as i64, role_name(message), serde_json::to_string(message)?],
-            )?;
-            search::index_message(&tx, session_id, seq, message)?;
-        }
-        tx.execute(
-            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
-            params![session_id, now_ms()],
-        )?;
-        tx.commit()?;
-        Ok(())
+        self.write_op(StoreOp::ReplaceMessages {
+            session_id: session_id.to_string(),
+            messages: messages
+                .iter()
+                .map(|message| Arc::new(message.borrow().clone()))
+                .collect(),
+        })
     }
 
     pub fn record_usage(&self, session_id: &str, usage: &ProviderUsage) -> Result<()> {
-        let tokens = |value: Option<i32>| i64::from(value.unwrap_or(0));
-        self.conn.lock().execute(
-            "INSERT INTO usage (session_id, at, model, input_tokens, output_tokens,
-                                cache_read_tokens, cache_write_tokens, cost)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                session_id,
-                now_ms(),
-                usage.model,
-                tokens(usage.usage.input_tokens),
-                tokens(usage.usage.output_tokens),
-                tokens(usage.usage.cache_read_input_tokens),
-                tokens(usage.usage.cache_write_input_tokens),
-                usage.cost,
-            ],
-        )?;
-        Ok(())
+        self.write_op(StoreOp::RecordUsage {
+            session_id: session_id.to_string(),
+            usage: usage.clone(),
+        })
     }
 
     pub fn usage_totals(&self, session_id: &str) -> Result<UsageTotals> {
-        Ok(self.conn.lock().query_row(
+        Ok(self.read().query_row(
             "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
                     COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0),
                     SUM(cost),
@@ -438,6 +522,113 @@ impl Store {
             },
         )?)
     }
+}
+
+impl Drop for Store {
+    /// Nothing queued is lost when the last holder lets go: the writer commits it first.
+    fn drop(&mut self) {
+        if let Err(error) = self.writer.shutdown() {
+            tracing::error!("session database at close: {error:#}");
+        }
+    }
+}
+
+// The writes themselves, on the writer's connection, inside the transaction (and savepoint) the
+// writer opened: none opens a transaction of its own.
+
+fn message_id(message: &Message) -> Result<&str> {
+    message
+        .id
+        .as_deref()
+        .context("messages must have an id before they are stored")
+}
+
+pub(crate) fn upsert_message_in(
+    conn: &Connection,
+    session_id: &str,
+    seq: usize,
+    message: &Message,
+) -> Result<()> {
+    let id = message_id(message)?;
+    let json = serde_json::to_string(message)?;
+    conn.execute(
+        "INSERT INTO messages (session_id, id, seq, role, json) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(session_id, seq) DO UPDATE SET id = excluded.id, role = excluded.role, json = excluded.json",
+        params![session_id, id, seq as i64, role_name(message), json],
+    )?;
+    search::index_message(conn, session_id, seq, message)?;
+    conn.execute(
+        "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+        params![session_id, now_ms()],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn replace_messages_in(
+    conn: &Connection,
+    session_id: &str,
+    messages: &[Arc<Message>],
+) -> Result<()> {
+    conn.execute("DELETE FROM messages WHERE session_id = ?1", [session_id])?;
+    conn.execute(
+        "DELETE FROM search_rows WHERE session_id = ?1",
+        [session_id],
+    )?;
+    for (seq, message) in messages.iter().enumerate() {
+        let id = message_id(message)?;
+        conn.execute(
+            "INSERT INTO messages (session_id, id, seq, role, json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                session_id,
+                id,
+                seq as i64,
+                role_name(message),
+                serde_json::to_string(&**message)?
+            ],
+        )?;
+        search::index_message(conn, session_id, seq, message)?;
+    }
+    conn.execute(
+        "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+        params![session_id, now_ms()],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn record_usage_in(
+    conn: &Connection,
+    session_id: &str,
+    usage: &ProviderUsage,
+) -> Result<()> {
+    let tokens = |value: Option<i32>| i64::from(value.unwrap_or(0));
+    conn.execute(
+        "INSERT INTO usage (session_id, at, model, input_tokens, output_tokens,
+                            cache_read_tokens, cache_write_tokens, cost)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            session_id,
+            now_ms(),
+            usage.model,
+            tokens(usage.usage.input_tokens),
+            tokens(usage.usage.output_tokens),
+            tokens(usage.usage.cache_read_input_tokens),
+            tokens(usage.usage.cache_write_input_tokens),
+            usage.cost,
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn set_system_prompt_in(
+    conn: &Connection,
+    session_id: &str,
+    system_prompt: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET system_prompt = ?2, updated_at = ?3 WHERE id = ?1",
+        params![session_id, system_prompt, now_ms()],
+    )?;
+    Ok(())
 }
 
 fn role_name(message: &Message) -> &'static str {
@@ -470,7 +661,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hermes-store-{}", uuid::Uuid::new_v4()));
         let store = Store::open(&dir.join("sessions.db")).unwrap();
         {
-            let conn = store.conn.lock();
+            let conn = store.writer.connection().lock();
             let mode: String = conn
                 .pragma_query_value(None, "journal_mode", |r| r.get(0))
                 .unwrap();
@@ -479,6 +670,13 @@ mod tests {
                 .unwrap();
             assert_eq!(mode, "wal");
             assert_eq!(sync, 1, "NORMAL");
+            // The read connection is a second one that cannot write.
+            let read = store.read.lock();
+            let query_only: i64 = read
+                .pragma_query_value(None, "query_only", |r| r.get(0))
+                .unwrap();
+            assert_eq!(query_only, 1);
+            assert!(read.execute("DELETE FROM sessions", []).is_err());
         }
         drop(store);
         let _ = std::fs::remove_dir_all(dir);

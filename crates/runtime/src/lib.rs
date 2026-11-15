@@ -409,6 +409,34 @@ pub enum TurnStatus {
     Failed(String),
 }
 
+/// Commits what a turn queued for its session (the store's writer batches it, Phase 13 CP13b),
+/// off the async workers. Every turn calls it before the page hears the turn ended, so a turn
+/// shown as finished is in the database even if the app is killed right after.
+async fn flush_turn(store: &Arc<Store>, session_id: &str) -> Result<()> {
+    let (store, id) = (store.clone(), session_id.to_string());
+    tokio::task::spawn_blocking(move || store.flush_session(&id))
+        .await
+        .unwrap_or_else(|error| Err(anyhow::anyhow!("{error}")))
+}
+
+/// The turn's status once its writes are committed: a write that failed makes it `Failed`,
+/// saying so, instead of a turn that looks saved (the reply stays on screen; the page shows the
+/// reason as it shows any failed turn).
+fn after_save(session_id: &str, status: TurnStatus, saved: Result<()>) -> TurnStatus {
+    let Err(error) = saved else {
+        return status;
+    };
+    tracing::error!("session {session_id}: {error:#}");
+    let unsaved = format!(
+        "This turn was not fully saved to the session database: {error:#}. \
+         What is shown may be missing after a restart."
+    );
+    TurnStatus::Failed(match status {
+        TurnStatus::Failed(reason) => format!("{reason}\n{unsaved}"),
+        TurnStatus::Completed | TurnStatus::Cancelled => unsaved,
+    })
+}
+
 /// Estimated tokens per part of the request (characters / 4, like Hermes's breakdown).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ContextBreakdown {
@@ -1478,6 +1506,7 @@ impl Runtime {
         // "running", Stop finds nothing to stop, and every new prompt waits behind it forever.
         let guard_session = runtime.session.clone();
         let guard_events = events_tx.clone();
+        let guard_store = runtime.store.clone();
         // Every model call of the turn is a `main` request in the ledger (the context is a
         // task-local, so it is set around this task; tasks the turn spawns need their own).
         let request_context = self.ledger.context(hermes_llm::observer::Purpose::Main, Some(&session_id));
@@ -1598,12 +1627,16 @@ impl Runtime {
                         let _ = events_tx.send(RuntimeEvent::Agent(AgentEvent::Message(user)));
                     }
                     outcome => {
-                        *runtime.session.running.lock() = None;
-                        *runtime.session.turn_state.lock() = None;
                         let status = match outcome {
                             Err(error) => TurnStatus::Failed(format!("{error:#}")),
                             Ok(_) => TurnStatus::Cancelled,
                         };
+                        // Flushed while the turn still holds the session, as at the normal end:
+                        // a next turn's writes and failures are not this one's.
+                        let saved = flush_turn(&runtime.store, &session_id).await;
+                        *runtime.session.running.lock() = None;
+                        *runtime.session.turn_state.lock() = None;
+                        let status = after_save(&session_id, status, saved);
                         let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
                         scheduler.idle_from_now(&session_id);
                         return;
@@ -1705,6 +1738,9 @@ impl Runtime {
             drop(machine);
             drop(emit);
             let _ = forward.await;
+            // The turn boundary: everything it queued is committed while it still holds the
+            // session, before anything else sees that it ended.
+            let saved = flush_turn(&runtime.store, &session_id).await;
             // Read while the turn still holds the session, so the next one can't add to it yet.
             let signal_answer =
                 signals::final_answer(runtime.session.conversation.lock().messages());
@@ -1721,6 +1757,7 @@ impl Runtime {
                     TurnStatus::Failed(format!("{error:#}"))
                 }
             };
+            let status = after_save(&session_id, status, saved);
             let limit_error = {
                 let conversation = runtime.session.conversation.lock();
                 conversation.messages().last().and_then(|last| {
@@ -1789,10 +1826,17 @@ impl Runtime {
                 && error.is_panic()
             {
                 tracing::error!("turn crashed: {error}");
+                let session_id = guard_session.record.lock().id.clone();
+                let saved = flush_turn(&guard_store, &session_id).await;
                 *guard_session.running.lock() = None;
                 *guard_session.turn_state.lock() = None;
-                let _ = guard_events.send(RuntimeEvent::TurnFinished(TurnStatus::Failed(
+                let status = TurnStatus::Failed(
                     "The turn stopped on an internal error (details in the log).".into(),
+                );
+                let _ = guard_events.send(RuntimeEvent::TurnFinished(after_save(
+                    &session_id,
+                    status,
+                    saved,
                 )));
             }
         });
@@ -1942,6 +1986,9 @@ impl Runtime {
                     }
                 }
             };
+            let session_id = open.record.lock().id.clone();
+            let saved = flush_turn(&store, &session_id).await;
+            let status = after_save(&session_id, status, saved);
             *open.running.lock() = None;
             let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
         }));

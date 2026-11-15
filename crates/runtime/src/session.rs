@@ -1,5 +1,10 @@
 //! Open sessions: the live conversation, its tools, and how state-machine effects are applied
 //! to memory, the database and the event stream.
+//!
+//! Effects reach the database through the store's writer (Phase 13 CP13b): `apply_effects`
+//! queues each write ([`Store::queue`]) and goes on; the writer commits them in batches. A
+//! queued write that failed is returned by the session's next `queue`, which stops the turn as
+//! a synchronous write did, and the turn's end flushes (`flush_turn` in `lib.rs`).
 
 use std::sync::Arc;
 
@@ -12,7 +17,7 @@ use hermes_agent::operation::{ConversationEffect, Emitter, MachineEffect};
 use hermes_llm::conversation::Conversation;
 use hermes_llm::conversation::message::{Message, MessageContent};
 use hermes_llm::conversation::token_usage::ProviderUsage;
-use hermes_store::{SessionRecord, Store};
+use hermes_store::{SessionRecord, Store, StoreOp};
 use hermes_tools::SessionTools;
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -181,10 +186,16 @@ impl OpenSession {
     ) -> Result<()> {
         let session_id = self.record.lock().id.clone();
         if let Some(prompt) = system_prompt {
-            store.set_system_prompt(&session_id, &prompt)?;
+            store.queue(StoreOp::SetSystemPrompt {
+                session_id: session_id.clone(),
+                system_prompt: prompt.clone(),
+            })?;
             self.record.lock().system_prompt = prompt;
         }
-        store.replace_messages(&session_id, conversation.messages())?;
+        store.queue(StoreOp::ReplaceMessages {
+            session_id,
+            messages: conversation.messages().to_vec(),
+        })?;
         *self.conversation.lock() = conversation;
         *self.context.lock() = None;
         Ok(())
@@ -215,30 +226,34 @@ pub struct TurnRuntime {
 }
 
 impl TurnRuntime {
-    /// Appends (or merges a streamed chunk into) the conversation, then stores the merged message.
+    /// Appends (or merges a streamed chunk into) the conversation, then queues the merged
+    /// message for the store's writer (committed within ~5 ms, and at the latest when the turn
+    /// ends: Phase 13 CP13b). Queued under the conversation's lock, so two writers to one
+    /// session reach the store in the order they changed it; queueing never blocks.
     pub fn append(&self, message: Message) -> Result<()> {
         let session_id = self.session.record.lock().id.clone();
-        let (index, stored) = {
-            let mut conversation = self.session.conversation.lock();
-            let id = message.id.clone();
-            conversation.push(message);
-            let messages = conversation.messages();
-            let index = id
-                .and_then(|id| {
-                    messages
-                        .iter()
-                        .rposition(|m| m.id.as_deref() == Some(id.as_str()))
-                })
-                .unwrap_or(messages.len().saturating_sub(1));
-            match messages.get(index) {
-                Some(message) => (index, message.clone()),
-                None => return Ok(()),
-            }
+        let mut conversation = self.session.conversation.lock();
+        let id = message.id.clone();
+        conversation.push(message);
+        let messages = conversation.messages();
+        let index = id
+            .and_then(|id| {
+                messages
+                    .iter()
+                    .rposition(|m| m.id.as_deref() == Some(id.as_str()))
+            })
+            .unwrap_or(messages.len().saturating_sub(1));
+        let Some(stored) = messages.get(index).cloned() else {
+            return Ok(());
         };
         if !self.persist {
             return Ok(());
         }
-        self.store.upsert_message(&session_id, index, &stored)
+        self.store.queue(StoreOp::UpsertMessage {
+            session_id,
+            seq: index,
+            message: stored,
+        })
     }
 
     /// Removes the error messages that ended the last turn; `None` when the conversation
@@ -258,29 +273,35 @@ impl TurnRuntime {
             if messages.len() == before {
                 return Ok(None);
             }
+            // Queued under the lock, as in `append`.
+            self.store.queue(StoreOp::ReplaceMessages {
+                session_id,
+                messages: conversation.messages().to_vec(),
+            })?;
             conversation.clone()
         };
-        self.store
-            .replace_messages(&session_id, conversation.messages())?;
         Ok(Some(conversation))
     }
 
     fn update_message(&self, message_id: &str, change: impl FnOnce(&mut Message)) -> Result<()> {
         let session_id = self.session.record.lock().id.clone();
-        let (index, stored) = {
-            let mut conversation = self.session.conversation.lock();
-            let messages = conversation.messages_mut();
-            let index = messages
-                .iter()
-                .rposition(|m| m.id.as_deref() == Some(message_id))
-                .with_context(|| format!("message {message_id} not found"))?;
-            change(Arc::make_mut(&mut messages[index]));
-            (index, messages[index].clone())
-        };
+        // Queued under the lock, as in `append`.
+        let mut conversation = self.session.conversation.lock();
+        let messages = conversation.messages_mut();
+        let index = messages
+            .iter()
+            .rposition(|m| m.id.as_deref() == Some(message_id))
+            .with_context(|| format!("message {message_id} not found"))?;
+        change(Arc::make_mut(&mut messages[index]));
+        let stored = messages[index].clone();
         if !self.persist {
             return Ok(());
         }
-        self.store.upsert_message(&session_id, index, &stored)
+        self.store.queue(StoreOp::UpsertMessage {
+            session_id,
+            seq: index,
+            message: stored,
+        })
     }
 }
 
@@ -312,8 +333,10 @@ impl EffectHandler<TurnSession, HermesEffect> for TurnRuntime {
                 )) => {
                     let session_id = self.session.record.lock().id.clone();
                     if self.persist {
-                        self.store
-                            .replace_messages(&session_id, conversation.messages())?;
+                        self.store.queue(StoreOp::ReplaceMessages {
+                            session_id,
+                            messages: conversation.messages().to_vec(),
+                        })?;
                     }
                     *self.session.conversation.lock() = conversation.clone();
                     emit.emit(AgentEvent::HistoryReplaced(conversation.clone()));
@@ -408,7 +431,10 @@ impl EffectHandler<TurnSession, HermesEffect> for TurnRuntime {
                     }
                     if self.record_usage {
                         let session_id = self.session.record.lock().id.clone();
-                        self.store.record_usage(&session_id, usage)?;
+                        self.store.queue(StoreOp::RecordUsage {
+                            session_id,
+                            usage: usage.clone(),
+                        })?;
                     }
                     emit.emit(AgentEvent::Usage(usage.clone()));
                 }

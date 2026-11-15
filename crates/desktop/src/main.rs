@@ -83,11 +83,15 @@ fn main() -> Result<()> {
     // The request ledger, once the backend is built: written out when the app exits (Tauri's
     // `run` never returns, so nothing after it would run).
     let exit_ledger: Arc<std::sync::OnceLock<hermes_runtime::ledger::Ledger>> = Arc::default();
+    // The runtime, for the same reason: its store's writer commits what is still queued (a turn
+    // that is still streaming) before the process ends (Phase 13 CP13b).
+    let exit_runtime: Arc<std::sync::OnceLock<Arc<Runtime>>> = Arc::default();
     {
         let window = window.clone();
         let url = url.clone();
         let terminals = terminals.clone();
         let exit_ledger = exit_ledger.clone();
+        let exit_runtime = exit_runtime.clone();
         tokio.spawn(async move {
             let built = tokio::task::spawn_blocking(move || -> Result<server::ServerState> {
                 // The runtime asks the user (approvals, clarify) through the page following the
@@ -99,6 +103,7 @@ fn main() -> Result<()> {
                 )?);
                 runtime.warm_up();
                 let _ = exit_ledger.set(runtime.ledger().clone());
+                let _ = exit_runtime.set(runtime.clone());
                 Ok(server::ServerState {
                     dist: webapp_dist(),
                     gateway: {
@@ -168,10 +173,15 @@ fn main() -> Result<()> {
         .build(tauri::generate_context!())
         .context("building the window")?
         .run(move |_, event| {
-            if let tauri::RunEvent::Exit = event
-                && let Some(ledger) = exit_ledger.get()
-            {
-                ledger.flush_blocking();
+            if let tauri::RunEvent::Exit = event {
+                if let Some(ledger) = exit_ledger.get() {
+                    ledger.flush_blocking();
+                }
+                if let Some(runtime) = exit_runtime.get()
+                    && let Err(error) = runtime.store().shutdown()
+                {
+                    tracing::error!("session database at exit: {error:#}");
+                }
             }
         });
     terminals.close_all();

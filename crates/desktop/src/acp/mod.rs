@@ -102,9 +102,15 @@ pub fn run() -> Result<()> {
             })
             .await??;
         let ledger = gateway.runtime.ledger().clone();
+        let runtime = gateway.runtime.clone();
         server::AcpServer::serve(gateway, tokio::io::stdin(), tokio::io::stdout()).await;
-        // The editor closed stdin: write the request counts before the process ends.
+        // The editor closed stdin: write the request counts before the process ends, and let
+        // the store's writer commit what is still queued (Phase 13 CP13b).
         ledger.flush_blocking();
+        let store_closed = tokio::task::spawn_blocking(move || runtime.store().shutdown()).await;
+        if let Ok(Err(error)) = store_closed {
+            tracing::error!("session database at exit: {error:#}");
+        }
         Ok::<(), anyhow::Error>(())
     })?;
     // Tasks that never finish (a read of stdin) must not keep the process alive.

@@ -1307,10 +1307,11 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   (the state machine's `TurnSession`, a review's view, a `HistoryReplaced` event) still holds it, and edits it in
   place otherwise. `session::tests::a_snapshot_shares_the_messages_and_does_not_see_later_changes` is the
   contract.
-- **`make_mut` on a message you just cloned an `Arc` of copies it.** `TurnRuntime::append` keeps an `Arc` clone only
-  while it reads the stored message, and drops it before the next chunk merges, so a streamed message is edited in
-  place; keep that order if you touch `append`/`push` (holding the clone across the next `push` would copy the whole
-  growing message per chunk).
+- **`make_mut` on a message you just cloned an `Arc` of copies it.** `TurnRuntime::append` hands an `Arc` clone of
+  the merged message to the store's writer queue (Phase 13b). While that batch is open (up to ~5 ms) the next chunk's
+  `push` copies the message once instead of editing it in place; that copy replaced 13a's per-chunk JSON
+  serialisation and commit on the turn's thread (the writer serialises only the last version per batch). Don't hold
+  any other clone across the next `push`.
 - **A projection must give back the very same `Arc` when it changes nothing**: `agent_visible_arc`,
   `messages_for_provider`, the repair passes. If you add a pass that rebuilds every message (a `.map(|m|
   m.clone())` or `agent_visible_content()` unconditionally) the request path is deep-copying again and nothing
@@ -1331,3 +1332,31 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **Byte-identical requests are the contract** (prompt caching, ground rule 8). The turns suite under the default,
   `requests` and `tokens` profiles was compared request by request with the pre-13a output (see
   `docs/backend/progress/phase-13.md`); repeat that comparison when you touch a repair pass.
+
+## The store's writer (Phase 13b, `crates/store/src/writer.rs`)
+
+- **Every `Store` read waits for the writes sent before it; you don't flush for read-after-write.** The read
+  methods go through `Store::read()`, which first settles the writer queue. A new read method must use
+  `self.read()`, never lock the read connection directly, or it reads stale rows: `Runtime::reload_if_stale`
+  compares the store's count with the live conversation and would "reload" a turn's history back to an older one.
+- **A new write method goes through the writer**: `self.write(session, move |conn| ..)` (waits for its commit,
+  ordered after every queued write), or a `StoreOp` for `Store::queue`. Never open a transaction inside it (the
+  writer's batch is the transaction, the write runs in a savepoint) and never write on the read connection (it is
+  `query_only`). The closure is `Fn`: a batch whose commit fails runs it again alone. Never `COMMIT`/`ROLLBACK` in
+  it either; if its error ends the transaction anyway (SQLite does on a full disk or an I/O error), the writer sees
+  `is_autocommit` and reruns every write of the batch alone, none of them twice. Tag it with the session it
+  touches (`None` when it touches no session or several): the upsert coalescing in `writer::superseded` relies on it.
+- **`Store::flush*` blocks; `Store::queue` doesn't.** From async code, flush through `spawn_blocking` (`flush_turn`
+  in `runtime/src/lib.rs`). `queue` can be called under the conversation's lock (it is, in `append` and
+  `update_message`, so two writers to one session keep their order).
+- **A turn's end must flush before the page hears it.** Every `TurnFinished` in `runtime/src/lib.rs` is preceded by
+  `flush_turn` + `after_save`; a new kind of turn (anything that queues writes and then reports "done") needs the
+  same, or a kill right after "done" loses its last ~5 ms and a failed write is reported to the next turn instead.
+- **`Err` from `Store::queue` is usually not about that write.** It is an earlier queued write of the same session
+  that failed (taken: reported once). The turn stops on it, as it did on a synchronous error.
+- **Another connection sees queued writes only after a flush**: the GPUI app, a test that opens a second `Store` or
+  a `rusqlite::Connection` on the same file. After a turn has finished that is automatic; elsewhere call
+  `store.flush()` first.
+- **An in-memory store has one connection** (two `:memory:` connections are two databases): the writer locks it per
+  batch, so a test that holds `store.writer.write.lock()` keeps the writer from starting (the writer tests use that to
+  fill a batch on purpose).

@@ -10725,3 +10725,86 @@ async fn a_session_that_moved_to_the_fallback_resumes_on_the_primary() {
     let messages = runtime.messages(&session).unwrap();
     assert_eq!(messages.last().unwrap().as_concat_text(), "a again");
 }
+
+// ---- Phase 13, CP13b: the store's writer (`crates/store/src/writer.rs`)
+
+/// The turn boundary: when the page hears a turn ended, everything it wrote is committed, so
+/// another connection (the GPUI app, the app restarted after a kill) reads it at once, without
+/// a flush of its own.
+#[tokio::test]
+async fn a_finished_turn_is_committed_before_the_page_hears_it_ended() {
+    let h = harness(vec![text_reply("the committed reply")]).await;
+    let session = session_in(&h);
+    let events = run_turn(&h, &session, "hello").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    let other = rusqlite::Connection::open(h.data.path().join("sessions.db")).unwrap();
+    let ids: Vec<String> = other
+        .prepare("SELECT id FROM messages WHERE session_id = ?1 ORDER BY seq")
+        .unwrap()
+        .query_map([&session], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let shown: Vec<String> = h
+        .runtime
+        .messages(&session)
+        .unwrap()
+        .iter()
+        .map(|m| m.id.clone().unwrap())
+        .collect();
+    // Same messages, same ids, same order as the conversation the page shows.
+    assert_eq!(ids, shown);
+    let last: String = other
+        .query_row(
+            "SELECT json FROM messages WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+            [&session],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(last.contains("the committed reply"));
+    let calls: i64 = other
+        .query_row(
+            "SELECT COUNT(*) FROM usage WHERE session_id = ?1",
+            [&session],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(calls, 1);
+}
+
+/// A queued write the database refuses is not swallowed: the turn ends `Failed`, naming the
+/// database's reason, the other writes of the turn are saved, and the failure is reported once
+/// (the next turn completes).
+#[tokio::test]
+async fn a_write_the_database_refuses_fails_the_turn_with_the_reason() {
+    let h = harness(vec![text_reply("the reply"), text_reply("again")]).await;
+    let session = session_in(&h);
+    // The usage row of the turn's model call is refused (as a full disk would refuse it).
+    let other = rusqlite::Connection::open(h.data.path().join("sessions.db")).unwrap();
+    other
+        .execute_batch(
+            "CREATE TRIGGER refuse_usage BEFORE INSERT ON usage
+             BEGIN SELECT RAISE(ABORT, 'no room for usage (test)'); END;",
+        )
+        .unwrap();
+    let events = run_turn(&h, &session, "hello").await;
+    match finished_status(&events) {
+        TurnStatus::Failed(reason) => {
+            assert!(reason.contains("no room for usage (test)"), "{reason}");
+            assert!(reason.contains("session database"), "{reason}");
+        }
+        other => panic!("the turn looked saved: {other:?}"),
+    }
+    let stored: i64 = other
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+            [&session],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, 2, "the message and the reply are saved");
+    other.execute_batch("DROP TRIGGER refuse_usage").unwrap();
+    let events = run_turn(&h, &session, "once more").await;
+    assert_eq!(finished_status(&events), TurnStatus::Completed);
+    assert_eq!(last_text(&h, &session), "again");
+}

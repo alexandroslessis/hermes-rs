@@ -74,7 +74,7 @@ pub fn project_for_path<'a>(projects: &'a [Project], cwd: &str) -> Option<&'a Pr
 impl Store {
     /// Every project, oldest first.
     pub fn list_projects(&self) -> Result<Vec<Project>> {
-        let conn = self.conn.lock();
+        let conn = self.read();
         let mut statement =
             conn.prepare("SELECT id, name, created_at FROM projects ORDER BY created_at, id")?;
         let mut projects: Vec<Project> = statement
@@ -104,38 +104,39 @@ impl Store {
             folders: dedup(folders),
             created_at: now_ms(),
         };
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT INTO projects (id, name, created_at) VALUES (?1, ?2, ?3)",
-            params![project.id, project.name, project.created_at],
-        )?;
-        insert_folders(&tx, &project.id, &project.folders)?;
-        tx.commit()?;
+        // Atomic: the writer runs each write in a savepoint of its own.
+        let row = project.clone();
+        self.write(None, move |conn| {
+            conn.execute(
+                "INSERT INTO projects (id, name, created_at) VALUES (?1, ?2, ?3)",
+                params![row.id, row.name, row.created_at],
+            )?;
+            insert_folders(conn, &row.id, &row.folders)
+        })?;
         Ok(project)
     }
 
     /// Renames the project and replaces its folders.
     pub fn update_project(&self, id: &str, name: &str, folders: &[String]) -> Result<()> {
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
-        let changed = tx.execute(
-            "UPDATE projects SET name = ?2 WHERE id = ?1",
-            params![id, name],
-        )?;
-        anyhow::ensure!(changed == 1, "no project {id}");
-        tx.execute("DELETE FROM project_folders WHERE project_id = ?1", [id])?;
-        insert_folders(&tx, id, &dedup(folders))?;
-        tx.commit()?;
-        Ok(())
+        let (id, name, folders) = (id.to_string(), name.to_string(), dedup(folders));
+        self.write(None, move |conn| {
+            let changed = conn.execute(
+                "UPDATE projects SET name = ?2 WHERE id = ?1",
+                params![id, name],
+            )?;
+            anyhow::ensure!(changed == 1, "no project {id}");
+            conn.execute("DELETE FROM project_folders WHERE project_id = ?1", [&id])?;
+            insert_folders(conn, &id, &folders)
+        })
     }
 
     /// Deletes the project. Its sessions stay; they just no longer belong to it.
     pub fn delete_project(&self, id: &str) -> Result<()> {
-        self.conn
-            .lock()
-            .execute("DELETE FROM projects WHERE id = ?1", [id])?;
-        Ok(())
+        let id = id.to_string();
+        self.write(None, move |conn| {
+            conn.execute("DELETE FROM projects WHERE id = ?1", [&id])?;
+            Ok(())
+        })
     }
 }
 

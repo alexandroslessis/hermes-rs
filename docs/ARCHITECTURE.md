@@ -45,7 +45,7 @@ it calls into. Everything runs in one process.
 | `crates/llm` | `hermes_llm` | Messages, the OpenAI-compatible provider, retries (from Goose) | `conversation::message::{Message, MessageContent}`; `observer.rs` is where every model POST is reported (purpose, session, provider) to the request ledger |
 | `crates/tools` | `hermes_tools` | Every agent tool + `SessionTools` (the per-session tool set) | One module per tool family; `paths.rs` resolves paths; `path_policy.rs` classifies where file edits and terminal commands may go (workspace, app data, skills/memory, persistence places, outside); `approval.rs` the dangerous-command check; `script.rs` + `script_guard.rs` the `run_script` tool (a script in PowerShell, Python through uv, or bash, run from a per-run scratch folder; `script_guard` reads the whole script for the approval, see PITFALLS.md "run_script"); `taint.rs` what the session has read that the user didn't write (see Taint in PITFALLS.md); `staging.rs` the writes a tainted session's `memory` / `skill_manage` calls leave for the user (`staging/<id>.json`, applied through the stores' own write paths); `index.rs` the local FTS5 index (`index.db`) over skills and memory, kept fresh by write hooks on `SkillStore` / `MemoryStore` |
 | `crates/memory` | `hermes_memory` | The memory store and tool (`§`-separated entries, char limits, drift guard) | `store.rs` (the API every caller uses), `tool.rs`, `threats.rs`; since Phase 9: `db.rs` (`memory.db`: entries with tier/scope/kind/links; the agent's removals kept as marked rows, the user's erased), `tiers.rs` (CP9.2: the `project` tier per git root and the `archive` tier, tags/links/notes validation, the project block of the system prompt, `mutate_tier`), `notes.rs` (long-form notes in `memories/notes/`), `similar.rs` (dedupe on add), `retrieval.rs` (CP9.3: what the index, the map and the curator read: indexable rows, the generation, batched hits, hygiene candidates, `demote_core`) and `sync.rs` (the files as the exported view of the database: migration with a backup copy, re-import of manual edits, the write step under the database's lock, fallback to the files alone) |
-| `crates/store` | `hermes_store` | SQLite: sessions, messages, usage, projects | **Schema frozen** (shared with GPUI) |
+| `crates/store` | `hermes_store` | SQLite: sessions, messages, usage, projects | **Schema frozen** (shared with GPUI). `writer.rs`: one writer thread owns the write connection and commits in batches; reads use their own connection (see "The store's writer" below) |
 | `crates/prompts` | `hermes_prompts` | Builds the system prompt; tool schemas; coding-command and side-question prompts | Text comes from `prompts/` |
 | `crates/app` | — | The frozen GPUI app | Keep it compiling |
 | `crates/markdown`, `highlight`, `themes` | — | Used by the GPUI app only | |
@@ -194,7 +194,8 @@ Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`
    `DeliverSteer` injects `/steer` text), and runs the Goose agent loop on a task. Returns a
    `Turn` with an `events` channel and a cancel handle.
 4. The agent streams from `hermes_llm`'s OpenAI-compatible provider, runs tool calls
-   (`hermes_tools`), persists each message to the store, and emits `AgentEvent`s.
+   (`hermes_tools`), queues each message for the store's writer (committed in ~5 ms batches, and
+   flushed before `TurnFinished`), and emits `AgentEvent`s.
 5. Gateway forwards those as page events, records generation stats (`note_generation`), and on
    `TurnFinished` sends `message.complete`, runs the next queued prompt, titles a new session
    (`title_session`, aux "titles" model), and the background review may run. Just before
@@ -245,6 +246,40 @@ share the same messages:
   an element (`make_mut` it), or a snapshot would see the change. Helpers over a conversation's list take
   `&[Arc<Message>]` (`hermes_llm::conversation::arcs(vec)` wraps plain messages, mostly for tests);
   `Store::replace_messages` and the OpenAI formatter are generic over `Borrow<Message>`.
+
+### The store's writer (Phase 13b)
+
+`hermes_store::Store` has two connections to `sessions.db`. The **write** connection belongs to
+one thread (`crates/store/src/writer.rs`, "hermes-store-writer"; C++: a worker thread with a
+message queue owning the connection); every write is a job on its channel, run in the order sent.
+The **read** connection is separate (`query_only`; WAL lets it read while the writer writes). An
+in-memory store (tests) has one connection that both use.
+
+- **Queued writes** (`Store::queue(StoreOp)`): the turn path. `TurnRuntime::append`,
+  `update_message`, `drop_trailing_errors`, a replaced history, compaction and token usage queue
+  their write and go on (`session.rs`). `Err` from `queue` is an *earlier* queued write of that
+  session that failed: the turn stops there, as when writes were synchronous.
+- **Waiting writes**: every other `Store` write method (`create_session`, `set_title`,
+  `replace_messages`, `delete_session`, projects...) is a job too, and returns once committed with
+  its own result. So it never overtakes a queued write, and the synchronous API the gateway and
+  the GPUI app use is unchanged.
+- **Batches**: from the first job, the writer keeps collecting for `BATCH_WINDOW` (5 ms), up to
+  `MAX_BATCH` (256), and stops early at a waiting write or a flush. One `BEGIN IMMEDIATE`; each
+  job in a savepoint (a failing job is rolled back alone and reported, the rest commit); a failed
+  `COMMIT` is retried job by job. A queued upsert of a message that a later job of the batch
+  upserts again (a streamed reply) is skipped.
+- **Reads see every write sent before them**: each read method calls `Writer::settle` first,
+  which asks the writer to commit now and waits (no wait when nothing is pending). No caller
+  needs to remember a flush for read-after-write in this process.
+- **Flush and errors**: `flush()` / `flush_session(id)` commit and return the queued failures
+  (each reported once). `Runtime` calls `flush_turn` before every `TurnFinished` (a turn, the
+  early-out path, `/compress`, a panicked turn) and `after_save` turns a failure into
+  `TurnStatus::Failed("... not fully saved ...")`. Failures are also logged at `error`.
+- **Exit**: `Store::shutdown()` (and `Drop`) drains the queue and joins the thread; the desktop app
+  calls it on `RunEvent::Exit`, ACP when stdin closes. A killed process loses at most the batch
+  not yet committed (~5 ms); never a finished turn. After shutdown, writes run inline.
+- Other processes (the GPUI app, a second `Store` on the file) see committed rows only: a flush
+  (or a turn's end) is what makes queued writes visible to them.
 
 ## Settings and data
 
@@ -366,7 +401,9 @@ API keys are in Windows Credential Manager (`keyring`), never in a file.
 ## Threading rules
 
 - Async handlers must not block: wrap filesystem, git (`std::process::Command`), SQLite and other
-  blocking calls in `tokio::task::spawn_blocking(move || …).await`.
+  blocking calls in `tokio::task::spawn_blocking(move || …).await`. `Store::flush*` and
+  `shutdown` wait for the writer thread: from async code always through `spawn_blocking` (as
+  `flush_turn` does). `Store::queue` never blocks and may be called anywhere, even under a lock.
 - Shared state in `Gateway` is `std::sync::Mutex` / `parking_lot::Mutex` held briefly, never across
   an `.await`. Poisoned locks: `lock().unwrap_or_else(|e| e.into_inner())`.
 - Long work started from an RPC (a turn, a background job) is `tokio::spawn`ed; the RPC answers at

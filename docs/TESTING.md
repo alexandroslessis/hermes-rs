@@ -149,6 +149,14 @@ Read the existing tests near the area you change before writing a new one; the h
   makes the same requests as without a chain; a smaller window compresses first (the summary request goes to b) and the real request fits; a
   fallback nothing can make fit is skipped and never sent the request; a session resumes on the primary after a restart.
   Live: `scripts/perf/fallback-check.mjs`.
+- The store's writer (Phase 13 CP13b): `crates/store/src/writer/tests.rs` (order, a waiting write after queued ones,
+  read-after-write from both connections and another thread, another `Store` on the file after a flush, batches, the
+  256 cap, superseded upserts, failures per session and reported once, a refused id, a commit that fails, a write
+  that ends the batch's transaction (nothing run twice), a write that panics, drop and `shutdown` draining, a write
+  during another thread's shutdown landing after the queue, a delete keeping the writer's own failure, many threads, and a killed process: the test binary runs itself with
+  `HERMES_STORE_CRASH_DB` set, flushes, queues more and exits without destructors). To fill a batch on purpose a
+  test holds `store.writer.write.lock()` while it queues. `turns.rs` (after the `CP13b` banner): a finished turn is
+  readable from another connection, and a write the database refuses (a test trigger) fails the turn with the reason.
 - Known flaky under heavy load: `an_exhausted_budget_ends_with_a_toolless_summary` (timing).
   Re-run it alone before suspecting your change.
 

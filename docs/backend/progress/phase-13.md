@@ -161,3 +161,232 @@ hot path) and the implementer's list. No correctness defect found; one test made
    after the answer the session list and the history still match what you saw.
 4. Click edit on an earlier message and resend: the conversation rewinds to that point and continues (rewind uses the shared list).
 5. Run `/compress` on a long session: the summary notice appears and the next message works.
+
+## CP13b — store writer actor
+Worktree: C:\Users\alexandros\repos\hermes-rs-p13   Branch: backend/p13-perf   Model: Opus 5.5 (subagent)
+On top of 20f3724 (CP13a). Not committed (the reviewer commits). Phase 13 is not done (13c-13f remain).
+Done:
+- **The writer** (`crates/store/src/writer.rs`, new; tests in `writer/tests.rs`): one thread ("hermes-store-writer") owns
+  the write `Connection` of `sessions.db`; every write is a job on one `std::sync::mpsc` channel, run in send order.
+  Two kinds of job: **queued** (`Store::queue(StoreOp)`, new: `UpsertMessage`, `ReplaceMessages`, `RecordUsage`,
+  `SetSystemPrompt`; returns at once) and **waiting** (every existing write method: it sends its write as a job and
+  blocks until that job's batch is committed, returning the write's own result). So the synchronous API the gateway, the
+  importer and the frozen GPUI app use is unchanged in signature and meaning, and it can never overtake a queued write.
+- **Reads** (`Store::read()`, crate-private): a second connection, `query_only`, busy timeout 5 s. Every read method
+  (sessions, messages, counts, usage, projects, search, insights: all of `lib.rs`, `projects.rs`, `search.rs`) first
+  calls `Writer::settle`: if anything is queued it sends a `Flush` marker (the writer closes its batch at once) and waits
+  until every job sent before the read is done. An in-memory store uses one connection for both (two `:memory:`
+  connections would be two databases).
+- **The turn path** (`crates/runtime/src/session.rs`): `TurnRuntime::append`, `update_message`, `drop_trailing_errors`,
+  the `ReplaceConversation` effect, `OpenSession::apply_compaction` (prompt + messages) and `RecordUsage` now `queue`.
+  `append` / `update_message` / `drop_trailing_errors` queue under the conversation's lock (queueing never blocks), so two
+  writers to one session reach the store in the order they changed the conversation (before, the synchronous upsert ran
+  after the lock was released, so two racing appends could land out of order).
+- **Turn boundaries** (`crates/runtime/src/lib.rs`): `flush_turn` (`Store::flush_session` through `spawn_blocking`) +
+  `after_save` before every `TurnFinished`: the normal end (right after the state machine and the event forwarder finish,
+  before `running` is cleared), the early-out path (the user message could not be added / cancelled), `/compress`, and
+  the panic guard of a crashed turn.
+- **Exit**: `Store::shutdown()` (new; also `Drop`): closes the channel, the thread commits what is queued and ends, joined.
+  `crates/desktop/src/main.rs` calls it on `RunEvent::Exit` (next to the ledger flush), `acp/mod.rs` when the editor
+  closes stdin. Writes after shutdown run inline on the caller's thread (the old behaviour), so a late background write is
+  not lost either.
+
+Decisions (the policy):
+- **Batching**: a batch starts with the first job and collects for `BATCH_WINDOW` = 5 ms, at most `MAX_BATCH` = 256 jobs;
+  it closes early at a waiting write (committed at once), a `Flush` marker (a read or a flush is waiting) or the channel
+  closing. Inside: `BEGIN IMMEDIATE` (the write lock up front, so no lock-upgrade deadlock with the GPUI app's writer),
+  each job in `SAVEPOINT store_op` ... `RELEASE`, then `COMMIT`. A queued upsert of `(session, seq)` that a later upsert of
+  the same row in the same batch replaces, with nothing between them that touches that session except upserts of other
+  rows, is skipped (a streamed reply: only its last version per batch is serialised and written). Waiting upserts are
+  never skipped.
+- **Rollback semantics**: a job that fails is rolled back to its savepoint alone; the rest of the batch commits. A `BEGIN`
+  that fails (busy past 5 s) fails every job of the batch with that error. A `COMMIT` that fails rolls the batch back and
+  runs each job again in a transaction of its own (jobs are `Fn`), so one job the database refuses at commit time (a
+  deferred constraint) never loses the others. A panic inside a job is caught (`catch_unwind`), the open transaction
+  rolled back, every job of that batch reported failed, and the writer goes on; a transaction left open is rolled back
+  before the next batch (`is_autocommit` check). Later queued writes of a session whose write failed still run (each
+  independently); the turn is stopped by the reported error at its next write or at its end.
+- **Errors are reported, not swallowed**: a waiting write gets its own `Result` (as before). A queued write that fails is
+  logged at `error` (`session database: a queued write for <session> failed: ...`) and kept per session (at most 64; the
+  rest counted) until someone takes it: the session's next `Store::queue` returns it as `Err` (an EARLIER write; this one
+  is queued all the same), which stops the turn at its next effect as a synchronous error did; otherwise the turn-end
+  `flush_session` returns it and `after_save` makes the status `TurnStatus::Failed("This turn was not fully saved to the
+  session database: N write(s) to the session database failed (the first: <SQLite's reason>). What is shown may be
+  missing after a restart.")`, appended to an existing failure reason. The page shows it as any failed turn (no new
+  shape). Each failure is reported once, to one `queue` or flush; `flush_session(id)` takes only that session's,
+  `flush()` all. A deleted session's leftover failures are dropped. A review's or a subagent's queued token usage is filed
+  under the parent session (their `record.id`), so its failure reaches the parent's next turn or flush.
+- **Nothing lost on exit or crash**: graceful exit drains (`shutdown`); a panic elsewhere in the app does not touch the
+  writer (its own thread; its own panics are caught). A killed process (or `process::exit`, no destructors) loses only
+  what was queued and not yet committed: at most the open batch, ~5 ms of writes. A turn boundary is never lost: the
+  turn's writes are committed before `TurnFinished` goes out, so a turn the page shows as finished is on disk (WAL +
+  `synchronous=NORMAL` as before: durable against a process kill; a power cut can lose the last commits, unchanged).
+  Tested with a real killed process (below).
+- **Never block the async workers**: `queue` is a channel send under two short mutexes. `flush*` blocks for at most one
+  commit and is called from async code only through `spawn_blocking` (`flush_turn`, the ACP exit). Read methods may wait
+  for one commit when writes are pending; they were already blocking SQLite calls on the async workers before this
+  checkpoint (CP13c's subject), and the wait is no longer than the old lock contention with a write on the single
+  connection.
+- **Order**: one channel, one thread, jobs in send order; `seq` numbers are assigned under the queue's lock, so
+  `done >= seq` means everything sent before is committed. Message rows are keyed by position as before; the ids and order
+  the page sees are unchanged (`a_finished_turn_is_committed_before_the_page_hears_it_ended` compares them).
+- Schema, protocol shapes, message ids: unchanged. The one connection-level difference: the read connection is
+  `query_only` (a per-connection pragma).
+
+Read-after-write: every `Store` read method waits for the writes sent before it (from any thread), so each point below is
+covered by the store itself; the column says why the read needs it.
+
+| Reader (where) | Store reads | Needs what a turn / write just did? | Covered by |
+|---|---|---|---|
+| `Runtime::reload_if_stale` (runtime `lib.rs`; before a turn, rewind, compress, `messages`) | `message_count`, `last_message_id`, `load_messages` | yes: compares the live conversation with the store; a stale read would "reload" an older history over it | read barrier |
+| `Runtime::open` / `open_fresh`, session switch, `session.resume` / `session.history` (gateway 992) | `load_messages`, `session` | yes | read barrier |
+| rewind / undo / retry / rollback (`rewind_as`, gateway `rewind_turn`) | `reload_if_stale`, then `replace_messages` (waiting write) | yes | barrier; the write is ordered after the turn's queue |
+| delete (`Runtime::delete_session`, gateway `session.delete`) | `delete_session` (waiting write) | a cancelled turn's last chunks | ordered after them in the queue |
+| `/usage`, `session.usage`, status bar (`usage_text`, gateway) | `usage_totals` | yes: the turn's last call | read barrier |
+| `/insights`, `insights.get` (`commands::insights_report`) | `insights` | yes | read barrier |
+| session list / sidebar / search (gateway `session.list`, `/api/sessions`, `/api/sessions/search`) | `list_sessions`, `message_counts`, `sessions_matching`, `session` | yes: titles, `updated_at`, counts right after a turn | read barrier |
+| export (`session.export`, `export.rs`), `/branch`, `hermes_import` | `Runtime::messages` (live conversation after `reload_if_stale`), `session` | yes | read barrier |
+| session info / title / model / workspace (gateway `session` reads, `workspace.rs`, `acp/server.rs`) | `session`, `message_count` | yes: `set_title` / `set_model` are waiting writes; a turn's `updated_at` | waiting write + barrier |
+| projects (gateway, runtime `list_projects`) | `list_projects` | after `create/update/delete_project` (waiting writes) | waiting write + barrier |
+| `session_search` tool, recall (`tools/src/recall.rs`) | `search`, `search_rows`, `search_row_session`, `session_by_title`, `list_sessions`, `session` | other sessions (the asking one is excluded); a `session_id` read of any | read barrier |
+| review, review schedule (`review_once.rs`, `review_schedule.rs`) | `session`, through `Runtime` | the turn that just ended | turn-end flush + barrier |
+| the GPUI app (another process), a second `Store` on the file, tests with `rusqlite` | anything | committed rows only | the turn-end flush; `flush()` elsewhere |
+| exit (`main.rs` `RunEvent::Exit`, ACP stdin closed) | — | — | `shutdown` drains |
+
+Files: crates/store/{Cargo.toml,src/lib.rs,src/projects.rs,src/search.rs,src/writer.rs (new),src/writer/tests.rs (new)},
+  crates/runtime/{src/session.rs,src/lib.rs,tests/turns.rs}, crates/desktop/src/{main.rs,acp/mod.rs}, Cargo.lock (`tracing` for
+  the store), docs/{ARCHITECTURE,PITFALLS,TESTING}.md, PORTING.md, docs/backend/progress/phase-13.md
+Tests (CARGO_TARGET_DIR=target/claude, final tree):
+- `hermes_store` 31 (12 old + 19 new in `writer/tests.rs`: send order with a replace in the middle; a waiting write
+  never overtakes a queued one (incl. a delete after queued upserts); every read sees what was queued before it, on the
+  other connection and from another thread, no flush; a second `Store` on the file sees the queue after `flush_session`;
+  200 queued writes in few batches (< 50, typically 1-2); the 256 cap (writer held off with the connection's lock: >= 3
+  batches); 30 chunks of one message written once (>= 28 skipped); `superseded` keeps an upsert across a replace, a
+  closure of unknown scope, and a waiting upsert; a failure goes to its own session's flush, once, the batch's other writes
+  saved; the next `queue` reports an earlier failure; 94 failures of one session never hide another's (per-session cap,
+  all counted); id refused before queueing; a waiting write's own error leaves nothing behind; a COMMIT that fails (a
+  deferred FK) is retried write by write (counter checked); a panicking write is reported and the writer goes on; drop
+  drains 500 queued writes; writes after `shutdown` run inline; 4 threads x 100 writes keep each thread's order; **a killed
+  process**: the test binary runs itself with `HERMES_STORE_CRASH_DB`, writes, flushes 100, queues 300 more and
+  `process::exit(42)` (no destructors): the 100 are there, what landed of the rest is a prefix, `integrity_check` ok).
+  The pragma test also checks the read connection is `query_only`.
+- `hermes_llm`, `hermes_agent`, `hermes_tools`, `hermes_memory`, `hermes_prompts`: green, unchanged counts.
+- `hermes_runtime --lib` 213. `turns` **258 passed / 7 ignored under the default, `HERMES_TEST_PROFILE=requests` and
+  `tokens`** (256 + 2 new: `a_finished_turn_is_committed_before_the_page_hears_it_ended`: another `rusqlite`
+  connection reads the turn's messages (same ids and order as `Runtime::messages`) and its usage row right after
+  `TurnFinished`; `a_write_the_database_refuses_fails_the_turn_with_the_reason`: a test trigger refuses the usage row,
+  the turn ends `Failed` naming SQLite's reason, the message and reply are saved, the next turn completes). No flake seen.
+- `hermes-desktop` 183 + acp 68. `cargo build --workspace` OK (placeholder `target/hermes-src/.../dist-webapp` in the
+  worktree, deleted afterwards).
+- `cargo clippy -p hermes_store --tests`: nothing new (two redundant-clone hits in old tests exist at HEAD). rustfmt: the
+  store crate formatted; my hunks in runtime/desktop are rustfmt-clean (those files have older unformatted code, left).
+- Live, own instance (debug exe, port 47810, data `target/perf`; a `tools` junction to the main checkout's Node, removed
+  afterwards): with `mock_llm.py`: `smoke.mjs` (export json/md/html, `/undo` rewind, rollback restore, compress, `/usage`,
+  `/insights`, `insights.get`, `/api/sessions/search`, curator), `rollback-check.mjs`, `stop-check.mjs`; as their own
+  provider: `side-and-branch-check.mjs`, `archive-check.mjs`, `preinject-check.mjs` (resume, rewind box, session search),
+  `workspace-check.mjs`, `provider-error-check.mjs`: all passed; no `session database` error in the instance's log. The
+  instance was stopped with `perf.ps1 -Do stop` (a kill). No perf/timing tools run (user's rule); no new check script.
+
+Deviations from the plan:
+- The plan says "a `flush()` awaitable for the places that need read-after-write". Instead every read waits for the
+  writes sent before it (a barrier in the store), plus explicit `flush_session` at turn boundaries. Reason: ~60 read call
+  sites in four crates, and one missed site (`reload_if_stale`) would silently rewind a live conversation; a barrier in the
+  store cannot be forgotten by future code. The cost: a read during a streaming turn closes the open batch early.
+- `flush` is blocking (the store crate has no tokio); the async wrapper is `flush_turn` in the runtime.
+- Only the turn path queues; every other write still waits for its commit (unchanged API, needed by the GPUI app and by
+  callers that use their write's result).
+
+For the reviewer:
+- **Read-after-write** (focus 1): every read method in `crates/store/src` goes through `self.read()`; there is no
+  `self.read.lock()` outside `read()` and the pragma test. The table above lists the callers by area.
+- **Nothing lost** (focus 2): `Drop`/`shutdown` drain (`dropping_the_store_commits_everything_queued`); `main.rs` Exit and
+  ACP; the kill test; `flush_turn` before each of the four `TurnFinished` sends in runtime `lib.rs` (normal end, early-out,
+  compress, panic guard). The GPUI app (frozen, not touched) relies on `Drop` and its turns' boundary flush; if its process
+  exits without dropping the runtime, it loses at most the open ~5 ms batch of a turn that had not finished.
+- **Errors** (focus 3): `queue` returns earlier failures (taken); `flush_session` / `after_save`; logged at `error`; the
+  wording of the `Failed` status. Check you agree that a mid-turn `queue` consuming the error (the turn then fails with
+  "N write(s) to the session database failed ..." rather than the `after_save` text) is acceptable.
+- Lock order: `queue` mutex -> `state` mutex (settle); the writer takes only `state` and the connection, never `queue`.
+  `queue` is called under the conversation's lock (no store lock is held while taking that lock). A writer thread that
+  died outside the per-batch `catch_unwind` releases waiters through a drop guard and leaves a session-less failure.
+- **Copy per chunk**: the queue holds an `Arc` of the streaming message until its batch commits, so the next chunk's
+  `make_mut` copies it (PITFALLS updated). Net: one message clone per chunk on the turn's thread instead of HEAD's per-chunk
+  JSON serialisation + upsert + FTS update + commit there. Not measured (no-perf rule).
+- An in-memory store shares one connection between reader and writer (tests only); file stores have two.
+- `superseded`'s rule (skip only a QUEUED upsert followed in the same batch by an upsert of the same row, with only
+  other-row upserts of that session in between) and the commit-failure retry (writes are `Fn`; run twice only on the retry
+  path, after the first run was rolled back).
+
+### Review (Opus, 2026-11-15)
+Read the whole diff against the plan's focus (read-after-write, nothing lost on exit or crash, errors reported) and
+the list above. Four defects fixed, each with a test where a test can show it.
+- **Fixed: a write whose error ends the whole transaction.** SQLite rolls a transaction back by itself on some errors
+  (a full disk, an I/O error, an interrupt). The batch then went on: `ROLLBACK TO` failed silently, each following
+  write's `SAVEPOINT` opened and its `RELEASE` committed a transaction of its own, the final `COMMIT` failed ("no
+  transaction"), and the retry ran every write again: usage rows counted twice, a committed `create_session` answering
+  "already exists" to its caller. Now `apply` checks `is_autocommit` after each write and, if the transaction is gone
+  (nothing of the batch committed), reruns every write of the batch alone. Test
+  `a_write_that_ends_the_transaction_never_runs_the_others_twice` (3 usage rows on the unfixed code, 2 now).
+- **Fixed: deleting a session swallowed the writer's own failure.** `delete_session` cleared its leftovers with
+  `take_failures(Some(id))`, which also takes the session-less "the writer stopped; queued writes were lost" entry,
+  and dropped the result. New `Writer::discard_failures` removes only that session's. Test
+  `deleting_a_session_keeps_a_failure_of_the_writer_itself` (fails on the unfixed code).
+- **Fixed: a write during a shutdown could overtake the queue.** After `shutdown` closed the channel (on another
+  thread: the exit hook) the writer was still draining, but a write refused by the closed channel ran inline at once,
+  racing the thread's last batch for the connection (a late write landing before older queued ones of its session).
+  A second `shutdown` (exit hook + `Drop`) also returned before the drain finished. Both now wait until the thread has
+  stopped (`wait_stopped`; `stopped` is set at once when the thread could not be spawned). Test
+  `a_write_during_a_shutdown_lands_after_the_queue` (a race on the unfixed code, which it passed by luck: it guards the
+  contract rather than reproducing the bug).
+- **Fixed: the early-out path cleared `running` before its flush**, so a next turn could start and have its writes'
+  failures taken by this turn's `flush_session`. Now flushed first, as at the normal end, `/compress` and the panic
+  guard.
+- **Tightened** the kill test: what landed after the flush must be positions `0..n` with their own ids.
+- **Coalescing (focus 1):** holds. Tried to build a counterexample: every write is tagged with the one session it
+  touches (session writes by id; projects `None`, which stops the scan), and no table references another session
+  (FKs go to `sessions(id)`; the FTS triggers stay within the row), so other rows' upserts and other sessions' writes
+  between two upserts of `(S, seq)` cannot change what the second leaves. A replace, delete or title change in between
+  stops the skip (tested). A skipped upsert whose replacement fails loses only the older version, and the failure is
+  reported.
+- **Order and turn boundaries:** one channel, one consumer; `seq` assigned under the queue lock; `done` moves only
+  after a batch. All four `TurnFinished` sends flush first; cancel/stop ends through the normal path (`stop-check.mjs`);
+  rewind / undo / rollback are waiting writes behind the queue; ACP uses the same turn path; no turn task is
+  `abort()`ed. Subagents (`persist: false`) and reviews only queue usage, under the parent id.
+- **Read-after-write (focus 2):** holds. Every read in `crates/store/src` goes through `read()`; nothing else opens
+  `sessions.db` (`hermes_import.rs` reads Hermes's own `state.db`; `tools/index.rs` and `memory` use their own
+  databases; only tests open it with `rusqlite`). `reload_if_stale` reads the conversation, then the (settled) store,
+  so the store can only be ahead of its snapshot, never behind; that race predates CP13b. The barrier instead of the
+  plan's explicit `flush()` per read point: **accepted**; a new read cannot forget it, and it costs an early-closed
+  batch.
+- **Deadlocks (focus 3):** none found. Lock order conversation -> queue -> state; the writer thread takes only state
+  and the connection (never together) and no caller's lock; jobs are closures over owned data and never call the
+  `Store`. `queue` under the conversation lock never blocks before shutdown (after it: an inline write, at exit only).
+  An in-memory store's single connection would deadlock a caller holding a read guard while waiting for a write; no
+  such caller exists (it would have self-deadlocked on the old single mutex too).
+- **Errors (focus 4):** the mid-turn `queue` wording ("N write(s) to the session database failed (the first: ...)")
+  as the turn's failure is acceptable: it names the database and SQLite's reason, and the turn stops as on a
+  synchronous error. A dead writer thread: waiting callers get "the session database writer stopped", reads stop
+  waiting (`stopped`), later writes run inline, the lost queue is one reported failure. No hang, no silent drop.
+- **Schema / protocol / GPUI (focus 5):** schema untouched (`query_only` is per connection); ids and order checked by
+  the turns test; GPUI app builds and gets the runtime's turn-end flush: only a turn still streaming when its process
+  exits without dropping the runtime can lose its open batch (~5 ms).
+- **Per-chunk copy / PITFALLS (focus 6):** accurate. PITFALLS gained: never `COMMIT`/`ROLLBACK` inside a write, and
+  tag a write with the session it touches (coalescing relies on it).
+- Tests after the review (CARGO_TARGET_DIR=target/claude): `hermes_store` 34 (31 + 3 new); `hermes_llm`,
+  `hermes_agent`, `hermes_tools`, `hermes_memory`, `hermes_prompts` green, counts unchanged; `hermes_runtime --lib`
+  213; `turns` **258 passed / 7 ignored under the default, `requests` and `tokens`**; `hermes-desktop` 183 + acp 68;
+  `cargo build --workspace` OK (placeholder `target/hermes-src/apps/desktop/dist-webapp`, deleted afterwards). Live,
+  own instance (debug, port 47810, `target/perf`): with `mock_llm.py` `smoke.mjs` (export, search, `/undo`, compress,
+  `/usage`, `/insights`), `rollback-check.mjs`, `stop-check.mjs`; `archive-check.mjs`; `preinject-check.mjs` (resume,
+  rewind box, session search) as its own provider: all passed; no `session database` line in the instance's log. No
+  perf or timing checks (user's rule).
+
+**User checklist** (no visible change; a sanity pass in the rebuilt app):
+1. Rebuild and start the app (`cargo build -p hermes-desktop`, your usual run).
+2. Send a message that makes the agent run a tool; while it streams, click another session and back: the history is the
+   same as on screen.
+3. After the reply ends, close the app at once (window X), start it again: the whole exchange is there.
+4. Search the sidebar for a word from that reply: the session is found. Run `/usage`: the call is counted.
+5. Edit an earlier message and resend (rewind): it continues from there; export the session (json/md): it matches.
+6. Negative case: not triggerable by hand (a database write failure shows as the turn failing with "This turn was not
+   fully saved to the session database: ..."; covered by the turns test).
