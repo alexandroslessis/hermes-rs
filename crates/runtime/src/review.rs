@@ -25,12 +25,12 @@ use hermes_llm::conversation::message::{Message, MessageContent};
 use hermes_llm::model::ModelConfig;
 use hermes_store::Store;
 use hermes_tools::{ReviewTools, SessionTools, UserBridge};
-use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::ops;
 use crate::session::{HermesEffect, OpenSession, ReviewHandle, TurnRuntime, TurnSession};
+use crate::session_actor::{Command, SessionHandle};
 
 /// How often a paused review checks whether the turn that paused it has ended.
 const PAUSE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -106,6 +106,8 @@ fn tool_names(message: &Message) -> Vec<String> {
 /// Everything one review needs, captured when it's started.
 pub struct ReviewJob {
     pub session: Arc<OpenSession>,
+    /// The session's actor: the review's slot and its pause live there.
+    pub actor: SessionHandle,
     pub store: Arc<Store>,
     pub bridge: Arc<dyn UserBridge>,
     pub llm: Arc<dyn Provider>,
@@ -118,7 +120,7 @@ pub struct ReviewJob {
     /// Requested by the user (`/refine`): memory keeps every operation, and the result is
     /// reported even when nothing changed.
     pub requested: bool,
-    /// The review's slot in its session (`OpenSession::review`): its cancel token, and the flag
+    /// The review's slot in its session (the actor's `review`): its cancel token, and the flag
     /// that says whether it has made its first request.
     pub handle: ReviewHandle,
     /// The budget knobs of the turn that started the review.
@@ -138,11 +140,15 @@ pub async fn run(job: ReviewJob) {
         job.requested,
         job.handle.cancel.clone(),
     );
+    let (actor, started) = (job.actor.clone(), job.handle.started.clone());
     let signals = job.signals.clone();
     let result = review(job).await;
     // Done: free the slot, unless a newer review took it (taking it cancels this one).
-    if !cancel.is_cancelled() {
-        *session.review.lock() = None;
+    if let Err(gone) = actor
+        .ask_async(|reply| Command::ReleaseReview { started, reply })
+        .await
+    {
+        tracing::warn!("session {session_id}: the review's slot was not freed: {gone}");
     }
     match result {
         Ok(_) if cancel.is_cancelled() => {}
@@ -163,6 +169,7 @@ pub async fn run(job: ReviewJob) {
 async fn review(job: ReviewJob) -> Result<(Vec<String>, Option<u64>)> {
     let ReviewJob {
         session,
+        actor,
         store,
         llm,
         model,
@@ -189,17 +196,29 @@ async fn review(job: ReviewJob) -> Result<(Vec<String>, Option<u64>)> {
     };
     // The conversation as it is when no turn is running, plus the review prompt; the copy never
     // touches the session. A turn that starts first pauses the review here (before its first
-    // request): the snapshot is taken under the `running` lock, which `begin_turn` holds while it
-    // claims the session, so the review never copies a conversation a turn is appending to (a
-    // half-finished tool exchange, or a user message with no answer yet).
+    // request). The session's actor says no turn runs (`IdleEpoch`), the conversation is copied,
+    // and the actor confirms no turn claimed the session in between (`ConfirmIdle`, which sets
+    // `started`); otherwise the copy is thrown away and the review waits. So the review never
+    // copies a conversation a turn is appending to (a half-finished tool exchange, or a user
+    // message with no answer yet).
     let mut conversation = loop {
-        {
-            let running = session.running.lock();
-            if running.is_none() {
-                handle
-                    .started
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                break session.conversation.lock().clone();
+        let Ok(idle) = actor.ask_async(|reply| Command::IdleEpoch { reply }).await else {
+            return Ok((Vec::new(), None));
+        };
+        if let Some(epoch) = idle {
+            let copy = session.conversation.lock().clone();
+            let started = handle.started.clone();
+            let confirmed = actor
+                .ask_async(|reply| Command::ConfirmIdle {
+                    epoch,
+                    started,
+                    reply,
+                })
+                .await;
+            match confirmed {
+                Ok(true) => break copy,
+                Ok(false) => {}
+                Err(_) => return Ok((Vec::new(), None)),
             }
         }
         tokio::select! {
@@ -218,16 +237,11 @@ async fn review(job: ReviewJob) -> Result<(Vec<String>, Option<u64>)> {
     // `tokens` session's prompt, which says the opposite, is left out (Phase 11).
     let mut record = session.record.lock().clone();
     record.system_prompt = hermes_prompts::deferred::strip_block(&record.system_prompt);
-    let fork = Arc::new(OpenSession {
-        record: Mutex::new(record),
-        conversation: Mutex::new(conversation),
-        tools: session.tools.clone(),
-        running: Mutex::new(None),
-        turn_state: Mutex::new(None),
-        review: Mutex::new(None),
-        nudges: Mutex::new(Nudges::default()),
-        context: Mutex::new(None),
-    });
+    let fork = Arc::new(OpenSession::new(
+        record,
+        conversation,
+        session.tools.clone(),
+    ));
     let session_id = fork.record.lock().id.clone();
     let state: ops::SharedTurnState = Arc::default();
     let runtime = TurnRuntime {

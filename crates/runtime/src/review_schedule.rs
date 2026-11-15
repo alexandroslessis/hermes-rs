@@ -141,8 +141,8 @@ pub(crate) struct Env {
     pub budget: Arc<Mutex<BudgetKnobs>>,
     /// Hermes's `background_review.enabled`.
     pub enabled: Arc<AtomicBool>,
-    /// The runtime's open sessions.
-    pub open: Arc<Mutex<HashMap<String, Arc<OpenSession>>>>,
+    /// The runtime's sessions (their actors, and the data of the loaded ones).
+    pub open: Arc<crate::session_actor::SessionRegistry>,
 }
 
 /// A session as the review reads it: from its open state, else from the store.
@@ -158,12 +158,13 @@ struct View {
 
 impl Env {
     fn open_session(&self, session_id: &str) -> Option<Arc<OpenSession>> {
-        self.open.lock().get(session_id).cloned()
+        self.open.get(session_id)?.open()
     }
 
     fn turn_running(&self, session_id: &str) -> bool {
-        self.open_session(session_id)
-            .is_some_and(|open| open.running.lock().is_some())
+        self.open
+            .get(session_id)
+            .is_some_and(|handle| handle.is_running())
     }
 
     async fn view(&self, session_id: &str) -> Result<View> {
@@ -566,14 +567,16 @@ impl Shared {
             shared: this.clone(),
             session_id: session_id.to_string(),
         };
-        // An agentic review takes its slot (`OpenSession::review`) after checking ours, under
-        // its own lock, so one of the two always sees the other.
-        // (The slot's lock is released before `claim` drops, which takes ours: no lock is ever
-        // held while waiting for the other in the opposite order.)
-        let agentic = this
-            .env
-            .open_session(session_id)
-            .is_some_and(|open| open.review.lock().is_some());
+        // An agentic review takes its slot (the session actor's `ClaimReview`) after checking
+        // ours, in one command; asking the actor (not its published status) orders this read
+        // after any such claim, so one of the two always sees the other. `states` is not held
+        // here: the actor's claim takes it (lock order: actor, then `states`; never the other
+        // way round). A session whose actor stopped is treated as reviewed.
+        let agentic = this.env.open.get(session_id).is_some_and(|handle| {
+            handle
+                .ask(|reply| crate::session_actor::Command::ReviewSlotTaken { reply })
+                .unwrap_or(true)
+        });
         (!agentic).then_some(claim)
     }
 

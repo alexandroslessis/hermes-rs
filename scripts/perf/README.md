@@ -63,6 +63,12 @@ rollback, `/undo`, the built-in commands, export, compress, the curator, memory,
 `rollback-check.mjs` is the checkpoint round trip on its own; `stop-check.mjs` checks Stop on a
 stalled provider, a long command and a huge output; `endpoints-check.mjs` checks Settings ▸
 Providers ▸ Custom endpoints (validate, save with a key, the picker, activate, delete).
+`queue-check.mjs` checks the turn-control paths the session actor owns (Phase 13 CP13d): prompts
+sent during a held turn are queued, the queue panel's cancel / edit, `session.steer` (a steer the
+turn missed runs first), the queue running front to back with `running: false` only after the
+last, `session.redirect`, an approval card (manual approvals, a flagged command, denied) and a
+clarify card; it is the provider itself (stop `mock_llm.py` first) and puts `approvals.mode`
+back.
 `attach-check.mjs` checks composer attachments (image upload and read-back, images reaching the
 model, held and detached images, file upload and `file.attach`); it is the provider on :47900
 itself, so stop `mock_llm.py` first.
@@ -72,7 +78,8 @@ download, a ranged media stream, the credential guard).
 stage, commit context, commit, branches, worktrees, revert).
 `terminal-check.mjs` checks the side panel's terminal (open, run, reattach with replay, close, exit).
 `subagents-check.mjs` checks live subagents (events, list, tail, steer, stop) with its own provider
-on :47900 (stop `mock_llm.py` first).
+on :47900 (stop `mock_llm.py` first); `delegation.status` must report the effective width (a
+`budget.delegate_max_children` override, else `requests` 3, `balanced` / `tokens` 10).
 `coding-commands-check.mjs` checks `/plan`, `/init`, `/learn` and `/review` (its reviewer subagent) with
 its own provider on :47900.
 `side-and-branch-check.mjs` checks `/branch` (all three routes, retries, the parent link), `/btw` and `/bg`

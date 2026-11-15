@@ -70,25 +70,13 @@ pub struct Gateway {
     replay_epoch: String,
     /// Event routes and open questions, shared with the runtime's bridge.
     hub: Arc<Hub>,
-    /// Session id → its edit revision (Hermes's CAS value).
-    revisions: std::sync::Mutex<std::collections::HashMap<String, u64>>,
-    /// Session id → the reasoning effort picked in the composer.
-    efforts: std::sync::Mutex<std::collections::HashMap<String, String>>,
-    /// Session id → prompts sent while its turn ran (`prompt.submit` params), run in order.
-    queued: std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<Value>>>,
     /// Admission id → the started turn waiting for its `prompt.submit` reply to go out first.
     starts: std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
-    /// Session id → the provider and model picked while its turn ran, applied when it ends.
-    pending_routes: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
-    /// Sessions with a turn in flight, counting the queued prompts that follow it.
-    live_turns: std::sync::Mutex<std::collections::HashSet<String>>,
     /// `provider\nmodel` → its context window, as the provider lists it (asked once).
     context_lengths: std::sync::Mutex<std::collections::HashMap<String, ModelFacts>>,
     /// Session id → output tokens generated and the seconds the model calls took (kept in
     /// `GENERATION_FILE`; the status bar's tokens per second).
     generation: std::sync::Mutex<std::collections::HashMap<String, (u64, f64)>>,
-    /// Session id → images attached for its next prompt (`image.attach`, `image.attach_bytes`).
-    pending_images: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
     /// File ticket → the file it opens (download links and media elements).
     file_tickets: std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
     /// Branch → the session it was branched from (`branch.rs`).
@@ -125,14 +113,8 @@ impl Gateway {
             data_dir,
             replay_epoch: uuid::Uuid::new_v4().to_string(),
             hub,
-            revisions: Default::default(),
-            efforts: Default::default(),
-            queued: Default::default(),
             starts: Default::default(),
-            pending_routes: Default::default(),
-            live_turns: Default::default(),
             context_lengths: Default::default(),
-            pending_images: Default::default(),
             file_tickets: Default::default(),
             branches: crate::branch::Links::load(&data_dir_for_stats),
             workspaces: std::sync::Arc::new(crate::workspace::Workspaces::load(
@@ -667,14 +649,8 @@ impl Gateway {
                 match (key, params["session_id"].as_str()) {
                     ("reasoning", Some(id)) => {
                         let effort = value.as_str().unwrap_or_default().to_lowercase();
-                        if let Ok(mut efforts) = self.efforts.lock() {
-                            // Nothing picked (an editor's "Default"): Settings' effort again.
-                            if effort.is_empty() {
-                                efforts.remove(id);
-                            } else {
-                                efforts.insert(id.to_string(), effort.clone());
-                            }
-                        }
+                        // Nothing picked (an editor's "Default"): Settings' effort again.
+                        self.pick_effort(id, Some(effort.clone()).filter(|e| !e.is_empty()));
                         self.emit(id, "session.info", self.session_info(id));
                         Ok(json!({"key": key, "value": effort, "ok": true}))
                     }
@@ -1009,32 +985,32 @@ impl Gateway {
                     }
                     saved["path"].as_str().unwrap_or_default().to_string()
                 };
-                let mut pending = self
-                    .pending_images
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let images = pending.entry(id).or_default();
-                images.push(path.clone());
+                // Held by the session's actor (`PageState::images`) until the next prompt.
+                let count = self
+                    .runtime
+                    .session_handle(&id)
+                    .map_err(|e| format!("{e:#}"))
+                    .and_then(|handle| handle.attach_image(&path).map_err(|e| e.to_string()))
+                    .map_err(|e| (SERVER_ERROR, e))?;
                 let name = std::path::Path::new(&path)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
                 Ok(
-                    json!({"attached": true, "path": path, "name": name, "count": images.len(),
+                    json!({"attached": true, "path": path, "name": name, "count": count,
                           "text": format!("[User attached image: {name}]")}),
                 )
             }
             "image.detach" => {
                 let id = session_id(params)?;
                 let path = params["path"].as_str().unwrap_or_default().trim();
-                let mut pending = self
-                    .pending_images
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let images = pending.entry(id).or_default();
-                let before = images.len();
-                images.retain(|p| p != path);
-                Ok(json!({"detached": images.len() != before, "count": images.len()}))
+                let (detached, count) = match self.runtime.existing_session_handle(&id) {
+                    Some(handle) => handle
+                        .detach_image(path)
+                        .map_err(|e| (SERVER_ERROR, e.to_string()))?,
+                    None => (false, 0),
+                };
+                Ok(json!({"detached": detached, "count": count}))
             }
             // Activity over the last `days` (default 30): sessions touched and their messages.
             "insights.get" => {
@@ -1442,17 +1418,19 @@ impl Gateway {
             .and_then(|id| self.runtime.store().session(id).ok().flatten());
         if let Some(record) = &record {
             let changes = record.model != model || record.provider != provider;
-            if self.runtime.is_running(&record.id) {
-                // Mid-reply: the pick applies from the next turn on (Hermes's deferred pick); it
-                // shows as the session's model right away. Picking the running model again
-                // withdraws an earlier pick.
-                if let Ok(mut picks) = self.pending_routes.lock() {
-                    if changes {
-                        picks.insert(record.id.clone(), (provider.clone(), model.clone()));
-                    } else {
-                        picks.remove(&record.id);
-                    }
-                }
+            // Mid-reply: the pick applies from the next turn on (Hermes's deferred pick); it
+            // shows as the session's model right away. Picking the running model again
+            // withdraws an earlier pick. "Is a turn running" and keeping the pick are one step
+            // of the session's actor: a turn ending in between gets the switch now instead,
+            // and the actor drops a pick that turn left untaken, so it can't override this one.
+            // (No actor: nothing runs and nothing was picked; none is started for this.)
+            let pick = changes.then(|| (provider.clone(), model.clone()));
+            let deferred = self
+                .runtime
+                .existing_session_handle(&record.id)
+                .and_then(|handle| handle.set_pending_route(pick).ok())
+                .unwrap_or(false);
+            if deferred {
                 self.emit(&record.id, "session.info", self.session_info(&record.id));
             } else if changes {
                 self.route_session(&record.id, &provider, &model)?;
@@ -1583,10 +1561,7 @@ impl Gateway {
         let context = |provider: &str, model: &str| self.known_context(provider, model);
         // Only a picked effort is sent; unset leaves the provider's default (as Hermes).
         let effort = self
-            .efforts
-            .lock()
-            .ok()
-            .and_then(|efforts| efforts.get(session).cloned())
+            .picked_effort(session)
             // "ultra" is Hermes's own step above max: the wire has no more than max.
             .map(|e| if e == "ultra" { "max".to_string() } else { e });
         let mut aux = crate::aux_models::runtime_models(&settings, &context);
@@ -1777,16 +1752,15 @@ impl Gateway {
 
     /// The provider and model picked while the session's turn runs, if any.
     fn pending_route(&self, id: &str) -> Option<(String, String)> {
-        self.pending_routes.lock().ok()?.get(id).cloned()
+        self.runtime.existing_session_handle(id)?.page().pending_route
     }
 
     /// A model picked while the last turn ran, applied now that it has finished.
     fn apply_pending_route(&self, id: &str) {
         let pick = self
-            .pending_routes
-            .lock()
-            .ok()
-            .and_then(|mut picks| picks.remove(id));
+            .runtime
+            .existing_session_handle(id)
+            .and_then(|handle| handle.take_pending_route().ok().flatten());
         if let Some((provider, model)) = pick {
             if let Err((_, error)) = self.route_session(id, &provider, &model) {
                 tracing::warn!("applying the model picked during the turn in {id}: {error}");
@@ -1824,9 +1798,7 @@ impl Gateway {
                     .as_str()
                     .unwrap_or_default()
                     .to_lowercase();
-                if let Ok(mut efforts) = self.efforts.lock() {
-                    efforts.insert(id.clone(), effort.clone());
-                }
+                self.pick_effort(&id, Some(effort.clone()));
                 self.emit(&id, "session.info", self.session_info(&id));
                 json!({"effort": effort, "status": "applied"})
             }
@@ -2556,37 +2528,46 @@ impl Gateway {
     }
 
     /// The session's edit counter (Hermes's CAS revision), which the page presents with each edit.
+    /// (Kept by the session's actor: `PageState::revision`.)
     fn revision(&self, id: &str) -> u64 {
-        self.revisions
-            .lock()
-            .ok()
-            .and_then(|revisions| revisions.get(id).copied())
-            .unwrap_or(1)
+        self.runtime
+            .existing_session_handle(id)
+            .map_or(1, |handle| handle.page().revision)
     }
 
     fn bump_revision(&self, id: &str) -> u64 {
-        let Ok(mut revisions) = self.revisions.lock() else {
-            return 1;
-        };
-        let revision = revisions.entry(id.to_string()).or_insert(1);
-        *revision += 1;
-        *revision
+        self.runtime
+            .session_handle(id)
+            .ok()
+            .and_then(|handle| handle.bump_revision().ok())
+            .unwrap_or(1)
     }
 
-    /// The effort picked for this session, if any (not Settings' default).
+    /// The effort picked for this session, if any (not Settings' default). Kept by the
+    /// session's actor (`PageState::effort`).
     pub(crate) fn picked_effort(&self, id: &str) -> Option<String> {
-        self.efforts
-            .lock()
-            .ok()
-            .and_then(|efforts| efforts.get(id).cloned())
+        self.runtime.existing_session_handle(id)?.page().effort
+    }
+
+    /// Picks the session's effort (`None`: Settings' again). A session may get one before it
+    /// was ever loaded (its actor starts here; nothing is read).
+    fn pick_effort(&self, id: &str, effort: Option<String>) {
+        let picked = match &effort {
+            Some(_) => self.runtime.session_handle(id).map_err(|e| format!("{e:#}")),
+            None => match self.runtime.existing_session_handle(id) {
+                Some(handle) => Ok(handle),
+                None => return,
+            },
+        }
+        .and_then(|handle| handle.set_effort(effort).map_err(|e| e.to_string()));
+        if let Err(error) = picked {
+            tracing::warn!("picking the effort of {id}: {error}");
+        }
     }
 
     /// The session's reasoning effort: picked in the composer, else Settings' default.
     pub(crate) fn effort(&self, id: &str) -> String {
-        self.efforts
-            .lock()
-            .ok()
-            .and_then(|efforts| efforts.get(id).cloned())
+        self.picked_effort(id)
             .or_else(|| {
                 self.rest
                     .config_value("agent.reasoning_effort")
@@ -2599,7 +2580,9 @@ impl Gateway {
     /// Whether the session has a turn in flight as the page sees it: the runtime's turn, or the
     /// gap between a turn and its queued follow-up (the page must not see the turn end there).
     fn is_live(&self, id: &str) -> bool {
-        self.runtime.is_running(id) || self.live_turns.lock().is_ok_and(|turns| turns.contains(id))
+        self.runtime
+            .existing_session_handle(id)
+            .is_some_and(|handle| handle.is_live())
     }
 
     fn session_info(&self, id: &str) -> Value {
@@ -2636,58 +2619,77 @@ impl Gateway {
     }
 
     /// The session's queued prompts as Hermes's pending admissions, in the order they'll run.
+    /// (The queue is the session actor's: `PageState::queue`.)
     fn pending_rows(&self, id: &str) -> Vec<Value> {
-        let Ok(queued) = self.queued.lock() else {
+        let Some(handle) = self.runtime.existing_session_handle(id) else {
             return Vec::new();
         };
-        queued
-            .get(id)
-            .map(|queue| {
-                queue
-                    .iter()
-                    // A redirect or a missed steer is on the page already, as the bubble the
-                    // composer drew: as a card too it would show twice.
-                    .filter(|params| params["shown"] != true)
-                    .map(|params| {
-                        json!({
-                            "admission_id": params["submission_id"],
-                            "text": params["text"],
-                            "status": "queued",
-                            "controls": ["steer", "replace", "cancel"],
-                        })
-                    })
-                    .collect()
+        handle
+            .page()
+            .queue
+            .iter()
+            // A redirect or a missed steer is on the page already, as the bubble the composer
+            // drew: as a card too it would show twice.
+            .filter(|params| params["shown"] != true)
+            .map(|params| {
+                json!({
+                    "admission_id": params["submission_id"],
+                    "text": params["text"],
+                    "status": "queued",
+                    "controls": ["steer", "replace", "cancel"],
+                })
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     /// Queues a prompt behind the running turn (at the front for a redirect or a steer the turn
     /// missed) and tells the page; returns its admission id.
-    fn enqueue(&self, id: &str, mut params: Value, front: bool) -> String {
+    fn enqueue(&self, id: &str, params: Value, front: bool) -> String {
+        self.enqueue_as(id, params, front, false)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+    }
+
+    /// [`Self::enqueue`] at the back, only while a turn holds the session (checked and queued
+    /// in one step of its actor, so a turn ending in between can't leave the prompt queued with
+    /// nobody to run it); `None` when no turn runs.
+    fn enqueue_while_running(&self, id: &str, params: Value) -> Option<String> {
+        self.enqueue_as(id, params, false, true)
+    }
+
+    fn enqueue_as(
+        &self,
+        id: &str,
+        mut params: Value,
+        front: bool,
+        only_if_running: bool,
+    ) -> Option<String> {
         let admission = admission_id(&params).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         params["session_id"] = json!(id);
         params["submission_id"] = json!(admission);
-        if let Ok(mut queued) = self.queued.lock() {
-            let queue = queued.entry(id.to_string()).or_default();
-            if front {
-                queue.push_front(params);
-            } else {
-                queue.push_back(params);
-            }
+        let queued = self
+            .runtime
+            .session_handle(id)
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|handle| {
+                handle
+                    .enqueue(params, front, only_if_running)
+                    .map_err(|e| e.to_string())
+            });
+        match queued {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => tracing::warn!("queueing a prompt in {id}: {error}"),
         }
         self.emit(id, "session.info", self.session_info(id));
-        admission
+        Some(admission)
     }
 
     /// Takes a queued prompt out by its admission id (`None` when it already ran or never was).
     fn dequeue(&self, id: &str, admission: &str) -> Option<Value> {
-        let taken = self.queued.lock().ok().and_then(|mut queued| {
-            let queue = queued.get_mut(id)?;
-            let index = queue
-                .iter()
-                .position(|params| params["submission_id"] == admission)?;
-            queue.remove(index)
-        });
+        let taken = self
+            .runtime
+            .existing_session_handle(id)
+            .and_then(|handle| handle.dequeue(admission).ok().flatten());
         if taken.is_some() {
             self.emit(id, "session.info", self.session_info(id));
         }
@@ -3007,12 +3009,14 @@ impl Gateway {
             }
             // Anything else waits its turn (Hermes's queued admission, listed in the panel).
             self.subscribe(&id, outbox);
-            let admission_id = self.enqueue(&id, params.clone(), false);
-            return Ok(json!({
-                "status": "queued",
-                "admission_id": admission_id,
-                "ref": {"session_id": id},
-            }));
+            if let Some(admission_id) = self.enqueue_while_running(&id, params.clone()) {
+                return Ok(json!({
+                    "status": "queued",
+                    "admission_id": admission_id,
+                    "ref": {"session_id": id},
+                }));
+            }
+            // The turn ended in between: this prompt starts now.
         }
         // Restore / edit / regenerate: drop that user turn and everything after it first.
         // The cut is a stored row (the transcript's `row_id`), else the n-th typed message.
@@ -3106,10 +3110,9 @@ impl Gateway {
         // `/api/chat/image-upload`): their bytes go with the prompt.
         // Images attached through `image.attach` go with this prompt too.
         let held: Vec<Value> = self
-            .pending_images
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&id)
+            .runtime
+            .existing_session_handle(&id)
+            .and_then(|handle| handle.take_images().ok())
             .unwrap_or_default()
             .into_iter()
             .map(|path| json!({"path": path}))
@@ -3452,10 +3455,9 @@ impl Gateway {
     /// Starts the session's next queued prompt, once its turn has finished.
     fn run_queued(self: &Arc<Self>, id: &str, outbox: &Outbox) {
         let next = self
-            .queued
-            .lock()
-            .ok()
-            .and_then(|mut queued| queued.get_mut(id).and_then(|q| q.pop_front()));
+            .runtime
+            .existing_session_handle(id)
+            .and_then(|handle| handle.take_next().ok().flatten());
         let Some(params) = next else {
             return;
         };
@@ -3473,20 +3475,22 @@ impl Gateway {
 
     /// Whether prompts wait behind the session's turn.
     fn has_queued(&self, id: &str) -> bool {
-        self.queued
-            .lock()
-            .is_ok_and(|queued| queued.get(id).is_some_and(|q| !q.is_empty()))
+        self.runtime
+            .existing_session_handle(id)
+            .is_some_and(|handle| !handle.page().queue.is_empty())
     }
 
     /// Marks the session as having a turn in flight: from the start of a turn through any queued
     /// prompts that follow it. The page hears `running: false` only when that ends.
     fn set_live(&self, id: &str, live: bool) {
-        if let Ok(mut turns) = self.live_turns.lock() {
-            if live {
-                turns.insert(id.to_string());
-            } else {
-                turns.remove(id);
-            }
+        // The session's actor holds it (`PageState::live`); clearing it never starts one.
+        let handle = if live {
+            self.runtime.session_handle(id).ok()
+        } else {
+            self.runtime.existing_session_handle(id)
+        };
+        if let Some(Err(error)) = handle.map(|handle| handle.set_live(live)) {
+            tracing::warn!("marking {id}'s turn live={live}: {error}");
         }
     }
 

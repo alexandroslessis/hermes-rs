@@ -25,7 +25,6 @@ use hermes_tools::{
     ClarifyOutcome, ClarifyRequest, ProcessNotice, SessionTools, UserBridge,
     approval::{ApprovalChoice, CommandApproval},
 };
-use parking_lot::Mutex;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Role, Tool};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -555,20 +554,15 @@ impl Delegator {
             "{base_prompt}\n\n{}",
             child_prompt_block(context, &workspace)
         );
-        let child = Arc::new(OpenSession {
-            record: Mutex::new(record),
-            conversation: Mutex::new(Conversation::new_unvalidated(vec![
+        let child = Arc::new(OpenSession::new(
+            record,
+            Conversation::new_unvalidated(vec![
                 Message::user()
                     .with_text(goal)
                     .with_generated_id_if_missing(),
-            ])),
-            tools: tools.clone(),
-            running: Mutex::new(None),
-            turn_state: Mutex::new(None),
-            review: Mutex::new(None),
-            nudges: Mutex::new(Default::default()),
-            context: Mutex::new(None),
-        });
+            ]),
+            tools.clone(),
+        ));
         let state: ops::SharedTurnState = Arc::default();
         // Usage counts toward the parent session (Hermes rolls children's cost up).
         let runtime = TurnRuntime {

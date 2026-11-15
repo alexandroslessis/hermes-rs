@@ -37,7 +37,6 @@ use hermes_llm::model::ModelConfig;
 use hermes_store::SessionRecord;
 use hermes_tools::curator::{MIN_IDLE_HOURS, TransitionCounts};
 use hermes_tools::{ReviewTools, SessionTools, SessionToolsConfig};
-use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -73,9 +72,9 @@ impl Runtime {
 
     fn anything_running(&self) -> bool {
         self.sessions
-            .lock()
-            .values()
-            .any(|open| open.running.lock().is_some() || open.review.lock().is_some())
+            .all()
+            .iter()
+            .any(|handle| handle.is_running() || handle.reviewing())
     }
 
     /// Runs the curator now. `consolidate` names the model for the consolidation pass; without
@@ -201,8 +200,8 @@ impl Runtime {
         let message = Message::user()
             .with_text(hermes_prompts::review::curator_message(candidates))
             .with_generated_id_if_missing();
-        let session = Arc::new(OpenSession {
-            record: Mutex::new(SessionRecord {
+        let session = Arc::new(OpenSession::new(
+            SessionRecord {
                 id: "curator".into(),
                 title: None,
                 cwd: skills_root.display().to_string(),
@@ -212,15 +211,10 @@ impl Runtime {
                 created_at: 0,
                 updated_at: 0,
                 pinned: false,
-            }),
-            conversation: Mutex::new(Conversation::new_unvalidated(vec![message])),
-            tools: tools.clone(),
-            running: Mutex::new(None),
-            turn_state: Mutex::new(None),
-            review: Mutex::new(None),
-            nudges: Mutex::new(Default::default()),
-            context: Mutex::new(None),
-        });
+            },
+            Conversation::new_unvalidated(vec![message]),
+            tools.clone(),
+        ));
         let state: ops::SharedTurnState = Arc::default();
         let runtime = TurnRuntime {
             session: session.clone(),

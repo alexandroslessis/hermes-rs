@@ -560,12 +560,22 @@ async fn cancel_ends_the_turn_with_cancelled() {
             json!({"sessionId": session, "prompt": [{"type": "text", "text": "go"}]}),
         )
         .await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // Cancel once the turn's request has reached the model (the turn holds the session then),
+    // not after a fixed delay: under a loaded machine the agent took more than 800 ms to start
+    // the turn, the cancel found nothing running, and the turn ended normally 20 s later.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while agent.model.requests().is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(agent.model.requests().len(), 1, "the turn never asked the model");
+    let began = std::time::Instant::now();
     agent
         .notify("session/cancel", json!({"sessionId": session}))
         .await;
     let answer = agent.response(prompt).await;
     assert_eq!(answer["result"]["stopReason"], "cancelled", "{answer}");
+    // Stop is immediate: well before the model's 20 s reply.
+    assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
 }
 
 #[tokio::test]
@@ -1788,8 +1798,23 @@ async fn retry_sends_the_last_prompt_again_without_the_old_answer() {
     agent.prompt(&session, "alpha").await;
     let answer = agent.prompt(&session, "/retry").await;
     assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
-    let requests = agent.model.requests();
-    assert_eq!(requests.len(), 2);
+    // The turns' requests only: `/retry` is an undone turn, a learning signal, so the `balanced`
+    // profile's `nudges` starts a background review after the retried turn (same tools and system
+    // prompt as a turn, for the cache; its last message is the review prompt, and here it gets
+    // the mock's 500 and retries). Its first request raced this read under a loaded machine:
+    // 3 requests, on 8e3d12d as on CP13d (CP13d review). (The desktop app does not apply the
+    // test config's `background_review: false`: only the GPUI app calls `set_background_review`.)
+    let requests: Vec<Value> = agent
+        .model
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            let last = &request["messages"].as_array().unwrap().last().unwrap()["content"];
+            !last.to_string().contains("Review the conversation above")
+        })
+        .collect();
+    // (On failure: what the agent said, e.g. a refused rewind.)
+    assert_eq!(requests.len(), 2, "{}", agent.reply_text(&session));
     let again = &requests[1];
     assert_eq!(user_texts(again).len(), 1, "{again}");
     assert!(user_texts(again)[0].contains("alpha"));

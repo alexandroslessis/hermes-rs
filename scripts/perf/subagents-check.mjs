@@ -86,7 +86,11 @@ check('subagent.progress (its text)', of('subagent.progress')[0]?.payload.text =
 const listed = await rpc('subagent.list', { session_id: sid })
 check('subagent.list while it runs', listed.subagents.length === 1 && listed.subagents[0].subagent_id === child.subagent_id && listed.subagents[0].status === 'running' && listed.subagents[0].last_tool === 'terminal', listed)
 const status = await rpc('delegation.status', {})
-check('delegation.status', status.active.length === 1 && status.paused === false && status.max_concurrent_children === 10, status)
+// The effective width: a per-knob override, else the profile's (`requests` 3, `balanced` / `tokens` 10).
+const profile = (await rpc('config.get', { key: 'budget.profile' })).value
+const override = (await rpc('config.get', { key: 'budget.delegate_max_children' })).value
+const width = Number.isInteger(override) ? override : (profile || 'requests') === 'requests' ? 3 : 10
+check(`delegation.status (width ${width}, profile ${profile})`, status.active.length === 1 && status.paused === false && status.max_concurrent_children === width, status)
 const tail = await rpc('subagent.tail', { session_id: sid, subagent_id: child.subagent_id })
 check('subagent.tail', tail.available && tail.text.includes('Looking into it first.') && tail.text.includes('terminal: Start-Sleep'), tail)
 const steered = await rpc('subagent.steer', { session_id: sid, subagent_id: child.subagent_id, text: 'wrap up soon' })

@@ -1409,3 +1409,56 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   the hook table is global. To cover a new tool, call `test_pause(&session_id)` first in its closure and add a case.
   It measures wall-clock time: under a heavily loaded machine the 150 ms tolerance can in principle fail; a real block
   shows 300 ms or more, so re-run before suspecting the code.
+- **A test that stops a script must wait for the script, not a timer.** PowerShell's start-up time varies a lot
+  between machines and days (security scanning of `-EncodedCommand`, a cold .NET):
+  `stopping_the_turn_kills_the_script_and_removes_its_scratch_folder` sent Stop after a fixed 1.5 s and began
+  failing on HEAD too, before the script had printed anything (CP13d review). It now waits for a marker file the
+  script writes after its first line (deadline 90 s), then checks that Stop ended the two-minute sleep within 30 s
+  and kept the output. Do the same in new tests of that kind.
+
+## The session actor (Phase 13d, `crates/runtime/src/session_actor.rs`)
+
+- **A session's control state has one owner: its actor's thread.** Who runs the session (the run slot and the
+  turn's cancel token and steer box), its agentic review's slot, the review counters, which `OpenSession` is
+  loaded, and the page's state (queue, live, pending model pick, effort, revision, held images) are changed only
+  by `Command`s (`SessionHandle::ask` / `ask_async`). Don't add a `Mutex` field to `OpenSession` or a
+  `HashMap<session_id, ..>` to `Gateway` for new per-session state: add a field to `SessionState` / `PageState`
+  and a command. The data (`record`, `conversation`, `context`) stays on `OpenSession` (see the CP13d notes).
+- **A handler never blocks**: no store, file, network or process work, no `.await`, no call to any
+  `SessionHandle` (its own or another session's: refused as `Gone::Reentrant`, a debug assertion), no lock that a
+  caller may hold while it waits for an answer. The one outside lock a handler takes is the review scheduler's
+  `states` (`ClaimReview` -> `Scheduler::is_busy`): **never ask an actor while holding `states`** (lock order:
+  actor, then `states`). File work that belongs to a claim (the `TurnLock`) is done by the caller.
+- **Ask with no lock held that a handler takes.** Today that is only `states`; holding the conversation or record
+  lock while asking is safe (no handler takes them), but don't make a habit of it.
+- **Wait for every command.** A command's effect is in `SessionHandle::status()` once its answer arrived; a
+  fire-and-forget one would leave readers (`is_running`, `has_queued`, `session_info`) seeing the old state. The
+  `RunGuard` waits for its `Release` in `Drop` for exactly this: the gateway starts the next queued prompt right
+  after `TurnFinished`, and must find the slot free.
+- **Check-then-act on another caller's state is one command.** "Queue it if a turn runs" is
+  `enqueue(.., only_if_running: true)`, "keep the model pick if a turn runs" is `set_pending_route`, "drop it if
+  idle" is `detach(true)`, "start a review unless ..." is `ClaimReview`. Reading `is_running()` and then sending a
+  plain command leaves a gap a turn's end can fall into (the queued prompt nobody runs).
+- **Stop never queues.** `SessionHandle::cancel` cancels the published token directly. Keep it that way: a
+  `Command::Cancel` would wait behind whatever is queued.
+- **The run slot is RAII.** Hold the `RunGuard` for exactly as long as the session is busy and drop it where the
+  slot must be free (before `TurnFinished`); every early `return` / `?` frees it. Don't keep one in a struct that
+  outlives the turn, and don't store it in the actor (its `Drop` asks the actor).
+- **Reads never start an actor; writes may.** `Runtime::existing_session_handle` / `SessionRegistry::get` for
+  reads (the archive sweep asks 100,000 ids), `session_handle` / `get_or_spawn` to set something (an effort may be
+  picked for a session never loaded). A thread per session that was ever used in this process: closing keeps it
+  (the page state survives, as the gateway maps did); only a delete ends it.
+- **A stopped actor answers `Gone`, it never hangs.** Map it to an error or a safe default at the call site (see
+  the CP13d notes); don't `unwrap` it. An actor whose loop died (a panic outside a handler; delivering an answer
+  is caught too) is dropped by `SessionRegistry::get` / `get_or_spawn` on the session's next use, its last
+  published turn cancelled, and a fresh actor started: without that, every later call for the session would
+  answer `Gone` until the app restarts.
+- **Nothing heavy is dropped on the actor's thread either.** A value a handler throws away runs its `Drop` there:
+  `Attach` hands a losing caller's `OpenSession` (its tools) back instead of dropping it. Keep it that way for
+  new commands that replace a value with `Drop` work.
+- **`Runtime::open` starts the actor only after the store has the session**, so an unknown id (a stale page
+  asking for a deleted session's messages) leaves no thread behind.
+- **Tests**: `session_actor/tests.rs` (order, many threads, a panicking handler, a stopped actor, commands queued
+  when the thread ends, re-entrancy, lifecycle, the one-thread runtime, the run slot and Stop's priority path, the
+  review pause and the review pair raced 300 times, the page state). A test that needs an `OpenSession` uses
+  `session::testing::open_session`.

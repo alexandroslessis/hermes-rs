@@ -21,6 +21,7 @@ mod review;
 pub mod review_once;
 pub mod review_schedule;
 mod session;
+pub mod session_actor;
 pub mod signals;
 mod skill_outcomes;
 pub mod subagents;
@@ -486,7 +487,8 @@ pub struct Runtime {
     config: RuntimeConfig,
     bridge: Arc<dyn UserBridge>,
     windows_version: String,
-    sessions: Arc<Mutex<HashMap<String, Arc<OpenSession>>>>,
+    /// Every session's actor (`session_actor.rs`): its control state, and its loaded data.
+    sessions: Arc<session_actor::SessionRegistry>,
     /// When the evidence review runs (`review_schedule.rs`): per-session idle timers, the
     /// one-review-at-a-time slot, back-off and the hourly cap.
     scheduler: review_schedule::Scheduler,
@@ -558,7 +560,7 @@ impl Runtime {
         let signals = signals::SignalStore::open(config.data_dir.join("signals"));
         let budget = Arc::new(Mutex::new(config.budget));
         let store = Arc::new(store);
-        let sessions: Arc<Mutex<HashMap<String, Arc<OpenSession>>>> = Arc::default();
+        let sessions: Arc<session_actor::SessionRegistry> = Arc::default();
         let background_review = Arc::new(AtomicBool::new(true));
         let scheduler = review_schedule::Scheduler::new(review_schedule::Env {
             store: store.clone(),
@@ -736,7 +738,7 @@ impl Runtime {
     ) -> Result<()> {
         let open = self.open(session_id)?;
         anyhow::ensure!(
-            open.running.lock().is_none(),
+            !self.is_running(session_id),
             "the model can't change while a turn is running"
         );
         let (provider, cwd) = {
@@ -919,9 +921,35 @@ impl Runtime {
         Arc::new(move || source.build(&provider, &model, context_length, &cwd, true))
     }
 
+    /// The session's loaded data, if it is loaded in this process (nothing is loaded or started).
+    fn loaded(&self, session_id: &str) -> Option<Arc<OpenSession>> {
+        self.sessions.get(session_id)?.open()
+    }
+
+    /// The session's actor (`session_actor.rs`), started on first use: its control state lives
+    /// there. Starting it does no store or file work.
+    fn handle(&self, session_id: &str) -> Result<session_actor::SessionHandle> {
+        self.sessions
+            .get_or_spawn(session_id)
+            .with_context(|| format!("the session {session_id} could not get its thread"))
+    }
+
+    /// The session's actor, started on first use (no store or file work): what the desktop
+    /// gateway keeps for the session lives there too (`session_actor::PageState`).
+    pub fn session_handle(&self, session_id: &str) -> Result<session_actor::SessionHandle> {
+        self.handle(session_id)
+    }
+
+    /// The session's actor if it runs (a read: never starts one).
+    pub fn existing_session_handle(&self, session_id: &str) -> Option<session_actor::SessionHandle> {
+        self.sessions.get(session_id)
+    }
+
+    /// The session's loaded data, loading it from the store first if needed (store reads: from
+    /// async code, call it off the async workers). Two callers loading at once keep the first.
     fn open(&self, session_id: &str) -> Result<Arc<OpenSession>> {
-        if let Some(open) = self.sessions.lock().get(session_id) {
-            return Ok(open.clone());
+        if let Some(open) = self.loaded(session_id) {
+            return Ok(open);
         }
         let record = self
             .store
@@ -954,22 +982,11 @@ impl Runtime {
                     .any(|c| matches!(c, MessageContent::Text(_)))
             })
             .count();
-        let open = Arc::new(OpenSession {
-            record: Mutex::new(record),
-            conversation: Mutex::new(conversation),
-            tools: Arc::new(tools),
-            running: Mutex::new(None),
-            turn_state: Mutex::new(None),
-            review: Mutex::new(None),
-            nudges: Mutex::new(review::Nudges::resumed(user_turns)),
-            context: Mutex::new(None),
-        });
-        Ok(self
-            .sessions
-            .lock()
-            .entry(session_id.to_string())
-            .or_insert(open)
-            .clone())
+        let open = OpenSession::new(record, conversation, Arc::new(tools));
+        // The actor starts only for a session the store has (an unknown id asked for its
+        // messages must not leave a thread behind).
+        let handle = self.handle(session_id)?;
+        Ok(handle.attach(Arc::new(open), review::Nudges::resumed(user_turns))?)
     }
 
     /// `open`, with the conversation brought up to date when it is idle: the desktop app and an
@@ -977,7 +994,7 @@ impl Runtime {
     /// thread since this one loaded it.
     fn open_fresh(&self, session_id: &str) -> Result<Arc<OpenSession>> {
         let open = self.open(session_id)?;
-        if open.running.lock().is_none() {
+        if !self.is_running(session_id) {
             self.reload_if_stale(&open, session_id);
         }
         Ok(open)
@@ -1030,7 +1047,7 @@ impl Runtime {
     /// it got something wrong (`signals.rs`). Earlier signals stay.
     fn rewind_as(&self, session_id: &str, keep: usize, via: &str) -> Result<Vec<Message>> {
         let open = self.open_fresh(session_id)?;
-        if open.running.lock().is_some() {
+        if self.is_running(session_id) {
             anyhow::bail!("a turn is running in this session");
         }
         // Not under another window's running turn either: rows are keyed by position, so cutting
@@ -1139,9 +1156,7 @@ impl Runtime {
 
     /// The session's background processes (empty when it isn't open in this process).
     pub fn processes(&self, session_id: &str) -> Vec<serde_json::Value> {
-        self.sessions
-            .lock()
-            .get(session_id)
+        self.loaded(session_id)
             .map(|open| open.tools.process_list())
             .unwrap_or_default()
     }
@@ -1153,21 +1168,13 @@ impl Runtime {
         session_id: &str,
         process_id: &str,
     ) -> Option<serde_json::Value> {
-        let tools = self
-            .sessions
-            .lock()
-            .get(session_id)
-            .map(|open| open.tools.clone())?;
+        let tools = self.loaded(session_id).map(|open| open.tools.clone())?;
         Some(tools.kill_process(process_id).await)
     }
 
     /// Kills all of the session's background processes; how many were running.
     pub async fn stop_processes(&self, session_id: &str) -> usize {
-        let tools = self
-            .sessions
-            .lock()
-            .get(session_id)
-            .map(|open| open.tools.clone());
+        let tools = self.loaded(session_id).map(|open| open.tools.clone());
         match tools {
             Some(tools) => tools.kill_all_processes().await,
             None => 0,
@@ -1176,9 +1183,8 @@ impl Runtime {
 
     pub fn is_running(&self, session_id: &str) -> bool {
         self.sessions
-            .lock()
             .get(session_id)
-            .is_some_and(|open| open.running.lock().is_some())
+            .is_some_and(|handle| handle.is_running())
     }
 
     /// Adds the user's message and runs the agent until it finishes, stops or is cancelled.
@@ -1261,6 +1267,7 @@ impl Runtime {
             .as_deref()
             .map(|effort| effort_request_params(&provider.base_url, effort));
         let open = self.open(session_id)?;
+        let handle = self.handle(session_id)?;
         let cancel = CancellationToken::new();
         // The daily request quota: refused only when it is used up, warned when nearly so.
         let quota_notice = match self.governor().check(&provider.id, Purpose::Main) {
@@ -1280,15 +1287,15 @@ impl Runtime {
             governor::Verdict::Warn(text) => Some(text),
             governor::Verdict::Allow => None,
         };
-        {
-            let mut running = open.running.lock();
-            anyhow::ensure!(
-                running.is_none(),
-                "a turn is already running in this session"
-            );
-            let lock = turnlock::TurnLock::acquire(&self.config.data_dir, session_id)?;
-            *running = Some(session::RunGuard::new(cancel.clone(), Some(lock)));
-        }
+        // The turn's loop state: where `/steer` text waits, published with the claim.
+        let state: ops::SharedTurnState = Arc::default();
+        // The session's run slot (its actor's), then the cross-process lock. Every way out of
+        // this function and of the turn's task drops `run`, which frees both.
+        let mut run = session::RunGuard::claim(&handle, cancel.clone(), Some(state.clone()))?
+            .map_err(|session_actor::Busy| {
+                anyhow::anyhow!("a turn is already running in this session")
+            })?;
+        run.hold(turnlock::TurnLock::acquire(&self.config.data_dir, session_id)?);
         // Activity: no review timer while the turn runs (its end arms one again).
         self.scheduler
             .turn_started(session_id, provider, &review_route);
@@ -1315,18 +1322,10 @@ impl Runtime {
             };
             Ok((llm, summarizer, review))
         });
-        let (llm, summarizer, review_model) = match models {
-            Ok(models) => models,
-            Err(error) => {
-                *open.running.lock() = None;
-                return Err(error);
-            }
-        };
+        let (llm, summarizer, review_model) = models?;
         // The providers a request moves to when this one cannot serve it (Phase 12).
         let fallback_chain = fallback::build(&provider.id, &fallback, &budget, &self.ledger);
         let fallback_shared = fallback_chain.as_ref().map(|chain| chain.shared.clone());
-        let state: ops::SharedTurnState = Arc::default();
-        *open.turn_state.lock() = Some(state.clone());
         open.tools.begin_turn();
         open.tools.set_vision(supports_vision);
         open.tools.set_limits(tool_limits(&budget));
@@ -1366,7 +1365,10 @@ impl Runtime {
         // don't compete for the model; here it would waste the requests it already made, Phase 4):
         // one that hasn't made its first request waits for this turn to end, one that has is on
         // its own copy of the conversation and finishes. See `session::ReviewHandle`.
-        let review_memory = text.is_some() && open.nudges.lock().tick_memory();
+        let review_memory = text.is_some()
+            && handle
+                .ask(|reply| session_actor::Command::TickMemory { reply })
+                .unwrap_or(false);
         let review_provider_id = aux
             .review
             .as_ref()
@@ -1466,13 +1468,7 @@ impl Runtime {
                 .and_then(|conversation| conversation.context("there is no failed turn to retry"))
                 .map(|conversation| vec![AgentEvent::HistoryReplaced(conversation)]),
         };
-        let first_events = match first_events {
-            Ok(events) => events,
-            Err(error) => {
-                *open.running.lock() = None;
-                return Err(error);
-            }
-        };
+        let first_events = first_events?;
         let mut turn_start = open.conversation.lock().messages().len();
         let web = self.web.clone();
         let rebuild_prompt = self.prompt_rebuild(&open, context_length, budget);
@@ -1514,6 +1510,7 @@ impl Runtime {
         let (learn_ledger, learn_provider) = (self.ledger.clone(), provider.id.clone());
         let signal_store = self.signals.clone();
         let skill_store = self.skills.clone();
+        let turn_actor = handle;
         let turn = tokio::spawn(hermes_llm::observer::scope(request_context, async move {
             let mut signal_message_id = signal_message_id;
             // The skills the local index attached to this turn's message (a use, `skill_outcomes`).
@@ -1645,8 +1642,7 @@ impl Runtime {
                         // Flushed while the turn still holds the session, as at the normal end:
                         // a next turn's writes and failures are not this one's.
                         let saved = flush_turn(&runtime.store, &session_id).await;
-                        *runtime.session.running.lock() = None;
-                        *runtime.session.turn_state.lock() = None;
+                        drop(run);
                         let status = after_save(&session_id, status, saved);
                         let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
                         scheduler.idle_from_now(&session_id);
@@ -1755,8 +1751,7 @@ impl Runtime {
             // Read while the turn still holds the session, so the next one can't add to it yet.
             let signal_answer =
                 signals::final_answer(runtime.session.conversation.lock().messages());
-            *runtime.session.running.lock() = None;
-            *runtime.session.turn_state.lock() = None;
+            drop(run);
             if let Some(text) = state.lock().pending_steer.take() {
                 let _ = events_tx.send(RuntimeEvent::SteerUndelivered(text));
             }
@@ -1823,11 +1818,15 @@ impl Runtime {
                 .await;
             }
             let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
-            if let Some(setup) =
-                review_setup.after_turn(&runtime.session, turn_start, review_memory, finished)
-            {
+            if let Some(setup) = review_setup.after_turn(
+                &runtime.session,
+                &turn_actor,
+                turn_start,
+                review_memory,
+                finished,
+            ) {
                 // `nudges`: no counter is due, but the learning signals may be.
-                setup.after_turn_signals(&runtime.session).await;
+                setup.after_turn_signals(&runtime.session, &turn_actor).await;
             }
             // `idle_once`: the session's review waits for it to go quiet from here.
             scheduler.idle_from_now(&session_id);
@@ -1837,10 +1836,9 @@ impl Runtime {
                 && error.is_panic()
             {
                 tracing::error!("turn crashed: {error}");
+                // The turn's `RunGuard` was dropped with its task, before this.
                 let session_id = guard_session.record.lock().id.clone();
                 let saved = flush_turn(&guard_store, &session_id).await;
-                *guard_session.running.lock() = None;
-                *guard_session.turn_state.lock() = None;
                 let status = TurnStatus::Failed(
                     "The turn stopped on an internal error (details in the log).".into(),
                 );
@@ -1867,8 +1865,9 @@ impl Runtime {
         focus: Option<String>,
     ) -> Result<()> {
         let open = self.open(session_id)?;
+        let handle = self.handle(session_id)?;
         anyhow::ensure!(
-            open.running.lock().is_none(),
+            !handle.is_running(),
             "a turn is running in this session; refine it when it ends"
         );
         anyhow::ensure!(
@@ -1919,7 +1918,7 @@ impl Runtime {
             "This session is being reviewed in the background; refine it when that ends."
         );
         let skills = SessionTools::tool_names().contains(&"skill_manage");
-        setup.start(&open, true, skills, focus, true);
+        setup.start(&open, &handle, true, skills, focus, true);
         Ok(())
     }
 
@@ -1934,35 +1933,23 @@ impl Runtime {
         focus: Option<String>,
     ) -> Result<Turn> {
         let open = self.open(session_id)?;
+        let handle = self.handle(session_id)?;
         let cancel = CancellationToken::new();
-        {
-            let mut running = open.running.lock();
-            anyhow::ensure!(
-                running.is_none(),
-                "a turn is running in this session; compress it when it ends"
-            );
-            let lock = turnlock::TurnLock::acquire(&self.config.data_dir, session_id)?;
-            *running = Some(session::RunGuard::new(cancel.clone(), Some(lock)));
-        }
+        // Runs like a turn: the run slot and the cross-process lock, freed when `run` drops.
+        let mut run = session::RunGuard::claim(&handle, cancel.clone(), None)?.map_err(
+            |session_actor::Busy| {
+                anyhow::anyhow!("a turn is running in this session; compress it when it ends")
+            },
+        )?;
+        run.hold(turnlock::TurnLock::acquire(&self.config.data_dir, session_id)?);
         self.reload_if_stale(&open, session_id);
         // The budget knobs, read once for this compression.
         let budget = self.budget();
-        let llm = match provider.provider_with(budget.http_retries) {
-            Ok(llm) => llm,
-            Err(error) => {
-                *open.running.lock() = None;
-                return Err(error);
-            }
-        };
+        let llm = provider.provider_with(budget.http_retries)?;
         let rebuild_prompt = self.prompt_rebuild(&open, options.context_length, budget);
         let model = open.record.lock().model.clone();
-        let summarizer = match summarizer_for(&options.aux, &llm, &model, options.context_length, &budget) {
-            Ok(summarizer) => summarizer,
-            Err(error) => {
-                *open.running.lock() = None;
-                return Err(error);
-            }
-        };
+        let summarizer =
+            summarizer_for(&options.aux, &llm, &model, options.context_length, &budget)?;
         let store = self.store.clone();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let turn_cancel = cancel.clone();
@@ -2000,7 +1987,7 @@ impl Runtime {
             let session_id = open.record.lock().id.clone();
             let saved = flush_turn(&store, &session_id).await;
             let status = after_save(&session_id, status, saved);
-            *open.running.lock() = None;
+            drop(run);
             let _ = events_tx.send(RuntimeEvent::TurnFinished(status));
         }));
         Ok(Turn {
@@ -2068,7 +2055,7 @@ impl Runtime {
     /// before the tainting read (the conservative side). Call it before `to` is opened. Blocking
     /// (a small file): the gateway's branch handler already does its store work in line.
     pub fn copy_taint(&self, from: &str, to: &str) {
-        let open = self.sessions.lock().get(from).cloned();
+        let open = self.loaded(from);
         let sources = match open {
             Some(open) => Some(open.tools.taint()).filter(|t| t.is_tainted()).map(|t| t.sources),
             None => hermes_tools::taint::load(&self.config.data_dir, from),
@@ -2093,9 +2080,7 @@ impl Runtime {
 
     /// The session's approval mode (its own, else Settings'); see [`hermes_tools::ApprovalMode`].
     pub fn approval_mode(&self, session_id: &str) -> hermes_tools::ApprovalMode {
-        self.sessions
-            .lock()
-            .get(session_id)
+        self.loaded(session_id)
             .map_or(hermes_tools::ApprovalMode::AcceptEdits, |open| {
                 open.tools.mode()
             })
@@ -2111,9 +2096,7 @@ impl Runtime {
     }
 
     pub fn yolo(&self, session_id: &str) -> bool {
-        self.sessions
-            .lock()
-            .get(session_id)
+        self.loaded(session_id)
             .is_some_and(|open| open.tools.yolo())
     }
 
@@ -2345,7 +2328,7 @@ impl Runtime {
     fn idle_session(&self, session_id: &str) -> Result<Arc<OpenSession>> {
         let open = self.open(session_id)?;
         anyhow::ensure!(
-            open.running.lock().is_none(),
+            !self.is_running(session_id),
             "a turn is running in this session; wait for it to end"
         );
         Ok(open)
@@ -2581,9 +2564,8 @@ impl Runtime {
     pub fn steer(&self, session_id: &str, text: &str) -> bool {
         let state = self
             .sessions
-            .lock()
             .get(session_id)
-            .and_then(|open| open.turn_state.lock().clone());
+            .and_then(|handle| handle.turn_state());
         let Some(state) = state else {
             return false;
         };
@@ -2600,9 +2582,8 @@ impl Runtime {
     pub fn set_steer(&self, session_id: &str, text: Option<&str>) -> bool {
         let state = self
             .sessions
-            .lock()
             .get(session_id)
-            .and_then(|open| open.turn_state.lock().clone());
+            .and_then(|handle| handle.turn_state());
         let Some(state) = state else {
             return false;
         };
@@ -2611,10 +2592,9 @@ impl Runtime {
     }
 
     pub fn cancel(&self, session_id: &str) {
-        if let Some(open) = self.sessions.lock().get(session_id) {
-            if let Some(cancel) = open.running.lock().as_ref() {
-                cancel.cancel();
-            }
+        // The token directly (the actor's priority path): never behind queued commands.
+        if let Some(handle) = self.sessions.get(session_id) {
+            handle.cancel();
         }
     }
 
@@ -2624,17 +2604,14 @@ impl Runtime {
     /// `drop_session_terminal` on a committed workspace move). The transcript is the store's
     /// (every append is persisted), so nothing is lost. Idle sessions only.
     pub async fn evict(&self, session_id: &str) -> Result<()> {
-        // The idle check and the removal under one hold of the map: a turn can't start between them.
-        let open = {
-            let mut sessions = self.sessions.lock();
-            let Some(open) = sessions.get(session_id).cloned() else {
-                return Ok(());
-            };
-            if open.running.lock().is_some() {
-                anyhow::bail!("a turn is running in this session");
-            }
-            sessions.remove(session_id);
-            open
+        // The idle check and the removal are one command of the session's actor.
+        let Some(handle) = self.sessions.get(session_id) else {
+            return Ok(());
+        };
+        let open = match handle.detach(true)? {
+            Ok(Some(open)) => open,
+            Ok(None) => return Ok(()),
+            Err(session_actor::Busy) => anyhow::bail!("a turn is running in this session"),
         };
         open.tools.shutdown().await;
         Ok(())
@@ -2649,11 +2626,12 @@ impl Runtime {
     }
 
     async fn close_quietly(&self, session_id: &str) {
-        let open = self.sessions.lock().remove(session_id);
+        let Some(handle) = self.sessions.get(session_id) else {
+            return;
+        };
+        handle.cancel();
+        let open = handle.detach(false).ok().and_then(Result::ok).flatten();
         if let Some(open) = open {
-            if let Some(cancel) = open.running.lock().as_ref() {
-                cancel.cancel();
-            }
             open.tools.shutdown().await;
         }
     }
@@ -2662,6 +2640,9 @@ impl Runtime {
         // No review for a deleted session: its timer and a review in flight stop.
         self.scheduler.forget(session_id);
         self.close_quietly(session_id).await;
+        // Its actor goes too (with what the page kept for it): it ends once a turn still ending
+        // has let go of it. A later use of the id starts a fresh one.
+        self.sessions.remove(session_id);
         // The store write waits for its commit and the folders are removed from disk: off the
         // async workers. The store's error is returned; the leftovers are best effort.
         let (store, scratch) = (self.store.clone(), self.scratch_dir(session_id));
@@ -3070,15 +3051,15 @@ impl ReviewSetup {
     fn after_turn(
         self,
         session: &Arc<OpenSession>,
+        actor: &session_actor::SessionHandle,
         turn_start: usize,
         review_memory: bool,
         finished: bool,
     ) -> Option<Self> {
-        let (review_skills, answered) = {
+        let (turn, answered) = {
             let conversation = session.conversation.lock();
             let messages = conversation.messages();
-            let turn = messages.get(turn_start..).unwrap_or_default();
-            let review_skills = session.nudges.lock().finish_turn(turn);
+            let turn = messages.get(turn_start..).unwrap_or_default().to_vec();
             let answered = messages.last().is_some_and(|last| {
                 last.role == rmcp::model::Role::Assistant
                     && last.error_kind().is_none()
@@ -3086,8 +3067,12 @@ impl ReviewSetup {
                         matches!(content, MessageContent::Text(text) if !text.text.trim().is_empty())
                     })
             });
-            (review_skills, answered)
+            (turn, answered)
         };
+        // The counters are the session actor's (asked with no lock held).
+        let review_skills = actor
+            .ask(|reply| session_actor::Command::FinishTurn { turn, reply })
+            .unwrap_or(false);
         let mode = self.budget.review_mode;
         if mode == budget::ReviewMode::IdleOnce {
             return None;
@@ -3102,13 +3087,17 @@ impl ReviewSetup {
         if !self.enabled.load(Ordering::Relaxed) {
             return None;
         }
-        self.start(session, review_memory, review_skills, None, false);
+        self.start(session, actor, review_memory, review_skills, None, false);
         None
     }
 
     /// `nudges`: the session's learning signals reached the threshold (two corrections, an undone
     /// turn, "remember this"...): the same review a due counter starts, of memory and skills.
-    async fn after_turn_signals(self, session: &Arc<OpenSession>) {
+    async fn after_turn_signals(
+        self,
+        session: &Arc<OpenSession>,
+        actor: &session_actor::SessionHandle,
+    ) {
         let id = session.record.lock().id.clone();
         let signals = self.signals.snapshot(&id).await;
         if !signals.triggered_at(self.budget.review_threshold) {
@@ -3124,12 +3113,13 @@ impl ReviewSetup {
             signals.score()
         );
         let skills = SessionTools::tool_names().contains(&"skill_manage");
-        self.start(session, true, skills, None, false);
+        self.start(session, actor, true, skills, None, false);
     }
 
     fn start(
         self,
         session: &Arc<OpenSession>,
+        actor: &session_actor::SessionHandle,
         memory: bool,
         skills: bool,
         focus: Option<String>,
@@ -3144,51 +3134,38 @@ impl ReviewSetup {
             tracing::info!("review skipped: {why}");
             return;
         }
-        let (mut memory, mut skills) = (memory, skills);
         let session_id = session.record.lock().id.clone();
-        let handle = {
-            // Under `running` (lock order: running, then review): a paused review takes its
-            // snapshot and sets `started` under this lock, so it can't start between the check
-            // below and its cancellation.
-            let _running = session.running.lock();
-            let mut slot = session.review.lock();
-            // One review per session at a time (Phase 7): an evidence review holds it. Checked
-            // under the slot's lock, which the evidence review's claim checks after taking its
-            // own, so one of the two always sees the other.
-            if self.scheduler.is_busy(&session_id) {
-                tracing::info!("review skipped: an evidence review of the session is running");
+        // The slot is the session actor's: the scheduler's busy check, keeping or replacing a
+        // paused review and taking the slot are one command there (`ClaimReview`), serialized
+        // with the paused review's own start (`ConfirmIdle`) and the scheduler's claim.
+        let evidence_busy: Box<dyn FnOnce() -> bool + Send> = {
+            let (scheduler, id) = (self.scheduler.clone(), session_id.clone());
+            Box::new(move || scheduler.is_busy(&id))
+        };
+        let claim = actor.ask(|reply| session_actor::Command::ClaimReview {
+            memory,
+            skills,
+            requested,
+            evidence_busy,
+            reply,
+        });
+        let handle = match claim {
+            Ok(session_actor::ReviewClaim::Start(handle)) => handle,
+            Ok(session_actor::ReviewClaim::Skipped(why)) => {
+                tracing::info!("review skipped: {why}");
                 return;
             }
-            if let Some(previous) = slot.as_ref() {
-                // One already past its first request finishes (cancelling it would waste what it
-                // spent); a newly due review is skipped, except one the user asked for with
-                // /refine, which replaces it. The skipped review's turns aren't lost: every
-                // review reads the whole conversation, so the next one due sees them.
-                if previous.has_started() && !requested {
-                    tracing::info!("review skipped: one is still running");
-                    return;
-                }
-                if !previous.has_started() {
-                    // A paused /refine stays (it covers memory and skills, and the user waits
-                    // for its report); a paused due review is replaced by this one, which will
-                    // see the same conversation, and takes over what it was to cover.
-                    if previous.requested && !requested {
-                        tracing::info!("review skipped: a /refine is waiting to run");
-                        return;
-                    }
-                    memory |= previous.memory;
-                    skills |= previous.skills;
-                }
-                previous.cancel.cancel();
+            Err(gone) => {
+                tracing::warn!("review skipped: {gone}");
+                return;
             }
-            let handle = session::ReviewHandle::new(memory, skills, requested);
-            *slot = Some(handle.clone());
-            handle
         };
+        let (memory, skills) = (handle.memory, handle.skills);
         let context = self.ledger.context(Purpose::Review, Some(&session_id));
         let signals = (self.budget.review_mode != budget::ReviewMode::Agentic).then_some(self.signals);
         tokio::spawn(hermes_llm::observer::scope(context, review::run(review::ReviewJob {
             session: session.clone(),
+            actor: actor.clone(),
             store: self.store,
             bridge: self.bridge,
             llm: self.llm,

@@ -596,3 +596,416 @@ compiled regexes, and the sync helpers they call (`session_info`, `usage_snapsho
   false start of mine: `perf.ps1 -Do start` hung on its timing step (no `tools/node` in the worktree), so my first
   `smoke.mjs` ran before its working folder existed and found no checkpoint; with the instance started directly
   (perf.ps1's environment, no timing) every run passed. No perf or timing checks (the user's rule).
+
+## CP13d — per-session actor
+Worktree: C:\Users\alexandros\repos\hermes-rs-p13   Branch: backend/p13-perf   Model: Opus 5.5 (subagent)
+On top of 8e3d12d (CP13a-c). Not committed (an Opus reviewer reviews, splits and commits). Phase 13 is not done
+(13e-13f remain).
+
+### Inventory (before CP13d)
+Every lock, map and atomic keyed by (or living on) a session, on `OpenSession` (`crates/runtime/src/session.rs`),
+`Runtime` (`crates/runtime/src/lib.rs`) and `Gateway` (`crates/desktop/src/gateway.rs`). "Turn task" is the task
+`begin_turn` spawns; "blocking" a `spawn_blocking` thread (CP13c moved most gateway work there); "worker" an async
+worker of the 4-thread runtime; "GPUI" the frozen app's own threads.
+
+| # | State | Kind | Written by (where, thread) | Read by | Notes / invariants |
+|---|---|---|---|---|---|
+| R1 | `Runtime.sessions` | `Mutex<HashMap<id, Arc<OpenSession>>>` | `open` (insert-if-absent after a store load: blocking / GPUI / a worker in tests), `evict` (idle check + remove under the map lock), `close_quietly` (remove); shared with the scheduler (`Env.open`) | every `Runtime` method (`open`, `is_running`, `processes`, `steer`, `cancel`, `yolo`...), `review_schedule` (`turn_running`, `view`, `claim`), the curator (`anything_running`) | held only for get / insert / remove, except in `evict`, which held it across the `running` check (map -> running) |
+| O1 | `OpenSession.record` | `Mutex<SessionRecord>` | `set_session_route` (model switch: blocking), `apply_compaction` (turn task, `/compress` task) | everywhere: the id per streamed chunk (`TurnRuntime::append`), model / provider / cwd / prompt per turn, the snapshot per pass, review, subagents, curator | data; taken alone or before `conversation` ("one lock at a time") |
+| O2 | `OpenSession.conversation` | `Mutex<Conversation>` | the turn task per chunk (`append`, `update_message`, effects; the store queue is called *under* this lock, CP13b), `rewind_as`, `reload_if_stale`, `add_command_output`, `apply_compaction` | the snapshot per pass, the gateway's transcripts (`messages`), the review / scheduler views, `usage_text`, `context_breakdown`, `session_tool_definitions`, signals | data; CP13b's order rule needs the store queue under it |
+| O3 | `OpenSession.context` | `Mutex<Option<(tokens, len)>>` | the turn task (`RecordUsage`); reset by compaction, rewind, reload | `snapshot` per pass | data, tied to the conversation's length |
+| O4 | `OpenSession.running` | `Mutex<Option<RunGuard>>` (token + `TurnLock`) | `begin_turn` / `compress` (claim under the lock: check, take the `TurnLock`, set); cleared **by hand at 8 points** (`begin_turn`: 2 early errors, the early-out path, the normal end; the panic guard task; `compress`: 2 errors and its end) | `is_running` (the gateway's page state, the archive sweep, `note_session_left`), idle checks (`set_session_route`, `rewind_as`, `refine`, `idle_session`, `open_fresh`, `evict`), `cancel` and `close_quietly` (the token), the scheduler's `turn_running`, the curator, the review's pause | lock order **running -> review** (`ReviewSetup::start`), **running -> conversation** (the review's paused snapshot) |
+| O5 | `OpenSession.turn_state` | `Mutex<Option<Arc<Mutex<TurnState>>>>` | set in `begin_turn` a few steps after the claim; cleared with `running` (3 points) | `steer`, `set_steer` (clone the inner `Arc`, then lock it) | the inner `TurnState` is the turn's own loop state (its steps lock it), not session state |
+| O6 | `OpenSession.review` | `Mutex<Option<ReviewHandle>>` | `ReviewSetup::start` (under `running`: check the scheduler's busy flag, keep / replace a paused review, cancel the old one), `review::run`'s end (clear unless replaced) | the scheduler's `claim` (after setting its busy flag), the curator | a **Dekker pair** with the scheduler: the agentic side checks busy and sets the slot under the slot's lock; the scheduler sets busy, then reads the slot: one of the two always sees the other. `ReviewHandle.started` (atomic) is set by the paused review under `running` |
+| O7 | `OpenSession.nudges` | `Mutex<Nudges>` | `begin_turn` (`tick_memory`), the turn's end (`finish_turn`) | — | seeded from the conversation at load (`Nudges::resumed`) |
+| G1 | `Gateway.queued` | `Mutex<HashMap<id, VecDeque<params>>>` | `submit` (enqueue when `is_running`: blocking), `enqueue` at the front for a redirect / an undelivered steer, `dequeue` (`prompt.cancel`, `prompt.steer_queued`, `prompt.replace_queued`), `run_queued` (pop the front at a turn's end: blocking) | `pending_rows` (`session_info`, `session.resume`), `has_queued` (a turn's end decides whether the page hears `running: false`) | **order**: front for a redirect / a missed steer, back otherwise; one runs at each turn's end. A check-then-act race: `submit` read `is_running` and enqueued in two steps (a turn ending in between left the prompt queued with nobody to run it) |
+| G2 | `Gateway.live_turns` | `Mutex<HashSet<id>>` | `set_live(true)` after a turn starts; `end_live` (a turn's end without a queue, a failed queued prompt) | `is_live` = runtime running OR live (`session_info.running`, `session.active_list`) | keeps the page's turn live across a queue |
+| G3 | `Gateway.pending_routes` | `Mutex<HashMap<id, (provider, model)>>` | `switch_model` while running (set / withdraw), `apply_pending_route` (taken at the turn's end) | `session_info`, `model_options` | applied after the turn, before the next queued prompt |
+| G4 | `Gateway.efforts` | `Mutex<HashMap<id, String>>` | `config.set reasoning` (worker), `session.mutate reasoning` | `turn_options` (each turn), `session_info`, ACP `settle_effort` / `effort` | exists for ids never loaded (set before a turn); kept for the process lifetime |
+| G5 | `Gateway.revisions` | `Mutex<HashMap<id, u64>>` | `bump_revision` (`session.mutate`, `session.rewind`) | `session_info`, the `session.create/resume/branch` replies | default 1 |
+| G6 | `Gateway.pending_images` | `Mutex<HashMap<id, Vec<path>>>` | `image.attach*` (worker), `image.detach` | `submit` (takes them) | may exist before the session is loaded (a fresh `session.create` is not loaded) |
+| G7 | `Gateway.generation` | `Mutex<HashMap<id, (u64, f64)>>` + `generation-stats.json` | `note_generation` (blocking) | `usage_snapshot` | the file holds every session: each write needs all of them |
+| G8 | `Gateway.starts` | `Mutex<HashMap<admission id, oneshot>>` | `submit` (gated) | `release_admission` (after the reply) | keyed by admission; lives for one RPC |
+| G9 | `Gateway.context_lengths` | map by `provider\nmodel` | model facts | usage, turn options | not per session |
+| G10 | `Gateway.file_tickets`, `branch_keys`, `viewing` | maps by ticket, idempotency key, page socket | | | not per session (`viewing` relates pages to sessions: cross-session) |
+| G11 | `Hub.subscribers`, `Hub.prompts` (`hub.rs`) | session -> socket; prompt id -> a waiting answer | subscribe on create / resume / submit; the bridge (approval / clarify from inside a tool call) | every `emit` (per streamed chunk) | the event route: every page event goes through it |
+| S1 | `review_schedule::Shared.states` | map by session (timers, busy, back-off) | the scheduler | | its own mutex |
+| A1 | `Runtime.subagents`, ACP `AcpServer.sessions` | | | | their own registries (subagent id; the ACP thread's state) |
+
+Cross-map invariants found: (1) O4 / O6 / S1: the review's pause and the one-review-at-a-time rule (above);
+(2) O4 + G1 + G2: the page sees `running` = O4 or G2, and a turn's end runs G1's front prompt; (3) at a turn's end
+O4 is released, then G3 is applied, then G1's front runs, in that order; (4) R1 + O4 in `evict` (the idle check and
+the removal together). Lock order today: map -> running (`evict`); running -> review -> scheduler.states
+(`ReviewSetup::start`); running -> conversation (the review's pause); record before conversation; conversation ->
+store queue (CP13b). No gateway map lock is held while another is taken (each is locked for one get / insert /
+remove).
+
+### Design
+`crates/runtime/src/session_actor.rs` (tests in `session_actor/tests.rs`). One **thread** per session
+("hermes-session-<id end>", 256 KiB stack) owns `SessionState`; callers hold a cloneable `SessionHandle`
+(`std::sync::mpsc::Sender<Command>` + the published status). `Runtime.sessions` is a `SessionRegistry` (id ->
+handle), the one map by session that stays.
+
+**What moved into the actor** (one owner, each change one command):
+
+| Before | Now (`SessionState` / `PageState`) | Commands |
+|---|---|---|
+| R1 `Runtime.sessions` (the loaded `OpenSession`s) | `open: Option<Arc<OpenSession>>` | `Attach` (keep the first of two racing loads), `Detach { only_idle }` (`evict`: the idle check and the drop in one step; `close`) |
+| O4 `running` + O5 `turn_state` | `run: Option<RunInfo { claim, cancel, turn_state }>`, `claims` | `ClaimRun` (-> claim number or `Busy`), `Release { claim }` (stale numbers ignored) |
+| O6 `review` (+ `ReviewHandle.started`) | `review: Option<ReviewHandle>` | `ClaimReview` (the whole of `ReviewSetup::start`'s locked section, with the scheduler's busy check run inside), `ReleaseReview { started }` (only its own slot), `ReviewSlotTaken`, `IdleEpoch` / `ConfirmIdle` (the paused review's snapshot) |
+| O7 `nudges` | `nudges` (seeded by `Attach`) | `TickMemory`, `FinishTurn` |
+| G1 `queued` | `page.queue` | `Enqueue { front, only_if_running }`, `Dequeue { admission }`, `TakeNext` |
+| G2 `live_turns` | `page.live` | `SetLive` |
+| G3 `pending_routes` | `page.pending_route` | `SetPendingRoute` (kept only while running, one step), `TakePendingRoute` |
+| G4 `efforts` | `page.effort` | `SetEffort` |
+| G5 `revisions` | `page.revision` (starts at 1) | `BumpRevision` |
+| G6 `pending_images` | `page.images` | `AttachImage`, `DetachImage`, `TakeImages` |
+| — | — | `Barrier` (answers once everything sent before is handled) |
+
+**What stayed, on purpose:**
+- `OpenSession.record`, `.conversation`, `.context` (O1-O3): the session's *data*, not its control state. The turn
+  writes the conversation per streamed chunk and must queue the store write *under* its lock (CP13b's order rule);
+  every reader is synchronous code (the snapshot per pass, transcripts, reviews, `/usage`); a review's, a
+  subagent's and the curator's copies are `OpenSession`s without an actor. A command per chunk would put the
+  actor on the hot path for nothing: while a turn holds the run slot it is the only writer (rewind, `/compress`,
+  model switch and the other writers refuse while it runs, as before).
+- `Gateway.generation` (G7): one file holds every session's numbers, so each write needs all of them.
+- `Gateway.starts` (G8, by admission id, one RPC), `context_lengths` (by model), `file_tickets`, `branch_keys`,
+  `viewing` (G9-G10): not per session.
+- `Hub` (G11): the event route; every `emit` (per streamed chunk) reads it, and the bridge's open questions
+  (approval / clarify) are keyed by prompt id. Order and shapes of those events are untouched.
+- The scheduler's `states` (S1), `Subagents`, ACP's `AcpServer.sessions` (A1): their own components.
+
+**Commands and replies.** Every command in the app is waited for (`ask` from synchronous code: a std channel;
+`ask_async` from async code: a tokio oneshot, the task waits, the worker doesn't). Even "set" commands are waited
+for, so their effect is in the status the caller (or anyone it tells) reads next; there is no fire-and-forget in
+the app (`tell` is test-only). The actor **publishes** a `SessionStatus` (one `Arc`, swapped whole after each
+command, before the answer goes out): `is_running`, `turn_state`, `is_live`, `page()`, `open()`, `reviewing()`
+read it without a round trip. A read that must be ordered against another caller's command uses a command
+(`ReviewSlotTaken`, the `only_if_running` forms).
+
+**Consistent snapshots.** A status is one consistent picture (all fields from the same moment), e.g.
+`is_live` = run slot or `page.live` from one status (before: two locks taken at different moments), and
+`session_info`'s queue rows, effort, revision and pending route come from it. It reflects every command whose
+answer the reader already has.
+
+**Why a thread, not a tokio task.** `Runtime::start_turn`, `compress`, `refine`, `ReviewSetup::start` are
+synchronous and must know at once whether they got the session; the `turns` tests (and the GPUI app) call them from
+a one-thread tokio runtime. A task-based actor could not run while that thread waits for its answer (deadlock); a
+thread of its own always can. Its handlers are in-memory, so a synchronous wait is bounded like taking a mutex
+(`a_waiting_call_on_a_one_thread_runtime_does_not_deadlock`).
+
+**The actor never blocks.** Handlers only change `SessionState`: no store, file, network or process work, no
+`.await`, no call to any handle. Two things are kept out of it for that reason: the cross-process `TurnLock` (file
+open and delete) is taken and dropped by the turn's `RunGuard`, not the actor; and the store is never touched (the
+CP13b queue is used by the turn itself, as before). The one outside lock a handler takes is the review scheduler's
+`states` (`ClaimReview` calls `Scheduler::is_busy`), see the rules below.
+
+**Unbounded channel.** Commands come at the pace of user actions and turn boundaries, never per chunk; senders
+include `Drop` (the `RunGuard`) and code holding other locks, where a full bounded queue would add a way to block
+or deadlock and buy nothing.
+
+**Cancel stays immediate.** Stop never goes through the queue: `ClaimRun` publishes the turn's
+`CancellationToken`, and `SessionHandle::cancel` (`Runtime::cancel`, `close`, `session.interrupt`,
+`session.redirect`) cancels it straight from the status, even while the actor is busy with queued commands
+(`cancel_reaches_the_turn_while_the_actor_is_held_up`). The CP13c rule (a tool call dropped by Stop keeps its
+output) is untouched: nothing in the tool or machine path changed.
+
+**RAII for the run slot.** `RunGuard` (session.rs) is now the claim: `RunGuard::claim(handle, token,
+turn_state)` asks `ClaimRun`; `hold(TurnLock)` keeps the cross-process lock; `Drop` drops the lock first, then
+waits for `Release`. The 8 places that reset `running` / `turn_state` by hand are gone: `begin_turn`'s and
+`compress`'s early errors just return (`?`), the turn's early-out and normal end `drop(run)` exactly where they
+cleared the slot before (so `TurnFinished` is still sent after the slot is free), and a panicking turn's task drops
+its guard while tokio drops the future, before its `JoinHandle` resolves (the panic guard no longer resets
+anything; `a_panicking_turn_task_frees_the_slot_before_its_join_handle_resolves`). The review's slot is freed by
+`ReleaseReview` at its end; the queue / route / images are taken by commands (`TakeNext`, `TakePendingRoute`,
+`TakeImages`), never reset in place.
+
+**The review's pause without the `running` lock.** Before, the paused review copied the conversation under the
+`running` lock, which `begin_turn` held while claiming. Now: `IdleEpoch` (no run: the number of claims so far),
+copy the conversation, `ConfirmIdle { epoch }` (still no run and no claim since: set `started`, use the copy; else
+throw it away and wait). `started` is set only inside the actor, so `ClaimReview`'s "has the old review started?"
+and its cancel are one step with respect to it, which is what holding `running` in `ReviewSetup::start` was for.
+
+**Errors, never hangs.** `Gone::Stopped` when the actor's thread has ended (send fails) or a handler panicked
+(its reply sender is dropped with the command; caught by `catch_unwind`, logged, the actor goes on with the next
+command; handlers change the state only in their last step). `Gone::Reentrant` when called from an actor's own
+thread (with a debug assertion). Callers map `Gone` to an error (`anyhow` in the runtime: "the session's state
+stopped answering ...", RPC `SERVER_ERROR` for `image.attach*`) or a safe default (a read: not running; the
+scheduler: treat as reviewed; a review: stop). Unchanged RPC shapes and codes on every normal path.
+
+**Lifecycle.**
+- *Create*: `Runtime::handle(id)` (`SessionRegistry::get_or_spawn`) starts the actor on first use, with no store
+  or file work (an effort or an image may be set for a session never loaded, as before). Reads (`get`) never start
+  one (the archive sweep asks `is_running` of 100,000 sessions).
+- *Resume / open*: `Runtime::open` loads from the store outside the actor, then `Attach` (two racing loads keep
+  the first, as `entry().or_insert` did).
+- *Close* (ACP `session/close`) and *evict* (workspace move): `Detach` (evict: `only_idle`, one step); the actor
+  and the page's state stay (efforts, revisions, a queue survive as the gateway maps did).
+- *Delete*: `close_quietly` (cancel, `Detach`, the tools' shutdown), then the handle is removed from the registry
+  (its page state goes with it), then the store delete (a waiting write, after the turn's queued writes, CP13b).
+  The actor ends when the last handle is dropped: a turn still ending holds one through its `RunGuard`, a review
+  through its job, so their releases are still handled; a later use of the id starts a fresh actor.
+- *Archive*: no change (a side file in the gateway; the actor is not involved).
+- *Shutdown*: `Runtime` drop drops the registry; each actor ends once the last turn task / review lets go. The
+  store's writer is shut down by `main.rs` / ACP as before (the actor holds no store work, so there is no order to
+  keep between them). No thread is joined (a join from async code would block).
+
+**Order.** One channel per session, one consumer: commands from one sender are handled in the order sent, and a
+caller that waited for an answer is ordered before anything it does next. At a turn's end the order is as before:
+release (inside the runtime, before `TurnFinished`), then the gateway's `message.complete`, `end_live` if nothing is
+queued, the title, `apply_pending_route` (`TakePendingRoute`), `run_queued` (`TakeNext`). The queue keeps back / front
+order (`the_queue_keeps_back_and_front_order_and_takes_by_admission`).
+
+### Deadlock and re-entrancy rules (enforced where they can be)
+1. **A handler never waits.** No IO, no `.await`, no `SessionHandle` call (any session's), no lock a caller may
+   hold while waiting. Enforced: handlers are plain `fn`s on `SessionState` (no `.await` possible); a handle call
+   from an actor thread returns `Gone::Reentrant` (thread-local flag) and trips a debug assertion
+   (`a_call_from_the_actors_own_thread_is_refused_not_deadlocked`); the `TurnLock` file work lives in `RunGuard`,
+   outside the actor.
+2. **Lock order: actor, then the scheduler's `states`.** `ClaimReview` runs `Scheduler::is_busy` (takes
+   `states`) inside the handler. So nobody may wait for an actor while holding `states`: checked by reading every
+   `states.lock()` in `review_schedule.rs` (`turn_started`, `forget`, `shutdown`, `status`, `is_busy`, `nudge_due`,
+   `arm`, `claim`, `fire`, `finished`, `Claim::drop`): none calls a handle while holding it; `Shared::claim` asks
+   `ReviewSlotTaken` after its `states` block ends. No other outside lock is taken by a handler.
+3. **No wait for a task from a handler, and no wait for a task-actor from a one-thread runtime**: the actor is a
+   thread, so a synchronous `ask` from the only thread of a `current_thread` runtime is answered
+   (`a_waiting_call_on_a_one_thread_runtime_does_not_deadlock`).
+4. **A held lock while asking is allowed only if no handler takes it**: the conversation and record locks are
+   never taken by a handler (holding them while asking would be safe; no code does: `ReviewSetup::after_turn`
+   copies the turn's messages and releases the lock before `FinishTurn`).
+5. **`RunGuard::drop` asks (waits)**: never drop one on an actor thread (none is ever stored in the actor).
+
+### No lost command
+- One `mpsc` channel per session, one consumer: every command sent is handled in send order, or answered with an
+  error. A send to a stopped actor fails at once (`Gone::Stopped`); a command still queued when the thread ends is
+  dropped with its reply sender, so its waiter wakes with `Gone::Stopped`
+  (`commands_queued_when_the_thread_ends_are_answered_with_an_error`); a panicking handler's caller gets
+  `Gone::Stopped` and the next command is handled (`a_panicking_handler_answers_an_error_and_the_actor_goes_on`).
+- A session that is closing: `delete_session` cancels, detaches, then removes the handle from the registry; a turn
+  or review still ending holds its own handle clone, so its `Release` / `ReleaseReview` are still handled before
+  the thread ends (`the_actor_ends_when_the_last_handle_is_dropped`). A command to a removed id simply starts a
+  fresh actor (an effort set on a deleted id goes to a new, empty state, as the old maps would have kept it
+  forever).
+- The race fixed on the way: `submit` read `is_running` and enqueued in two steps; a turn ending in between left
+  the prompt queued with nobody to run it (until the next turn's end). Now `enqueue(.., only_if_running)` is one
+  step; if the turn has ended, the prompt starts at once
+  (`a_prompt_is_queued_while_running_only_if_a_turn_still_holds_the_session`). Same for a model picked mid-turn
+  (`set_pending_route`): a turn ending in between gets the switch now instead of a pick nobody applies until
+  the next turn's end. Shapes and the normal order are unchanged.
+
+### Stages (each left the tree building and green)
+Each stage moved one map / one group of coupled state. Each stage's incremental diff is kept outside the repo
+(`C:\Users\alexandros\AppData\Local\Temp\claude\27b2cb05ce638374\c52af161-c1c3-40cf-bcd0-adf29c3f76ef\scratchpad\stages\N-*.patch`,
+each against the one before), so the reviewer can commit them one by one. The docs, `queue-check.mjs` and two
+clippy / rustfmt touch-ups after stage 9 (`enqueue_as` wrapped, a redundant `handle.clone()` in `begin_turn`) are
+not in any stage patch.
+
+| # | Moved | Tests after it |
+|---|---|---|
+| 1 | R1 `Runtime.sessions` -> `SessionRegistry` + the actor (`Attach` / `Detach`); `OpenSession::new` for every fork; `evict` / `close` through `Detach` | runtime lib 225, turns 258/7 ign (default), desktop 183 + acp 68 (acp: `retry_sends_the_last_prompt_again_without_the_old_answer` failed 2 of 7 full runs, see doubts) |
+| 2 | O4 `running` + O5 `turn_state` + O6 `review` (one group: the review's pause and `ReviewSetup::start` held running -> review together); `RunGuard` becomes the RAII claim; the 8 hand resets removed; Stop on the published token; the scheduler asks `ReviewSlotTaken` | runtime lib 234, turns 258/7, desktop 183 + 68 |
+| 3 | O7 `nudges` (`TickMemory`, `FinishTurn`, seeded by `Attach`) | runtime lib 235, turns 258/7, desktop 183 + 68 |
+| 4 | G1 `queued` (`Enqueue` with `only_if_running`, `Dequeue`, `TakeNext`) | runtime lib 238, turns 258/7, desktop 183 + 68 |
+| 5 | G2 `live_turns` (`SetLive`; `is_live` from one status) | runtime lib 238, desktop 183 + 68 (turns not re-run: no runtime path changed, only an added command) |
+| 6 | G3 `pending_routes` (`SetPendingRoute` only while running, `TakePendingRoute`) | same as 5 |
+| 7 | G4 `efforts` (`SetEffort`) | same as 5 |
+| 8 | G5 `revisions` (`BumpRevision`) | same as 5 |
+| 9 | G6 `pending_images` (`AttachImage`, `DetachImage`, `TakeImages`) + module doc | runtime lib 242, turns 258/7, desktop 183 + 68 |
+
+### Tests (final tree, CARGO_TARGET_DIR=target/claude)
+- `hermes_runtime --lib` **242** (213 + 29 actor tests in `session_actor/tests.rs`).
+- `turns` **258 passed / 7 ignored under the default, `HERMES_TEST_PROFILE=requests` and `tokens`** (unchanged).
+- `hermes-desktop` 183 + acp 68. `hermes_store` 34, `hermes_llm` 489 (+7 ign) + 5, `hermes_agent` 45, `hermes_memory`
+  101, `hermes_prompts` 37: green. `hermes_tools` 336 / 1 failed: `script::tests::stopping_the_turn_kills_the_script_and_removes_its_scratch_folder`
+  (asserts that PowerShell printed "begun" within the 1.5 s before Stop; on this machine it now fails alone too,
+  3 of 3). The crate is unchanged by CP13d (`git diff HEAD -- crates/tools` is empty) and doesn't depend on the
+  runtime: an environment timing failure (slow PowerShell start), not weakened, flagged here.
+- `cargo build --workspace` OK (GPUI app builds; placeholder `target/hermes-src/apps/desktop/dist-webapp`, removed
+  afterwards). `cargo clippy --no-deps -p hermes_runtime`: nothing in the CP13d files (fixed 3 redundant clones of
+  mine); the crate still has older clippy errors (`signals.rs`, `mcp.rs`, `changes.rs`...), so the desktop crate's
+  clippy pass is blocked by them, as before. `rustfmt` run on `session_actor.rs` (+ tests); my hunks elsewhere
+  are formatted by hand (those files have older unformatted code).
+- Live, own instance (debug exe, port 47810, `target/perf`; main checkout's `tools/node/node.exe` run in place; the
+  instance started with `perf.ps1`'s environment without its timing step; working folders in my scratch folder;
+  stopped by its PID): with `mock_llm.py` (started and stopped by its PIDs) `smoke.mjs` (all passed),
+  `stop-check.mjs` (both cases ok), `rollback-check.mjs` (restore ok); as their own provider **`queue-check.mjs`
+  (new)**, `side-and-branch-check.mjs`, `archive-check.mjs`, `workspace-check.mjs`: all passed;
+  `attach-check.mjs` all passed on a fresh instance (after other checks it fails "model does not support vision",
+  known since CP13c); `subagents-check.mjs`: all passed except `delegation.status`, which expects
+  `max_concurrent_children == 10` (the `balanced` value) while the instance runs the default `requests` (3):
+  stale since Phase 3, not CP13d. No perf / timing checks (user's rule).
+- There was no live check for steering, queued prompts, approvals or clarify (scripts/perf/README.md has none), so
+  `scripts/perf/queue-check.mjs` is new: a held turn with three prompts queued, `prompt.cancel` (twice),
+  `prompt.replace_queued`, `session.steer`, `session.resume`'s `pending_submissions`, release -> the missed steer
+  then the queue run in order with `running: false` only after the last; `session.redirect` (interrupted, then the
+  redirect); an approval card under manual approvals (`approval.pending`, `approval.respond` deny, `settled`);
+  a clarify card answered; idle-session answers of `prompt.steer_queued` / `session.steer`.
+
+### Deviations from the plan
+- **A thread per session, not a tokio task** (reason in the design: synchronous claimers on one-thread runtimes).
+- **`record`, `conversation`, `context` stay on `OpenSession`** (data, not control; the per-chunk path and CP13b's
+  queue-under-the-lock rule). So "replace OpenSession's ~7 mutexes" is 4 of 7 (running, turn_state, review,
+  nudges) plus the registry.
+- **Gateway maps**: the 6 session-keyed ones moved (queued, live_turns, pending_routes, efforts, revisions,
+  pending_images); the plan's "~14" counted every map; the others are not per session or are file-backed for all
+  sessions (generation), kept with reasons.
+- Two check-then-act races closed on the way (a prompt queued after its turn ended, a model pick kept after its
+  turn ended); shapes and the normal order unchanged.
+- Stages 5-8 were gated without the `turns` suite (gateway-only moves plus an added runtime command each); stages
+  1-4 and 9 ran the full gate.
+- A live check script added (none existed for these paths).
+
+### For the reviewer
+- **No deadlock**: the rules above; check `review_schedule.rs` never asks an actor while holding `states`
+  (`Shared::claim` asks `ReviewSlotTaken` after its block), and that no handler in `SessionState::handle` does
+  IO or takes any lock but via `evidence_busy`. `RunGuard::drop` waits for the actor: it is dropped only in the
+  turn / compress tasks and early returns, never on an actor thread.
+- **Cancel still immediate**: `SessionHandle::cancel` reads the published token; `Runtime::cancel`,
+  `close_quietly` use it; `cancel_reaches_the_turn_while_the_actor_is_held_up`; `stop-check.mjs`. The CP13c tool
+  path is untouched.
+- **Release before `TurnFinished`**: `drop(run)` sits where `*running = None` was (early-out after its flush,
+  normal end after the flush and the final-answer read); the panic guard relies on tokio dropping the future
+  before the `JoinHandle` resolves (`a_panicking_turn_task_frees_the_slot_before_its_join_handle_resolves`).
+  `begin_turn` now claims before taking the `TurnLock` (as before, inside one locked section) and builds the turn
+  state before the claim (steer can reach the turn a few lines earlier than before; harmless).
+- **The review pause** (`IdleEpoch` / copy / `ConfirmIdle`) replaces "copy under the running lock": please check
+  the argument in the design section, and `the_review_claim_and_the_schedulers_claim_always_see_each_other`.
+- **`ReleaseReview` compares the `started` Arc** instead of "not cancelled -> clear": equivalent while replacing is
+  the only canceller, stricter otherwise.
+- **Lifecycle**: close / evict keep the actor (page state survives as the maps did); delete removes it. Actors
+  accumulate per session used in a process (as `OpenSession`s did in the old map, since the page's
+  `session.close` never closed the runtime's session): one parked thread with a 256 KiB stack each. Say if you want
+  a cap or idle retirement (would need the page state moved out of the actor first).
+- `Gone` mapping: runtime errors carry "the session's state stopped answering ..."; `image.attach*` answers
+  `SERVER_ERROR` with it; reads fall back to defaults (not running, revision 1, no effort); the scheduler treats
+  a gone actor as "reviewed". None of these happen on a normal path.
+
+### Doubts
+- `retry_sends_the_last_prompt_again_without_the_old_answer` (acp) failed in 2 of 7 full ACP runs after stage 1 and
+  in none of the later full runs (stages 2-9, final: 9 runs). Stage 1 changed nothing on that path (it only swapped
+  the map for the registry), so I believe it is an older timing flake, but I could not see the failing count and
+  did not run HEAD to compare. Worth a look if it reappears.
+- Thread per session (above).
+
+**User checklist** (no visible change; a sanity pass in the rebuilt app):
+1. Rebuild and start the app (`cargo build -p hermes-desktop`, your usual run).
+2. Send a long request (ask it to run a slow command); while it works, send two more messages: they appear as
+   queue cards. Delete one card, edit the other: the queue shows the edit last.
+3. While it still works, use Steer with a short note. When the reply ends, the note runs first, then the queued
+   message; the Stop button stays until the last one ends.
+4. Start another long request and press Stop: it stops at once (a command's output so far is kept).
+5. Pick another model while a reply streams: it shows at once and is used from the next message.
+6. Change the effort in the composer, switch to another session and back: the pick is still there.
+7. Negative case: Stop with nothing running: nothing happens, no error.
+
+### Review (Opus, 2026-11-15)
+Read the whole diff against 8e3d12d, the actor and its tests, and every caller of a handle; built the wait-for graph.
+
+**Deadlock (wait-for graph).** Waiters on an actor: `RunGuard::claim` / `Drop` (start_turn, compress, the turn task,
+early returns), `attach` / `detach` (open, evict, close, delete), `ClaimReview` (`ReviewSetup::start`, from the turn
+task's end and `/refine`), `TickMemory` / `FinishTurn`, the gateway's page commands (all from RPC handlers or the
+turn's event loop, sync), `Shared::claim`'s `ReviewSlotTaken` (scheduler), and the review's `ask_async`s. What a
+handler waits on: nothing but `states` (inside `ClaimReview`'s `evidence_busy`) and the status `RwLock` (written
+after the handler, never held while waiting). Every `states.lock()` in `review_schedule.rs` was read: none asks an
+actor or blocks on anything that does (`fire` holds it across a `tokio::spawn` only; `Claim::drop` takes it after
+`ReviewSlotTaken` returned). No caller holds `states` while asking; the conversation / record / Hub / store locks
+are never taken by a handler, so holding them while asking cannot close a cycle; the store writer never waits for an
+actor. (a) re-entrancy: no handler or closure run inside one calls a handle (the only closure is `is_busy`); (c) a
+one-thread runtime: the replier is an OS thread and needs no tokio thread (`states` is never held across an
+`.await`: parking_lot guards are `!Send`, and none is); (d) `RunGuard::drop` waits for `Release`, which only needs
+the actor's thread; the guard is never owned by the actor, and its drop during a panic (tokio drops a panicking
+task's future inside its guard, before the `JoinHandle` resolves) or an abort runs on a worker. No cycle found;
+no deadlock test beyond the implementer's could be built that fails.
+
+**Lost commands / races.** Every command answers or errors (`Gone`); one channel per session keeps a sender's order.
+The two closed races are correct: an `Enqueue{only_if_running}` that succeeds is handled before the turn's
+`Release`, which comes before `TurnFinished`, before the gateway's `has_queued` / `TakeNext`, so a queued prompt is
+always run, and a refused one is started by its own `submit` (never both). Found and fixed:
+1. **A model picked just after a turn ended could be overridden by the pick made during it.** Turn running, pick B
+   (kept); the turn releases; pick C before the turn's end ran `TakePendingRoute`: C was switched now, then the
+   turn's end applied B (the last pick lost; the same race existed with the old map). `SetPendingRoute` refused
+   (no run) now also drops a kept pick, and the gateway asks the actor whenever one exists (not only when
+   `is_running` said so, which left the stale pick in place on that path).
+   Test `a_model_pick_after_the_turn_ended_drops_the_pick_it_left_behind`.
+2. **A dead actor made its session unusable until restart.** The registry kept a handle whose loop had died
+   (a panic outside a handler: e.g. a `Drop` while delivering an answer to a dropped async caller), so every later
+   call answered `Gone::Stopped` ("reopen the session", which reopened the same dead actor), its last status said
+   "running" forever (curator `anything_running` true, `is_running` true), and Stop could no longer reach its turn
+   once replaced. Now: an `alive` flag cleared when the loop ends (normal or unwinding); `SessionRegistry::get`,
+   `get_or_spawn` and `all` skip / replace a dead actor and cancel its last published turn; delivering an answer is
+   inside `catch_unwind` too. Test `a_dead_actor_is_replaced_and_its_published_turn_stopped` (a test-only
+   `Command::Exit` ends the loop).
+3. **The losing copy of a racing load was dropped on the actor's thread** (its `SessionTools`: the "a handler does
+   no work" rule). `Attach` hands it back; the caller drops it. Test
+   `a_losing_load_gets_its_copy_back_to_drop_on_its_own_thread`.
+4. **`Runtime::open` started an actor before the store load**, so asking for an unknown id (a stale page asking
+   `/api/sessions/<deleted>/messages`) left a parked thread per id. The actor now starts after the load succeeds.
+
+Not changed (noted): the panic guard's flush now runs after the slot is free (the guard was dropped with the task),
+so a turn started in that instant could have its queued-write failures reported to the crashed turn's flush:
+harmless. `steer` can reach the turn state a few statements earlier than before (published with the claim); if
+`start_turn` then fails before spawning, that steer is lost while `steer` said `true` (window: the synchronous
+part of `start_turn`; the page steers only a turn it was told runs). Close (`session/close`) while a turn ends now
+refuses a new turn with "a turn is already running" until the old one releases, where before the map entry was
+gone at once and the new turn failed on the cross-process `TurnLock` instead: both refuse, the text differs.
+
+**Cancel.** `SessionHandle::cancel` reads the published token; `Runtime::cancel`, `close_quietly`,
+`session.interrupt` / `redirect` use it. `cancel_reaches_the_turn_while_the_actor_is_held_up` is meaningful: with
+a `Command::Cancel` through `ask` it would block 10 s behind the held actor (the 1 s bound fails), through `tell` the
+token would not be cancelled. The tool path is unchanged (`git diff HEAD -- crates/tools crates/agent` was empty
+before this review), so CP13c's kept-output property holds; `stop-check.mjs` re-run below.
+
+**Behaviour parity.** The eight hand resets map one to one onto `drop(run)` / `?` (the early-out and the normal end
+drop at the same statements, before `TurnFinished`; compress after `after_save`, before `TurnFinished`; the panic
+guard above). RPC shapes, codes and texts unchanged on every normal path (`image.attach*` answers `SERVER_ERROR`
+only on `Gone`). ACP unchanged (no file in `acp/` touched). GPUI app: API unchanged, builds. Schema untouched.
+
+**Resources.** A thread per session opened (or given page state) in a process, never retired. Before CP13d each
+such session already stayed loaded for the process (the map was never pruned by the page's `session.close`), with
+its conversation and tools; a parked thread adds a kernel object and a few committed stack pages (the 256 KiB is
+reserved address space). Every path that starts one is a user opening or acting on one session (resume, its
+messages, a submit, an effort / image / revision); lists, search, the archive sweep and insights only read. With
+the unknown-id leak fixed, hundreds of threads after a long day is the realistic bound: acceptable. Retiring idle
+actors is not cheap-safe now (the page state would be lost or must move out, and a retire racing a
+`get_or_spawn` or a clone held elsewhere makes two actors per id); not added. If it is ever needed: retire only
+actors with no `open`, no run, no review and a default `PageState`, under the registry lock, checking
+`Arc::strong_count(inner) == 1`.
+
+**Failing test.** `script::tests::stopping_the_turn_kills_the_script_and_removes_its_scratch_folder` fails on HEAD
+(8e3d12d, a throwaway worktree, 1 of 1) as on the CP13d tree (3 of 3): environment timing (PowerShell now takes
+over 1.5 s to print its first line here), not a regression. Made robust without weakening it: the script writes
+`begun.txt` after its line, Stop is sent once that exists (deadline 90 s), and it must end the 120 s sleep within
+30 s with the output kept and the scratch folder gone. 3 of 3 green alone, and in the full crate run. PITFALLS
+notes the rule.
+
+**ACP flakes.** 15 full ACP runs on the reviewed tree (alone on the machine): 13 green, one
+`retry_sends_the_last_prompt_again_without_the_old_answer`, one `cancel_ends_the_turn_with_cancelled`. On HEAD
+(8e3d12d, throwaway worktree `hermes-rs-p13-head`, removed): `retry_...` failed in 2 of 4 runs (`left: 3, right:
+2`), so it is older than CP13d; stopped after 4 runs, the cause being found. Alone, 30 of 30 green. Cause (probed):
+`/retry` is an undone turn, a learning signal, so the `balanced` profile's `nudges` starts a background review
+after the retried turn; its request (same tools and system prompt as a turn, the review prompt last) sometimes
+reached the mock before the test read the request list. The test now counts the turns' requests only (not the
+review prompt's) and prints the agent's reply on failure. Found on the way, **not fixed (outside CP13d)**: the
+desktop app never applies `background_review: false` from `config.json` (only the GPUI app calls
+`Runtime::set_background_review`), so the ACP tests and the perf instance review after turns whatever the config
+says. `cancel_...` cancelled after a fixed 800 ms: under load the turn had not claimed the session yet, so Stop
+found nothing and the turn ran its 20 s. It now waits for the turn's request to reach the model, then requires
+`cancelled` within 10 s. Then: 3 more full ACP runs green.
+
+**Live checks** (own instance: the debug exe of this tree, port 47810, fresh `target/perf`, started with perf.ps1's
+environment without its timing step; main checkout's `tools/node/node.exe`; working folders in the scratchpad;
+`mock_llm.py` and the instance stopped by their PIDs): with `mock_llm.py`: `smoke.mjs` all passed, `stop-check.mjs`
+both cases interrupted with `running: false`, `rollback-check.mjs` restored; as their own provider:
+`queue-check.mjs` all passed (queue, cancel, replace, steer, order, `running: false` after the last, redirect,
+approval, clarify), `side-and-branch-check.mjs`, `archive-check.mjs`, `workspace-check.mjs`, `review-check.mjs`
+(needs the home folder as its second argument when run from outside the repo), `staging-check.mjs`,
+`subagents-check.mjs` (now reads the effective width: `requests` 3) all passed.
+
+**Tests (final tree).** `hermes_runtime --lib` 245 (242 + 3 review tests); `turns` 258 passed / 7 ignored under
+default, `requests` and `tokens`; `hermes-desktop` 183 + acp 68 (3 runs); `hermes_tools` 337 (the script test
+green), `hermes_store` 34, `hermes_llm` 489 (+7 ign) + 5, `hermes_agent` 45, `hermes_memory` 101, `hermes_prompts`
+37; `cargo build --workspace` OK (placeholder `target/hermes-src`, removed).
+
+**Commit.** One commit for CP13d (the stage patches each build, but the review fixes cut across stages 1, 6 and the
+module; one commit listing the stages is the honest history).

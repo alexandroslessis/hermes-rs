@@ -22,7 +22,8 @@ use hermes_tools::SessionTools;
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::ops::TurnState;
+use crate::ops::{SharedTurnState, TurnState};
+use crate::session_actor::{Busy, Command, Gone, SessionHandle};
 
 pub enum HermesEffect {
     Conversation(ConversationEffect),
@@ -105,16 +106,57 @@ impl MachineSession for TurnSession {
     }
 }
 
-/// A running turn: its cancellation token, and the cross-process lock that keeps another window
-/// from starting a turn on the same thread (released when the turn is dropped from `running`).
+/// A running turn's hold on its session (RAII, like a C++ `lock_guard`): the session actor's run
+/// slot, its cancellation token, and the cross-process lock that keeps another window from
+/// starting a turn on the same thread. Dropping it frees all three, on every path (the end, an
+/// early error, a panicking turn whose task is dropped): nothing resets the slot by hand.
 pub struct RunGuard {
+    handle: SessionHandle,
+    claim: u64,
     token: CancellationToken,
-    _lock: Option<crate::turnlock::TurnLock>,
+    lock: Option<crate::turnlock::TurnLock>,
 }
 
 impl RunGuard {
-    pub fn new(token: CancellationToken, lock: Option<crate::turnlock::TurnLock>) -> Self {
-        Self { token, _lock: lock }
+    /// Takes the session's run slot: `Ok(Err(Busy))` while another turn (or `/compress`) holds
+    /// it. `turn_state` is where `/steer` text for this turn waits (none for `/compress`).
+    pub fn claim(
+        handle: &SessionHandle,
+        token: CancellationToken,
+        turn_state: Option<SharedTurnState>,
+    ) -> Result<Result<Self, Busy>, Gone> {
+        let cancel = token.clone();
+        let claim = handle.ask(|reply| Command::ClaimRun {
+            cancel,
+            turn_state,
+            reply,
+        })?;
+        Ok(claim.map(|claim| Self {
+            handle: handle.clone(),
+            claim,
+            token,
+            lock: None,
+        }))
+    }
+
+    /// Keeps the cross-process lock with the claim (taken after it: file work stays out of the
+    /// actor).
+    pub fn hold(&mut self, lock: crate::turnlock::TurnLock) {
+        self.lock = Some(lock);
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        // The cross-process lock first: once the slot is free, this process's next turn must
+        // find the file free too.
+        drop(self.lock.take());
+        // Waited for (in-memory work on the actor's thread), so whoever learns that the turn
+        // ended (its `TurnFinished` is sent after this) sees the slot free.
+        let claim = self.claim;
+        if let Err(gone) = self.handle.ask(|reply| Command::Release { claim, reply }) {
+            tracing::warn!("session {}: the run slot was not released: {gone}", self.handle.id());
+        }
     }
 }
 
@@ -129,12 +171,13 @@ impl std::ops::Deref for RunGuard {
 /// A background review in flight. A turn starting while it runs leaves it alone (Phase 4):
 /// before its first request ([`ReviewHandle::started`] is `false`) it waits for the turn to end
 /// (a pause: it takes its snapshot of the conversation only when no turn is running), and after
-/// that it is left to finish on its own copy of the conversation.
+/// that it is left to finish on its own copy of the conversation. Its slot is the session
+/// actor's (`session_actor::Command::ClaimReview`).
 #[derive(Clone)]
 pub struct ReviewHandle {
     pub cancel: CancellationToken,
-    /// Set, under the session's `running` lock, when the review took its snapshot of the
-    /// conversation, i.e. when it is about to make its first request.
+    /// Set by the session's actor (`ConfirmIdle`) when the review took its snapshot of the
+    /// conversation with no turn running, i.e. when it is about to make its first request.
     pub started: Arc<std::sync::atomic::AtomicBool>,
     /// What the review covers, and whether the user asked for it (`/refine`): a review that
     /// replaces a paused one takes these over, so the paused one's job isn't lost.
@@ -159,23 +202,28 @@ impl ReviewHandle {
     }
 }
 
+/// A session's data: what a turn reads and writes. Its control state (who runs it, its review,
+/// what the page queued) is its actor's (`session_actor.rs`); a review's or a subagent's copy
+/// has none.
 pub struct OpenSession {
     pub record: Mutex<SessionRecord>,
     pub conversation: Mutex<Conversation>,
     pub tools: Arc<SessionTools>,
-    pub running: Mutex<Option<RunGuard>>,
-    /// The running turn's loop state (where `/steer` text waits for delivery).
-    pub turn_state: Mutex<Option<Arc<Mutex<TurnState>>>>,
-    /// The background review running after the last turn. A new turn no longer cancels it: see
-    /// [`ReviewHandle`].
-    pub review: Mutex<Option<ReviewHandle>>,
-    /// Hermes's nudge counters, which decide when a turn is followed by a review.
-    pub nudges: Mutex<crate::review::Nudges>,
     /// The last request's tokens and the conversation length then (see [`TurnSession`]).
     pub context: Mutex<Option<(usize, usize)>>,
 }
 
 impl OpenSession {
+    /// A session's data: its record, conversation and tools, nothing measured yet.
+    pub fn new(record: SessionRecord, conversation: Conversation, tools: Arc<SessionTools>) -> Self {
+        Self {
+            record: Mutex::new(record),
+            conversation: Mutex::new(conversation),
+            tools,
+            context: Mutex::new(None),
+        }
+    }
+
     /// Stores a compacted conversation and, when rebuilt, the new frozen prompt (compaction is
     /// the one place it may change, as in Hermes). The next request is measured afresh.
     pub fn apply_compaction(
@@ -458,8 +506,9 @@ fn merge_json(target: &mut serde_json::Value, patch: &serde_json::Value) {
     }
 }
 
+/// Test helpers shared with other modules' tests (`session_actor`).
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use super::*;
     use hermes_store::NewSession;
     use hermes_tools::{
@@ -477,7 +526,7 @@ mod tests {
     }
 
     /// An open session over an in-memory store, with a user message and a short reply stored.
-    fn open_session(dir: &std::path::Path) -> (TurnRuntime, Arc<OpenSession>) {
+    pub(crate) fn open_session(dir: &std::path::Path) -> (TurnRuntime, Arc<OpenSession>) {
         let store = Arc::new(Store::open_in_memory().unwrap());
         let record = store
             .create_session(NewSession {
@@ -511,16 +560,7 @@ mod tests {
                 .with_text("answer")
                 .with_generated_id_if_missing(),
         ]);
-        let session = Arc::new(OpenSession {
-            record: Mutex::new(record),
-            conversation: Mutex::new(conversation),
-            tools,
-            running: Mutex::new(None),
-            turn_state: Mutex::new(None),
-            review: Mutex::new(None),
-            nudges: Mutex::new(Default::default()),
-            context: Mutex::new(None),
-        });
+        let session = Arc::new(OpenSession::new(record, conversation, tools));
         let runtime = TurnRuntime {
             session: session.clone(),
             store,
@@ -530,6 +570,12 @@ mod tests {
         };
         (runtime, session)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::open_session;
+    use super::*;
 
     #[test]
     fn a_snapshot_shares_the_messages_and_does_not_see_later_changes() {

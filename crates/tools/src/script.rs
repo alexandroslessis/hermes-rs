@@ -1339,18 +1339,29 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let emit = Emitter::new(tx, cancel.clone());
         let stopper = cancel.clone();
+        // Stop once the script has printed its line (it writes `begun.txt` right after), not after
+        // a fixed delay: PowerShell's start-up time varies a lot between machines and loads (a
+        // 1.5 s timer stopped it before it printed anything). See docs/PITFALLS.md.
+        let marker = tools.cwd().join("begun.txt");
+        let stopped_at = Arc::new(parking_lot::Mutex::new(None::<Instant>));
+        let stopped = stopped_at.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let deadline = Instant::now() + Duration::from_secs(90);
+            while !marker.exists() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            *stopped.lock() = Some(Instant::now());
             stopper.cancel();
         });
-        let started = Instant::now();
         let result = run_script(
             &tools,
-            json!({"language": "powershell", "code": "Write-Output begun\nStart-Sleep -Seconds 120", "timeout": 300}),
+            json!({"language": "powershell", "code": "Write-Output begun\nSet-Content -Path begun.txt -Value x\nStart-Sleep -Seconds 120", "timeout": 300}),
             Some(("call_1", &emit)),
         )
         .await;
-        assert!(started.elapsed() < Duration::from_secs(30), "{:?}", started.elapsed());
+        // Stop ends the script promptly (it would otherwise sleep for two minutes).
+        let since_stop = stopped_at.lock().expect("Stop was sent").elapsed();
+        assert!(since_stop < Duration::from_secs(30), "{since_stop:?}");
         assert_eq!(result.value["interrupted"], true, "{:?}", result.value);
         assert!(result.value["output"].as_str().unwrap().contains("begun"));
         assert_eq!(scripts_left(&tools), 0);

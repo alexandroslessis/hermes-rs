@@ -40,7 +40,7 @@ it calls into. Everything runs in one process.
 | Crate | Package | Role | Notes |
 |---|---|---|---|
 | `crates/desktop` | `hermes-desktop` | The app: Tauri window, axum server, the protocol layer | The main app. Most feature work lands here. |
-| `crates/runtime` | `hermes_runtime` | Sessions and turns over the agent: `Runtime` | `lib.rs` (API), `session.rs`, `ops.rs` (per-turn tool guards), `delegate.rs` + `subagents.rs`, `compress.rs`, `review.rs` (background review), `signals.rs` (learning signals: what each turn says is worth learning, scored locally into `signals/<id>.json`), `skill_outcomes.rs` (how the turns a skill was used in went, into `.usage.json`), `review_once.rs` (the evidence review: one request with a packet of signals, skills and memory; a JSON reply validated and applied or staged), `review_schedule.rs` (when it runs: per-session idle timers, switched-away/closed, one review at a time, back-off, hourly cap), `curator.rs` + `curator/` (the curator: the agent loop of `balanced`, and per-cluster proposals under `requests`), `mcp.rs`, `commands.rs` (`/diff`, `/usage`…), `guards.rs`, `changes.rs` |
+| `crates/runtime` | `hermes_runtime` | Sessions and turns over the agent: `Runtime` | `lib.rs` (API), `session.rs`, `session_actor.rs` (each session's actor: run slot, review slot, the page's state; Phase 13d), `ops.rs` (per-turn tool guards), `delegate.rs` + `subagents.rs`, `compress.rs`, `review.rs` (background review), `signals.rs` (learning signals: what each turn says is worth learning, scored locally into `signals/<id>.json`), `skill_outcomes.rs` (how the turns a skill was used in went, into `.usage.json`), `review_once.rs` (the evidence review: one request with a packet of signals, skills and memory; a JSON reply validated and applied or staged), `review_schedule.rs` (when it runs: per-session idle timers, switched-away/closed, one review at a time, back-off, hourly cap), `curator.rs` + `curator/` (the curator: the agent loop of `balanced`, and per-cluster proposals under `requests`), `mcp.rs`, `commands.rs` (`/diff`, `/usage`…), `guards.rs`, `changes.rs` |
 | `crates/agent` | `hermes_agent` | The agent state machine (from Goose): stream a reply, run tool calls, repeat | `events.rs` has `AgentEvent` |
 | `crates/llm` | `hermes_llm` | Messages, the OpenAI-compatible provider, retries (from Goose) | `conversation::message::{Message, MessageContent}`; `observer.rs` is where every model POST is reported (purpose, session, provider) to the request ledger |
 | `crates/tools` | `hermes_tools` | Every agent tool + `SessionTools` (the per-session tool set) | One module per tool family; `paths.rs` resolves paths; `path_policy.rs` classifies where file edits and terminal commands may go (workspace, app data, skills/memory, persistence places, outside); `approval.rs` the dangerous-command check; `script.rs` + `script_guard.rs` the `run_script` tool (a script in PowerShell, Python through uv, or bash, run from a per-run scratch folder; `script_guard` reads the whole script for the approval, see PITFALLS.md "run_script"); `taint.rs` what the session has read that the user didn't write (see Taint in PITFALLS.md); `staging.rs` the writes a tainted session's `memory` / `skill_manage` calls leave for the user (`staging/<id>.json`, applied through the stores' own write paths); `index.rs` the local FTS5 index (`index.db`) over skills and memory, kept fresh by write hooks on `SkillStore` / `MemoryStore` |
@@ -281,6 +281,30 @@ in-memory store (tests) has one connection that both use.
 - Other processes (the GPUI app, a second `Store` on the file) see committed rows only: a flush
   (or a turn's end) is what makes queued writes visible to them.
 
+### The session actor (Phase 13d)
+
+Each session's control state belongs to one thread, its actor (`crates/runtime/src/session_actor.rs`; C++: a
+worker thread with a message queue owning its data; Python: a thread reading a `queue.Queue`). Everything else holds
+a `SessionHandle` (from `Runtime`'s `SessionRegistry`, the one map by session id) and sends it `Command`s, handled
+one at a time in the order sent:
+
+- **What it owns**: which `OpenSession` is loaded (`Attach` / `Detach`), the **run slot** (`ClaimRun` /
+  `Release`, with the turn's cancel token and steer box), the agentic review's slot (`ClaimReview`,
+  `ReleaseReview`, the paused review's `IdleEpoch` / `ConfirmIdle`), the review counters, and the page's state
+  for the gateway (`PageState`: queued prompts, live, the model picked mid-turn, the effort pick, the revision,
+  images held for the next prompt). The data a turn works on (`record`, `conversation`, `context`) stays on
+  `OpenSession` under its mutexes (the turn is its only writer while it holds the run slot).
+- **Reads** go to the published `SessionStatus` (swapped whole after each command, before its answer): no round
+  trip. **Writes and check-then-act** are commands, always waited for (`ask` from sync code, `ask_async` from
+  async code).
+- **`RunGuard`** (RAII) is the turn's claim: dropping it frees the slot and the cross-process `TurnLock` on every
+  path. **Stop** cancels the published token directly, never behind the queue.
+- **Never blocks**: handlers do in-memory work only (no IO, no awaits, no call to a handle), so a synchronous wait
+  is bounded like a mutex; that is also why the actor is a thread and not a task (synchronous `start_turn` from a
+  one-thread runtime). A stopped actor or a panicking handler answers `Gone`, never hangs.
+- Lifecycle: started on first use (no IO), kept across a close or a workspace move, removed on delete; it ends when
+  its last handle (a turn or a review still ending) lets go. Rules for new code: PITFALLS "The session actor".
+
 ## Settings and data
 
 Two settings files, with different owners — don't mix them up:
@@ -409,7 +433,8 @@ API keys are in Windows Credential Manager (`keyring`), never in a file.
   dispatch, the checkpoint before a write, the post-write lint and the hint files all run on the
   blocking pool (Phase 13c; the audit is in `docs/backend/progress/phase-13.md`, the test in
   `crates/tools/src/blocking_tests.rs`).
-- Shared state in `Gateway` is `std::sync::Mutex` / `parking_lot::Mutex` held briefly, never across
+- Per-session state is the session actor's (above), not a lock or a map in `Gateway` / `OpenSession`.
+  Other shared state in `Gateway` is `std::sync::Mutex` / `parking_lot::Mutex` held briefly, never across
   an `.await`. Poisoned locks: `lock().unwrap_or_else(|e| e.into_inner())`.
 - Long work started from an RPC (a turn, a background job) is `tokio::spawn`ed; the RPC answers at
   once and progress arrives as events.

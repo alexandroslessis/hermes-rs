@@ -167,6 +167,20 @@ Read the existing tests near the area you change before writing a new one; the h
   a very loaded machine, re-run alone before suspecting the code. The same file checks
   `off_worker_unless_stopped` (the tool follow-ups' hop): raced against Stop as `agent/machine.rs` races a
   step, it keeps the result where a plain `spawn_blocking` hop loses it, and without Stop it leaves the worker free.
+- The session actor (Phase 13 CP13d): `crates/runtime/src/session_actor/tests.rs` (unit tests over a real actor
+  thread: order from one and many senders, a barrier, answers from a panicking handler and a stopped actor,
+  commands queued when its thread ends, re-entrancy refused, the thread ending with its last handle, the registry,
+  a waiting call on a one-thread runtime; the run slot (`RunGuard` claim / drop, stale releases, a panicking turn's
+  task), Stop's priority path while the actor is held up, the review pause (`IdleEpoch` / `ConfirmIdle`), the
+  review slot's rules and the scheduler pair raced 300 times; the page's queue order, `only_if_running`, live,
+  model pick, effort, revision, images, close vs delete; from the review: a pick after the turn ended drops the
+  one it left, a dead actor is replaced and its turn stopped, a losing load gets its copy back).
+  `session::testing::open_session` makes an `OpenSession`. The `turns` suite and the desktop / ACP tests run
+  unchanged on top.
+- ACP tests must not count on a background job being late: `/retry` and `/undo` are learning signals, so under
+  `balanced` a review may follow the turn (the desktop app ignores the test config's `background_review: false`),
+  with the turn's tools and system prompt; filter its requests out (its last message is the review prompt). A test
+  that stops a turn waits for the turn's request to reach the mock, not a fixed delay.
 - Known flaky under heavy load: `an_exhausted_budget_ends_with_a_toolless_summary` (timing).
   Re-run it alone before suspecting your change.
 
