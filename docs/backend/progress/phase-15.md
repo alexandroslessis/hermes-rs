@@ -345,7 +345,10 @@ Left (noted, not worth it now or by design):
 - A moved recorded folder keeps its label at its new place (forgotten as `gone`).
 - `blocked_hint` heuristics as the implementer described (an unquoted path with spaces is cut; a false hint costs one line).
 - The pipe-inheritance window (CP15.1).
-Tests (reviewer, `CARGO_TARGET_DIR=target/claude`): TESTS_PLACEHOLDER
+Tests (reviewer, `CARGO_TARGET_DIR=target/claude`): `cargo test -p hermes_tools` 373 passed / 2
+ignored (was 367; +6 new, one end-to-end test extended), three full runs green; `hermes_runtime --lib` 265; `--test turns`
+258 passed / 7 ignored (unchanged); `hermes-desktop` 193 lib + 68 acp; `cargo build --workspace --locked` OK, no
+warnings (no `Cargo.lock` change: `toml` was already a `hermes_tools` dependency). CP15.2 commit: 6f715aa.
 `scripts/clean-test-temp.ps1 -Delete` run after. Checked after the runs: `%USERPROFILE%`, both checkouts and the
 data folder carry no mandatory label and their DACL flags are unchanged (`D:P`, `D:`, `D:`; the data folder's `D:AI` is
 `%APPDATA%`'s own); no `hermes-sandbox-probe*` in `%USERPROFILE%`; no `sandbox-labels.json` in `%APPDATA%\hermes-rs`.
