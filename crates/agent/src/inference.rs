@@ -18,14 +18,11 @@ use hermes_llm::model::ModelConfig;
 use tracing_futures::Instrument;
 
 use crate::events::AgentEvent;
-use crate::fallback::{
-    switch_notice, Bound, ChainRun, FallbackChain, FallbackTarget, Pending,
-};
+use crate::fallback::{switch_notice, Bound, ChainRun, FallbackChain, FallbackTarget, Pending};
 use crate::operation::{
     applied, messages_since_kickoff, not_applicable, trailing_error, Emitter, Inference,
     InferenceInput, MachineSession, Operation, OperationResult, CLIENT_LOG,
 };
-use hermes_llm::maybe_send::{MaybeSend, MaybeSync};
 
 pub struct PreparedInferenceRequest {
     pub system_prompt: String,
@@ -33,9 +30,8 @@ pub struct PreparedInferenceRequest {
     pub additional_messages: Vec<Message>,
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-pub trait InferenceRequestPreparer<S>: MaybeSend + MaybeSync {
+#[async_trait]
+pub trait InferenceRequestPreparer<S>: Send + Sync {
     async fn prepare_session(&self, _session: &S) -> Result<Option<S>> {
         Ok(None)
     }
@@ -50,9 +46,8 @@ pub trait InferenceRequestPreparer<S>: MaybeSend + MaybeSync {
 
 pub struct IdentityInferenceRequestPreparer;
 
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-impl<S: MaybeSync> InferenceRequestPreparer<S> for IdentityInferenceRequestPreparer {
+#[async_trait]
+impl<S: Sync> InferenceRequestPreparer<S> for IdentityInferenceRequestPreparer {
     async fn prepare(
         &self,
         _session: &S,
@@ -72,7 +67,7 @@ impl<S: MaybeSync> InferenceRequestPreparer<S> for IdentityInferenceRequestPrepa
     }
 }
 
-pub trait InferenceEffect: From<Message> + MaybeSend + 'static {
+pub trait InferenceEffect: From<Message> + Send + 'static {
     fn record_usage(usage: ProviderUsage) -> Self;
 }
 
@@ -150,34 +145,6 @@ fn attach_operation_logs(message: &mut Message, logs: &mut Vec<String>) {
     if message.role == rmcp::model::Role::Assistant && !logs.is_empty() {
         message.metadata.operation_logs = std::mem::take(logs);
     }
-}
-
-pub fn chat_span(
-    provider: &dyn Provider,
-    model_config: &ModelConfig,
-    session_id: &str,
-    purpose: &'static str,
-) -> tracing::Span {
-    let span = tracing::info_span!(
-        target: "goose::state_machine",
-        "chat",
-        "gen_ai.operation.name" = "chat",
-        "gen_ai.provider.name" = %provider.get_name(),
-        "gen_ai.request.model" = %model_config.model_name,
-        "gen_ai.request.temperature" = tracing::field::Empty,
-        "gen_ai.request.max_tokens" = tracing::field::Empty,
-        "gen_ai.response.model" = tracing::field::Empty,
-        "gen_ai.response.finish_reasons" = tracing::field::Empty,
-        "gen_ai.response.id" = tracing::field::Empty,
-        "gen_ai.request.id" = tracing::field::Empty,
-        "gen_ai.usage.input_tokens" = tracing::field::Empty,
-        "gen_ai.usage.output_tokens" = tracing::field::Empty,
-        "goose.chat.purpose" = purpose,
-        "error.type" = tracing::field::Empty,
-        session.id = %session_id,
-    );
-    record_request_params(&span, model_config);
-    span
 }
 
 fn is_empty_response(message: &Message) -> bool {
@@ -282,7 +249,9 @@ enum Opened {
 fn exhausted(first_error: Option<ProviderError>, trail: &[String]) -> ProviderError {
     with_trail(
         first_error.unwrap_or_else(|| {
-            ProviderError::RequestFailed("no provider of the fallback chain could serve the request".into())
+            ProviderError::RequestFailed(
+                "no provider of the fallback chain could serve the request".into(),
+            )
         }),
         trail,
     )
@@ -453,7 +422,7 @@ fn inference_span(provider: &dyn Provider, model_config: &ModelConfig) -> tracin
     span
 }
 
-impl<'a, S: MaybeSync, E: InferenceEffect> InferenceRunner<'a, S, E> {
+impl<'a, S: Sync, E: InferenceEffect> InferenceRunner<'a, S, E> {
     pub fn new(provider: Arc<dyn Provider>, model_config: ModelConfig) -> Self {
         Self {
             provider,
@@ -477,14 +446,6 @@ impl<'a, S: MaybeSync, E: InferenceEffect> InferenceRunner<'a, S, E> {
     /// How often an empty reply is requested again before the empty-response marker is given.
     pub fn with_empty_response_retries(mut self, retries: usize) -> Self {
         self.empty_response_retries = retries;
-        self
-    }
-
-    pub fn with_request_preparer(
-        mut self,
-        request_preparer: Arc<dyn InferenceRequestPreparer<S> + 'a>,
-    ) -> Self {
-        self.request_preparer = request_preparer;
         self
     }
 
@@ -526,7 +487,9 @@ impl<'a, S: MaybeSync, E: InferenceEffect> InferenceRunner<'a, S, E> {
                 n => chain.targets[n - 1].label.clone(),
             }
         };
-        let tokens = chain.gate.estimate(system_prompt, request.messages(), tools);
+        let tokens = chain
+            .gate
+            .estimate(system_prompt, request.messages(), tools);
 
         // Where this request starts: after a compression asked for a target, at that target;
         // else where the turn is now, unless the gate refuses that provider.
@@ -805,9 +768,8 @@ impl<'a, S: MaybeSync, E: InferenceEffect> InferenceRunner<'a, S, E> {
     }
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-impl<S: MaybeSync, E: InferenceEffect> Operation<S, E> for InferenceRunner<'_, S, E> {
+#[async_trait]
+impl<S: Sync, E: InferenceEffect> Operation<S, E> for InferenceRunner<'_, S, E> {
     fn name(&self) -> &'static str {
         "llm"
     }
@@ -822,8 +784,7 @@ impl<S: MaybeSync, E: InferenceEffect> Operation<S, E> for InferenceRunner<'_, S
     }
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[async_trait]
 impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S, E> {
     fn applies(&self, conversation: &Conversation) -> bool {
         let Ok(turn) = messages_since_kickoff(conversation) else {
@@ -896,110 +857,112 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
                 ends_with_successful_tool_response(conversation.messages());
             let mut empty_responses = 0;
             let empty_output = loop {
-            let attempt_start = self.output().usage.len();
-            let opened = self
-                .open_stream(
-                    &model_config,
-                    session.max_tokens_override(),
-                    &system_prompt,
-                    &conversation_for_provider,
-                    fallback_base.as_deref(),
-                    &tools,
-                    emit,
-                )
-                .await;
-            let (mut stream, serving) = match opened {
-                Opened::Stream(stream, serving) => (stream, serving),
-                Opened::Failed(err) => return self.error_outcome(&err, &mut operation_logs, emit),
-                // The turn's compress step makes the conversation fit the next provider; this
-                // runs again after it.
-                Opened::Compress => {
-                    self.output().additional_messages.clear();
-                    return applied(Vec::<E>::new());
-                }
-            };
-
-            let requested_model = serving.model.clone();
-            let resolved_model = serving
-                .provider
-                .fetch_model_info(&requested_model)
-                .await
-                .ok()
-                .and_then(|model_info| model_info.resolved_model);
-            let provider_session_id = serving.provider.provider_session_id();
-            let inference = Some(InferenceMetadata {
-                provider: serving.provider.get_name().to_string(),
-                requested_model,
-                resolved_model,
-                provider_session_id,
-            });
-
-            let mut tool_request_ids = HashSet::new();
-            while let Some(result) = stream.next().await {
-                let (msg_opt, usage_opt) = match result {
-                    Ok(chunk) => chunk,
-                    Err(err) => return self.error_outcome(&err, &mut operation_logs, emit),
+                let attempt_start = self.output().usage.len();
+                let opened = self
+                    .open_stream(
+                        &model_config,
+                        session.max_tokens_override(),
+                        &system_prompt,
+                        &conversation_for_provider,
+                        fallback_base.as_deref(),
+                        &tools,
+                        emit,
+                    )
+                    .await;
+                let (mut stream, serving) = match opened {
+                    Opened::Stream(stream, serving) => (stream, serving),
+                    Opened::Failed(err) => {
+                        return self.error_outcome(&err, &mut operation_logs, emit)
+                    }
+                    // The turn's compress step makes the conversation fit the next provider; this
+                    // runs again after it.
+                    Opened::Compress => {
+                        self.output().additional_messages.clear();
+                        return applied(Vec::<E>::new());
+                    }
                 };
-                if let Some(usage) = usage_opt {
-                    record_chat_usage(&tracing::Span::current(), &usage);
-                    let mut output = self.output();
-                    output.usage.truncate(attempt_start);
-                    output.usage.push(usage);
-                }
-                if let Some(mut chunk) = msg_opt {
-                    if let Some(inference) = &inference {
-                        chunk = chunk.with_inference_if_assistant(inference.clone());
-                    }
-                    chunk.content.retain(|content| match content {
-                        MessageContent::ToolRequest(request) => {
-                            tool_request_ids.insert(request.id.clone())
-                        }
-                        _ => true,
-                    });
-                    drop_repeated_tool_call_thinking(&self.output().accumulator, &mut chunk);
-                    if chunk.content.is_empty() && !chunk.metadata.output_token_limit_reached {
-                        self.output().accumulator.push(chunk);
-                    } else {
-                        attach_operation_logs(&mut chunk, &mut operation_logs);
-                        self.emit_message(chunk, emit);
-                    }
-                }
-            }
 
-            let empty_output = {
-                let output = self.output();
-                !output
-                    .accumulator
-                    .iter()
-                    .any(|message| message.metadata.output_token_limit_reached)
-                    && output
+                let requested_model = serving.model.clone();
+                let resolved_model = serving
+                    .provider
+                    .fetch_model_info(&requested_model)
+                    .await
+                    .ok()
+                    .and_then(|model_info| model_info.resolved_model);
+                let provider_session_id = serving.provider.provider_session_id();
+                let inference = Some(InferenceMetadata {
+                    provider: serving.provider.get_name().to_string(),
+                    requested_model,
+                    resolved_model,
+                    provider_session_id,
+                });
+
+                let mut tool_request_ids = HashSet::new();
+                while let Some(result) = stream.next().await {
+                    let (msg_opt, usage_opt) = match result {
+                        Ok(chunk) => chunk,
+                        Err(err) => return self.error_outcome(&err, &mut operation_logs, emit),
+                    };
+                    if let Some(usage) = usage_opt {
+                        record_chat_usage(&tracing::Span::current(), &usage);
+                        let mut output = self.output();
+                        output.usage.truncate(attempt_start);
+                        output.usage.push(usage);
+                    }
+                    if let Some(mut chunk) = msg_opt {
+                        if let Some(inference) = &inference {
+                            chunk = chunk.with_inference_if_assistant(inference.clone());
+                        }
+                        chunk.content.retain(|content| match content {
+                            MessageContent::ToolRequest(request) => {
+                                tool_request_ids.insert(request.id.clone())
+                            }
+                            _ => true,
+                        });
+                        drop_repeated_tool_call_thinking(&self.output().accumulator, &mut chunk);
+                        if chunk.content.is_empty() && !chunk.metadata.output_token_limit_reached {
+                            self.output().accumulator.push(chunk);
+                        } else {
+                            attach_operation_logs(&mut chunk, &mut operation_logs);
+                            self.emit_message(chunk, emit);
+                        }
+                    }
+                }
+
+                let empty_output = {
+                    let output = self.output();
+                    !output
                         .accumulator
                         .iter()
-                        .all(|message| is_empty_response(message))
-            };
-            if !empty_output || successful_tool_response || emit.cancel_token().is_cancelled() {
-                break empty_output;
-            }
-            self.output().accumulator.clear();
-            if empty_responses < self.empty_response_retries {
-                empty_responses += 1;
-                tracing::warn!(
-                    "Provider returned an empty response; retrying ({empty_responses}/{})",
-                    self.empty_response_retries
+                        .any(|message| message.metadata.output_token_limit_reached)
+                        && output
+                            .accumulator
+                            .iter()
+                            .all(|message| is_empty_response(message))
+                };
+                if !empty_output || successful_tool_response || emit.cancel_token().is_cancelled() {
+                    break empty_output;
+                }
+                self.output().accumulator.clear();
+                if empty_responses < self.empty_response_retries {
+                    empty_responses += 1;
+                    tracing::warn!(
+                        "Provider returned an empty response; retrying ({empty_responses}/{})",
+                        self.empty_response_retries
+                    );
+                    continue;
+                }
+                let mut marker = Message::assistant()
+                    .with_text(EMPTY_RESPONSE_MESSAGE)
+                    .with_visibility(false, false);
+                attach_operation_logs(&mut marker, &mut operation_logs);
+                marker.metadata.set_operation_note(
+                    EMPTY_RESPONSE_NOTE_SCOPE,
+                    EMPTY_RESPONSE_NOTE,
+                    serde_json::Value::Bool(true),
                 );
-                continue;
-            }
-            let mut marker = Message::assistant()
-                .with_text(EMPTY_RESPONSE_MESSAGE)
-                .with_visibility(false, false);
-            attach_operation_logs(&mut marker, &mut operation_logs);
-            marker.metadata.set_operation_note(
-                EMPTY_RESPONSE_NOTE_SCOPE,
-                EMPTY_RESPONSE_NOTE,
-                serde_json::Value::Bool(true),
-            );
-            self.output().accumulator.push(marker);
-            return applied(self.take_output());
+                self.output().accumulator.push(marker);
+                return applied(self.take_output());
             };
 
             if empty_output && successful_tool_response {

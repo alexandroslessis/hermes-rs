@@ -26,7 +26,6 @@ use hermes_llm::base::Provider;
 use hermes_llm::conversation::message::Message;
 use hermes_llm::errors::ProviderError;
 use hermes_llm::fallback::Trigger;
-use hermes_llm::maybe_send::{MaybeSend, MaybeSync};
 use hermes_llm::model::ModelConfig;
 
 /// One entry of the chain after the primary.
@@ -44,7 +43,7 @@ pub struct FallbackTarget {
 }
 
 /// What the host decides about each position of the chain (`0` is the primary).
-pub trait FallbackGate: MaybeSend + MaybeSync {
+pub trait FallbackGate: Send + Sync {
     /// May a request go to this provider now (the governor, an "exhausted until reset" mark)?
     /// `Err` is why not, in words for the user.
     fn allow(&self, index: usize) -> Result<(), String>;

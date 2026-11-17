@@ -6,230 +6,17 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::watch;
 
 use crate::{
-    canonical::{
-        catalog::ProviderSetupMetadata, map_to_canonical_model, recommended_models_from_registry,
-        CanonicalModelRegistry,
-    },
+    canonical::{map_to_canonical_model, CanonicalModelRegistry},
     conversation::{
         message::{Message, MessageContentBlock},
         token_usage::{ProviderUsage, Usage},
     },
     errors::ProviderError,
-    goose_mode::GooseMode,
-    maybe_send::{MaybeSend, MaybeSync},
     model::ModelConfig,
-    permission::PermissionConfirmation,
     retry::RetryConfig,
-    thinking::ThinkingEffortSupport,
 };
-
-/// Metadata about a provider's configuration requirements and capabilities
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderMetadata {
-    /// The unique identifier for this provider
-    pub name: String,
-    /// Display name for the provider in UIs
-    pub display_name: String,
-    /// Description of the provider's capabilities
-    pub description: String,
-    /// The default/recommended model for this provider
-    pub default_model: String,
-    /// A list of currently known models with their capabilities
-    pub known_models: Vec<ModelInfo>,
-    /// Link to the docs where models can be found
-    pub model_doc_link: String,
-    /// Required configuration keys
-    pub config_keys: Vec<ConfigKey>,
-    /// step-by-step instructions for set up providers eg: api key
-    #[serde(default)]
-    pub setup_steps: Vec<String>,
-    /// Setup information exposed to clients.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub setup: Option<ProviderSetupMetadata>,
-    /// Structured deprecation information for providers kept for compatibility.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deprecated: Option<ProviderDeprecation>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderDeprecation {
-    pub replacement: Option<String>,
-}
-
-impl ProviderMetadata {
-    pub fn new(
-        name: &str,
-        display_name: &str,
-        description: &str,
-        default_model: &str,
-        model_names: Vec<&str>,
-        model_doc_link: &str,
-        config_keys: Vec<ConfigKey>,
-    ) -> Self {
-        Self {
-            name: name.to_string(),
-            display_name: display_name.to_string(),
-            description: description.to_string(),
-            default_model: default_model.to_string(),
-            known_models: model_names
-                .iter()
-                .map(|&model_name| model_info_for_provider_model(name, model_name))
-                .collect(),
-            model_doc_link: model_doc_link.to_string(),
-            config_keys,
-            setup_steps: vec![],
-            setup: None,
-            deprecated: None,
-        }
-    }
-
-    pub fn with_models(
-        name: &str,
-        display_name: &str,
-        description: &str,
-        default_model: &str,
-        models: Vec<ModelInfo>,
-        model_doc_link: &str,
-        config_keys: Vec<ConfigKey>,
-    ) -> Self {
-        Self {
-            name: name.to_string(),
-            display_name: display_name.to_string(),
-            description: description.to_string(),
-            default_model: default_model.to_string(),
-            known_models: models,
-            model_doc_link: model_doc_link.to_string(),
-            config_keys,
-            setup_steps: vec![],
-            setup: None,
-            deprecated: None,
-        }
-    }
-
-    pub fn empty() -> Self {
-        Self {
-            name: "".to_string(),
-            display_name: "".to_string(),
-            description: "".to_string(),
-            default_model: "".to_string(),
-            known_models: vec![],
-            model_doc_link: "".to_string(),
-            config_keys: vec![],
-            setup_steps: vec![],
-            setup: None,
-            deprecated: None,
-        }
-    }
-
-    pub fn with_setup_steps(mut self, steps: Vec<&str>) -> Self {
-        self.setup_steps = steps.into_iter().map(|s| s.to_string()).collect();
-        self
-    }
-
-    pub fn with_setup(mut self, setup: ProviderSetupMetadata) -> Self {
-        self.setup = Some(setup);
-        self
-    }
-
-    pub fn deprecated(mut self, replacement: Option<&str>) -> Self {
-        self.deprecated = Some(ProviderDeprecation {
-            replacement: replacement.map(str::to_string),
-        });
-        self
-    }
-}
-
-/// Configuration key metadata for provider setup
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConfigKey {
-    /// The name of the configuration key (e.g., "API_KEY")
-    pub name: String,
-    /// Whether this key is required for the provider to function
-    pub required: bool,
-    /// Whether this key should be stored securely (e.g., in keychain)
-    pub secret: bool,
-    /// Optional default value for the key
-    pub default: Option<String>,
-    /// Whether this key should be configured using an OAuth flow
-    /// When true, the provider's configure_oauth() method will be called instead of prompting for manual input
-    pub oauth_flow: bool,
-    /// Whether this OAuth flow uses the device code grant (RFC 8628)
-    /// When true, the user must enter a verification code in the browser
-    #[serde(default)]
-    pub device_code_flow: bool,
-    /// Whether this key should be shown prominently during provider setup
-    /// (onboarding, settings modal, CLI configure)
-    #[serde(default)]
-    pub primary: bool,
-}
-
-impl ConfigKey {
-    /// Create a new ConfigKey
-    pub fn new(
-        name: &str,
-        required: bool,
-        secret: bool,
-        default: Option<&str>,
-        primary: bool,
-    ) -> Self {
-        Self {
-            name: name.to_string(),
-            required,
-            secret,
-            default: default.map(|s| s.to_string()),
-            oauth_flow: false,
-            device_code_flow: false,
-            primary,
-        }
-    }
-
-    /// Create a new ConfigKey that uses an OAuth flow for configuration
-    ///
-    /// This is used for providers that support OAuth authentication instead of manual API key entry.
-    /// When oauth_flow is true, the configuration system will call the provider's configure_oauth() method.
-    pub fn new_oauth(
-        name: &str,
-        required: bool,
-        secret: bool,
-        default: Option<&str>,
-        primary: bool,
-    ) -> Self {
-        Self {
-            name: name.to_string(),
-            required,
-            secret,
-            default: default.map(|s| s.to_string()),
-            oauth_flow: true,
-            device_code_flow: false,
-            primary,
-        }
-    }
-
-    /// Create a new ConfigKey that uses OAuth device code flow (RFC 8628) for configuration
-    ///
-    /// Similar to new_oauth, but indicates the provider uses the device code grant where the user
-    /// must enter a verification code in the browser.
-    pub fn new_oauth_device_code(
-        name: &str,
-        required: bool,
-        secret: bool,
-        default: Option<&str>,
-        primary: bool,
-    ) -> Self {
-        Self {
-            name: name.to_string(),
-            required,
-            secret,
-            default: default.map(|s| s.to_string()),
-            oauth_flow: true,
-            device_code_flow: true,
-            primary,
-        }
-    }
-}
 
 /// How a model's thinking is replayed back to the provider on subsequent turns.
 ///
@@ -307,11 +94,6 @@ impl ModelInfo {
         self
     }
 
-    pub fn with_optional_context_limit(mut self, context_limit: Option<usize>) -> Self {
-        self.context_limit = context_limit;
-        self
-    }
-
     pub fn with_vision_support(mut self, supports_vision: bool) -> Self {
         self.supports_vision = Some(supports_vision);
         self
@@ -342,27 +124,12 @@ impl ModelInfo {
     }
 }
 
-pub trait ProviderDescriptor {
-    fn metadata() -> ProviderMetadata;
-}
-
 /// A message stream yields partial text content but complete tool calls, all within the Message object
 /// So a message with text will contain potentially just a word of a longer response, but tool calls
 /// messages will only be yielded once concatenated.
-#[cfg(not(target_arch = "wasm32"))]
 pub type MessageStream = Pin<
     Box<dyn Stream<Item = Result<(Option<Message>, Option<ProviderUsage>), ProviderError>> + Send>,
 >;
-
-#[cfg(target_arch = "wasm32")]
-pub type MessageStream =
-    Pin<Box<dyn Stream<Item = Result<(Option<Message>, Option<ProviderUsage>), ProviderError>>>>;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PermissionRouting {
-    ActionRequired,
-    Noop,
-}
 
 pub fn model_info_for_provider_model(provider_name: &str, model_name: &str) -> ModelInfo {
     let registry = CanonicalModelRegistry::bundled().ok();
@@ -394,11 +161,6 @@ pub fn model_info_for_provider_model(provider_name: &str, model_name: &str) -> M
     }
 }
 
-/// Model IDs are case-sensitive; declarations apply only to the requested ID.
-pub fn find_declared_model<'a>(models: &'a [ModelInfo], model_name: &str) -> Option<&'a ModelInfo> {
-    models.iter().find(|model| model.name == model_name)
-}
-
 /// Build `ModelInfo` for discovered model names, preferring metadata declared in
 /// provider configuration over the canonical registry.
 ///
@@ -419,13 +181,6 @@ pub fn merge_configured_model_info(
                 .cloned()
                 .unwrap_or_else(|| model_info_for_provider_model(provider_name, model_name))
         })
-        .collect()
-}
-
-pub fn known_models_from_registry(provider: &str) -> Vec<ModelInfo> {
-    recommended_models_from_registry(provider)
-        .into_iter()
-        .map(|name| model_info_for_provider_model(provider, &name))
         .collect()
 }
 
@@ -528,9 +283,8 @@ pub fn stream_from_single_message(message: Message, usage: ProviderUsage) -> Mes
 }
 
 /// Base trait for AI providers (OpenAI, Anthropic, etc)
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-pub trait Provider: MaybeSend + MaybeSync {
+#[async_trait]
+pub trait Provider: Send + Sync {
     /// Get the name of this provider instance
     fn get_name(&self) -> &str;
 
@@ -709,77 +463,10 @@ pub trait Provider: MaybeSend + MaybeSync {
         !self.manages_own_context()
     }
 
-    /// Configure OAuth authentication for this provider
-    ///
-    /// This method is called when a provider has configuration keys marked with oauth_flow = true.
-    /// Providers that support OAuth should override this method to implement their specific OAuth flow.
-    ///
-    /// # Returns
-    /// * `Ok(())` if OAuth configuration succeeds and credentials are saved
-    /// * `Err(ProviderError)` if OAuth fails or is not supported by this provider
-    ///
-    /// # Default Implementation
-    /// The default implementation returns an error indicating OAuth is not supported.
-    async fn configure_oauth(&self) -> Result<(), ProviderError> {
-        Err(ProviderError::ExecutionError(
-            "OAuth configuration not supported by this provider".to_string(),
-        ))
-    }
-
     async fn refresh_credentials(&self) -> Result<(), ProviderError> {
         Err(ProviderError::NotImplemented(
             "credential refresh not supported by this provider".to_string(),
         ))
-    }
-
-    async fn update_mode(&self, _session_id: &str, _mode: GooseMode) -> Result<(), ProviderError> {
-        Ok(())
-    }
-
-    /// How this provider participates in thinking-effort selection. Providers
-    /// that manage reasoning through an external harness report the harness's
-    /// advertised capability; the default keeps the model-name-based path.
-    fn thinking_effort_support(&self) -> ThinkingEffortSupport {
-        ThinkingEffortSupport::Unspecified
-    }
-
-    /// Subscribe to provider-managed thinking-effort capability changes.
-    /// Providers without an asynchronous capability source return `None`.
-    fn subscribe_thinking_effort_support(&self) -> Option<watch::Receiver<ThinkingEffortSupport>> {
-        None
-    }
-
-    /// Forward a thinking-effort selection to the provider. Returns `Ok(true)`
-    /// when the provider applied the value itself (no provider recreation
-    /// needed); `Ok(false)` when the caller should use the legacy path.
-    async fn set_thinking_effort(
-        &self,
-        _session_id: &str,
-        _value: &str,
-    ) -> Result<bool, ProviderError> {
-        Ok(false)
-    }
-
-    /// Apply a session's model selection after the provider is installed.
-    /// Providers that manage their own model (e.g. ACP harnesses) override
-    /// this to sync the selection before the first prompt.
-    async fn apply_model_selection(
-        &self,
-        _model_config: &ModelConfig,
-    ) -> Result<(), ProviderError> {
-        Ok(())
-    }
-
-    fn permission_routing(&self) -> PermissionRouting {
-        PermissionRouting::Noop
-    }
-
-    async fn handle_permission_confirmation(
-        &self,
-        _request_id: &str,
-        _confirmation: &PermissionConfirmation,
-    ) -> bool {
-        false
     }
 }
 

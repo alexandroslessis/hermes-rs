@@ -1,4 +1,3 @@
-use reqwest::StatusCode;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -103,30 +102,10 @@ impl ProviderError {
             | ProviderError::Refusal { details, .. } => Some(details),
         }
     }
-
-    pub fn is_endpoint_not_found(&self) -> bool {
-        matches!(self, ProviderError::EndpointNotFound(_))
-    }
-
-    /// Recover a typed `ProviderError` from a streaming decode error, falling
-    /// back to a retryable stream decode error for errors that did not
-    /// originate as one.
-    pub fn from_stream_error(error: anyhow::Error) -> Self {
-        error
-            .downcast()
-            .unwrap_or_else(ProviderError::stream_decode_error)
-    }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn is_connect_error(error: &reqwest::Error) -> bool {
     error.is_connect()
-}
-
-// reqwest's wasm client does not expose is_connect
-#[cfg(target_arch = "wasm32")]
-fn is_connect_error(_error: &reqwest::Error) -> bool {
-    false
 }
 
 fn is_network_error(err: &reqwest::Error) -> bool {
@@ -242,6 +221,7 @@ impl From<LogError> for ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::StatusCode;
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -298,43 +278,5 @@ mod tests {
         assert!(!message.contains("url-password"));
         assert!(message.contains("status: 401 Unauthorized"));
         assert!(message.contains(&format!("http://{address}/chat")));
-    }
-}
-
-#[derive(Debug)]
-pub enum GoogleErrorCode {
-    BadRequest = 400,
-    Unauthorized = 401,
-    Forbidden = 403,
-    NotFound = 404,
-    TooManyRequests = 429,
-    InternalServerError = 500,
-    ServiceUnavailable = 503,
-}
-
-impl GoogleErrorCode {
-    pub fn to_status_code(&self) -> StatusCode {
-        match self {
-            Self::BadRequest => StatusCode::BAD_REQUEST,
-            Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::Forbidden => StatusCode::FORBIDDEN,
-            Self::NotFound => StatusCode::NOT_FOUND,
-            Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
-            Self::InternalServerError => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-        }
-    }
-
-    pub fn from_code(code: u64) -> Option<Self> {
-        match code {
-            400 => Some(Self::BadRequest),
-            401 => Some(Self::Unauthorized),
-            403 => Some(Self::Forbidden),
-            404 => Some(Self::NotFound),
-            429 => Some(Self::TooManyRequests),
-            500 => Some(Self::InternalServerError),
-            503 => Some(Self::ServiceUnavailable),
-            _ => Some(Self::InternalServerError),
-        }
     }
 }

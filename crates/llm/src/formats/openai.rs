@@ -8,7 +8,6 @@ use crate::documents::{
 use crate::errors::ProviderError;
 use crate::images::{convert_image, detect_image_path, load_image_file, ImageFormat};
 use crate::json::{parse_tool_arguments, truncation_error_message};
-use crate::maybe_send::MaybeSend;
 use crate::mcp_utils::extract_text_from_resource;
 use crate::model::{is_goose_internal_request_param, ModelConfig};
 use crate::thinking::{
@@ -1272,7 +1271,7 @@ pub fn response_to_streaming_message<S>(
     mut stream: S,
 ) -> impl Stream<Item = anyhow::Result<(Option<Message>, Option<ProviderUsage>)>> + 'static
 where
-    S: Stream<Item = anyhow::Result<String>> + Unpin + MaybeSend + 'static,
+    S: Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
 {
     try_stream! {
         use futures::StreamExt;

@@ -440,13 +440,6 @@ pub fn parse_request_id_suffix(message: &str) -> Option<String> {
     inner.strip_prefix(PROVIDER_ID_LABEL).map(str::to_string)
 }
 
-pub async fn read_error_body(response: Response) -> Option<String> {
-    read_response_body_with_limit(response, MAX_PROVIDER_JSON_RESPONSE_BYTES)
-        .await
-        .ok()
-        .map(|body| String::from_utf8_lossy(&body).into_owned())
-}
-
 pub async fn read_json_response<T: DeserializeOwned>(
     response: Response,
 ) -> Result<T, ProviderError> {

@@ -24,10 +24,6 @@ impl Display for LoggerAlreadyInstalled {
 
 impl Error for LoggerAlreadyInstalled {}
 
-pub fn install_logger<R: RequestLogger + 'static>(r: R) -> Result<(), LoggerAlreadyInstalled> {
-    LOGGER.set(Arc::new(r)).map_err(|_| LoggerAlreadyInstalled)
-}
-
 pub trait RequestLogger: Send + Sync {
     fn start(&self) -> Result<Box<dyn RequestLogHandle>, RequestLogError>;
 }

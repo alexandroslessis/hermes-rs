@@ -1,4 +1,4 @@
-use crate::conversation::token_usage::{CostSource, ProviderUsage};
+use crate::conversation::token_usage::CostSource;
 use crate::conversation::tool_result_serde;
 use crate::mcp_utils::extract_text_from_resource;
 use crate::utils::sanitize_unicode_tags;
@@ -12,11 +12,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use uuid::Uuid;
-
-pub enum ToolCallResult<T> {
-    Success { value: T },
-    Error { error: String },
-}
 
 /// Custom deserializer for MessageContent that sanitizes Unicode Tags in text content
 fn deserialize_sanitized_content<'de, D>(
@@ -191,6 +186,18 @@ pub struct ToolConfirmationRequest {
     pub prompt: Option<String>,
 }
 
+/// The answer to a tool confirmation. Kept (it is part of the stored `ActionRequiredData` shape)
+/// when `permission.rs` was deleted in Phase 14.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission {
+    AlwaysAllow,
+    AllowOnce,
+    Cancel,
+    DenyOnce,
+    AlwaysDeny,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "actionType", rename_all = "camelCase")]
 pub enum ActionRequiredData {
@@ -214,7 +221,7 @@ pub enum ActionRequiredData {
     },
     ToolConfirmationResponse {
         id: String,
-        permission: crate::permission::Permission,
+        permission: Permission,
     },
 }
 
@@ -565,46 +572,6 @@ impl MessageContentBlock {
         })
     }
 
-    pub fn action_required_elicitation<S: Into<String>>(
-        id: S,
-        message: String,
-        requested_schema: serde_json::Value,
-    ) -> Self {
-        MessageContentBlock::ActionRequired(ActionRequired {
-            data: ActionRequiredData::Elicitation {
-                id: id.into(),
-                message,
-                requested_schema,
-            },
-        })
-    }
-
-    pub fn action_required_tool_confirmation_response<S: Into<String>>(
-        id: S,
-        permission: crate::permission::Permission,
-    ) -> Self {
-        MessageContentBlock::ActionRequired(ActionRequired {
-            data: ActionRequiredData::ToolConfirmationResponse {
-                id: id.into(),
-                permission,
-            },
-        })
-    }
-
-    pub fn action_required_elicitation_response<S: Into<String>>(
-        id: S,
-        user_data: serde_json::Value,
-        action: ElicitationAction,
-    ) -> Self {
-        MessageContentBlock::ActionRequired(ActionRequired {
-            data: ActionRequiredData::ElicitationResponse {
-                id: id.into(),
-                user_data,
-                action,
-            },
-        })
-    }
-
     pub fn thinking<S1: Into<String>, S2: Into<String>>(thinking: S1, signature: S2) -> Self {
         MessageContentBlock::Thinking(ThinkingContentBlock {
             thinking: thinking.into(),
@@ -614,17 +581,6 @@ impl MessageContentBlock {
 
     pub fn redacted_thinking<S: Into<String>>(data: S) -> Self {
         MessageContentBlock::RedactedThinking(RedactedThinkingContentBlock { data: data.into() })
-    }
-
-    pub fn system_notification<S: Into<String>>(
-        notification_type: SystemNotificationType,
-        msg: S,
-    ) -> Self {
-        MessageContentBlock::SystemNotification(SystemNotificationContent {
-            notification_type,
-            msg: msg.into(),
-            data: None,
-        })
     }
 
     pub fn system_notification_with_data<S: Into<String>>(
@@ -678,14 +634,6 @@ impl MessageContentBlock {
         }
     }
 
-    pub fn as_action_required(&self) -> Option<&ActionRequired> {
-        if let MessageContentBlock::ActionRequired(ref action_required) = self {
-            Some(action_required)
-        } else {
-            None
-        }
-    }
-
     pub fn as_tool_response_text(&self) -> Option<String> {
         if let Some(tool_response) = self.as_tool_response() {
             if let Ok(result) = &tool_response.tool_result {
@@ -706,22 +654,6 @@ impl MessageContentBlock {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             MessageContentBlock::Text(text) => Some(&text.text),
-            _ => None,
-        }
-    }
-
-    /// Get the thinking content if this is a ThinkingContent variant
-    pub fn as_thinking(&self) -> Option<&ThinkingContentBlock> {
-        match self {
-            MessageContentBlock::Thinking(thinking) => Some(thinking),
-            _ => None,
-        }
-    }
-
-    /// Get the redacted thinking content if this is a RedactedThinkingContent variant
-    pub fn as_redacted_thinking(&self) -> Option<&RedactedThinkingContentBlock> {
-        match self {
-            MessageContentBlock::RedactedThinking(redacted) => Some(redacted),
             _ => None,
         }
     }
@@ -803,24 +735,6 @@ pub struct MessageUsage {
     pub time_to_first_token_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_compaction: bool,
-}
-
-impl MessageUsage {
-    pub fn from_provider_usage(usage: &ProviderUsage, is_compaction: bool) -> Self {
-        let stats = usage.stats.as_ref();
-        MessageUsage {
-            input_tokens: usage.usage.input_tokens,
-            output_tokens: usage.usage.output_tokens,
-            total_tokens: usage.usage.total_tokens,
-            cache_read_tokens: usage.usage.cache_read_input_tokens,
-            cache_write_tokens: usage.usage.cache_write_input_tokens,
-            cost: usage.cost,
-            cost_source: usage.cost_source,
-            elapsed_ms: stats.and_then(|s| s.elapsed_ms),
-            time_to_first_token_ms: stats.and_then(|s| s.time_to_first_token_ms),
-            is_compaction,
-        }
-    }
 }
 
 /// Notes an operation left on a message, keyed by operation name. Nested rather
@@ -966,11 +880,6 @@ impl MessageMetadata {
 
     pub fn with_turn_context(mut self) -> Self {
         self.turn_context = true;
-        self
-    }
-
-    pub fn with_compaction_summary(mut self) -> Self {
-        self.compaction_summary = true;
         self
     }
 }
@@ -1144,21 +1053,6 @@ impl Message {
         self.with_content(MessageContentBlock::tool_request(id, tool_call))
     }
 
-    pub fn with_tool_request_with_metadata<S: Into<String>>(
-        self,
-        id: S,
-        tool_call: ToolResult<CallToolRequestParams>,
-        metadata: Option<&ProviderMetadata>,
-        tool_meta: Option<serde_json::Value>,
-    ) -> Self {
-        self.with_content(MessageContentBlock::ToolRequest(ToolRequest {
-            id: id.into(),
-            tool_call,
-            metadata: metadata.cloned(),
-            tool_meta,
-        }))
-    }
-
     pub fn with_tool_response<S: Into<String>>(
         self,
         id: S,
@@ -1177,19 +1071,6 @@ impl Message {
             .push(MessageContentBlock::tool_response_with_metadata(
                 id, result, metadata,
             ));
-    }
-
-    /// Add an action required message for tool confirmation
-    pub fn with_action_required<S: Into<String>>(
-        self,
-        id: S,
-        tool_name: String,
-        arguments: JsonObject,
-        prompt: Option<String>,
-    ) -> Self {
-        self.with_content(MessageContentBlock::action_required(
-            id, tool_name, arguments, prompt,
-        ))
     }
 
     /// Add thinking content to the message
@@ -1241,20 +1122,6 @@ impl Message {
             .collect()
     }
 
-    /// Retrieves all tool `id` from ToolRequest messages
-    pub fn get_tool_request_ids(&self) -> HashSet<&str> {
-        self.content
-            .iter()
-            .filter_map(|content| {
-                if let MessageContentBlock::ToolRequest(req) = content {
-                    Some(req.id.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
     /// Retrieves all tool `id` from ToolResponse messages
     pub fn get_tool_response_ids(&self) -> HashSet<&str> {
         self.content
@@ -1267,25 +1134,6 @@ impl Message {
                 }
             })
             .collect()
-    }
-
-    /// Check if the message has only TextContent
-    pub fn has_only_text_content(&self) -> bool {
-        self.content
-            .iter()
-            .all(|c| matches!(c, MessageContentBlock::Text(_)))
-    }
-
-    pub fn with_system_notification<S: Into<String>>(
-        self,
-        notification_type: SystemNotificationType,
-        msg: S,
-    ) -> Self {
-        self.with_content(MessageContentBlock::system_notification(
-            notification_type,
-            msg,
-        ))
-        .with_metadata(MessageMetadata::user_only())
     }
 
     pub fn with_system_notification_with_data<S: Into<String>>(
@@ -1412,30 +1260,6 @@ impl Message {
     pub fn is_turn_context(&self) -> bool {
         self.metadata.turn_context
     }
-
-    pub fn is_compaction_summary(&self) -> bool {
-        self.metadata.compaction_summary
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TokenState {
-    pub input_tokens: i32,
-    pub output_tokens: i32,
-    pub total_tokens: i32,
-    #[serde(default)]
-    pub cache_read_tokens: i32,
-    #[serde(default)]
-    pub cache_write_tokens: i32,
-    pub accumulated_input_tokens: i32,
-    pub accumulated_output_tokens: i32,
-    pub accumulated_total_tokens: i32,
-    #[serde(default)]
-    pub accumulated_cache_read_tokens: i32,
-    #[serde(default)]
-    pub accumulated_cache_write_tokens: i32,
-    pub accumulated_cost: Option<f64>,
 }
 
 #[cfg(test)]

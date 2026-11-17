@@ -41,7 +41,6 @@ enum TransportPolicy {
     Default,
     HttpsOnly,
     LoopbackHttp,
-    SameOrigin(url::Origin),
 }
 
 pub enum AuthMethod {
@@ -69,19 +68,6 @@ impl TlsConfig {
             client_identity: None,
             ca_cert_path: None,
         }
-    }
-
-    pub fn with_client_cert_and_key(mut self, cert_path: PathBuf, key_path: PathBuf) -> Self {
-        self.client_identity = Some(TlsCertKeyPair {
-            cert_path,
-            key_path,
-        });
-        self
-    }
-
-    pub fn with_ca_cert(mut self, path: PathBuf) -> Self {
-        self.ca_cert_path = Some(path);
-        self
     }
 
     pub fn is_configured(&self) -> bool {
@@ -314,33 +300,10 @@ impl ApiClient {
         self.timeout
     }
 
-    pub fn default_header(&self, name: &str) -> Option<&str> {
-        self.default_headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-    }
-
     fn client_builder(timeout: Duration) -> reqwest::ClientBuilder {
         Client::builder()
             .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
             .read_timeout(timeout)
-    }
-
-    /// Build a reqwest client that honors the same custom CA and client
-    /// certificate settings as provider API clients.
-    pub fn http_client(tls_config: Option<&TlsConfig>) -> Result<Client> {
-        Ok(Self::http_client_builder(tls_config)?.build()?)
-    }
-
-    pub(crate) fn http_client_builder(
-        tls_config: Option<&TlsConfig>,
-    ) -> Result<reqwest::ClientBuilder> {
-        let mut client_builder =
-            Self::client_builder(Duration::from_secs(DEFAULT_PROVIDER_TIMEOUT_SECS));
-        if let Some(tls_config) = tls_config {
-            client_builder = Self::configure_tls(client_builder, tls_config)?;
-        }
-        Ok(client_builder)
     }
 
     fn rebuild_client(&mut self) -> Result<()> {
@@ -386,19 +349,6 @@ impl ApiClient {
                         }
                     }))
             }
-            TransportPolicy::SameOrigin(origin) => {
-                let origin = origin.clone();
-                client_builder.redirect(Policy::custom(move |attempt| {
-                    if attempt.previous().len() >= 10 {
-                        return attempt.error("too many redirects");
-                    }
-                    if attempt.url().origin() == origin {
-                        attempt.follow()
-                    } else {
-                        attempt.error("redirect crosses the authenticated request origin")
-                    }
-                }))
-            }
         }
     }
 
@@ -437,17 +387,6 @@ impl ApiClient {
         Ok(client_builder)
     }
 
-    pub fn with_headers(mut self, headers: HeaderMap) -> Result<Self> {
-        self.default_headers = headers;
-        self.rebuild_client()?;
-        Ok(self)
-    }
-
-    pub fn with_query(mut self, params: Vec<(String, String)>) -> Self {
-        self.default_query = params;
-        self
-    }
-
     pub fn with_header(mut self, key: &str, value: &str) -> Result<Self> {
         let header_name = HeaderName::from_bytes(key.as_bytes())?;
         let header_value = HeaderValue::from_str(value)?;
@@ -461,13 +400,6 @@ impl ApiClient {
         self
     }
 
-    // Auth is applied fresh on every request, so unlike `with_headers` this
-    // doesn't need to rebuild the underlying `reqwest::Client`.
-    pub fn with_auth(mut self, auth: AuthMethod) -> Self {
-        self.auth = auth;
-        self
-    }
-
     pub fn with_https_only(mut self) -> Result<Self> {
         self.transport_policy = TransportPolicy::HttpsOnly;
         self.rebuild_client()?;
@@ -476,15 +408,6 @@ impl ApiClient {
 
     pub fn with_loopback_http_only(mut self) -> Result<Self> {
         self.transport_policy = TransportPolicy::LoopbackHttp;
-        self.rebuild_client()?;
-        Ok(self)
-    }
-
-    pub fn with_same_origin_redirects(mut self) -> Result<Self> {
-        let origin = url::Url::parse(&self.host)
-            .map_err(|error| anyhow::anyhow!("Invalid base URL: {}", error))?
-            .origin();
-        self.transport_policy = TransportPolicy::SameOrigin(origin);
         self.rebuild_client()?;
         Ok(self)
     }
@@ -672,7 +595,10 @@ fn is_loopback_host(host: &str) -> bool {
         .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]" | "::1"))
 }
 
-fn finish_observation(observation: Option<crate::observer::Observation>, result: &Result<Response>) {
+fn finish_observation(
+    observation: Option<crate::observer::Observation>,
+    result: &Result<Response>,
+) {
     if let Some(observation) = observation {
         observation.finish(match result {
             Ok(response) => crate::observer::Outcome::Status(response.status().as_u16()),

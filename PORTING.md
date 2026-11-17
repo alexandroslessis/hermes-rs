@@ -45,6 +45,13 @@ Not from Hermes, so not in the map:
   `Next::{Continue, Retry(reason), Done}` instead of Goose `Operation`s. `MachineSession` moved to
   `operation.rs`; `ToolOperation` and `InferenceRunner` keep Goose's `Operation` / `Inference` traits.
   A Goose update must not bring the state machine back.
+  **Trimmed** (Phase 14 CP14.1): the Goose code we never call is deleted: `goose_mode.rs`, `permission.rs`
+  (only `Permission`, part of the stored `ActionRequiredData` shape, lives on in `message.rs`),
+  `maybe_send.rs` and every `wasm32` branch (`MaybeSend`/`MaybeSync` are plain `Send`/`Sync`),
+  `canonical/catalog.rs` (the provider setup catalog) with `provider_metadata.json`, `ProviderMetadata` /
+  `ConfigKey`, the unused `Provider` trait methods (OAuth, modes, thinking-effort and permission routing),
+  and in `crates/agent` the `skills`, `compaction` and `subagent` modules and `ToolOperation`'s typed-tool
+  registration (only `with_provider` remains). A Goose update must not bring them back.
 - `crates/app`, `crates/themes`, `crates/highlight`, `crates/markdown`, `vendor/zed`: the GPUI app
   and Zed's UI code. The GPUI app is frozen (kept as a fallback, no new features).
 

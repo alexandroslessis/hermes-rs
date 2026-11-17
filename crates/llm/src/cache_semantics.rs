@@ -44,10 +44,6 @@ impl CacheSemantics {
             _ => CacheSemantics::ImplicitStrict,
         }
     }
-
-    pub fn uses_explicit_breakpoints(self) -> bool {
-        matches!(self, CacheSemantics::ExplicitBreakpoints { .. })
-    }
 }
 
 /// Anthropic's cache lookback window, measured in content blocks: a new

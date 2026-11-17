@@ -711,10 +711,6 @@ fn has_tool_response(message: &Message) -> bool {
         .any(|content| matches!(content, MessageContentBlock::ToolResponse(_)))
 }
 
-pub const TURN_CONTEXT_TAG: &str = "turn-context";
-pub const CURRENT_TIME_TAG: &str = "current-time";
-pub const WORKING_DIRECTORY_TAG: &str = "working-directory";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffectiveRole {
     User,

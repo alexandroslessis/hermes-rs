@@ -76,21 +76,6 @@ impl CanonicalModelRegistry {
         Ok(registry)
     }
 
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        let content = std::fs::read_to_string(path.as_ref())
-            .context("Failed to read canonical models file")?;
-        Self::from_json(&content)
-    }
-
-    pub fn to_file(&self, path: impl AsRef<Path>) -> Result<()> {
-        let mut models: Vec<&CanonicalModel> = self.models.values().collect();
-        models.sort_by(|a, b| a.id.cmp(&b.id));
-        let json = serde_json::to_string_pretty(&models)
-            .context("Failed to serialize canonical models")?;
-        std::fs::write(path.as_ref(), json).context("Failed to write canonical models file")?;
-        Ok(())
-    }
-
     pub fn register(&mut self, provider: &str, model: &str, canonical_model: CanonicalModel) {
         self.models
             .insert((provider.to_string(), model.to_string()), canonical_model);

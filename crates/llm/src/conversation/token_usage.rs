@@ -67,11 +67,6 @@ impl ProviderUsage {
         }
     }
 
-    pub fn with_stats(mut self, stats: ProviderStats) -> Self {
-        self.stats = Some(stats);
-        self
-    }
-
     pub fn with_cost(mut self, cost: f64, source: CostSource) -> Self {
         self.cost = Some(cost);
         self.cost_source = Some(source);
@@ -85,11 +80,6 @@ impl ProviderUsage {
 
     pub fn with_response_id(mut self, id: String) -> Self {
         self.response_id = Some(id);
-        self
-    }
-
-    pub fn with_request_id(mut self, id: String) -> Self {
-        self.request_id = Some(id);
         self
     }
 }

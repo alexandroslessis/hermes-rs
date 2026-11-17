@@ -131,20 +131,6 @@ impl ModelConfig {
         })
     }
 
-    pub fn with_canonical_vision_support(mut self, provider_name: &str) -> Self {
-        if self.supports_vision.is_none() {
-            if let Some(canonical) = self.canonical_model(provider_name) {
-                self.supports_vision = Some(
-                    canonical
-                        .modalities
-                        .input
-                        .contains(&crate::canonical::Modality::Image),
-                );
-            }
-        }
-        self
-    }
-
     pub fn with_canonical_limits(mut self, provider_name: &str) -> Self {
         let canonical = self.canonical_model(provider_name);
 
@@ -186,30 +172,6 @@ impl ModelConfig {
 
     pub fn with_max_tokens(mut self, tokens: Option<i32>) -> Self {
         self.max_tokens = tokens;
-        self
-    }
-
-    pub fn with_default_context_limit(mut self, limit: Option<usize>) -> Self {
-        if self.context_limit.is_none() {
-            self.context_limit = limit;
-        }
-        self
-    }
-
-    pub fn with_default_max_tokens(mut self, tokens: Option<i32>) -> Self {
-        if self.max_tokens.is_none() {
-            self.max_tokens = tokens;
-        }
-        self
-    }
-
-    pub fn with_toolshim(mut self, toolshim: bool) -> Self {
-        self.toolshim = toolshim;
-        self
-    }
-
-    pub fn with_toolshim_model(mut self, model: Option<String>) -> Self {
-        self.toolshim_model = model;
         self
     }
 
@@ -397,18 +359,6 @@ impl ModelConfig {
     pub fn thinking_effort(&self) -> Option<ThinkingEffort> {
         self.request_param::<String>("thinking_effort")
             .and_then(|s| s.parse::<ThinkingEffort>().ok())
-    }
-
-    pub fn with_prompt_cache_disabled(self) -> Self {
-        self.with_merged_request_params(HashMap::from([(
-            "disable_prompt_cache".to_string(),
-            Value::Bool(true),
-        )]))
-    }
-
-    pub fn prompt_cache_disabled(&self) -> bool {
-        self.request_param::<bool>("disable_prompt_cache")
-            .unwrap_or(false)
     }
 
     /// Set the prompt-cache TTL requested from providers that support one

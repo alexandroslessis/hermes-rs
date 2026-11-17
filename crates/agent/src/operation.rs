@@ -1,36 +1,20 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use futures::Stream;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::events::AgentEvent;
 use hermes_llm::conversation::message::{Message, MessageContent, MessageErrorKind};
-use hermes_llm::conversation::{effective_role, Conversation, EffectiveRole};
-use hermes_llm::maybe_send::{MaybeSend, MaybeSync};
+use hermes_llm::conversation::Conversation;
 use rmcp::model::Tool;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub type OperationFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-#[cfg(target_arch = "wasm32")]
-pub type OperationFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub type OperationStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;
-
-#[cfg(target_arch = "wasm32")]
-pub type OperationStream<'a, T> = Pin<Box<dyn Stream<Item = T> + 'a>>;
 
 pub const CLIENT_LOG: &str = "client_log";
 
 /// What an inference step reads from the session it runs in. hermes-rs: kept from Goose's
 /// `machine.rs` when the `StateMachine` was replaced by the runtime's explicit loop
 /// (`crates/runtime/src/agent_loop.rs`, Phase 13 CP13e).
-pub trait MachineSession: MaybeSend + MaybeSync {
+pub trait MachineSession: Send + Sync {
     fn id(&self) -> &str;
     fn conversation(&self) -> Option<&Conversation>;
     fn thinking_effort(&self) -> Option<hermes_llm::thinking::ThinkingEffort> {
@@ -67,13 +51,6 @@ pub fn trailing_error(conversation: &Conversation) -> Option<MessageErrorKind> {
     conversation.last().and_then(Message::error_kind)
 }
 
-pub fn last_effective_role(messages: &[Arc<Message>]) -> Result<EffectiveRole> {
-    messages
-        .last()
-        .map(|message| effective_role(message))
-        .ok_or_else(|| anyhow!("cannot determine the role of an empty conversation"))
-}
-
 pub fn assistant_turn_count(messages: &[Arc<Message>]) -> u32 {
     let mut turns = 0;
     let mut in_assistant_block = false;
@@ -103,9 +80,8 @@ pub fn ends_turn(messages: &[Arc<Message>]) -> bool {
     })
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-pub trait Operation<S, E: MaybeSend + 'static = ConversationEffect>: MaybeSend + MaybeSync {
+#[async_trait]
+pub trait Operation<S, E: Send + 'static = ConversationEffect>: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Note on a message something this operation did, so that a pipeline rebuilt
@@ -172,9 +148,8 @@ pub struct InferenceInput {
     pub moim_parts: Vec<String>,
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-pub trait Inference<S, E: MaybeSend + 'static = ConversationEffect>: Operation<S, E> {
+#[async_trait]
+pub trait Inference<S, E: Send + 'static = ConversationEffect>: Operation<S, E> {
     /// Whether the next step would reach the provider. The machine asks before
     /// firing the hooks that mark the start of a turn.
     fn applies(&self, conversation: &Conversation) -> bool;
@@ -225,14 +200,6 @@ pub fn applied<E>(effects: impl IntoIterator<Item = E>) -> Result<OperationResul
 pub fn yielded<E>() -> Result<OperationResult<E>> {
     Ok(OperationResult::Applied(StepResult {
         effects: Vec::new(),
-        applied_step: None,
-        status: RunStatus::Yielded,
-    }))
-}
-
-pub fn yielded_with<E>(effects: impl IntoIterator<Item = E>) -> Result<OperationResult<E>> {
-    Ok(OperationResult::Applied(StepResult {
-        effects: effects.into_iter().collect(),
         applied_step: None,
         status: RunStatus::Yielded,
     }))

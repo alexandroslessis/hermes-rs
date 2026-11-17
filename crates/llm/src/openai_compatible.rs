@@ -20,9 +20,8 @@ use super::retry::{ProviderRetry, RetryConfig};
 use crate::conversation::message::Message;
 use crate::errors::ProviderError;
 use crate::formats::openai::{
-    create_request, create_request_for_model_with_options, get_cost, get_usage,
-    record_response_metadata, response_to_message, response_to_streaming_message,
-    OpenAiFormatOptions,
+    create_request, get_cost, get_usage, record_response_metadata, response_to_message,
+    response_to_streaming_message,
 };
 use crate::model::ModelConfig;
 use crate::request_log::{start_log, LoggerHandleExt, RequestLogHandle};
@@ -71,56 +70,6 @@ impl OpenAiCompatibleProvider {
     pub fn with_max_retries(mut self, max_retries: usize) -> Self {
         self.max_retries = Some(max_retries);
         self
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn build_request_for_model(
-        &self,
-        model_config: &ModelConfig,
-        wire_model: &str,
-        capability_model: &str,
-        system: &str,
-        messages: &[Arc<Message>],
-        tools: &[Tool],
-        for_streaming: bool,
-    ) -> Result<Value, ProviderError> {
-        create_request_for_model_with_options(
-            model_config,
-            wire_model,
-            capability_model,
-            system,
-            messages,
-            tools,
-            &ImageFormat::OpenAi,
-            for_streaming,
-            OpenAiFormatOptions {
-                preserve_thinking_context: true,
-                supports_vision: model_config.supports_vision.unwrap_or_default(),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| ProviderError::RequestFailed(format!("Failed to create request: {}", e)))
-    }
-
-    pub async fn stream_for_model(
-        &self,
-        model_config: &ModelConfig,
-        wire_model: &str,
-        capability_model: &str,
-        system: &str,
-        messages: &[Arc<Message>],
-        tools: &[Tool],
-    ) -> Result<MessageStream, ProviderError> {
-        let payload = self.build_request_for_model(
-            model_config,
-            wire_model,
-            capability_model,
-            system,
-            messages,
-            tools,
-            self.supports_streaming,
-        )?;
-        self.stream_payload(model_config, payload).await
     }
 
     async fn stream_payload(

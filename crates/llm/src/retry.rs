@@ -1,14 +1,9 @@
 use crate::base::Provider;
 use crate::errors::ProviderError;
-use crate::maybe_send::MaybeSend;
 use async_trait::async_trait;
 use std::future::Future;
 use std::time::Duration;
 
-// wasm32 hosts run without a tokio runtime, so back off on the host's timer.
-#[cfg(target_arch = "wasm32")]
-use gloo_timers::future::sleep;
-#[cfg(not(target_arch = "wasm32"))]
 use tokio::time::sleep;
 
 pub const DEFAULT_MAX_RETRIES: usize = 3;
@@ -19,7 +14,15 @@ pub const DEFAULT_MAX_RETRY_INTERVAL_MS: u64 = 30_000;
 /// The longest Retry-After honored as a sleep (Hermes's `RETRY_AFTER_CAP_S`): 600s covers
 /// realistic provider rate-limit windows while rejecting pathological ones (a daily-limit 429
 /// with `retry_after_seconds: 19919` would otherwise freeze the turn for hours per retry).
+/// hermes-rs: until Phase 14 CP14.1 the cap sat only in Goose's unused `retry_operation`, so the
+/// provider's retry loop slept a Retry-After as given (anything under an hour; an hour or more
+/// is a daily quota, `fallback::is_daily_quota`, and is not retried at all).
 pub const MAX_RETRY_WAIT_SECS: u64 = 600;
+
+/// How long a rate limit's own Retry-After is slept: as given, up to [`MAX_RETRY_WAIT_SECS`].
+fn capped_retry_wait(hint: Duration) -> Duration {
+    hint.min(Duration::from_secs(MAX_RETRY_WAIT_SECS))
+}
 
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -130,11 +133,6 @@ pub fn is_usage_limit(message: &str) -> bool {
         .any(|marker| lower.contains(marker))
 }
 
-/// How long a rate limit's own Retry-After is slept: as given, up to [`MAX_RETRY_WAIT_SECS`].
-fn capped_retry_wait(hint: Duration) -> Duration {
-    hint.min(Duration::from_secs(MAX_RETRY_WAIT_SECS))
-}
-
 fn is_permanent_request_failure(message: &str) -> bool {
     PERMANENT_REQUEST_FAILURE_MARKERS
         .iter()
@@ -164,9 +162,7 @@ pub fn should_retry(error: &ProviderError, config: &RetryConfig) -> bool {
         ProviderError::RequestFailed(message) if is_permanent_request_failure(message) => false,
         // A model the provider does not have will not appear on the next try (the fallback chain
         // moves on instead, Phase 12).
-        ProviderError::RequestFailed(message)
-            if crate::fallback::is_model_not_found(message) =>
-        {
+        ProviderError::RequestFailed(message) if crate::fallback::is_model_not_found(message) => {
             false
         }
         ProviderError::RequestFailed(_) => !config.transient_only,
@@ -174,52 +170,10 @@ pub fn should_retry(error: &ProviderError, config: &RetryConfig) -> bool {
     }
 }
 
-pub async fn retry_operation<F, Fut, T>(
-    config: &RetryConfig,
-    operation: F,
-) -> Result<T, ProviderError>
-where
-    F: Fn() -> Fut + MaybeSend,
-    Fut: Future<Output = Result<T, ProviderError>> + MaybeSend,
-    T: MaybeSend,
-{
-    let mut attempts = 0;
-
-    loop {
-        match operation().await {
-            Ok(result) => return Ok(result),
-            Err(error) => {
-                if should_retry(&error, config) && attempts < config.max_retries {
-                    attempts += 1;
-                    tracing::warn!(
-                        "Request failed, retrying ({}/{}): {:?}",
-                        attempts,
-                        config.max_retries,
-                        error
-                    );
-
-                    let delay = match &error {
-                        ProviderError::RateLimitExceeded {
-                            retry_delay: Some(d),
-                            ..
-                        } => capped_retry_wait(*d),
-                        _ => config.delay_for_attempt(attempts),
-                    };
-
-                    sleep(delay).await;
-                    continue;
-                }
-                return Err(error);
-            }
-        }
-    }
-}
-
 /// Trait for retry functionality to keep Provider dyn-compatible.
 ///
 /// All `Provider` implementors get this via the blanket impl below.
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[async_trait]
 pub trait ProviderRetry {
     fn retry_config(&self) -> RetryConfig {
         RetryConfig::default()
@@ -227,9 +181,9 @@ pub trait ProviderRetry {
 
     async fn with_retry<F, Fut, T>(&self, operation: F) -> Result<T, ProviderError>
     where
-        F: Fn() -> Fut + MaybeSend,
-        Fut: Future<Output = Result<T, ProviderError>> + MaybeSend,
-        T: MaybeSend,
+        F: Fn() -> Fut + Send,
+        Fut: Future<Output = Result<T, ProviderError>> + Send,
+        T: Send,
     {
         self.with_retry_config(operation, self.retry_config()).await
     }
@@ -240,13 +194,12 @@ pub trait ProviderRetry {
         config: RetryConfig,
     ) -> Result<T, ProviderError>
     where
-        F: Fn() -> Fut + MaybeSend,
-        Fut: Future<Output = Result<T, ProviderError>> + MaybeSend,
-        T: MaybeSend;
+        F: Fn() -> Fut + Send,
+        Fut: Future<Output = Result<T, ProviderError>> + Send,
+        T: Send;
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[async_trait]
 impl<P: Provider> ProviderRetry for P {
     fn retry_config(&self) -> RetryConfig {
         Provider::retry_config(self)
@@ -258,9 +211,9 @@ impl<P: Provider> ProviderRetry for P {
         config: RetryConfig,
     ) -> Result<T, ProviderError>
     where
-        F: Fn() -> Fut + MaybeSend,
-        Fut: Future<Output = Result<T, ProviderError>> + MaybeSend,
-        T: MaybeSend,
+        F: Fn() -> Fut + Send,
+        Fut: Future<Output = Result<T, ProviderError>> + Send,
+        T: Send,
     {
         let mut attempts = 0;
         let mut auth_retried = false;
@@ -303,7 +256,7 @@ impl<P: Provider> ProviderRetry for P {
                             ProviderError::RateLimitExceeded {
                                 retry_delay: Some(provider_delay),
                                 ..
-                            } => *provider_delay,
+                            } => capped_retry_wait(*provider_delay),
                             _ => config.delay_for_attempt(attempts),
                         };
 
@@ -467,12 +420,49 @@ mod tests {
         assert!(should_retry(&error, &config));
     }
 
-    #[test]
-    fn a_retry_sleeps_at_most_the_retry_wait_cap() {
-        // A daily-limit hint past the cap degrades to the cap, not to a five-hour sleep.
-        assert_eq!(
-            capped_retry_wait(Duration::from_secs(19919)),
-            Duration::from_secs(MAX_RETRY_WAIT_SECS)
+    struct NoProvider;
+
+    #[async_trait]
+    impl Provider for NoProvider {
+        fn get_name(&self) -> &str {
+            "none"
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &crate::model::ModelConfig,
+            _system: &str,
+            _messages: &[std::sync::Arc<crate::conversation::message::Message>],
+            _tools: &[rmcp::model::Tool],
+        ) -> Result<crate::base::MessageStream, ProviderError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_provider_retry_loop_sleeps_at_most_the_retry_wait_cap() {
+        // A half-hour hint (below the hour that marks a daily quota, which is not retried at
+        // all) degrades to the cap.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let start = tokio::time::Instant::now();
+        let result = NoProvider
+            .with_retry(|| async {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Err(ProviderError::RateLimitExceeded {
+                        details: "too many requests".into(),
+                        retry_delay: Some(Duration::from_secs(1800)),
+                    })
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
+        assert!(result.is_ok());
+        let slept = start.elapsed();
+        assert!(
+            slept >= Duration::from_secs(MAX_RETRY_WAIT_SECS)
+                && slept < Duration::from_secs(MAX_RETRY_WAIT_SECS + 1),
+            "slept {slept:?}"
         );
         // A short hint is honored as given.
         assert_eq!(
