@@ -247,6 +247,36 @@ checklist: a short pass over the main screens).
 
 ## Phase 2 — Design system and app frame
 
+### Reference screenshots from t3code (user-supplied, 2026-11-18)
+
+The user will provide screenshots of t3code so the design matches the original as closely as
+possible. They are the visual ground truth for Phase 2, and later phases reuse them.
+
+- **Where:** `docs/native-ui/reference/t3code/`, committed. Names say what and which theme:
+  `<screen-or-component>-<light|dark>[-<state>].png` (e.g. `sidebar-dark.png`,
+  `button-variants-light.png`, `titlebar-dark-maximised.png`). The user adds a line per file to
+  `reference/t3code/README.md` (what it shows, window size, scale) when they drop them in.
+- **Before CP2.1 starts**, the orchestrator checks that folder. If it is empty, it asks the user
+  for the screenshots Phase 2 needs rather than guessing: both themes of the app frame (title bar,
+  sidebar, empty main area), the buttons in every variant and size, a list row in its states, a
+  badge, kbd, tooltip, toast, and the command palette. Screens for later phases can come later.
+- **CP2.1 (tokens):** the implementer reads the t3code CSS values first (`index.css`) and uses
+  the screenshots to *check* them (sample a few pixel colours per token, background, border,
+  muted text, accent, from the images), recording any token whose screenshot colour differs from
+  the CSS in the progress note. Font choice (step 4) is judged against the screenshots too.
+- **CP2.2 (components, frame):** each design component and the frame gets its screenshot named in
+  its module header next to the t3code source line, and a gallery story with the same states and
+  the same size as the reference (same window width, same scale), so the two can be compared side
+  by side.
+- **Checking:** the implementer reads only the text (CSS, source) plus the *few* screenshots its
+  checkpoint names. The **visual check** (Sonnet at CP2.1 and CP2.2) compares each new snapshot
+  crop with its reference screenshot and reports per image `matches | differs: <what, where>`
+  (spacing, size, radius, colour, weight, alignment). `differs` lines are fixed or explained by the
+  reviewer; they are not accepted as baselines silently. Keeps the "text before images" rule: only
+  those pairs are looked at, cropped.
+- **Not pixel-perfect by design:** differences from fonts, text rendering and the platform's
+  anti-aliasing are expected; layout, spacing, sizes, radii and colours should match.
+
 ### CP2.1 — Themes and tokens (M)
 
 1. `design/tokens.rs`: the token set, named after t3code's CSS variables (`background`,
