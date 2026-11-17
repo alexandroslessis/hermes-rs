@@ -1379,7 +1379,7 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   `.await`: take the lock inside the closure, from an `Arc<Mutex<..>>` you cloned (`SessionTools::hints`,
   `turn_checkpoints`). Do the cheap in-memory check first and spawn only when there is work (`limit_output_off_worker`,
   `spill_oversized_off_worker`, `Web::truncate_off_worker` copy nothing for a short result).
-- **The gateway has a helper for it**: `Gateway::blocking(|g| ...)` (`gateway.rs`) runs a closure with the `Arc<Gateway>`
+- **The gateway has a helper for it**: `Gateway::blocking(|g| ...)` (`gateway/mod.rs`) runs a closure with the `Arc<Gateway>`
   on the blocking pool and answers a failed thread as an RPC error. `dispatch`, `mutate`, `rest`, `session_route`, the
   turn's event loop use it for every store read, file read and repository call. A method that needs it must take
   `self: &Arc<Self>`. In a REST route use `Gateway::rest_blocking`: a failed thread answers 500, never `None` (that
@@ -1493,6 +1493,30 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   behaviour is `turns.rs` (unchanged by CP13e). A change to the loop should be compared with a golden trace (every
   request body, agent event and queued store write per test, before and after): the method is in
   `docs/backend/progress/phase-13.md`, CP13e.
+
+## The typed gateway dispatch (Phase 13f, `crates/desktop/src/gateway/rpc.rs`)
+
+- **Never read a method's params with serde's struct deserializer.** The page sends loose JSON and the handlers always read
+  `params["f"].as_str()...`: a missing field, `null` or absent params, extra fields and a number where a string was
+  expected were never an error. Serde would reject `null`, read an array positionally, and turn "invalid" into a failed
+  parse; `Request::parse` answers a failed parse as **-32601 "Method not found"** (the page then hides the feature), so a
+  params type that can fail makes a served method vanish. Each params type implements `FromParams` (the same reads) and
+  is wrapped in `P<T>`; `every_served_method_parses_from_any_params` is the guard. A new field keeps the rule: absent and
+  wrong-typed are the same, a default is spelled out.
+- **A method that passes the params on to a long function** (`session.create`, `prompt.submit`, `session.mutate`, the
+  branches, ...) carries `Raw`, the value as sent (they read 10-30 fields and mutate it: `enqueue_as` writes
+  `session_id` / `submission_id` into it, which panics on a non-object: that is how it always was). Typing them is a
+  separate change with its own golden record.
+- **`RpcError::server("session busy")` is `Busy`** (same code and text, plus `data.reason`): the page's canonical protocol
+  reads the reason, and the old `handle` added it for that exact message whatever wrote it. Build errors with
+  `RpcError::server` / `invalid` / `failed`, not the variants, so this holds. `Gateway::call` still answers the ACP server a
+  `(code, message)` tuple (`acp/rpc.rs` has its own `RpcError`; they are different types).
+- **`dispatch` loads `Settings` before it parses**, for every name, as before; an unknown name costs that file read.
+- **The area files are `impl Gateway` blocks in child modules.** A private item of `gateway/mod.rs` (`Gateway`'s fields,
+  `blocking`, `emit`, `session_id`) is visible to the children; a handler the `dispatch` arm calls, or another area uses, is
+  `pub(super)`. The moved code starts with `use super::*;` (it reads as it did in one file). `Gateway::blocking` and
+  `rest_blocking` (CP13c) are in `mod.rs` / `rest.rs`; the off-worker rules did not change.
+- **`scripts/contract.mjs` reads `gateway/rpc.rs`** (`rename = "<method>"`) to say which contract methods are served.
 
 ## Test folders that do not go away (2026-11-17, `crates/testdir`)
 

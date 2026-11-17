@@ -1746,6 +1746,24 @@ fn user_texts(request: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The turns' requests only. `/undo` and `/retry` are undone turns, a learning signal, so the
+/// `balanced` profile's `nudges` starts a background review (same tools and system prompt as a
+/// turn, for the cache; its last message is the review prompt). The mock has no reply left for
+/// it, so it gets a 500 and retries, and a retry can land after the next turn's request: on a
+/// loaded machine `requests().last()` was the review's, still holding the undone turns (CP13d
+/// review for `/retry`, CP13f review for `/undo 2`). (The desktop app does not apply the test
+/// config's `background_review: false`: only the GPUI app calls `set_background_review`; GAPS.)
+fn turn_requests(model: &Model) -> Vec<Value> {
+    model
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            let last = &request["messages"].as_array().unwrap().last().unwrap()["content"];
+            !last.to_string().contains("Review the conversation above")
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn undo_drops_the_last_turn_and_the_next_prompt_continues_from_there() {
     let (mut agent, session) =
@@ -1758,12 +1776,12 @@ async fn undo_drops_the_last_turn_and_the_next_prompt_continues_from_there() {
     assert!(said.contains("Undid 1 turn"), "{said}");
     assert!(said.contains("second question"), "{said}");
     assert_eq!(
-        agent.model.requests().len(),
+        turn_requests(&agent.model).len(),
         2,
         "/undo must not call the model"
     );
     agent.prompt(&session, "third question").await;
-    let requests = agent.model.requests();
+    let requests = turn_requests(&agent.model);
     let last = user_texts(requests.last().unwrap()).join(" ");
     assert!(last.contains("first question"), "{last}");
     assert!(last.contains("third question"), "{last}");
@@ -1785,7 +1803,7 @@ async fn undo_n_drops_n_turns() {
     agent.prompt(&session, "/undo 2").await;
     assert!(agent.reply_text(&session).contains("Undid 2 turns"));
     agent.prompt(&session, "four").await;
-    let requests = agent.model.requests();
+    let requests = turn_requests(&agent.model);
     let last = user_texts(requests.last().unwrap()).join(" ");
     assert!(last.contains("one") && last.contains("four"), "{last}");
     assert!(!last.contains("two") && !last.contains("three"), "{last}");
@@ -1798,21 +1816,9 @@ async fn retry_sends_the_last_prompt_again_without_the_old_answer() {
     agent.prompt(&session, "alpha").await;
     let answer = agent.prompt(&session, "/retry").await;
     assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
-    // The turns' requests only: `/retry` is an undone turn, a learning signal, so the `balanced`
-    // profile's `nudges` starts a background review after the retried turn (same tools and system
-    // prompt as a turn, for the cache; its last message is the review prompt, and here it gets
-    // the mock's 500 and retries). Its first request raced this read under a loaded machine:
-    // 3 requests, on 8e3d12d as on CP13d (CP13d review). (The desktop app does not apply the
-    // test config's `background_review: false`: only the GPUI app calls `set_background_review`.)
-    let requests: Vec<Value> = agent
-        .model
-        .requests()
-        .into_iter()
-        .filter(|request| {
-            let last = &request["messages"].as_array().unwrap().last().unwrap()["content"];
-            !last.to_string().contains("Review the conversation above")
-        })
-        .collect();
+    // The turns' requests only (`turn_requests`): the review's first request raced this read
+    // under a loaded machine, 3 requests, on 8e3d12d as on CP13d (CP13d review).
+    let requests = turn_requests(&agent.model);
     // (On failure: what the agent said, e.g. a refused rewind.)
     assert_eq!(requests.len(), 2, "{}", agent.reply_text(&session));
     let again = &requests[1];

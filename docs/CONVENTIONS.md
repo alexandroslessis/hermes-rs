@@ -9,9 +9,10 @@ code and mention it.
 - **A page feature** (something Hermes's frontend calls): a new module in `crates/desktop/src/`
   named after the feature (`files.rs`, `git_review.rs`, `branch.rs`, `toolsets.rs`), declared in
   `main.rs`. The module holds the logic as plain functions taking what they need (`&Path` data
-  dir, `&Value` body, a store handle) and returning `Value` or `(u16, Value)`. `gateway.rs` gets
-  only a thin arm: one line in `dispatch`, or one prefix block in `rest`. `gateway.rs` is already
-  3,300 lines; don't grow it with logic.
+  dir, `&Value` body, a store handle) and returning `Value` or `(u16, Value)`. `gateway/` gets
+  only a thin handler: a variant in `gateway/rpc.rs`, a handler in the area's file under `gateway/`
+  and one arm in `dispatch`, or one prefix block in `rest` (`gateway/rest.rs`). The gateway is already
+  about 4,800 lines in ten files, plus `rpc.rs`: don't grow it with logic.
 - **Agent behaviour** (what happens in a turn, new tool semantics): `crates/runtime` (turn
   machinery) or `crates/tools` (a tool). Expose a small method on `Runtime` and call it from the
   gateway; don't reach into runtime internals from the desktop crate.

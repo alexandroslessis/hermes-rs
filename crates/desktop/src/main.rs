@@ -1,6 +1,6 @@
 //! Hermes's desktop frontend in a Tauri window, backed by the hermes-rs runtime instead of
 //! Hermes's Python backend. The window loads Hermes's webapp bundle from a local server
-//! (`server.rs`) that also speaks Hermes's gateway protocol (`gateway.rs`).
+//! (`server.rs`) that also speaks Hermes's gateway protocol (`gateway/`).
 
 // Release builds are GUI-only (no console window); debug builds keep the console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]

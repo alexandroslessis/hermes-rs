@@ -18,7 +18,7 @@ Read [AGENTS.md](../AGENTS.md) first.
 │     /api/{*rest}      → Gateway::rest  (None → 404 "No such API endpoint")  │      │
 │     /api/host-terminal, /api/fs/download, /api/files/*, file-upload, window │      │
 │                                                                            ▼      │
-│   gateway.rs  Gateway { runtime, hub, rest (settings), side stores … }            │
+│   gateway/    Gateway { runtime, hub, rest (settings), side stores … }            │
 │     │  per-feature modules: endpoints, attachments, files, git_review,           │
 │     │  terminal, branch, toolsets, learning, hermes_import, export, skills …     │
 │     ▼                                                                             │
@@ -85,15 +85,38 @@ it calls into. Everything runs in one process.
 Two channels, both shaped by Hermes; `target/hermes-src/apps/shared/src/gateway-contract.openrpc.json`
 is the contract (257 methods), `apps/desktop/src/api/` is how the page calls them.
 
-### JSON-RPC over `/api/ws` (`gateway.rs`)
+### JSON-RPC over `/api/ws` (`gateway/`)
 
-- `connection` reads frames; `handle` spawns each request; `dispatch(method, params, outbox)` is a
-  big `match method { … }` returning `RpcResult = Result<Value, (i64, String)>`.
-- Error codes: `METHOD_NOT_FOUND` -32601 (we don't serve it: page hides the feature),
-  `INVALID_PARAMS` -32602 (bad/missing params: `session_id(params)?` gives you this), `SERVER_ERROR`
-  -32000 (it failed: message shown to the user, so write it for a human).
-- Unknown methods fall to the `_` arm, which logs under target `hermes_desktop::missing` and
-  answers -32601. That log is the live to-do list.
+`gateway/` is a directory module (Phase 13 CP13f): `mod.rs` has `Gateway`, the socket and
+`dispatch`; `rpc.rs` has the typed requests and errors; one file per area has the handlers
+(`sessions.rs`, `turn.rs`, `slash.rs`, `settings.rs`, `projects.rs`, `attachments.rs`,
+`delegation.rs`, `usage.rs`, `rest.rs`: the table is at the top of `mod.rs`). All handlers are
+`impl Gateway` blocks (Python: methods of one class spread over several files).
+
+- `connection` reads frames; `handle` spawns each request; `dispatch(method, params, outbox)` parses
+  the request with `Request::parse` and `match`es the typed `Request` (one variant per served
+  method, `#[serde(tag = "method", content = "params")]`), each arm one call to a handler returning
+  `Reply = Result<Value, RpcError>`. `Gateway::call` (the ACP server's way in) answers the same
+  but with `(code, message)` as the error.
+- **Params are lenient on purpose.** The page sends loose JSON and every handler always read it as
+  `params["f"].as_str()...`: a missing field, `null` params or a field of the wrong type was never an
+  error by itself. `rpc.rs` keeps that: each method's params type is built by `FromParams` (the same
+  reads, in one place), never by serde's struct deserializer (it rejects `null` and reads an array
+  positionally). What a method requires it checks itself (`SessionRef::id()` is "session_id is
+  required"). A handler that passes the params on to a long function reads `Raw`, the value as sent.
+- Errors are `RpcError`: `MethodNotFound(name)` -32601 (we don't serve it: page hides the feature),
+  `InvalidParams(text)` -32602 (bad/missing params: `p.id()?` / `RpcError::invalid(..)`),
+  `Server(text)` -32000 (it failed: message shown to the user, so write it for a human;
+  `RpcError::server(..)`, `RpcError::failed(e)` for an `anyhow` chain), `Busy` (-32000 `session
+  busy` with `data.reason = "session_busy"`). `to_json()` is the `error` object the page gets.
+- Unknown methods: `Request::parse` fails for any name that is not exactly a variant (other case,
+  spaces, empty included), `handle` logs it under target `hermes_desktop::missing` and answers -32601
+  `Method not found: <name>`. That log is the live to-do list.
+- **Adding a method:** a variant in `rpc::Request` (`#[serde(rename = "a.b")]`, its params type
+  next to the others, with the old-style lenient reads) and its name in `rpc::SERVED` (the tests
+  check the two lists agree), a handler in the area's file (`pub(super)`), one arm in `dispatch`,
+  then `HERMES_RPC_TABLE_BLESS=1 cargo test -p hermes-desktop --lib rpc_table` and read the diff of
+  `crates/desktop/tests/fixtures/rpc_table.txt` (the table of what every method answers).
 - **Events** go out as `{"method":"event","params":{"type":…,"session_id":…,"payload":…}}` via
   `self.emit(session_id, event, payload)`. Delivery goes through `Hub` (`hub.rs`): each socket
   subscribes to the sessions it opened (`subscribe`), so a session's events reach whichever
@@ -102,7 +125,7 @@ is the contract (257 methods), `apps/desktop/src/api/` is how the page calls the
   `tool.complete`, `message.complete`, `approval.request`, `clarify.request`, `subagent.*`,
   `btw.complete`, `background.complete`, `session.info`, …).
 - Bigger features live in their own module and `dispatch` has a one-line arm calling it
-  (e.g. `"session.branch" => self.branch(...)`, `crate::git_review::route`).
+  (e.g. `Request::SessionBranch(..) => self.session_branch(...)`, `crate::git_review::route`).
 
 ### REST under `/api` (`Gateway::rest`)
 
@@ -143,7 +166,7 @@ one thread (PITFALLS: "Two windows"). Tests: `crates/desktop/tests/acp.rs`
 
 ## Feature map: screen → code → check
 
-Where to look first for each thing the user sees. (`gw` = an arm in `gateway.rs`.)
+Where to look first for each thing the user sees. (`gw` = a handler in `gateway/`.)
 
 | Screen / command | Backend | Calls | Live check |
 |---|---|---|---|

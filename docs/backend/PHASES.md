@@ -52,9 +52,9 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 10 | Fewer round trips: script tool, first-turn context, batching — ✅ 2026-11-14 | M | 3 | Sonnet | A |
 | 11 | Token mode: deferred tool schemas — ✅ 2026-11-14 | S–M | 3 | Sonnet | A |
 | 12 | Provider fallback chain — ✅ 2026-11-14 | M | 2 | Sonnet | A |
-| 13a/c/f | Perf: `Arc<Message>`, `spawn_blocking`, typed dispatch | M | 0 | Sonnet | filler |
-| 13b | Perf: store writer actor | M | 0 | **Opus** | C |
-| 13d/e | Perf: session actor, explicit agent loop | L | all others | **Opus** | last, alone |
+| 13a/c/f | Perf: `Arc<Message>`, `spawn_blocking`, typed dispatch — ✅ 2026-11-17 (20f3724, 8e3d12d, CP13f: the `backend p13 cp13f` commit) | M | 0 | Sonnet | filler |
+| 13b | Perf: store writer actor — ✅ 2026-11-17 (74ac1f7) | M | 0 | **Opus** | C |
+| 13d/e | Perf: session actor, explicit agent loop — ✅ 2026-11-17 (acad3ca, a110767) | L | all others | **Opus** | last, alone |
 | 14 | Trim `hermes_llm` | S–M | 2, 12 | Sonnet | filler |
 | 15 | OS sandbox for the shell | L | 1, 6 | **Opus** | C |
 
@@ -921,6 +921,27 @@ typed `enum RpcError`. Unknown methods still answer -32601 (ground rule 5). Spli
 (3.8k lines) by area into `gateway/{sessions,config,skills,…}.rs`.
 
 Optional: `mimalloc` as the global allocator (one line; measure first if perf checks are allowed).
+
+**Done 2026-11-17** ([progress](progress/phase-13.md)), on branch `backend/p13-perf`: CP13a
+`Arc<Message>` 20f3724, CP13b store writer 74ac1f7, CP13c `spawn_blocking` 8e3d12d, CP13d session
+actor acad3ca, CP13e explicit loop a110767, the test-temp leak fix fce5fec (`hermes_testdir`),
+CP13f typed dispatch (the `backend p13 cp13f` commit). No behaviour change by design; the safety
+nets were golden records (CP13e: every `turns` request body, event and store write; CP13f: every
+method's answer over a spread of params, before and after), not request-count baselines, which did
+not move (`turns` 258 passed / 7 ignored under default, `requests` and `tokens` throughout). Notes
+for later phases:
+- `gateway.rs` is now `crates/desktop/src/gateway/` (`mod.rs` + one file per area, `rpc.rs` for
+  the typed `Request` / `RpcError`). A new method is a `Request` variant with a lenient
+  `FromParams` params type, a handler and one `dispatch` arm, then a blessed
+  `tests/fixtures/rpc_table.txt` (PITFALLS "The typed gateway dispatch").
+- 15 methods still carry their params as `Raw` (`session.create`, `prompt.submit`,
+  `session.mutate`, the branches, `rollback.*`, ...): typing them is a change of its own, with its
+  own golden record.
+- Store writes go through the writer thread and reads wait for earlier writes (CP13b); async code
+  never does store, file, git or process work on a worker (CP13c, `Gateway::blocking`); a
+  session's control state is its actor's (CP13d); the agent loop is `AgentLoop` (CP13e).
+- Not done: `mimalloc` (the user's "no performance checks" rule); the desktop app still ignores
+  `background_review: false` (GAPS section 4, pre-existing).
 
 ---
 

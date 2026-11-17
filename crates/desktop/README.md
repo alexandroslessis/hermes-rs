@@ -6,7 +6,7 @@ the browser); this crate serves it and speaks the protocol it expects:
 
 - `src/server.rs`: a local HTTP server for the bundle, with the globals Hermes's own server injects
   (`hermes_cli/web_server_dashboard.py`), the session token, and plugin defaults.
-- `src/gateway.rs`: Hermes's `tui_gateway` JSON-RPC over `/api/ws` (`tui_gateway/ws.py`), mapped
+- `src/gateway/`: Hermes's `tui_gateway` JSON-RPC over `/api/ws` (`tui_gateway/ws.py`), mapped
   onto `hermes_runtime`. Shapes follow `apps/shared/src/gateway-contract.openrpc.json`.
 - `src/rest.rs`: the REST routes under `/api` the frontend needs at startup.
 - `src/transcript.rs`: our messages as Hermes's transcript and stream events.

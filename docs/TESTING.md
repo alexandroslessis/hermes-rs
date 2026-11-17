@@ -11,8 +11,8 @@ or as an absolute path). The user's own build locks `target/debug`.
 ## 1. Unit tests (in the module)
 
 - A `#[cfg(test)] mod tests { use super::*; … }` at the bottom of the module you changed.
-- Test the plain functions the gateway calls (that's why logic lives outside `gateway.rs`): give
-  them a `tempfile::tempdir()` as the data folder or the working folder, call them, assert on the
+- Test the plain functions the gateway calls (that's why logic lives outside `gateway/`): give
+  them a `hermes_testdir::tempdir()` (section 5) as the data folder or the working folder, call them, assert on the
   returned `Value` / file contents.
 - Name tests as sentences describing behaviour: `a_disabled_toolset_is_not_offered`,
   `branching_keeps_tool_calls`, `credential_files_are_refused`.
@@ -192,6 +192,19 @@ Read the existing tests near the area you change before writing a new one; the h
   durations, and compare per test. Run the "before" twice: the tests whose order differs between two identical runs
   are the noise floor (concurrent tool calls, background reviews). CP13e's patch and comparer are described in
   `docs/backend/progress/phase-13.md`.
+- The typed gateway dispatch (Phase 13 CP13f): `crates/desktop/src/gateway/rpc.rs` tests (every served name parses
+  from any shape of params, a name that is not exactly served is `MethodNotFound` with the old text and no `data`, the `SERVED`
+  list is the enum, the page's payloads land in the typed fields, a wrong-typed field reads as absent, errors keep codes,
+  texts and `data`) and `gateway/rpc_table_tests.rs`: every method over a spread of params that need no session
+  (absent, `{}`, a string, a number, a number / string / null in every field, plus payloads shaped like the page's), the
+  code and text of every error and the shape of every success, compared with `tests/fixtures/rpc_table.txt` (900 lines,
+  recorded on the code **before** CP13f); a second test sends the unserved names through `Gateway::call`. After changing
+  a handler's answer on purpose: `HERMES_RPC_TABLE_BLESS=1 cargo test -p hermes-desktop --lib rpc_table` and read the
+  fixture's diff. Live: `scripts/perf/rpc-dispatch-check.mjs` (all 80 methods over the socket). **Golden comparison**
+  for a change to the dispatch itself (method in `docs/backend/progress/phase-13.md`, CP13f): a throw-away per-method
+  gateway test over ~25 params per method (2,181 answers, sessions included), and a throw-away line in `handle` logging
+  every request and reply frame to a file named by an env var while the live checks run; normalise ids, times, temp names
+  and compare before and after. The table test above is the part that stayed.
 - ACP tests must not count on a background job being late: `/retry` and `/undo` are learning signals, so under
   `balanced` a review may follow the turn (the desktop app ignores the test config's `background_review: false`),
   with the turn's tools and system prompt; filter its requests out (its last message is the review prompt). A test

@@ -1,5 +1,42 @@
 # Phase 13 progress
 
+## Phase 13 summary (done 2026-11-17, branch `backend/p13-perf`)
+Six plumbing checkpoints, each reviewed and committed on its own, with no behaviour change by design (protocol shapes,
+event order, RPC codes, ACP and the `sessions.db` schema unchanged; `turns` 258 passed / 7 ignored under default,
+`requests` and `tokens` after every one):
+- **CP13a** (20f3724): conversations are `Vec<Arc<Message>>`; snapshots share messages, edits go through `make_mut`.
+- **CP13b** (74ac1f7): one writer thread owns `sessions.db`'s write connection; turn writes are queued, reads wait for
+  the writes sent before them, a finished turn is flushed before `TurnFinished`.
+- **CP13c** (8e3d12d): no store, file, git or process work left on an async worker (`Gateway::blocking`,
+  `rest_blocking`, `off_worker_unless_stopped`).
+- **CP13d** (acad3ca): one actor thread per session owns its control state (run slot, review slot, queue, live turns,
+  pending route, effort, revisions, held images).
+- **CP13e** (a110767): Goose's `StateMachine` replaced by `AgentLoop` in `crates/runtime/src/agent_loop.rs`.
+- **Test-temp leak fix** (fce5fec): `hermes_testdir` for every test folder (the runs had filled 300 GB of `%TEMP%`).
+- **CP13f** (the `backend p13 cp13f` commit): `gateway.rs` split into `gateway/` by area, dispatch over a typed
+  `Request` enum with lenient params and a typed `RpcError`; answers proven unchanged by golden records.
+
+**User checklist** (one sanity pass covering all six; nothing should look different):
+1. Rebuild and start your app (`cargo build -p hermes-desktop`, your usual run). The sidebar lists your sessions and
+   the project tree; open an existing long session: the same history as before.
+2. Send "list the files here": the reply streams, the tool card shows, the title and the status bar's tokens appear.
+3. Ask for something slow (a slow command) and, while it runs, send two more messages: they appear as queue cards;
+   delete one, edit the other (the edit goes last); use Steer with a short note: the note runs first when the turn ends.
+4. Start another long request and press Stop: it stops at once and the tool card keeps the output it had. Stop with
+   nothing running does nothing.
+5. While a reply streams, click another session and back: the history is the same as on screen. When it ends, close
+   the app at once and start it again: the whole exchange is there.
+6. Edit an earlier message and resend (rewind): it continues from there. Run `/compress` on a long session, then send a
+   message: the summary notice shows and the reply works. `/usage`, `/status`, `/context`, `/save json` and `/rollback`
+   answer as before.
+7. Pick another model while a reply streams: it is used from the next message. Change the effort, switch sessions and
+   back: the pick is kept. Settings: switch auto-archive and the budget profile: both are kept after a restart.
+8. Move a session to another folder with the composer's folder picker: it works; while a turn runs it says the session
+   is busy. Rename, archive and unarchive a session, delete another: each applies at once.
+9. Ask the agent to remember something, to save a skill and to delegate a small task: memory and skill are saved, the
+   subagent row runs and its summary comes back.
+10. Negative: voice, pet and wake features stay hidden; nothing new appears.
+
 ## CP13a — `Arc<Message>` conversations
 Worktree: C:\Users\alexandros\repos\hermes-rs-p13   Branch: backend/p13-perf   Model: Sonnet 5.5 (subagent)
 Cut from `main` at e16fbe2 (Phases 0-12 merged). Reviewed (Opus) and committed on the branch. Phase 13 is not done (13b-13f remain).
@@ -1293,3 +1330,374 @@ false`), `rollback-check.mjs` (restored, file gone); as their own provider: `que
 `fallback-check` all passed, instance restarted, then `side-and-branch-check`, `review-check`, `staging-check`,
 `coding-commands-check` all passed; no panic / "turn crashed" / "The request stopped" / "not fully saved" line in the
 restarted instance's logs. No perf or timing check (the user's rule). Phase 13 not done (13f follows).
+
+## CP13f — typed gateway dispatch
+Worktree: C:\Users\alexandros\repos\hermes-rs-p13   Branch: backend/p13-perf   Model: Sonnet 5.5 (subagent)
+On top of a110767 (CP13a-e committed). Not committed, not reviewed. Phase 13 not done (the reviewer closes it).
+
+Done: `Request` / `RpcError` / `Reply` (`gateway/rpc.rs`), `dispatch` as one `match` over the typed request, `gateway.rs` split into
+`gateway/{mod,rpc,sessions,turn,slash,settings,projects,attachments,delegation,usage,rest}.rs` (+ `tests.rs`,
+`rpc_table_tests.rs`), the table fixture, `rpc-dispatch-check.mjs`, the docs. **No behaviour change**: the answers of every
+served method over ~25 params each (2,181 answers) are identical before, after the typed dispatch and after the split, and
+802 live request / reply pairs are identical but for a measured tokens-per-second figure. Not committed.
+
+### Inventory (before CP13f, `gateway.rs` at a110767)
+
+How the old `dispatch(method, params, outbox)` read `params`: a loose `serde_json::Value`, `params` = `Null` when the
+frame had none. Every read is `params["f"]` (a missing field, a non-object `params` and `null` all give `Null`),
+then `.as_str()` / `.as_u64()` / `.as_i64()` / `.as_bool()` / `== true` / `.clone()`. A field of the wrong type reads as
+absent (a number is never turned into a string, `"7"` is not 7, `1.5` is not an integer, `1` is not `true`), so **no
+shape of `params` made a served method answer an error by itself**; the only errors are the ones each handler raises
+on purpose (below). `dispatch` loaded `Settings` before the `match`, for every method (also an unknown one).
+
+Errors: the three codes (`-32601` `Method not found: <name>`, `-32602`, `-32000`), as `(i64, String)`. `handle` added
+`data: {"reason": "session_busy"}` when the message was exactly `session busy` (any code), logged a -32601 under
+`hermes_desktop::missing` and every other error as a warning. `Gateway::call` (ACP) returned the tuple unchanged.
+
+| Method(s) | Params as read | Errors it raises | New file |
+|---|---|---|---|
+| `gateway.ping`, `client.capabilities`, `onboarding.state`, `projects.discover_repos`, `projects.record_repos`, `session.close`, `pet.info`, `shared_metrics.status`, `free_tier.status`, `wake.status` | none | none | `mod.rs` / `settings.rs` |
+| `setup.status`, `setup.runtime_check`, `profiles.list` | none (Settings) | none | `settings.rs` |
+| `projects.tree`, `projects.project_sessions` | `preview_limit` (`as_u64`, default 3), `project_id` (`as_str`) | none | `projects.rs` |
+| `projects.list` | none | none | `projects.rs` |
+| `projects.create` | `name` (str, default "Project", trimmed), `folders` (array of str, non-strings skipped), `primary_path` (str, non-empty), `use` (`== true`) | -32000 store failure | `projects.rs` |
+| `projects.update`, `projects.add_folder` | `id` (str, default ""), `name` (str, non-blank), `path` (str, non-empty), `is_primary` (`== true`) | -32000 `No project <id>`, store failure | `projects.rs` |
+| `projects.delete` | `id` (str, default "") | -32000 store failure | `projects.rs` |
+| `projects.set_active` | `id` (any value, kept as sent) | none | `projects.rs` |
+| `session.active_list` | none | none | `sessions.rs` |
+| `model.options` | `session_id` (str) | none | `settings.rs` |
+| `requests.status` | `provider` (str) | -32602 `No provider is configured` | `usage.rs` |
+| `staging.list` | none | none | `usage.rs` |
+| `staging.apply`, `staging.reject` | `id` (str) | -32602 `id is required`; -32000 the failure's message | `usage.rs` |
+| `config.get` | `key` (str) | none | `settings.rs` |
+| `config.set` | `key` (`== "model"` picks the model path, else str, default ""), `value` (any), `session_id` (str); the model path reads the whole params | -32602 `key is required`, a bad `budget.*` value (the validator's text), `a model is required`; -32000 `No provider is configured`, `Unknown provider <id>`, store failures | `settings.rs` |
+| `commands.catalog` | none | none | `slash.rs` |
+| `complete.slash` | `text` (str) | none | `slash.rs` |
+| `complete.path` | `word` (str), `cwd` (str, non-empty), `session_id` (str) | none | `slash.rs` |
+| `slash.exec` | `command` (str; a command starting `goal` after the slashes answers an empty exec first), whole params for the session | -32000 `not a quick/plugin/bundle/skill command`; the builtins' and coding commands' own (-32602 `session_id is required`, `/init needs a session with a folder`, -32000 store text) | `slash.rs` |
+| `command.dispatch` | `name`, `arg` (str, default ""), whole params | -32000 `not a quick/plugin/bundle/skill command`, the coding command's | `slash.rs` |
+| `session.status` | `session_id` | -32602 `session_id is required`; -32000 `Session <id> not found` | `sessions.rs` |
+| `session.title` | `session_id`, `title` (str; none = read only) | -32602 `session_id is required`, `No session <id>.`; -32000 store | `sessions.rs` |
+| `session.mutate` | `session_id`, `operation` (str), `payload` (object read by field) | -32602 `session_id is required`, `target_message_id is required`, `cwd is required`, `No such folder: <f>`; -32000 `session busy` (+data), the move/store text | `sessions.rs` |
+| `session.rewind` | `session_id`, `replay_only` (`== true`), `target_message_id` (`as_u64`; absent = "nothing") | -32602 `session_id is required`; -32000 `session busy` (+data) | `sessions.rs` |
+| `rollback.list`, `.diff`, `.restore` | `session_id`, `hash` (str, trimmed lowercase), `file_path` (str), `all` (`== true`) | -32602 `session_id is required`; -32000 `No checkpoint <h>; /rollback lists them.`, checkpoints off, `session busy` (+data) | `sessions.rs` |
+| `session.export` | `session_id`, `format` (str, default json), `redact` (`== true`) | -32602 `session_id is required`, `format is json, md or html`; -32000 `Session <id> not found` | `sessions.rs` |
+| `session.foreign.list` | `source` (str), `offset` (`as_u64`, default 0) | none | `sessions.rs` |
+| `session.foreign.preview`, `.import` | `id` (str, default "") | -32602 the importer's text; -32000 `No provider is configured`... | `sessions.rs` |
+| `session.branch`, `.branch_whole`, `.branch_stored` | `parent_session_id` or `session_id` (non-empty str), `idempotency_key`, `through_message_id`, `count`, `cwd`, `name`; whole params | -32602 `session_id is required`, `No session <id>.`, the folder text; -32000 store | `sessions.rs` |
+| `prompt.btw`, `prompt.background` | `session_id`, `text` (str, trimmed) | -32602 `session_id is required`, `text required`; -32000 `Session <id> not found`, `No provider is configured`, the runtime's | `turn.rs` |
+| `file.attach` | `session_id`, whole params (`path`, `name`, `staged_upload`, `data_url`, `content_base64`) | -32602 `session_id is required`, `No session <id>.`, the importer text | `attachments.rs` |
+| `image.attach` | `session_id`, `path` (str, trimmed) | -32602 `image not found: <p>`, `unsupported image: <p>`; -32000 actor | `attachments.rs` |
+| `image.attach_bytes` | `session_id`, whole params | -32602 the upload's detail | `attachments.rs` |
+| `image.detach` | `session_id`, `path` (str, trimmed) | -32602 `session_id is required` | `attachments.rs` |
+| `insights.get` | `days` (`as_i64`, > 0, default 30) | none | `usage.rs` |
+| `session.compress` | `session_id`, `focus_topic` (str, trimmed, non-empty) | -32602 `session_id is required`; -32000 not found, no provider, the compressor's | `sessions.rs` |
+| `session.delete` | `session_id` | -32602 `session_id is required`; -32000 the runtime's | `sessions.rs` |
+| `session.create` | `provider`, `model`, `cwd`, `title`, `messages`, `parent_session_id`; whole params | -32000 `No provider is configured`, `Unknown provider <id>`, `No model is chosen`, store | `sessions.rs` |
+| `session.resume`, `session.history` | `session_id` | -32602 `session_id is required`; -32000 `Session not found: <id>` | `sessions.rs` |
+| `prompt.submit` | `session_id`, `text` (a string, else the value's JSON text), `submission_id` / `input_id`, `attachments`, `confirm_truncate`, `truncate_before_*`, ...; whole params | -32602 `session_id is required`, `Unknown session <id>`, the attachments' text; -32000 `session busy` (+data), no provider, the runtime's | `turn.rs` |
+| `approval.respond`, `clarify.respond` | `prompt_id` or `request_id` (str), `choice` / `answer` (str, default "") | -32602 `prompt_id is required`; -32000 `No pending approval|clarify request` | `turn.rs` |
+| `approval.pending` | `session_id` | -32602 `session_id is required` | `turn.rs` |
+| `session.context_breakdown` | `session_id` | -32602 `session_id is required`; -32000 `Session not found: <id>` | `sessions.rs` |
+| `process.list`, `process.stop` | `session_id` | -32602 `session_id is required` | `delegation.rs` |
+| `process.kill` | `session_id`, `process_id` (str, default "") | -32602 `session_id is required` | `delegation.rs` |
+| `subagent.list` | `session_id` | -32602 `session_id is required` | `delegation.rs` |
+| `subagent.tail`, `.interrupt` | `session_id`, `subagent_id` (str, default "") | -32602 `session_id is required` | `delegation.rs` |
+| `subagent.steer` | `session_id`, `subagent_id`, `text` (str, trimmed) | -32602 `session_id is required`, `text is required` | `delegation.rs` |
+| `delegation.status` | none | none | `delegation.rs` |
+| `delegation.pause` | `paused` (`as_bool`, default **true**) | none | `delegation.rs` |
+| `session.steer` | `session_id`, `text` (str, as sent) | -32602 `session_id is required` | `turn.rs` |
+| `prompt.cancel` | `session_id`, `admission_id` (str, default "") | -32602 `session_id is required` | `turn.rs` |
+| `prompt.steer_queued` | `session_id`, `admission_id` | -32602 `session_id is required`; -32000 `session_idle`, `admission_started` | `turn.rs` |
+| `prompt.replace_queued` | `session_id`, `admission_id`, `text`, `submission_id` (any value, as sent) | -32602 `session_id is required`; -32000 `admission_started` | `turn.rs` |
+| `session.redirect` | `session_id`, `text` (str, as sent) | -32602 `session_id is required` | `turn.rs` |
+| `session.interrupt` | `session_id` | -32602 `session_id is required` | `turn.rs` |
+| anything else | - | -32601 `Method not found: <name as sent>` | `rpc.rs` |
+
+`rpc_table_tests.rs` and the table fixture cover the rest of the 80 (below); the live checks cover 36 of them.
+
+### Design
+
+**`Request`** (`gateway/rpc.rs`): `#[derive(Deserialize)] #[serde(tag = "method", content = "params")] enum Request`, one
+variant per served method (80), `#[serde(rename = "a.b")]`, the payload `P<T>` where `T` is the method's params type
+(`SessionRef`, `ProjectsCreate`, `ConfigSet`, `QueueRef`, ... 28 small structs, `Nothing` for methods without params, `Raw`
+for those that hand the whole value on). `Request::parse(method, &params)` builds `{"method": m, "params": p}` and
+`serde_json::from_value`s it; **any** failure is `RpcError::MethodNotFound(method)`, which is exactly the old `_` arm
+(`Method not found: <name as sent>`, -32601, no `data`). No `#[serde(other)]`: the name is already in hand, and a name
+with other case, spaces, a trailing NUL or an empty string simply is not a variant.
+
+**How the leniency was kept.** Every old read is `params["f"]` then `as_str()` / `as_u64()` / `as_i64()` / `as_bool()` /
+`== true` / `.clone()`: never an error for the shape of the JSON. serde's struct deserializer would break that three ways
+(`null` params fail, an array is read positionally, a wrong type is an error), and a failed parse would look like -32601.
+So `P<T>` implements `Deserialize` by reading a `Value` first and calling `T::from_params(&value)`, the old reads moved
+into one place per method (`FromParams`), which cannot fail. What a handler required it still checks, in the same order:
+`SessionRef::id()` is `session_id(params)?` ("session_id is required", -32602), the empty-text, empty-id, unknown-folder
+errors are raised where they were. Defaults are the old ones (`preview_limit` 3, `days` 30, `paused` **true** unless a JSON
+boolean, `offset` 0, the project `name` "Project"). The 15 methods whose handlers pass the params to a long function
+(`session.create`, `.resume`, `.history`, `prompt.submit`, `session.mutate`, `.rewind`, `.compress`, `.export`,
+`session.branch*`, `rollback.*`, `file.attach`) carry `Raw` (the old function reads 10-30 fields, and `enqueue_as` writes into the
+value): typing them would be its own change.
+
+**`RpcError`**: `MethodNotFound(name)`, `InvalidParams(text)`, `Server(text)`, `Busy`; `code()`, `message()`, `data()`
+(`{"reason": "session_busy"}` for `Busy` only), `to_json()` (the `error` object, built as before: `code`, `message`, then
+`data`), `into_parts()`. `RpcError::server("session busy")` **is** `Busy`, because the old `handle` attached the `data` to any
+error whose message was exactly `session busy` (`rollback` and `rewind_turn` wrote it as a plain string). Constructors
+`invalid` / `server` / `failed` (an `anyhow` chain, `{e:#}`). 65 tuple literals `(INVALID_PARAMS|SERVER_ERROR, text)` were
+rewritten by a script that matches parentheses (not by hand), every `(i64, String)` became `RpcError`. `Reply = Result<Value,
+RpcError>` is what handlers return; `Gateway::call` (ACP) still returns `Result<Value, (i64, String)>` (`RpcResult`, the type
+the old tests and `acp/server.rs` use), converted with `into_parts` at the boundary: ACP and its tests are untouched.
+
+**`dispatch`** is `Settings::load` (before parsing, as before, for every name) then `match Request::parse(..)? { Request::X(P(p))
+=> self.handler(p).. }`, 80 arms of one line (a few of two or three). The arms that were inline bodies became handlers
+(`projects.rs`, `settings.rs`, `usage.rs`, `delegation.rs`, `attachments.rs`, `slash.rs`, `sessions.rs`, `turn.rs`), same
+statements in the same order, `self.blocking(..)` where it was. `blocking` / `rest_blocking` answer a failed thread as
+`RpcError::server("The request stopped: ...")` (CP13c) and are in `mod.rs` / `rest.rs`. `handle`: the missing-method log
+fires for `MethodNotFound`, the warning for the rest, the reply is built with `error.to_json()`; the admission release after
+`prompt.submit` and the tracing lines are unchanged.
+
+### The file split (pure moves, done last)
+
+| File | Lines | What moved in (existing functions, verbatim apart from `pub(super)`) |
+|---|---|---|
+| `mod.rs` | 474 | `Gateway`, `new`, `new_for_acp`, `build`, `schedule`, `install_review_route`, `connection`, `handle`, `release_admission`, `call`, `blocking`, `dispatch`, the free `admission_id`, `session_id`, `send`; the layout table |
+| `rpc.rs` | 1,065 | new: `Request`, params types, `RpcError`, `Reply`, tests (815 lines of types and the enum, 250 of tests) |
+| `sessions.rs` | 1,101 | `active_sessions`, `context_breakdown`, `mutate`, `rewind_turn`, `rollback`, `window_for`, `status_text`, `context_text`, `compress_session`, `export_session`, `set_archived`, `rename`, `revision`, `bump_revision`, `pick_effort`, `session_info`, `branch`, `create_session`, `resume_session`, `viewing`, `auto_archive`, `pending_route`, `apply_pending_route` (+ the handlers for status, title, delete, foreign, branch, create, resume) |
+| `turn.rs` | 920 | `turn_options`, `pending_rows`, `enqueue*`, `dequeue`, `subscribe`, `submit`, `run_queued`, `has_queued`, `set_live`, `end_live*`, `title_session`, `is_live`, `emit` (+ the handlers for submit, btw, background, respond, pending, steer, the queue, redirect, interrupt) |
+| `slash.rs` | 387 | `review_task`, `coding_command`, `builtin_command` (+ catalog, complete.slash, complete.path, slash.exec, command.dispatch) |
+| `settings.rs` | 588 | `apply_settings`, `apply_approvals_mode`, `model_options`, `switch_model`, `route_session`, `known_context`, `context_length`, `model_facts`, `sends_images`, `provider_for`, `session_provider`, `import_route`, `ModelFacts`, `FALLBACK_CONTEXT`, `provider_limits` and its tests (+ setup, profiles, config.get / set, the "off" answers) |
+| `usage.rs` | 156 | `note_generation`, `usage_snapshot`, `requests_status` (+ requests.status, staging.*, insights.get) |
+| `rest.rs` | 794 | `data_dir`, `file_path`, `ticket_allows`, `rest_blocking`, `rest`, `session_route`, `stored_messages`, `session_row(s)`, `session_list` |
+| `projects.rs` | 137 | `project_list` (+ projects.*) |
+| `attachments.rs`, `delegation.rs` | 95, 113 | new handlers only |
+| `tests.rs`, `rpc_table_tests.rs` | 253, 365 | the old `budget_tests` (bodies unchanged), the new table test |
+
+`git diff --stat -M` cannot call this a rename (ten files out of one), so the proof is a script: every non-blank line of
+the pre-split `gateway.rs` (4,278 distinct-position lines, trimmed, `pub(super)` ignored) appears in the new files exactly
+as often, and the only lines in the new files that were not in it are the `impl Gateway {` / `}` wrappers, the `use` lines,
+`mod` declarations, the layout doc and the two test-module wrappers (`mod budget_tests {` -> a file); the dropped lines are
+`use hermes_agent::events::AgentEvent;` (no longer used there). `git diff --color-moved=dimmed-zebra` shows the same.
+Visibility edits: `ModelFacts` (and its two fields) and `FALLBACK_CONTEXT` are `pub(super)` (the struct field of `Gateway`
+and two other files use them), every moved method is `pub(super)`.
+
+### Tests (final tree, CARGO_TARGET_DIR=target/claude)
+Run on the final tree (on top of fce5fec, hermes_testdir in the new tests; `clean-test-temp.ps1 -Delete` afterwards, no
+"could not remove" line): `cargo build --workspace` OK, no warning; `hermes-desktop` lib **191** (183 + 6 `rpc.rs` + 2 table tests;
+the old tests unchanged) and acp **68, three runs in a row**; `turns` 258 passed / 7 ignored under default, `requests` and
+`tokens` (turns.rs untouched; run before fce5fec, which only touched test folders); `hermes_runtime --lib` 265; agent 45, llm
+489+5, store 34, tools 337, memory 101, prompts 37 (all ok).
+
+
+### Golden comparison (old vs new, byte for byte)
+
+**1. Per-method gateway test** (a throw-away module, copy in the scratchpad `golden_tmp.rs`): for each of the 80 served
+names and 11 unserved ones, a fresh data folder (config.json with a mock provider on a closed port, a working folder with a
+text file and a PNG, one session and one project created first), then ~21 generic params (absent, `{}`, `[]`, `["a","b"]`,
+`"x"`, `7`, `true`, `{"session_id":5}`, `{"session_id":""}`, an unknown id, the real session id, with extra fields, nulls,
+and an object with all 60 field names set to `5` / `"5"` / `null` / `true` / `[]` / `{}` / `-1` / `1.5`) plus 0-18 payloads
+shaped like the page's (from the live checks), 2,181 answers in all, every one the code and text of the error or the
+whole JSON of the success, normalised for ids, long numbers, temp and home folders, task ids and image names. Run at
+a110767 **twice** (noise floor: identical, 0 differing lines after normalising two random task ids and two image names),
+after the typed dispatch with the handlers still in one place (stage 1) and after the file split (stage 3): **0 differing
+lines in 2,181, both times.** Includes: every error text and code in the inventory, `session busy` + the lenient reads, the
+-32601 names (`Gateway.Ping`, `gateway.ping `, empty, ...), `projects.create` with wrong-typed folders, `delegation.pause`
+with `"false"`, `insights.get` with 0 / -3 / 1.5 / `"7"`, `session.branch` idempotency, `session.mutate` operations, `file.attach`
+and `image.*` over paths and base64, the slash commands and coding commands, `prompt.submit` over a real session (queued
+while a turn runs), `session.delete`.
+
+**2. Live traffic** (every request and reply frame written to a file by a throw-away line in `handle`, HEAD's exe and the
+new exe each built with it, removed afterwards: the exes are in `target/claude/head` and `target/claude/after`, the
+sources are clean): the fifteen live checks, then `rpc-dispatch-check.mjs`, on a fresh `target/perf/home` each. Compared per method as a multiset of (params, reply) after normalising ids (session, project, admission, task, uuid),
+long numbers, ISO times, temp and checkpoint names (`trace_diff.cjs`, scratchpad). **802 request / reply pairs** (159 from the
+fifteen checks, 643 from `rpc-dispatch-check.mjs`; the new exe was run twice, the second time with the folders named as at
+HEAD): **801 identical; one `session.resume` reply differs only in `info.avg_tps` (80.x against 81.x), the status bar's
+measured generation speed, which comes from the mock's timing**. No error code, message or `data` differs; the busy
+refusals (`session busy` + `data.reason`), the workspace "No such folder" error and the approval / clarify answers are among
+the identical ones. Per-method counts: `scratchpad/traces/*.jsonl` (not kept in the repo).
+
+**3. The table fixture** `tests/fixtures/rpc_table.txt` (900 lines) was recorded at a110767 (the HEAD gateway plus the
+test module, blessed, run again unchanged to prove it stable) and passes unchanged on the new code.
+
+### Methods not covered by a live check
+Of the 80 served methods the fifteen requested live checks call **36**. The other **44**: `client.capabilities`,
+`commands.catalog`, `complete.path`, `complete.slash`, `delegation.pause`, `delegation.status`, `free_tier.status`,
+`gateway.ping`, `image.attach`, `model.options`, `onboarding.state`, `pet.info`, `process.kill`, `process.list`,
+`process.stop`, `profiles.list`, `projects.add_folder`, `projects.create`, `projects.delete`, `projects.discover_repos`,
+`projects.list`, `projects.project_sessions`, `projects.record_repos`, `projects.set_active`, `projects.update`,
+`requests.status`, `session.active_list`, `session.close`, `session.context_breakdown`, `session.delete`,
+`session.foreign.import`, `session.foreign.list`, `session.foreign.preview`, `session.history`, `setup.runtime_check`,
+`setup.status`, `shared_metrics.status`, `staging.apply`, `staging.reject`, `subagent.interrupt`, `subagent.list`,
+`subagent.steer`, `subagent.tail`, `wake.status`. Where each is covered instead: **all 80** by the new
+`rpc-dispatch-check.mjs` (live, over the socket: no -32601, shapes, the errors) and by the table test + golden record (every
+method over ~25 params); some also by existing checks outside the requested list (`subagents-check.mjs`: `subagent.*`,
+`delegation.status`; `import-check.mjs`: `session.foreign.*`; `requests-check.mjs`, `fallback-check.mjs`:
+`requests.status`; `endpoints-check.mjs`: `model.options`; `deferred-tools-check.mjs`: `session.context_breakdown`;
+`budget-check.mjs`: `delegation.status`) that were not re-run.
+
+### Live checks (own instance, port 47810, fresh `target/perf/home`, main checkout's `tools/node/node.exe` run in place,
+working folders in `%TEMP%\p13f`, `mock_llm.py` started and stopped by its PID)
+All passed on the HEAD exe (a110767 + the throw-away trace line) and on the new exe (twice): `smoke`, `stop-check` (both cases:
+a stalled reply and a slow command, interrupted, `running: false`), `rollback-check` (restored, file gone) with
+`mock_llm.py` started and stopped by its PID; `queue-check`, `side-and-branch`, `archive`, `workspace`, `staging`,
+`memory`, `toolsets`, `attach`, `review`, `coding-commands`, `provider-error`, `preinject` as their own provider; and the
+new `rpc-dispatch`. Each ran on a freshly started instance with a deleted `target/perf/home` (so `attach` was a fresh
+instance too). The exes: `target/claude/head`, `target/claude/after` (they carry the trace line; the sources do not). No
+timing check; `stop-check`'s "complete=" milliseconds vary (14 ms to 244 ms) as on any run, it asserts only that the turn
+ends and stays ended. `perf.ps1 -Do start` was not used (its timing step needs `tools/node`, which a worktree lacks): the
+runner starts the exe with perf.ps1's environment (`HERMES_RS_HOME`, port 47810, WebView2 folder, `RUST_LOG`).
+
+### Deviations from the plan
+- **15 of 80 methods carry `Raw`** (and 6 more keep the raw value beside typed fields) (the whole params) instead of a typed struct, as the task allowed ("fall back to the raw
+  Value for that method"): their handlers are long functions that read many fields themselves; typing them would touch
+  `submit` (460 lines), `branch`, `create_session`, `mutate`, with no way to keep "no behaviour change" cheap. The other 65 are
+  typed, including every method with a read the golden record could show a difference in.
+- `Request::parse` clones the params once (`from_value` wants an owned value); the handlers cloned them anyway.
+- The module for slash commands is `slash.rs`, not `commands.rs` (`crate::commands` is the logic module `gateway` imports).
+- The full per-method golden is not committed (about 1 MB and four minutes); the compact table (900 lines, 85 KB, ~27 s) is.
+- Added `scripts/perf/rpc-dispatch-check.mjs` (the live check of every method) and changed `scripts/contract.mjs` to read
+  `gateway/rpc.rs` (it grepped `"name"` in `gateway.rs`).
+- `git diff -M` shows no renames (one file became ten); see "The file split" for the proof.
+- Not done: the optional `mimalloc` line (measure first; the user's rule forbids it for now), the `PHASES.md` closing.
+
+### For the reviewer
+1. **Params, method by method**: read `rpc.rs` `FromParams` impls against the inventory table above (each read is the old one;
+   defaults; which fields are trimmed; `delegation.pause` default true; `projects.create` `use == true`; `insights.get`).
+2. **-32601**: `Request::parse` is the only place a name is refused; `a_name_that_is_not_exactly_served...` and the table's 12
+   unserved names x 8 params, `rpc-dispatch-check.mjs`. No `#[serde(other)]`.
+3. **Errors**: `to_json` builds the same object as the old `handle` (`code`, `message`, `data` only for `Busy`); `Busy` from any
+   `"session busy"` message. ACP: `Gateway::call` returns `(code, message)` as before; its tests ran 3 times.
+4. **CP13c / CP13d rules**: `git diff --color-moved` of the handlers against the old arms; `self.blocking(..)` /
+   `spawn_blocking` calls are where they were (the arms that ran inline still run inline: `process.*`, `subagent.*`,
+   `session.steer`, the queue calls, `approval.*`); Stop, interrupt and redirect handlers are the old statements;
+   `Settings::load` still runs before parsing.
+5. **The split**: the line-accounting above (rerun it: `git show a110767:crates/desktop/src/gateway.rs` vs the files).
+6. `tests.rs` is `budget_tests` unchanged except `mod` -> file; `rpc_table_tests.rs` takes ~27 s (1,100 calls on one gateway).
+7. Docs: ARCHITECTURE (gateway section), CONVENTIONS, PITFALLS (new section), TESTING, PORTING (two rows), GAPS-PLAYBOOK,
+   `scripts/perf/README.md`, `scripts/contract.mjs`; a few stale `gateway.rs` mentions in `docs/acp/` fixed, the history
+   docs (`PLAN.md`, `GAPS.md`) left.
+
+### User checklist (no visible change is expected; this is a plumbing change)
+1. Rebuild and restart your app (`cargo build -p hermes-desktop`, your own `target/debug`), open it: the sidebar lists your
+   sessions and the project tree as before.
+2. Open a chat, send "say hi": the reply streams, the title appears, the status bar shows tokens.
+3. While a turn runs, type a second prompt: it queues (the queue panel); press Stop: the turn stops at once.
+4. Settings: change the model with the picker, switch Settings > Sessions auto-archive, set the budget profile: each is kept
+   after a restart.
+5. Move a session to another folder (composer folder picker): it works, and while a turn runs it says the session is busy.
+6. Negative: Voice / pet / "wake" features stay hidden (the backend still answers "not here" for them); nothing new appears.
+
+### Doubts
+1. **15 methods carry `Raw`**: typing them is the part of "typed dispatch" this change does not do; each is a long function
+   that mutates or forwards the value (`enqueue_as` writes into it and would panic on a non-object `params`: still true).
+   A reviewer who wants them typed should ask for it as a step of its own with a golden record, not fold it in here.
+2. **The golden and the trace instrumentation are not in the repo** (a 1 MB, four-minute test and a patch of 12 lines).
+   They are in the session's scratchpad (`golden_tmp.rs`, `trace_on.cjs`, `trace_diff.cjs`, `runchecks.ps1`); the table
+   fixture and `rpc-dispatch-check.mjs` are the lasting part. The compact table test takes ~27 s (1,100 calls on one
+   gateway, the slow ones are `session.create` and the commands that read the skills): trim the spread if that is too slow.
+3. `git diff -M` shows the old file as deleted and ten new ones; `git add -N` was run so they appear in `git diff`. Nothing
+   is committed.
+4. `scripts/contract.mjs` was edited but not run (`target/hermes-src` is a placeholder here); the change is two lines.
+5. Per-call cost: `Request::parse` builds one `json!` object (a clone of the params) and one `from_value`. Not measured
+   (the user's rule); the handlers cloned the params at least once already.
+6. `prompt.btw` is a plain `fn` that `tokio::spawn`s (it was async code before); it is only called from `dispatch`, inside the
+   runtime, like the old arm.
+7. `session_id(&Value)` (free function) and `SessionRef::id()` both say "session_id is required": the raw handlers use the
+   first, the typed ones the second; the tests pin the text.
+
+### Review (Opus, 2026-11-17)
+Reviewed the uncommitted tree on fce5fec with comparisons of my own (not the implementer's golden artifacts alone).
+
+**1. Method set.** Extracted every top-level arm of HEAD's `dispatch` (`git show HEAD:crates/desktop/src/gateway.rs`,
+a brace-matching script; the guarded `"config.set" if key == model` and `"slash.exec" if goal...` arms folded into their
+names) and compared with the `rename = "..."` list of `Request`: the same 80 names, none lost, none added. The other
+`match method` blocks in the old file were inside handlers (subagent tail / steer / interrupt) or REST (`rest`, moved
+verbatim). `Request::parse` is the only refusal; a name that is not exactly a variant (case, spaces, NUL, empty, a prefix,
+`rpc.discover`) is `MethodNotFound`, -32601 `Method not found: <name as sent>`, no `data`, logged under
+`hermes_desktop::missing` as before. The socket layer (`connection`, `handle`) is line-identical but for the error branch:
+non-JSON lines skipped, a frame without a string `method` (a batch array, a response, `method: 5`) gets no reply, `id`
+echoed as sent (string, number, null), absent `params` = `Null`, extra fields ignored. These are now checked live
+(`rpc-dispatch-check.mjs` section 0, added in review) and pass on HEAD's exe and on the new one. `scripts/contract.mjs`
+(not runnable here: no `target/hermes-src` export) was checked by running its old and new `served()` over Hermes's
+contract (`../hermes-agent/apps/shared/src/gateway-contract.openrpc.json`, read only): 256 of 257 methods agree; the one
+that moved, `session.usage`, was a false "answered" before (the old check matched any `"session.usage"` string literal in
+`gateway.rs`); 68 contract methods are answered.
+
+**2. Params.** Read every `FromParams` against the old arm (defaults, trims, `== true`, `as_u64` / `as_i64`, `paused`
+default true, `use`, `request_id` for `prompt_id`, `choice` vs `answer` by method) and the order of the checks in each
+handler (session id first, then text, then the rest): equal. Then a golden of my own: a throw-away `git worktree add` of
+fce5fec (`hermes-rs-p13-head`, removed afterwards) and the new tree each ran the same scratch test, 764 answers: nine odd
+params shapes on every method (arrays, `true`, `1.5`, ids that are arrays / objects / blanks, every field `true` or
+`[]`), then 100 calls on a real session and a real project (titles, mutate operations with wrong-typed payloads, rewind,
+rollback, export formats, branches, effort, model, images, `file.attach`, processes, subagents, the queue calls, steer,
+redirect, interrupt, ten slash commands, `command.dispatch`, completion, compress, projects update / add folder with
+`is_primary` 1 and "true", tree, delete, insights, delegation, the btw / bg refusals, `session.delete`), successes kept in
+full up to 600 characters, ids, temp names and times normalised: **0 differing lines in 764.** The table fixture
+re-recorded at HEAD (the table test adapted to HEAD's gateway, blessed, on the second path
+`C:\Users\alexandros\repos\hermes-rs-p13-head`) is **byte-identical** to the committed `rpc_table.txt` (900 lines): it
+really is the old gateway's, and it does not depend on the checkout's path. Which methods answer -32602, -32000 or
+success is unchanged throughout (no served method can fail to parse: `P<T>` reads a `Value` first).
+
+**3. Errors and ACP.** `to_json` builds `{code, message}` plus `data: {reason: "session_busy"}` for `Busy` only; every
+"session busy" text goes through `RpcError::server` (two `Busy`, two `server("session busy")`, one through `rollback`'s
+`error` closure) and so keeps the `data`; nothing builds an `RpcError` variant directly outside `rpc.rs`; no
+invalid-params text can be "session busy" (the old rule looked at the message for any code). The 65 rewritten literals:
+the multiset of old and new lines (script below) pairs each `(INVALID_PARAMS|SERVER_ERROR, text)` with an
+`RpcError::invalid|server|failed(text)` of the same text; `failed` is `{e:#}` as before. `Gateway::blocking` answers a
+failed thread `server("The request stopped: ...")` (same text); `rest_blocking` and the REST error paths answer
+`(500, {"detail": message})` as before (`error.message()` is the old string); `session.foreign.*` keep their own
+`e.to_string()` join errors. `Gateway::call` returns `(code, message)` through `into_parts`; `acp/server.rs` is unchanged.
+
+**4. The split.** My own check: every non-blank trimmed line of HEAD's `gateway.rs` against the new files (minus `rpc.rs`
+and the table test), as multisets, `pub(super)` ignored. Only in the old file: the dispatch arms, the `params[..]` reads
+now in `FromParams`, the tuple error literals and `tempfile::tempdir()` in the old test module (now `hermes_testdir`).
+Only in the new files: their typed counterparts, the handler signatures, `impl Gateway {` wrappers, `use` / `mod` lines
+and module docs. Nothing else moved or changed. No statics, `OnceLock`s or thread-locals in either; the two
+`#[cfg(test)]` modules are `settings.rs`'s provider-limit tests and `tests.rs`; `use super::*` in the area files resolves
+the same names; every `self.blocking(..)` / `spawn_blocking` is where it was, the arms that ran inline still do
+(`process.*`, `subagent.*`, `session.steer`, the queue calls, `approval.*`; `prompt.btw` is now a plain fn that
+`tokio::spawn`s inside the runtime, as the arm did); no std `Mutex` guard is held across an `.await` in a new handler;
+Stop, interrupt and redirect are the old statements. After these checks, `rustfmt` on `gateway/` (the old `gateway.rs`
+was rustfmt-clean, the moved and de-indented code was not); the table test ran green on the result.
+
+**5. `Raw`.** Kept: the 15 `Raw` methods (and the six with `raw` beside typed fields) hand the value to long functions
+(`submit`, `branch`, `create_session`, `mutate`, `rollback`, `export`, `switch_model`, `coding_command`, `builtin_command`,
+the image upload) that read 10-30 fields, and `enqueue_as` writes into it. Typing them now would re-implement those reads
+for little compile-time gain at a real parity risk; the enum already makes the dispatch exhaustive. A later step with its
+own golden (PHASES, Phase 13 "Done").
+
+**6. Test hygiene.** The table test uses `hermes_testdir`, a fixed config on a closed port, no clock in its lines (ids
+and long numbers normalised) and no port; it ran green twice on the new tree and blessed identically at HEAD on another
+path. One soft spot, left: the `complete.path` row with an unknown session falls back to the home folder and records only
+`{items}` (a machine with an empty home folder would print `{"items":[]}`).
+
+**Fixed in review:**
+- ACP `undo_n_drops_n_turns` failed once in the first full run (the last request still held "two" / "three"): the same
+  race as CP13d's `/retry` test, the background review that `/undo` (a learning signal) starts, whose 500-and-retry
+  request landed after the next turn's (the desktop app ignores `background_review: false`, GAPS section 4). A
+  `turn_requests` helper filters the review's requests out, used by both `/undo` tests and the `/retry` test. Not caused
+  by CP13f.
+- `rpc-dispatch-check.mjs`: the envelope section (ids, frames that get no reply, two frames in one message,
+  `params: null`).
+- `slash.rs`: `builtin_command`'s doc comment sat on top of `review_task` (as in the old file); moved back. `mod.rs`'s
+  doc named `commands.rs` for `slash.rs`.
+- Docs: stale single-file `gateway.rs` references in `docs/acp/PHASES.md`, `docs/acp/README.md`, `PITFALLS.md`,
+  `TESTING.md` (which also still said `tempfile::tempdir()`) and `GAPS.md`; `scripts/perf/README.md` (the envelope).
+
+**Tests (final tree, CARGO_TARGET_DIR=target/claude):** `hermes-desktop` lib 191 (twice) and acp 68 (three runs in a
+row after the `turn_requests` fix; the first full run before it: 67 + `undo_n_drops_n_turns`, then three green runs
+without the fix too, so it is a race, not a regression); `turns` 258 passed / 7 ignored under default, `requests` and
+`tokens` (first run on top of fce5fec); `hermes_runtime --lib` 265; agent 45, llm 489 + 1 + 4, memory 101, prompts 37,
+store 34, testdir 4, tools 337; `cargo build --workspace` OK, no warning (placeholder `target/hermes-src`, removed
+afterwards); `scripts/clean-test-temp.ps1 -Delete` afterwards.
+
+**Live checks** (own instance, port 47810, a fresh `target/perf/home` per check, the main checkout's
+`tools/node/node.exe` run in place, the exe started directly with perf.ps1's environment (no timing step), working
+folders in `%TEMP%\p13f-review` with a file in each, `mock_llm.py` started and stopped by its PID): all passed on the final exe, 20 checks: `smoke`, `stop-check` (a stalled
+reply and a slow command, both interrupted, `running: false`), `rollback-check` (restored, file gone), `endpoints`
+(with the mock), `rpc-dispatch` (with the new envelope section), `queue`, `side-and-branch`, `archive`, `workspace`,
+`staging`, `memory`, `toolsets`, `attach` (fresh instance), `review`, `coding-commands`, `provider-error`, `preinject`,
+`import` (a Hermes home built by `make-hermes-db.py` from `../hermes-agent`'s `hermes_state`, read only with
+`PYTHONDONTWRITEBYTECODE`, as `target/hermes-src` has no export here), `subagents`, `requests`. `rpc-dispatch-check.mjs`
+(87 checks, envelope included) also passed against HEAD's exe (fce5fec, built in the throw-away worktree): the check
+describes the old behaviour. Not run: `scripts/contract.mjs` (no `target/hermes-src` export; checked as in point 1).
+
+**Left:** the desktop app ignoring `background_review: false` (GAPS section 4, pre-existing); typing the `Raw` methods.

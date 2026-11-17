@@ -1,8 +1,8 @@
 // Looks up methods in Hermes's gateway contract (the JSON-RPC methods the page may call) and prints
-// their params and result schemas with every $ref resolved, plus whether gateway.rs answers them.
+// their params and result schemas with every $ref resolved, plus whether gateway/rpc.rs (the `Request` enum) answers them.
 //   tools/node/node.exe scripts/contract.mjs session.branch        one method
 //   tools/node/node.exe scripts/contract.mjs mcp.                  every method starting with "mcp."
-//   tools/node/node.exe scripts/contract.mjs --missing [prefix]     methods gateway.rs doesn't answer
+//   tools/node/node.exe scripts/contract.mjs --missing [prefix]     methods gateway/rpc.rs doesn't answer
 //   tools/node/node.exe scripts/contract.mjs --events [prefix]      notifications (event payloads)
 // Reads target/hermes-src (run scripts/build-hermes-webapp.ps1 first).
 import fs from 'node:fs'
@@ -11,8 +11,8 @@ import { fileURLToPath } from 'node:url'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const contract = JSON.parse(fs.readFileSync(path.join(root, 'target/hermes-src/apps/shared/src/gateway-contract.openrpc.json'), 'utf8'))
-const gateway = fs.readFileSync(path.join(root, 'crates/desktop/src/gateway.rs'), 'utf8')
-const served = name => gateway.includes(`"${name}"`)
+const gateway = fs.readFileSync(path.join(root, 'crates/desktop/src/gateway/rpc.rs'), 'utf8')
+const served = name => gateway.includes(`rename = "${name}"`)
 
 const schemas = contract.components?.schemas ?? {}
 const resolve = (node, depth = 0) => {
@@ -36,7 +36,7 @@ if (args[0] === '--missing') {
   const found = contract.methods.filter(m => m.name === args[0] || (args[0].endsWith('.') && m.name.startsWith(args[0])))
   if (!found.length) { console.log('no such method'); process.exit(1) }
   for (const m of found) {
-    console.log(`## ${m.name}  (${served(m.name) ? 'answered by gateway.rs' : 'NOT answered'})\n${m.summary ?? ''}`)
+    console.log(`## ${m.name}  (${served(m.name) ? 'answered by gateway/rpc.rs' : 'NOT answered'})\n${m.summary ?? ''}`)
     console.log('params:', JSON.stringify(resolve(m.params?.[0]?.schema), null, 1))
     console.log('result:', JSON.stringify(resolve(m.result?.schema), null, 1), '\n')
   }

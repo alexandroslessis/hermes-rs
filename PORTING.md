@@ -58,7 +58,8 @@ A row marked `diverged` is backend behaviour we deliberately changed (AGENTS.md 
 |---|---|
 | **Desktop backend** (`crates/desktop`) | |
 | `server.rs` | `hermes_cli/web_server_dashboard.py` (page globals, token), `tui_gateway/ws.py` |
-| `gateway.rs` | `tui_gateway/server.py`, `methods_prompt.py`, `methods_session.py`, `ws.py`; `agent/context_breakdown.py`; the page's side: `apps/desktop/src/api/canonical-protocol.ts`, `apps/shared/src/gateway-contract.openrpc.json` |
+| `gateway/` (`mod.rs`, `sessions.rs`, `turn.rs`, `slash.rs`, `settings.rs`, `projects.rs`, `attachments.rs`, `delegation.rs`, `usage.rs`, `rest.rs`; the REST half is `rest.rs`) | `tui_gateway/server.py`, `methods_prompt.py`, `methods_session.py`, `ws.py`; `agent/context_breakdown.py`; the page's side: `apps/desktop/src/api/canonical-protocol.ts`, `apps/shared/src/gateway-contract.openrpc.json` |
+| `gateway/rpc.rs` | Rust plumbing, ours (Phase 13 CP13f): the typed `Request` (one variant per method this backend serves) and `RpcError`; the method names, params and error texts are the ones `gateway.rs` always answered (the page's side: `apps/desktop/src/api/canonical-protocol.ts`), params read as leniently as before; a method not here is -32601 |
 | `hub.rs` | event fan-out: `apps/desktop/src/api/canonical-protocol.ts` |
 | `transcript.rs` | `tui_gateway/methods_session.py`, `tui_gateway/prompt_turn.py`, `agent/conversation_loop.py` (`_close_durable_failed_turn`), `agent/turn_failure_copy.py` (`failed_turn_notice`) |
 | `rest.rs` | `hermes_cli/config.py` (config schema), `hermes_cli/web_routers/*.py`, `apps/desktop/src/types/hermes.ts` |
@@ -194,7 +195,7 @@ Hermes's frontend runs as is, with two kinds of changes, both kept outside Herme
    1. every changed Hermes file that a hermes-rs module cites, with the module and the `git diff`
       command to read;
    2. JSON-RPC methods added, removed or changed in `gateway-contract.openrpc.json`, marking the
-      ones `gateway.rs` serves;
+      ones `gateway/rpc.rs` serves (`scripts/contract.mjs`);
    3. REST routes added or removed in `hermes_cli/web_routers`;
    4. how much of the frontend changed, and which `patches/*.patch` no longer apply;
    5. changed prompt and tool-schema sources, and changed skills.
@@ -203,7 +204,7 @@ Hermes's frontend runs as is, with two kinds of changes, both kept outside Herme
    the cited module. Port behavior changes; skip pure Python refactors. Update citations if Hermes
    moved code (a renamed file shows as `R` in the report).
 
-4. **Protocol.** For changed methods that `gateway.rs` serves, match the new params and result
+4. **Protocol.** For changed methods that `gateway/` serves, match the new params and result
    shapes. New methods are features: implement them, or leave them answering "not here" (-32601).
 
 5. **Patches.** Redo any patch that no longer applies against the new file, then regenerate it.

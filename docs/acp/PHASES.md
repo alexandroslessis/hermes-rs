@@ -7,7 +7,7 @@ steps in order and run the phase's tests before moving on.
 Before Phase 0, read: [README.md](README.md) (decisions, architecture), [PROTOCOL.md](PROTOCOL.md)
 (the shapes), [TESTING.md](TESTING.md) (the harness), and from the repo: `AGENTS.md`,
 `docs/ARCHITECTURE.md` (the gateway section), `crates/desktop/src/hub.rs`,
-`crates/desktop/src/transcript.rs`, and in `gateway.rs` the functions `handle`, `dispatch`,
+`crates/desktop/src/transcript.rs`, and in `gateway/` (`mod.rs`, `sessions.rs`, `turn.rs`) the functions `handle`, `dispatch`,
 `create_session`, `resume_session`, `submit`.
 
 Rules that matter most here:
@@ -16,7 +16,7 @@ Rules that matter most here:
 - **Never block the async workers** (ground rule 7): store reads, file reads for diffs, the
   session list: `tokio::task::spawn_blocking`.
 - **Gateway changes stay small.** The ACP layer is a *client* of the gateway (README D2). If you
-  find yourself copying logic out of `gateway.rs`, stop: make the existing function
+  find yourself copying logic out of the gateway (`crates/desktop/src/gateway/`), stop: make the existing function
   `pub(crate)` or add a gateway method the page could use too, and say why in the commit.
 - **Don't touch the user's data.** Every test sets `HERMES_RS_HOME` to a temp folder. Build
   into `CARGO_TARGET_DIR=target/claude`.
@@ -91,7 +91,7 @@ agent and connects to it (creating a thread fails with "method not found", which
      for each session in our map), fail all pending outgoing requests, give tasks ~2 s, then
      return from `run` (the process exits). Check that terminal processes the agent started are
      stopped (`Runtime::stop_processes`).
-   - Analogy: this is a tiny version of what `gateway.rs` `connection`/`handle` do for the
+   - Analogy: this is a tiny version of what `gateway/mod.rs` `connection`/`handle` do for the
      WebSocket, with stdin/stdout instead.
 
 5. **Server skeleton** (`acp/server.rs`): `AcpServer { gateway: Arc<Gateway>, sender: Sender,

@@ -209,7 +209,7 @@ Enums: **ToolKind** `read | edit | delete | move | search | execute | think | fe
 The gateway's events are frames on our Outbox:
 `{"jsonrpc":"2.0","method":"event","params":{"type":"<event>","session_id":"…","payload":{…}}}`.
 Ignore frames whose `method` isn't `event`. Payload shapes: `transcript.rs` (`TurnStream::agent_event`)
-and `gateway.rs` `submit`; verify each against the code before relying on it.
+and `gateway/turn.rs` `submit`; verify each against the code before relying on it.
 
 | Gateway event | Payload (ours) | ACP |
 |---|---|---|
@@ -383,7 +383,7 @@ Config options (Zed renders `category: "model"` as its model picker, `thought_le
   `<provider id>/<model id>` can be ambiguous when a model id contains `/` (OpenRouter): split at
   the **first** `/` only, and provider ids never contain `/` (check `providers.rs`).
 - `session/set_config_option {sessionId, configId:"model", value}` → the same call the page makes
-  to switch a session's model (read `gateway.rs` `switch_model` / `session.mutate`); answer with the
+  to switch a session's model (read `gateway/settings.rs` `switch_model` / `gateway/sessions.rs` `mutate`); answer with the
   full `configOptions` again. Effort → the page's effort call (`efforts` in the gateway).
 - Switching model rebuilds the frozen system prompt (`Runtime::set_session_route`): applies from
   the next turn (ground rule 8). Refuse with -32603 while a turn is running.

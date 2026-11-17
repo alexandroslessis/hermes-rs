@@ -1,0 +1,900 @@
+gateway.ping null -> ok {"ok":true}
+gateway.ping {} -> ok {"ok":true}
+gateway.ping "x" -> ok {"ok":true}
+gateway.ping {"session_id":5} -> ok {"ok":true}
+gateway.ping {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"ok":true}
+gateway.ping {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"ok":true}
+gateway.ping {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"ok":true}
+gateway.ping {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"ok":true}
+client.capabilities null -> ok {"server_requests":[]}
+client.capabilities {} -> ok {"server_requests":[]}
+client.capabilities "x" -> ok {"server_requests":[]}
+client.capabilities {"session_id":5} -> ok {"server_requests":[]}
+client.capabilities {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"server_requests":[]}
+client.capabilities {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"server_requests":[]}
+client.capabilities {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"server_requests":[]}
+client.capabilities {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"server_requests":[]}
+setup.status null -> ok {inference_provider,ok,profile,provider_configured,ready}
+setup.status {} -> ok {inference_provider,ok,profile,provider_configured,ready}
+setup.status "x" -> ok {inference_provider,ok,profile,provider_configured,ready}
+setup.status {"session_id":5} -> ok {inference_provider,ok,profile,provider_configured,ready}
+setup.status {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {inference_provider,ok,profile,provider_configured,ready}
+setup.status {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {inference_provider,ok,profile,provider_configured,ready}
+setup.status {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {inference_provider,ok,profile,provider_configured,ready}
+setup.status {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {inference_provider,ok,profile,provider_configured,ready}
+onboarding.state null -> ok {"run":false,"eligible":false}
+onboarding.state {} -> ok {"run":false,"eligible":false}
+onboarding.state "x" -> ok {"run":false,"eligible":false}
+onboarding.state {"session_id":5} -> ok {"run":false,"eligible":false}
+onboarding.state {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"run":false,"eligible":false}
+onboarding.state {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"run":false,"eligible":false}
+onboarding.state {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"run":false,"eligible":false}
+onboarding.state {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"run":false,"eligible":false}
+profiles.list null -> ok {profiles}
+profiles.list {} -> ok {profiles}
+profiles.list "x" -> ok {profiles}
+profiles.list {"session_id":5} -> ok {profiles}
+profiles.list {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {profiles}
+profiles.list {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {profiles}
+profiles.list {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {profiles}
+profiles.list {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {profiles}
+projects.tree null -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.tree {} -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.tree "x" -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.tree {"session_id":5} -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.tree {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.tree {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.tree {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"project":null}
+projects.tree {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.tree {"preview_limit":1} -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.tree {"project_id":"nope-project"} -> ok {"project":null}
+projects.tree {"project_id":"nope-project","preview_limit":"2"} -> ok {"project":null}
+projects.project_sessions null -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.project_sessions {} -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.project_sessions "x" -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.project_sessions {"session_id":5} -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.project_sessions {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.project_sessions {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.project_sessions {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"project":null}
+projects.project_sessions {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.project_sessions {"preview_limit":1} -> ok {"projects":[],"scoped_session_ids":[],"active_id":null}
+projects.project_sessions {"project_id":"nope-project"} -> ok {"project":null}
+projects.project_sessions {"project_id":"nope-project","preview_limit":"2"} -> ok {"project":null}
+projects.list null -> ok {"projects":[],"active_id":null}
+projects.list {} -> ok {"projects":[],"active_id":null}
+projects.list "x" -> ok {"projects":[],"active_id":null}
+projects.list {"session_id":5} -> ok {"projects":[],"active_id":null}
+projects.list {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"projects":[],"active_id":null}
+projects.list {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"projects":[],"active_id":null}
+projects.list {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"projects":[],"active_id":null}
+projects.list {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"projects":[],"active_id":null}
+projects.create null -> ok {project}
+projects.create {} -> ok {project}
+projects.create "x" -> ok {project}
+projects.create {"session_id":5} -> ok {project}
+projects.create {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {project}
+projects.create {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {project}
+projects.create {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {project}
+projects.create {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {project}
+projects.create {"name":"  My  ","folders":["a",5,"b"],"primary_path":"b","use":true} -> ok {project}
+projects.create {"name":"","folders":"x","primary_path":""} -> ok {project}
+projects.create {"use":1} -> ok {project}
+projects.update null -> err -32000 No project 
+projects.update {} -> err -32000 No project 
+projects.update "x" -> err -32000 No project 
+projects.update {"session_id":5} -> err -32000 No project 
+projects.update {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000 No project 
+projects.update {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32000 No project 
+projects.update {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 No project 5
+projects.update {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32000 No project 
+projects.update {"id":"nope-project","name":" Renamed ","path":"c","is_primary":true} -> err -32000 No project nope-project
+projects.update {"id":"nope-project","name":"  ","path":""} -> err -32000 No project nope-project
+projects.update {"id":5} -> err -32000 No project 
+projects.add_folder null -> err -32000 No project 
+projects.add_folder {} -> err -32000 No project 
+projects.add_folder "x" -> err -32000 No project 
+projects.add_folder {"session_id":5} -> err -32000 No project 
+projects.add_folder {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000 No project 
+projects.add_folder {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32000 No project 
+projects.add_folder {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 No project 5
+projects.add_folder {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32000 No project 
+projects.add_folder {"id":"nope-project","name":" Renamed ","path":"c","is_primary":true} -> err -32000 No project nope-project
+projects.add_folder {"id":"nope-project","name":"  ","path":""} -> err -32000 No project nope-project
+projects.add_folder {"id":5} -> err -32000 No project 
+projects.set_active null -> ok {"active_id":null}
+projects.set_active {} -> ok {"active_id":null}
+projects.set_active "x" -> ok {"active_id":null}
+projects.set_active {"session_id":5} -> ok {"active_id":null}
+projects.set_active {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"active_id":null}
+projects.set_active {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"active_id":5}
+projects.set_active {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"active_id":"5"}
+projects.set_active {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"active_id":null}
+projects.set_active {"id":"nope-project"} -> ok {"active_id":"nope-project"}
+projects.set_active {"id":null} -> ok {"active_id":null}
+projects.discover_repos null -> ok {"repos":[]}
+projects.discover_repos {} -> ok {"repos":[]}
+projects.discover_repos "x" -> ok {"repos":[]}
+projects.discover_repos {"session_id":5} -> ok {"repos":[]}
+projects.discover_repos {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"repos":[]}
+projects.discover_repos {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"repos":[]}
+projects.discover_repos {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"repos":[]}
+projects.discover_repos {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"repos":[]}
+projects.record_repos null -> ok {"repos":[],"accepted":true}
+projects.record_repos {} -> ok {"repos":[],"accepted":true}
+projects.record_repos "x" -> ok {"repos":[],"accepted":true}
+projects.record_repos {"session_id":5} -> ok {"repos":[],"accepted":true}
+projects.record_repos {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"repos":[],"accepted":true}
+projects.record_repos {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"repos":[],"accepted":true}
+projects.record_repos {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"repos":[],"accepted":true}
+projects.record_repos {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"repos":[],"accepted":true}
+session.active_list null -> ok {"sessions":[]}
+session.active_list {} -> ok {"sessions":[]}
+session.active_list "x" -> ok {"sessions":[]}
+session.active_list {"session_id":5} -> ok {"sessions":[]}
+session.active_list {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"sessions":[]}
+session.active_list {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"sessions":[]}
+session.active_list {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"sessions":[]}
+session.active_list {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"sessions":[]}
+model.options null -> ok {model,provider,providers}
+model.options {} -> ok {model,provider,providers}
+model.options "x" -> ok {model,provider,providers}
+model.options {"session_id":5} -> ok {model,provider,providers}
+model.options {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {model,provider,providers}
+model.options {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {model,provider,providers}
+model.options {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {model,provider,providers}
+model.options {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {model,provider,providers}
+model.options {"session_id":"nope-session"} -> ok {model,provider,providers}
+requests.status null -> ok {by_purpose,limit,provider,rate_limited,resets_at,used}
+requests.status {} -> ok {by_purpose,limit,provider,rate_limited,resets_at,used}
+requests.status "x" -> ok {by_purpose,limit,provider,rate_limited,resets_at,used}
+requests.status {"session_id":5} -> ok {by_purpose,limit,provider,rate_limited,resets_at,used}
+requests.status {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {by_purpose,limit,provider,rate_limited,resets_at,used}
+requests.status {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {by_purpose,limit,provider,rate_limited,resets_at,used}
+requests.status {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {by_purpose,limit,provider,rate_limited,resets_at,used}
+requests.status {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {by_purpose,limit,provider,rate_limited,resets_at,used}
+requests.status {"provider":"mock"} -> ok {by_purpose,limit,provider,rate_limited,resets_at,used}
+requests.status {"provider":"nope"} -> ok {by_purpose,limit,provider,rate_limited,resets_at,used}
+requests.status {"provider":3} -> ok {by_purpose,limit,provider,rate_limited,resets_at,used}
+staging.list null -> ok {"items":[],"count":0}
+staging.list {} -> ok {"items":[],"count":0}
+staging.list "x" -> ok {"items":[],"count":0}
+staging.list {"session_id":5} -> ok {"items":[],"count":0}
+staging.list {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"items":[],"count":0}
+staging.list {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"items":[],"count":0}
+staging.list {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"items":[],"count":0}
+staging.list {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"items":[],"count":0}
+staging.apply null -> err -32602 id is required
+staging.apply {} -> err -32602 id is required
+staging.apply "x" -> err -32602 id is required
+staging.apply {"session_id":5} -> err -32602 id is required
+staging.apply {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 id is required
+staging.apply {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 id is required
+staging.apply {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 No staged item 5. It may already have been applied or rejected.
+staging.apply {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 id is required
+staging.apply {"id":"<ID>"} -> err -32000 No staged item <ID>. It may already have been applied or rejected.
+staging.apply {"id":5} -> err -32602 id is required
+staging.reject null -> err -32602 id is required
+staging.reject {} -> err -32602 id is required
+staging.reject "x" -> err -32602 id is required
+staging.reject {"session_id":5} -> err -32602 id is required
+staging.reject {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 id is required
+staging.reject {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 id is required
+staging.reject {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 No staged item 5. It may already have been applied or rejected.
+staging.reject {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 id is required
+staging.reject {"id":"<ID>"} -> err -32000 No staged item <ID>. It may already have been applied or rejected.
+staging.reject {"id":5} -> err -32602 id is required
+config.get null -> ok {"value":"","model":"mock","provider":"mock"}
+config.get {} -> ok {"value":"","model":"mock","provider":"mock"}
+config.get "x" -> ok {"value":"","model":"mock","provider":"mock"}
+config.get {"session_id":5} -> ok {"value":"","model":"mock","provider":"mock"}
+config.get {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"value":"","model":"mock","provider":"mock"}
+config.get {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"value":"","model":"mock","provider":"mock"}
+config.get {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"value":"","model":"mock","provider":"mock"}
+config.get {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"value":"","model":"mock","provider":"mock"}
+config.get {"key":"model"} -> ok {"value":{"default":"mock","provider":"mock"},"model":"mock","provider":"mock"}
+config.get {"key":"budget.profile"} -> ok {"value":"requests","model":"mock","provider":"mock"}
+config.get {"key":5} -> ok {"value":"","model":"mock","provider":"mock"}
+config.set null -> err -32602 key is required
+config.set {} -> err -32602 key is required
+config.set "x" -> err -32602 key is required
+config.set {"session_id":5} -> err -32602 key is required
+config.set {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 key is required
+config.set {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 key is required
+config.set {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"key":"5","value":"5","ok":true}
+config.set {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 key is required
+config.set {"key":"display.x","value":1} -> ok {"key":"display.x","value":1,"ok":true}
+config.set {"key":"display.x","value":{"a":[1,null]}} -> ok {"key":"display.x","value":{"a":[1,null]},"ok":true}
+config.set {"key":"model","value":"m2 --provider mock --session","session_id":"no -> ok {"key":"model","value":"m2","provider":"mock"}
+config.set {"key":"model","value":""} -> err -32602 a model is required
+config.set {"key":"model","value":5} -> err -32602 a model is required
+config.set {"key":"model","value":"m --provider nope"} -> err -32000 Unknown provider nope
+config.set {"key":"reasoning","value":"High","session_id":"nope-session"} -> ok {"key":"reasoning","value":"high","ok":true}
+config.set {"key":"reasoning","value":null,"session_id":"nope-session"} -> ok {"key":"reasoning","value":"","ok":true}
+config.set {"key":"reasoning","value":"low"} -> ok {"key":"agent.reasoning_effort","value":"low","ok":true}
+config.set {"key":"reasoning","value":5,"session_id":7} -> ok {"key":"agent.reasoning_effort","value":5,"ok":true}
+config.set {"key":"budget.profile","value":"tokens"} -> ok {"key":"budget.profile","value":"tokens","ok":true}
+config.set {"key":"budget.profile","value":"fast"} -> err -32602 budget.profile must be requests, balanced or tokens
+config.set {"key":"budget.max_iterations","value":0} -> err -32602 budget.max_iterations must be a whole number from 1 to 10000
+config.set {"key":"budget.nonsense","value":1} -> err -32602 budget.nonsense is not a budget setting
+config.set {"key":"","value":1} -> err -32602 key is required
+config.set {"key":5,"value":1} -> err -32602 key is required
+config.set {"value":1} -> err -32602 key is required
+pet.info null -> ok {"enabled":false}
+pet.info {} -> ok {"enabled":false}
+pet.info "x" -> ok {"enabled":false}
+pet.info {"session_id":5} -> ok {"enabled":false}
+pet.info {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"enabled":false}
+pet.info {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"enabled":false}
+pet.info {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"enabled":false}
+pet.info {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"enabled":false}
+setup.runtime_check null -> ok {"ok":true,"provider":"mock","model":"mock","profile":"default","error":null}
+setup.runtime_check {} -> ok {"ok":true,"provider":"mock","model":"mock","profile":"default","error":null}
+setup.runtime_check "x" -> ok {"ok":true,"provider":"mock","model":"mock","profile":"default","error":null}
+setup.runtime_check {"session_id":5} -> ok {"ok":true,"provider":"mock","model":"mock","profile":"default","error":null}
+setup.runtime_check {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"ok":true,"provider":"mock","model":"mock","profile":"default","error":null}
+setup.runtime_check {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"ok":true,"provider":"mock","model":"mock","profile":"default","error":null}
+setup.runtime_check {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"ok":true,"provider":"mock","model":"mock","profile":"default","error":null}
+setup.runtime_check {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"ok":true,"provider":"mock","model":"mock","profile":"default","error":null}
+shared_metrics.status null -> ok {"enabled":false,"send":false,"decided":true}
+shared_metrics.status {} -> ok {"enabled":false,"send":false,"decided":true}
+shared_metrics.status "x" -> ok {"enabled":false,"send":false,"decided":true}
+shared_metrics.status {"session_id":5} -> ok {"enabled":false,"send":false,"decided":true}
+shared_metrics.status {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"enabled":false,"send":false,"decided":true}
+shared_metrics.status {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"enabled":false,"send":false,"decided":true}
+shared_metrics.status {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"enabled":false,"send":false,"decided":true}
+shared_metrics.status {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"enabled":false,"send":false,"decided":true}
+free_tier.status null -> ok {available,enabled,has_guest,label,model,notice_pending}
+free_tier.status {} -> ok {available,enabled,has_guest,label,model,notice_pending}
+free_tier.status "x" -> ok {available,enabled,has_guest,label,model,notice_pending}
+free_tier.status {"session_id":5} -> ok {available,enabled,has_guest,label,model,notice_pending}
+free_tier.status {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {available,enabled,has_guest,label,model,notice_pending}
+free_tier.status {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {available,enabled,has_guest,label,model,notice_pending}
+free_tier.status {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {available,enabled,has_guest,label,model,notice_pending}
+free_tier.status {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {available,enabled,has_guest,label,model,notice_pending}
+wake.status null -> ok {audio_silent,available,capture,configured_surface,enabled,frame_length,hint,input_device,listening,local_input_available,owned_by_caller,phrase,provider,sample_rate}
+wake.status {} -> ok {audio_silent,available,capture,configured_surface,enabled,frame_length,hint,input_device,listening,local_input_available,owned_by_caller,phrase,provider,sample_rate}
+wake.status "x" -> ok {audio_silent,available,capture,configured_surface,enabled,frame_length,hint,input_device,listening,local_input_available,owned_by_caller,phrase,provider,sample_rate}
+wake.status {"session_id":5} -> ok {audio_silent,available,capture,configured_surface,enabled,frame_length,hint,input_device,listening,local_input_available,owned_by_caller,phrase,provider,sample_rate}
+wake.status {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {audio_silent,available,capture,configured_surface,enabled,frame_length,hint,input_device,listening,local_input_available,owned_by_caller,phrase,provider,sample_rate}
+wake.status {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {audio_silent,available,capture,configured_surface,enabled,frame_length,hint,input_device,listening,local_input_available,owned_by_caller,phrase,provider,sample_rate}
+wake.status {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {audio_silent,available,capture,configured_surface,enabled,frame_length,hint,input_device,listening,local_input_available,owned_by_caller,phrase,provider,sample_rate}
+wake.status {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {audio_silent,available,capture,configured_surface,enabled,frame_length,hint,input_device,listening,local_input_available,owned_by_caller,phrase,provider,sample_rate}
+commands.catalog null -> ok {canon,categories,commands,pairs,skill_count,skills,sub}
+commands.catalog {} -> ok {canon,categories,commands,pairs,skill_count,skills,sub}
+commands.catalog "x" -> ok {canon,categories,commands,pairs,skill_count,skills,sub}
+commands.catalog {"session_id":5} -> ok {canon,categories,commands,pairs,skill_count,skills,sub}
+commands.catalog {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {canon,categories,commands,pairs,skill_count,skills,sub}
+commands.catalog {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {canon,categories,commands,pairs,skill_count,skills,sub}
+commands.catalog {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {canon,categories,commands,pairs,skill_count,skills,sub}
+commands.catalog {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {canon,categories,commands,pairs,skill_count,skills,sub}
+complete.slash null -> ok {"items":[],"replace_from":1}
+complete.slash {} -> ok {"items":[],"replace_from":1}
+complete.slash "x" -> ok {"items":[],"replace_from":1}
+complete.slash {"session_id":5} -> ok {"items":[],"replace_from":1}
+complete.slash {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"items":[],"replace_from":1}
+complete.slash {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"items":[],"replace_from":1}
+complete.slash {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"items":[],"replace_from":1}
+complete.slash {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"items":[],"replace_from":1}
+complete.slash {"text":"/pl"} -> ok {items,replace_from}
+complete.slash {"text":5} -> ok {"items":[],"replace_from":1}
+slash.exec null -> err -32000 not a quick/plugin/bundle/skill command
+slash.exec {} -> err -32000 not a quick/plugin/bundle/skill command
+slash.exec "x" -> err -32000 not a quick/plugin/bundle/skill command
+slash.exec {"session_id":5} -> err -32000 not a quick/plugin/bundle/skill command
+slash.exec {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000 not a quick/plugin/bundle/skill command
+slash.exec {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32000 not a quick/plugin/bundle/skill command
+slash.exec {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 not a quick/plugin/bundle/skill command
+slash.exec {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32000 not a quick/plugin/bundle/skill command
+slash.exec {"command":"/goal set it"} -> ok {"type":"exec","output":""}
+slash.exec {"command":" /goal"} -> err -32000 not a quick/plugin/bundle/skill command
+slash.exec {"command":"/plan do it","session_id":"nope-session"} -> ok {display,message,type}
+slash.exec {"command":"/status"} -> err -32602 session_id is required
+slash.exec {"command":"/status","session_id":"nope-session"} -> err -32000 Session nope-session not found
+slash.exec {"command":"/usage","session_id":"nope-session"} -> err -32000 no session nope-session
+slash.exec {"command":"/review"} -> ok {"type":"exec","output":"Nothing to review yet — send a message first."}
+slash.exec {"command":"/init"} -> err -32602 /init needs a session with a folder
+slash.exec {"command":"/nonexistent a b"} -> err -32000 not a quick/plugin/bundle/skill command
+slash.exec {"command":""} -> err -32000 not a quick/plugin/bundle/skill command
+slash.exec {"command":5} -> err -32000 not a quick/plugin/bundle/skill command
+session.status null -> err -32602 session_id is required
+session.status {} -> err -32602 session_id is required
+session.status "x" -> err -32602 session_id is required
+session.status {"session_id":5} -> err -32602 session_id is required
+session.status {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000 Session nope-id not found
+session.status {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.status {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 Session 5 not found
+session.status {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+command.dispatch null -> err -32000 not a quick/plugin/bundle/skill command
+command.dispatch {} -> err -32000 not a quick/plugin/bundle/skill command
+command.dispatch "x" -> err -32000 not a quick/plugin/bundle/skill command
+command.dispatch {"session_id":5} -> err -32000 not a quick/plugin/bundle/skill command
+command.dispatch {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000 not a quick/plugin/bundle/skill command
+command.dispatch {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32000 not a quick/plugin/bundle/skill command
+command.dispatch {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 not a quick/plugin/bundle/skill command
+command.dispatch {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32000 not a quick/plugin/bundle/skill command
+command.dispatch {"name":"plan","arg":"x"} -> ok {display,message,type}
+command.dispatch {"name":"/review","session_id":"nope-session"} -> ok {"type":"exec","output":"Nothing to review yet — send a message first."}
+command.dispatch {"name":"nonexistent","arg":"a"} -> err -32000 not a quick/plugin/bundle/skill command
+command.dispatch {"name":5,"arg":6} -> err -32000 not a quick/plugin/bundle/skill command
+session.title null -> err -32602 session_id is required
+session.title {} -> err -32602 session_id is required
+session.title "x" -> err -32602 session_id is required
+session.title {"session_id":5} -> err -32602 session_id is required
+session.title {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"title":"","session_key":"nope-id"}
+session.title {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.title {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"title":"","session_key":"5"}
+session.title {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+session.title {"session_id":"nope-session","title":" A title "} -> ok {"title":"","session_key":"nope-session"}
+session.title {"session_id":"nope-session","title":5} -> ok {"title":"","session_key":"nope-session"}
+session.mutate null -> err -32602 session_id is required
+session.mutate {} -> err -32602 session_id is required
+session.mutate "x" -> err -32602 session_id is required
+session.mutate {"session_id":5} -> err -32602 session_id is required
+session.mutate {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000  isn't available in hermes-rs yet
+session.mutate {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.mutate {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 5 isn't available in hermes-rs yet
+session.mutate {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+session.mutate {"session_id":"nope-session","operation":"rename","payload":{"title":" -> ok {"title":"T","session_id":"nope-session","revision":2,"execution_generation":0}
+session.mutate {"session_id":"nope-session","operation":"model","payload":{"model":"m -> ok {execution_generation,model,provider,revision,session_id,status}
+session.mutate {"session_id":"nope-session","operation":"reasoning","payload":{"effor -> ok {effort,execution_generation,revision,session_id,status}
+session.mutate {"session_id":"nope-session","operation":"rewind","payload":{"target_m -> err -32000 no session nope-session
+session.mutate {"session_id":"nope-session","operation":"rewind","payload":{"target_m -> err -32602 target_message_id is required
+session.mutate {"session_id":"nope-session","operation":"workspace","payload":{"cwd": -> err -32602 No such folder: C:\nonexistent-folder
+session.mutate {"session_id":"nope-session","operation":"workspace","payload":{}} -> err -32602 cwd is required
+session.mutate {"session_id":"nope-session","operation":"archive","payload":{"archive -> err -32602 No session nope-session.
+session.mutate {"session_id":"nope-session","operation":"nope","payload":{}} -> err -32000 nope isn't available in hermes-rs yet
+session.mutate {"session_id":"nope-session","operation":5} -> err -32000  isn't available in hermes-rs yet
+session.rewind null -> err -32602 session_id is required
+session.rewind {} -> err -32602 session_id is required
+session.rewind "x" -> err -32602 session_id is required
+session.rewind {"session_id":5} -> err -32602 session_id is required
+session.rewind {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"session_id":"nope-id","status":"nothing","rewound_count":0}
+session.rewind {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.rewind {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"session_id":"5","status":"nothing","rewound_count":0}
+session.rewind {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+session.rewind {"session_id":"nope-session","replay_only":true} -> ok {"session_id":"nope-session","status":"nothing","rewound_count":0}
+session.rewind {"session_id":"nope-session","target_message_id":0} -> err -32000 no session nope-session
+session.rewind {"session_id":"nope-session","target_message_id":"1"} -> ok {"session_id":"nope-session","status":"nothing","rewound_count":0}
+rollback.list null -> err -32602 session_id is required
+rollback.list {} -> err -32602 session_id is required
+rollback.list "x" -> err -32602 session_id is required
+rollback.list {"session_id":5} -> err -32602 session_id is required
+rollback.list {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000 no session nope-id
+rollback.list {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+rollback.list {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 no session 5
+rollback.list {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+rollback.list {"session_id":"nope-session"} -> err -32000 no session nope-session
+rollback.list {"session_id":"nope-session","hash":" ABC ","all":true,"file_path":"a. -> err -32000 no session nope-session
+rollback.diff null -> err -32602 session_id is required
+rollback.diff {} -> err -32602 session_id is required
+rollback.diff "x" -> err -32602 session_id is required
+rollback.diff {"session_id":5} -> err -32602 session_id is required
+rollback.diff {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000 no session nope-id
+rollback.diff {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+rollback.diff {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 no session 5
+rollback.diff {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+rollback.diff {"session_id":"nope-session"} -> err -32000 no session nope-session
+rollback.diff {"session_id":"nope-session","hash":" ABC ","all":true,"file_path":"a. -> err -32000 no session nope-session
+rollback.restore null -> err -32602 session_id is required
+rollback.restore {} -> err -32602 session_id is required
+rollback.restore "x" -> err -32602 session_id is required
+rollback.restore {"session_id":5} -> err -32602 session_id is required
+rollback.restore {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000 no session nope-id
+rollback.restore {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+rollback.restore {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 no session 5
+rollback.restore {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+rollback.restore {"session_id":"nope-session"} -> err -32000 no session nope-session
+rollback.restore {"session_id":"nope-session","hash":" ABC ","all":true,"file_path":"a. -> err -32000 no session nope-session
+session.export null -> err -32602 session_id is required
+session.export {} -> err -32602 session_id is required
+session.export "x" -> err -32602 session_id is required
+session.export {"session_id":5} -> err -32602 session_id is required
+session.export {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000 Session nope-id not found
+session.export {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.export {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32602 format is json, md or html
+session.export {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+session.export {"session_id":"nope-session","format":"md"} -> err -32000 Session nope-session not found
+session.export {"session_id":"nope-session","format":"docx"} -> err -32602 format is json, md or html
+session.export {"session_id":"nope-session","format":5} -> err -32000 Session nope-session not found
+session.foreign.list null -> ok {host,next_offset,sessions,unreadable}
+session.foreign.list {} -> ok {host,next_offset,sessions,unreadable}
+session.foreign.list "x" -> ok {host,next_offset,sessions,unreadable}
+session.foreign.list {"session_id":5} -> ok {host,next_offset,sessions,unreadable}
+session.foreign.list {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {host,next_offset,sessions,unreadable}
+session.foreign.list {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {host,next_offset,sessions,unreadable}
+session.foreign.list {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {host,next_offset,sessions,unreadable}
+session.foreign.list {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {host,next_offset,sessions,unreadable}
+session.foreign.list {"source":"nosuch"} -> ok {host,next_offset,sessions,unreadable}
+session.foreign.list {"source":"nosuch","offset":3} -> ok {host,next_offset,sessions,unreadable}
+session.foreign.list {"source":"nosuch","offset":"3"} -> ok {host,next_offset,sessions,unreadable}
+session.foreign.list {"source":"nosuch","offset":-1} -> ok {host,next_offset,sessions,unreadable}
+session.foreign.preview null -> err -32602 Not a Hermes session: 
+session.foreign.preview {} -> err -32602 Not a Hermes session: 
+session.foreign.preview "x" -> err -32602 Not a Hermes session: 
+session.foreign.preview {"session_id":5} -> err -32602 Not a Hermes session: 
+session.foreign.preview {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 Not a Hermes session: 
+session.foreign.preview {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 Not a Hermes session: 
+session.foreign.preview {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32602 Not a Hermes session: 5
+session.foreign.preview {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 Not a Hermes session: 
+session.foreign.preview {"id":"nosuch-session"} -> err -32602 Not a Hermes session: nosuch-session
+session.foreign.preview {"id":5} -> err -32602 Not a Hermes session: 
+session.foreign.import null -> err -32602 Not a Hermes session: 
+session.foreign.import {} -> err -32602 Not a Hermes session: 
+session.foreign.import "x" -> err -32602 Not a Hermes session: 
+session.foreign.import {"session_id":5} -> err -32602 Not a Hermes session: 
+session.foreign.import {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 Not a Hermes session: 
+session.foreign.import {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 Not a Hermes session: 
+session.foreign.import {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32602 Not a Hermes session: 5
+session.foreign.import {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 Not a Hermes session: 
+session.foreign.import {"id":"nosuch-session"} -> err -32602 Not a Hermes session: nosuch-session
+session.foreign.import {"id":5} -> err -32602 Not a Hermes session: 
+session.branch null -> err -32602 session_id is required
+session.branch {} -> err -32602 session_id is required
+session.branch "x" -> err -32602 session_id is required
+session.branch {"session_id":5} -> err -32602 session_id is required
+session.branch {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 No session nope-id.
+session.branch {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.branch {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32602 No session 5.
+session.branch {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+session.branch {"session_id":"nope-session","idempotency_key":"k1","name":" B "} -> err -32602 No session nope-session.
+session.branch {"parent_session_id":"nope-session","through_message_id":0} -> err -32602 No session nope-session.
+session.branch {"parent_session_id":"","session_id":"nope-session"} -> err -32602 session_id is required
+session.branch_whole null -> err -32602 session_id is required
+session.branch_whole {} -> err -32602 session_id is required
+session.branch_whole "x" -> err -32602 session_id is required
+session.branch_whole {"session_id":5} -> err -32602 session_id is required
+session.branch_whole {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 No session nope-id.
+session.branch_whole {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.branch_whole {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32602 No session 5.
+session.branch_whole {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+session.branch_whole {"session_id":"nope-session","idempotency_key":"k1","name":" B "} -> err -32602 No session nope-session.
+session.branch_whole {"parent_session_id":"nope-session","through_message_id":0} -> err -32602 No session nope-session.
+session.branch_whole {"parent_session_id":"","session_id":"nope-session"} -> err -32602 session_id is required
+session.branch_stored null -> err -32602 session_id is required
+session.branch_stored {} -> err -32602 session_id is required
+session.branch_stored "x" -> err -32602 session_id is required
+session.branch_stored {"session_id":5} -> err -32602 session_id is required
+session.branch_stored {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 No session nope-id.
+session.branch_stored {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.branch_stored {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32602 No session 5.
+session.branch_stored {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+session.branch_stored {"session_id":"nope-session","idempotency_key":"k1","name":" B "} -> err -32602 No session nope-session.
+session.branch_stored {"parent_session_id":"nope-session","through_message_id":0} -> err -32602 No session nope-session.
+session.branch_stored {"parent_session_id":"","session_id":"nope-session"} -> err -32602 session_id is required
+prompt.btw null -> err -32602 session_id is required
+prompt.btw {} -> err -32602 session_id is required
+prompt.btw "x" -> err -32602 session_id is required
+prompt.btw {"session_id":5} -> err -32602 session_id is required
+prompt.btw {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 No session nope-id.
+prompt.btw {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+prompt.btw {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32602 No session 5.
+prompt.btw {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+prompt.btw {"session_id":"nope-session","text":"  hi "} -> err -32602 No session nope-session.
+prompt.btw {"session_id":"nope-session","text":"   "} -> err -32602 text required
+prompt.btw {"session_id":"nope-session","text":5} -> err -32602 text required
+prompt.background null -> err -32602 session_id is required
+prompt.background {} -> err -32602 session_id is required
+prompt.background "x" -> err -32602 session_id is required
+prompt.background {"session_id":5} -> err -32602 session_id is required
+prompt.background {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 No session nope-id.
+prompt.background {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+prompt.background {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32602 No session 5.
+prompt.background {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+prompt.background {"session_id":"nope-session","text":"  hi "} -> err -32602 No session nope-session.
+prompt.background {"session_id":"nope-session","text":"   "} -> err -32602 text required
+prompt.background {"session_id":"nope-session","text":5} -> err -32602 text required
+file.attach null -> err -32602 session_id is required
+file.attach {} -> err -32602 session_id is required
+file.attach "x" -> err -32602 session_id is required
+file.attach {"session_id":5} -> err -32602 session_id is required
+file.attach {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 No session nope-id.
+file.attach {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+file.attach {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32602 No session 5.
+file.attach {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+file.attach {"session_id":"nope-session","path":"a.txt"} -> err -32602 No session nope-session.
+file.attach {"session_id":"nope-session","name":"n.txt","content_base64":"aGk="} -> err -32602 No session nope-session.
+image.attach null -> err -32602 session_id is required
+image.attach {} -> err -32602 session_id is required
+image.attach "x" -> err -32602 session_id is required
+image.attach {"session_id":5} -> err -32602 session_id is required
+image.attach {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 image not found: 
+image.attach {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+image.attach {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32602 image not found: 5
+image.attach {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+image.attach {"session_id":"nope-session","path":"C:/nonexistent/none.png"} -> err -32602 image not found: C:/nonexistent/none.png
+image.attach {"session_id":"nope-session"} -> err -32602 image not found: 
+image.attach_bytes null -> err -32602 session_id is required
+image.attach_bytes {} -> err -32602 session_id is required
+image.attach_bytes "x" -> err -32602 session_id is required
+image.attach_bytes {"session_id":5} -> err -32602 session_id is required
+image.attach_bytes {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 Attach a PNG, JPEG, GIF, WebP, BMP or TIFF image.
+image.attach_bytes {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+image.attach_bytes {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32602 The image data isn't valid base64.
+image.attach_bytes {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+image.attach_bytes {"session_id":"nope-session","content_base64":"!!","filename":"a.png"} -> err -32602 The image data isn't valid base64.
+image.attach_bytes {"session_id":"nope-session"} -> err -32602 Attach a PNG, JPEG, GIF, WebP, BMP or TIFF image.
+image.detach null -> err -32602 session_id is required
+image.detach {} -> err -32602 session_id is required
+image.detach "x" -> err -32602 session_id is required
+image.detach {"session_id":5} -> err -32602 session_id is required
+image.detach {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"detached":false,"count":0}
+image.detach {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+image.detach {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"detached":false,"count":0}
+image.detach {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+image.detach {"session_id":"nope-session","path":" x "} -> ok {"detached":false,"count":0}
+image.detach {"session_id":"nope-session","path":5} -> ok {"detached":false,"count":0}
+insights.get null -> ok {"days":30,"sessions":0,"messages":0}
+insights.get {} -> ok {"days":30,"sessions":0,"messages":0}
+insights.get "x" -> ok {"days":30,"sessions":0,"messages":0}
+insights.get {"session_id":5} -> ok {"days":30,"sessions":0,"messages":0}
+insights.get {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"days":30,"sessions":0,"messages":0}
+insights.get {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"days":5,"sessions":0,"messages":0}
+insights.get {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"days":30,"sessions":0,"messages":0}
+insights.get {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"days":30,"sessions":0,"messages":0}
+insights.get {"days":7} -> ok {"days":7,"sessions":0,"messages":0}
+insights.get {"days":0} -> ok {"days":30,"sessions":0,"messages":0}
+insights.get {"days":-3} -> ok {"days":30,"sessions":0,"messages":0}
+insights.get {"days":"7"} -> ok {"days":30,"sessions":0,"messages":0}
+insights.get {"days":1.5} -> ok {"days":30,"sessions":0,"messages":0}
+session.compress null -> err -32602 session_id is required
+session.compress {} -> err -32602 session_id is required
+session.compress "x" -> err -32602 session_id is required
+session.compress {"session_id":5} -> err -32602 session_id is required
+session.compress {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000 Session nope-id not found
+session.compress {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.compress {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 Session 5 not found
+session.compress {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+session.compress {"session_id":"nope-session","focus_topic":"  x "} -> err -32000 Session nope-session not found
+session.close null -> ok {"closed":true}
+session.close {} -> ok {"closed":true}
+session.close "x" -> ok {"closed":true}
+session.close {"session_id":5} -> ok {"closed":true}
+session.close {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"closed":true}
+session.close {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"closed":true}
+session.close {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"closed":true}
+session.close {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"closed":true}
+session.create null -> ok {execution_generation,info,message_count,messages,revision,session_id,stored_session_id}
+session.create {} -> ok {execution_generation,info,message_count,messages,revision,session_id,stored_session_id}
+session.create "x" -> ok {execution_generation,info,message_count,messages,revision,session_id,stored_session_id}
+session.create {"session_id":5} -> ok {execution_generation,info,message_count,messages,revision,session_id,stored_session_id}
+session.create {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {execution_generation,info,message_count,messages,revision,session_id,stored_session_id}
+session.create {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {execution_generation,info,message_count,messages,revision,session_id,stored_session_id}
+session.create {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 Unknown provider 5
+session.create {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {execution_generation,info,message_count,messages,revision,session_id,stored_session_id}
+session.create {"cwd":"."} -> ok {execution_generation,info,message_count,messages,revision,session_id,stored_session_id}
+session.create {"cwd":".","title":"Titled","model":"m9"} -> ok {execution_generation,info,message_count,messages,revision,session_id,stored_session_id}
+session.create {"provider":"nope"} -> err -32000 Unknown provider nope
+session.create {"provider":"mock","model":"x","cwd":""} -> ok {execution_generation,info,message_count,messages,revision,session_id,stored_session_id}
+session.create {"cwd":".","messages":[{"role":"user","content":"hi"}],"parent_session -> ok {execution_generation,info,message_count,messages,revision,session_id,stored_session_id}
+session.create {"cwd":".","messages":"x","parent_session_id":"nope"} -> ok {execution_generation,info,message_count,messages,revision,session_id,stored_session_id}
+session.resume null -> err -32602 session_id is required
+session.resume {} -> err -32602 session_id is required
+session.resume "x" -> err -32602 session_id is required
+session.resume {"session_id":5} -> err -32602 session_id is required
+session.resume {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000 Session not found: nope-id
+session.resume {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.resume {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 Session not found: 5
+session.resume {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+session.history null -> err -32602 session_id is required
+session.history {} -> err -32602 session_id is required
+session.history "x" -> err -32602 session_id is required
+session.history {"session_id":5} -> err -32602 session_id is required
+session.history {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000 Session not found: nope-id
+session.history {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.history {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 Session not found: 5
+session.history {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+prompt.submit null -> err -32602 session_id is required
+prompt.submit {} -> err -32602 session_id is required
+prompt.submit "x" -> err -32602 session_id is required
+prompt.submit {"session_id":5} -> err -32602 session_id is required
+prompt.submit {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 Unknown session nope-id
+prompt.submit {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+prompt.submit {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32602 Unknown session 5
+prompt.submit {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+prompt.submit {"session_id":"nope-session","text":"hi"} -> err -32602 Unknown session nope-session
+prompt.submit {"session_id":"nope-session"} -> err -32602 Unknown session nope-session
+prompt.submit {"session_id":"nope-session","text":"hi","confirm_truncate":true,"trun -> err -32000 no session nope-session
+approval.respond null -> err -32602 prompt_id is required
+approval.respond {} -> err -32602 prompt_id is required
+approval.respond "x" -> err -32602 prompt_id is required
+approval.respond {"session_id":5} -> err -32602 prompt_id is required
+approval.respond {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 prompt_id is required
+approval.respond {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 prompt_id is required
+approval.respond {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 No pending approval request
+approval.respond {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 prompt_id is required
+approval.respond {"prompt_id":"p1","choice":"once","answer":"a"} -> err -32000 No pending approval request
+approval.respond {"request_id":"p1","choice":"once"} -> err -32000 No pending approval request
+approval.respond {"prompt_id":5} -> err -32602 prompt_id is required
+clarify.respond null -> err -32602 prompt_id is required
+clarify.respond {} -> err -32602 prompt_id is required
+clarify.respond "x" -> err -32602 prompt_id is required
+clarify.respond {"session_id":5} -> err -32602 prompt_id is required
+clarify.respond {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32602 prompt_id is required
+clarify.respond {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 prompt_id is required
+clarify.respond {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 No pending clarify request
+clarify.respond {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 prompt_id is required
+clarify.respond {"prompt_id":"p1","choice":"once","answer":"a"} -> err -32000 No pending clarify request
+clarify.respond {"request_id":"p1","choice":"once"} -> err -32000 No pending clarify request
+clarify.respond {"prompt_id":5} -> err -32602 prompt_id is required
+session.context_breakdown null -> err -32602 session_id is required
+session.context_breakdown {} -> err -32602 session_id is required
+session.context_breakdown "x" -> err -32602 session_id is required
+session.context_breakdown {"session_id":5} -> err -32602 session_id is required
+session.context_breakdown {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000 Session not found: nope-id
+session.context_breakdown {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.context_breakdown {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 Session not found: 5
+session.context_breakdown {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+approval.pending null -> err -32602 session_id is required
+approval.pending {} -> err -32602 session_id is required
+approval.pending "x" -> err -32602 session_id is required
+approval.pending {"session_id":5} -> err -32602 session_id is required
+approval.pending {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"approvals":[]}
+approval.pending {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+approval.pending {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"approvals":[]}
+approval.pending {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+process.list null -> err -32602 session_id is required
+process.list {} -> err -32602 session_id is required
+process.list "x" -> err -32602 session_id is required
+process.list {"session_id":5} -> err -32602 session_id is required
+process.list {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"processes":[]}
+process.list {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+process.list {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"processes":[]}
+process.list {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+process.kill null -> err -32602 session_id is required
+process.kill {} -> err -32602 session_id is required
+process.kill "x" -> err -32602 session_id is required
+process.kill {"session_id":5} -> err -32602 session_id is required
+process.kill {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"status":"not_found","session_id":""}
+process.kill {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+process.kill {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"status":"not_found","session_id":"5"}
+process.kill {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+process.kill {"session_id":"nope-session","process_id":"p"} -> ok {"status":"not_found","session_id":"p"}
+process.kill {"session_id":"nope-session","process_id":5} -> ok {"status":"not_found","session_id":""}
+process.stop null -> err -32602 session_id is required
+process.stop {} -> err -32602 session_id is required
+process.stop "x" -> err -32602 session_id is required
+process.stop {"session_id":5} -> err -32602 session_id is required
+process.stop {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"killed":0}
+process.stop {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+process.stop {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"killed":0}
+process.stop {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+subagent.list null -> err -32602 session_id is required
+subagent.list {} -> err -32602 session_id is required
+subagent.list "x" -> err -32602 session_id is required
+subagent.list {"session_id":5} -> err -32602 session_id is required
+subagent.list {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"subagents":[],"delegations":[]}
+subagent.list {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+subagent.list {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"subagents":[],"delegations":[]}
+subagent.list {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+subagent.tail null -> err -32602 session_id is required
+subagent.tail {} -> err -32602 session_id is required
+subagent.tail "x" -> err -32602 session_id is required
+subagent.tail {"session_id":5} -> err -32602 session_id is required
+subagent.tail {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"subagent_id":"","available":false,"text":"","truncated":false}
+subagent.tail {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+subagent.tail {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"subagent_id":"5","available":false,"text":"","truncated":false}
+subagent.tail {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+subagent.tail {"session_id":"nope-session","subagent_id":"sa1"} -> ok {"subagent_id":"sa1","available":false,"text":"","truncated":false}
+subagent.steer null -> err -32602 session_id is required
+subagent.steer {} -> err -32602 session_id is required
+subagent.steer "x" -> err -32602 session_id is required
+subagent.steer {"session_id":5} -> err -32602 session_id is required
+subagent.steer {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"status":"rejected","subagent_id":"","text":"hi"}
+subagent.steer {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+subagent.steer {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"status":"rejected","subagent_id":"5","text":"5"}
+subagent.steer {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+subagent.steer {"session_id":"nope-session","subagent_id":"sa1","text":" go "} -> ok {"status":"rejected","subagent_id":"sa1","text":"go"}
+subagent.steer {"session_id":"nope-session","subagent_id":"sa1","text":""} -> err -32602 text is required
+subagent.steer {"session_id":"nope-session","subagent_id":1,"text":5} -> err -32602 text is required
+subagent.interrupt null -> err -32602 session_id is required
+subagent.interrupt {} -> err -32602 session_id is required
+subagent.interrupt "x" -> err -32602 session_id is required
+subagent.interrupt {"session_id":5} -> err -32602 session_id is required
+subagent.interrupt {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"found":false,"subagent_id":""}
+subagent.interrupt {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+subagent.interrupt {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"found":false,"subagent_id":"5"}
+subagent.interrupt {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+subagent.interrupt {"session_id":"nope-session","subagent_id":"sa1"} -> ok {"found":false,"subagent_id":"sa1"}
+delegation.status null -> ok {"active":[],"paused":false,"max_spawn_depth":1,"max_concurrent_children":10}
+delegation.status {} -> ok {"active":[],"paused":false,"max_spawn_depth":1,"max_concurrent_children":10}
+delegation.status "x" -> ok {"active":[],"paused":false,"max_spawn_depth":1,"max_concurrent_children":10}
+delegation.status {"session_id":5} -> ok {"active":[],"paused":false,"max_spawn_depth":1,"max_concurrent_children":10}
+delegation.status {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"active":[],"paused":false,"max_spawn_depth":1,"max_concurrent_children":10}
+delegation.status {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"active":[],"paused":false,"max_spawn_depth":1,"max_concurrent_children":10}
+delegation.status {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"active":[],"paused":false,"max_spawn_depth":1,"max_concurrent_children":10}
+delegation.status {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"active":[],"paused":false,"max_spawn_depth":1,"max_concurrent_children":10}
+delegation.pause null -> ok {"paused":true}
+delegation.pause {} -> ok {"paused":true}
+delegation.pause "x" -> ok {"paused":true}
+delegation.pause {"session_id":5} -> ok {"paused":true}
+delegation.pause {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"paused":true}
+delegation.pause {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"paused":true}
+delegation.pause {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"paused":true}
+delegation.pause {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"paused":true}
+delegation.pause {"paused":false} -> ok {"paused":false}
+delegation.pause {"paused":true} -> ok {"paused":true}
+delegation.pause {"paused":"false"} -> ok {"paused":true}
+delegation.pause {"paused":null} -> ok {"paused":true}
+complete.path null -> ok {"items":[]}
+complete.path {} -> ok {"items":[]}
+complete.path "x" -> ok {"items":[]}
+complete.path {"session_id":5} -> ok {"items":[]}
+complete.path {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"items":[]}
+complete.path {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {"items":[]}
+complete.path {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"items":[]}
+complete.path {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {"items":[]}
+complete.path {"word":"@fi","cwd":"."} -> ok {items}
+complete.path {"word":"./","session_id":"nope-session"} -> ok {items}
+complete.path {"word":5,"cwd":5} -> ok {"items":[]}
+session.steer null -> err -32602 session_id is required
+session.steer {} -> err -32602 session_id is required
+session.steer "x" -> err -32602 session_id is required
+session.steer {"session_id":5} -> err -32602 session_id is required
+session.steer {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"status":"rejected","session_id":"nope-id","text":"hi"}
+session.steer {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.steer {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"status":"rejected","session_id":"5","text":"5"}
+session.steer {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+session.steer {"session_id":"nope-session","text":"now"} -> ok {"status":"rejected","session_id":"nope-session","text":"now"}
+session.steer {"session_id":"nope-session","text":5} -> ok {"status":"rejected","session_id":"nope-session","text":""}
+prompt.cancel null -> err -32602 session_id is required
+prompt.cancel {} -> err -32602 session_id is required
+prompt.cancel "x" -> err -32602 session_id is required
+prompt.cancel {"session_id":5} -> err -32602 session_id is required
+prompt.cancel {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"cancelled":false,"admission_id":"","session_id":"nope-id"}
+prompt.cancel {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+prompt.cancel {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"cancelled":false,"admission_id":"5","session_id":"5"}
+prompt.cancel {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+prompt.cancel {"session_id":"nope-session","admission_id":"a1","text":"t","submissio -> ok {"cancelled":false,"admission_id":"a1","session_id":"nope-session"}
+prompt.cancel {"session_id":"nope-session"} -> ok {"cancelled":false,"admission_id":"","session_id":"nope-session"}
+prompt.steer_queued null -> err -32602 session_id is required
+prompt.steer_queued {} -> err -32602 session_id is required
+prompt.steer_queued "x" -> err -32602 session_id is required
+prompt.steer_queued {"session_id":5} -> err -32602 session_id is required
+prompt.steer_queued {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000 session_idle
+prompt.steer_queued {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+prompt.steer_queued {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 session_idle
+prompt.steer_queued {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+prompt.steer_queued {"session_id":"nope-session","admission_id":"a1","text":"t","submissio -> err -32000 session_idle
+prompt.steer_queued {"session_id":"nope-session"} -> err -32000 session_idle
+prompt.replace_queued null -> err -32602 session_id is required
+prompt.replace_queued {} -> err -32602 session_id is required
+prompt.replace_queued "x" -> err -32602 session_id is required
+prompt.replace_queued {"session_id":5} -> err -32602 session_id is required
+prompt.replace_queued {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32000 admission_started
+prompt.replace_queued {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+prompt.replace_queued {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32000 admission_started
+prompt.replace_queued {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+prompt.replace_queued {"session_id":"nope-session","admission_id":"a1","text":"t","submissio -> err -32000 admission_started
+prompt.replace_queued {"session_id":"nope-session"} -> err -32000 admission_started
+session.redirect null -> err -32602 session_id is required
+session.redirect {} -> err -32602 session_id is required
+session.redirect "x" -> err -32602 session_id is required
+session.redirect {"session_id":5} -> err -32602 session_id is required
+session.redirect {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"status":"rejected","session_id":"nope-id","text":"hi"}
+session.redirect {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.redirect {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"status":"rejected","session_id":"5","text":"5"}
+session.redirect {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+session.redirect {"session_id":"nope-session","text":"now"} -> ok {"status":"rejected","session_id":"nope-session","text":"now"}
+session.redirect {"session_id":"nope-session","text":5} -> ok {"status":"rejected","session_id":"nope-session","text":""}
+session.interrupt null -> err -32602 session_id is required
+session.interrupt {} -> err -32602 session_id is required
+session.interrupt "x" -> err -32602 session_id is required
+session.interrupt {"session_id":5} -> err -32602 session_id is required
+session.interrupt {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"status":"not_interrupted","interrupted":false}
+session.interrupt {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.interrupt {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"status":"not_interrupted","interrupted":false}
+session.interrupt {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+projects.delete null -> ok {active_id,projects}
+projects.delete {} -> ok {active_id,projects}
+projects.delete "x" -> ok {active_id,projects}
+projects.delete {"session_id":5} -> ok {active_id,projects}
+projects.delete {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {active_id,projects}
+projects.delete {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> ok {active_id,projects}
+projects.delete {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {active_id,projects}
+projects.delete {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> ok {active_id,projects}
+projects.delete {"id":"nope-project"} -> ok {active_id,projects}
+projects.delete {"id":null} -> ok {active_id,projects}
+session.delete null -> err -32602 session_id is required
+session.delete {} -> err -32602 session_id is required
+session.delete "x" -> err -32602 session_id is required
+session.delete {"session_id":5} -> err -32602 session_id is required
+session.delete {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> ok {"deleted":"nope-id"}
+session.delete {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32602 session_id is required
+session.delete {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> ok {"deleted":"5"}
+session.delete {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32602 session_id is required
+nope.nothing null -> err -32601 Method not found: nope.nothing
+nope.nothing {} -> err -32601 Method not found: nope.nothing
+nope.nothing "x" -> err -32601 Method not found: nope.nothing
+nope.nothing {"session_id":5} -> err -32601 Method not found: nope.nothing
+nope.nothing {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32601 Method not found: nope.nothing
+nope.nothing {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32601 Method not found: nope.nothing
+nope.nothing {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32601 Method not found: nope.nothing
+nope.nothing {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32601 Method not found: nope.nothing
+Gateway.Ping null -> err -32601 Method not found: Gateway.Ping
+Gateway.Ping {} -> err -32601 Method not found: Gateway.Ping
+Gateway.Ping "x" -> err -32601 Method not found: Gateway.Ping
+Gateway.Ping {"session_id":5} -> err -32601 Method not found: Gateway.Ping
+Gateway.Ping {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32601 Method not found: Gateway.Ping
+Gateway.Ping {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32601 Method not found: Gateway.Ping
+Gateway.Ping {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32601 Method not found: Gateway.Ping
+Gateway.Ping {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32601 Method not found: Gateway.Ping
+gateway.ping  null -> err -32601 Method not found: gateway.ping 
+gateway.ping  {} -> err -32601 Method not found: gateway.ping 
+gateway.ping  "x" -> err -32601 Method not found: gateway.ping 
+gateway.ping  {"session_id":5} -> err -32601 Method not found: gateway.ping 
+gateway.ping  {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32601 Method not found: gateway.ping 
+gateway.ping  {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32601 Method not found: gateway.ping 
+gateway.ping  {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32601 Method not found: gateway.ping 
+gateway.ping  {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32601 Method not found: gateway.ping 
+ gateway.ping null -> err -32601 Method not found:  gateway.ping
+ gateway.ping {} -> err -32601 Method not found:  gateway.ping
+ gateway.ping "x" -> err -32601 Method not found:  gateway.ping
+ gateway.ping {"session_id":5} -> err -32601 Method not found:  gateway.ping
+ gateway.ping {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32601 Method not found:  gateway.ping
+ gateway.ping {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32601 Method not found:  gateway.ping
+ gateway.ping {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32601 Method not found:  gateway.ping
+ gateway.ping {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32601 Method not found:  gateway.ping
+ null -> err -32601 Method not found: 
+ {} -> err -32601 Method not found: 
+ "x" -> err -32601 Method not found: 
+ {"session_id":5} -> err -32601 Method not found: 
+ {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32601 Method not found: 
+ {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32601 Method not found: 
+ {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32601 Method not found: 
+ {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32601 Method not found: 
+session.save null -> err -32601 Method not found: session.save
+session.save {} -> err -32601 Method not found: session.save
+session.save "x" -> err -32601 Method not found: session.save
+session.save {"session_id":5} -> err -32601 Method not found: session.save
+session.save {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32601 Method not found: session.save
+session.save {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32601 Method not found: session.save
+session.save {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32601 Method not found: session.save
+session.save {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32601 Method not found: session.save
+terminal.resize null -> err -32601 Method not found: terminal.resize
+terminal.resize {} -> err -32601 Method not found: terminal.resize
+terminal.resize "x" -> err -32601 Method not found: terminal.resize
+terminal.resize {"session_id":5} -> err -32601 Method not found: terminal.resize
+terminal.resize {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32601 Method not found: terminal.resize
+terminal.resize {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32601 Method not found: terminal.resize
+terminal.resize {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32601 Method not found: terminal.resize
+terminal.resize {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32601 Method not found: terminal.resize
+voice.toggle null -> err -32601 Method not found: voice.toggle
+voice.toggle {} -> err -32601 Method not found: voice.toggle
+voice.toggle "x" -> err -32601 Method not found: voice.toggle
+voice.toggle {"session_id":5} -> err -32601 Method not found: voice.toggle
+voice.toggle {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32601 Method not found: voice.toggle
+voice.toggle {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32601 Method not found: voice.toggle
+voice.toggle {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32601 Method not found: voice.toggle
+voice.toggle {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32601 Method not found: voice.toggle
+config.show null -> err -32601 Method not found: config.show
+config.show {} -> err -32601 Method not found: config.show
+config.show "x" -> err -32601 Method not found: config.show
+config.show {"session_id":5} -> err -32601 Method not found: config.show
+config.show {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32601 Method not found: config.show
+config.show {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32601 Method not found: config.show
+config.show {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32601 Method not found: config.show
+config.show {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32601 Method not found: config.show
+session.list null -> err -32601 Method not found: session.list
+session.list {} -> err -32601 Method not found: session.list
+session.list "x" -> err -32601 Method not found: session.list
+session.list {"session_id":5} -> err -32601 Method not found: session.list
+session.list {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32601 Method not found: session.list
+session.list {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32601 Method not found: session.list
+session.list {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32601 Method not found: session.list
+session.list {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32601 Method not found: session.list
+gateway.PING null -> err -32601 Method not found: gateway.PING
+gateway.PING {} -> err -32601 Method not found: gateway.PING
+gateway.PING "x" -> err -32601 Method not found: gateway.PING
+gateway.PING {"session_id":5} -> err -32601 Method not found: gateway.PING
+gateway.PING {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32601 Method not found: gateway.PING
+gateway.PING {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32601 Method not found: gateway.PING
+gateway.PING {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32601 Method not found: gateway.PING
+gateway.PING {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32601 Method not found: gateway.PING
+event null -> err -32601 Method not found: event
+event {} -> err -32601 Method not found: event
+event "x" -> err -32601 Method not found: event
+event {"session_id":5} -> err -32601 Method not found: event
+event {"session_id":"nope-id","extra":{"a":1},"text":"hi"} -> err -32601 Method not found: event
+event {"session_id":5,"parent_session_id":5,"id":5,"name":5,"title":5,"text" -> err -32601 Method not found: event
+event {"session_id":"5","parent_session_id":"5","id":"5","name":"5","title": -> err -32601 Method not found: event
+event {"session_id":null,"parent_session_id":null,"id":null,"name":null,"tit -> err -32601 Method not found: event

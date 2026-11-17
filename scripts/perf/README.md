@@ -69,6 +69,13 @@ turn missed runs first), the queue running front to back with `running: false` o
 last, `session.redirect`, an approval card (manual approvals, a flagged command, denied) and a
 clarify card; it is the provider itself (stop `mock_llm.py` first) and puts `approvals.mode`
 back.
+`rpc-dispatch-check.mjs [port] [folder]` calls every JSON-RPC method the gateway serves (80, Phase 13 CP13f) over the real
+socket with no model call: the envelope first (an id echoed as sent, string, number or null; no reply to a frame without
+an id or a string method, a batch array or a non-JSON line; two frames in one message are two requests); none answers -32601 for absent, empty, list, string, number or wrong-typed params; names that are
+not exactly served (other case, spaces, empty, the ones the page probes: `session.save`, `terminal.resize`, ...) answer
+exactly -32601 `Method not found: <name>` with no `data`; the errors the page reads keep their code and text; the methods the
+other checks don't call (setup, projects create / update / add folder / set active / delete, delegation, processes,
+subagents, completion, approvals, the Import screen's list) answer their shapes. It leaves the instance as it found it.
 `attach-check.mjs` checks composer attachments (image upload and read-back, images reaching the
 model, held and detached images, file upload and `file.attach`); it is the provider on :47900
 itself, so stop `mock_llm.py` first.

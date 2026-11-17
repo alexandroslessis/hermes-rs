@@ -2,7 +2,7 @@
 //! channels. [`Turn::event`] takes one event and returns what to do about it; `server.rs` does it
 //! (sending the updates, asking the editor, answering the prompt).
 //!
-//! The events are the ones `gateway.rs` `submit` emits for the page: `message.delta`,
+//! The events are the ones `gateway/turn.rs` `submit` emits for the page: `message.delta`,
 //! `reasoning.delta`, `tool.start`, `tool.complete`, `approval.request`, `clarify.request`,
 //! `status.update`, `message.complete`.
 //!

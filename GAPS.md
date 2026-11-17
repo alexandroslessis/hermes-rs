@@ -7,8 +7,8 @@ tools and commands) against hermes-rs (`crates/desktop`, the runtime and tool cr
 endpoint, replacing Goose / opencode / Claude Code. Nothing hosted or always-on.
 
 **How it was checked:** the 257 JSON-RPC methods in `apps/shared/src/gateway-contract.openrpc.json`
-against what `gateway.rs` answers (46 today); the 155 `/api/...` paths in the frontend source
-against `gateway.rs` / `rest.rs` / `skills.rs` / `server.rs`; Hermes's core tools (`toolsets.py`)
+against what the gateway answered (46 then; `gateway/rpc.rs` `Request` lists the methods now); the 155 `/api/...` paths in the frontend source
+against the gateway / `rest.rs` / `skills.rs` / `server.rs`; Hermes's core tools (`toolsets.py`)
 and slash commands (`desktop-slash-registry.json`, `desktop-slash-commands.ts`) against the runtime;
 what `plugins/hermes-rs` and `hide.css` hide; FEATURES.md's keep/later/drop marks.
 
@@ -99,6 +99,13 @@ backend code · **L** = a port of a Hermes subsystem.
 - `/api/profiles/sessions/sidebar` unanswered (`/api/sessions/:id/messages` is served:
   `stored_messages`).
 - The context gauge's window falls back to 256k when a provider doesn't list the model's context.
+- `background_review: false` in `config.json` is ignored by the desktop app and the ACP server
+  (found 2026-11-15, Phase 13 CP13d review; still open 2026-11-17): only the frozen GPUI app calls
+  `Runtime::set_background_review` (`crates/app/src/state.rs`, `settings.rs`), so the runtime's
+  default (on) holds and background reviews run after turns (and after `/undo` / `/retry`, a
+  learning signal) whatever the config says. Fix where Settings reach the runtime
+  (`gateway/settings.rs` `apply_settings`), with a turn test; then the ACP tests' review filter
+  (`turn_requests` in `crates/desktop/tests/acp.rs`) can be revisited.
 
 ## 5. Later, if wanted
 

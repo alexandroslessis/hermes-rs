@@ -7,7 +7,7 @@ the order recommended. Every recipe assumes the procedure in [WORKFLOW.md](WORKF
 
 State as of 2026-11-05 (Hermes `c419cf7c`): 69 of the contract's 257 JSON-RPC methods answered
 (`tools/node/node.exe scripts/contract.mjs --missing` lists the rest; it matches names as strings
-in `gateway.rs`, so a method answered only through another one, like `session.save` via
+in `gateway/rpc.rs`, so a method answered only through another one, like `session.save` via
 `session.export`, may show as missing).
 
 ## The generic recipe (every gap)
@@ -17,7 +17,8 @@ in `gateway.rs`, so a method answered only through another one, like `session.sa
 2. Read Hermes's handler and behaviour module (paths below). Decide what to port; anything about
    profiles, Nous accounts, hosted rooms or messaging platforms is dropped.
 3. New module `crates/desktop/src/<feature>.rs` with a header (`Hermes:` line) and unit tests; thin
-   arms in `gateway.rs` (`dispatch` for RPC, a prefix block in `rest` for REST).
+   handlers in `gateway/` (a `Request` variant in `rpc.rs`, a handler in the area's file and an arm in
+   `dispatch` for RPC; a prefix block in `rest` for REST).
 4. Settings keys: add Hermes's default under `config_defaults()` in `rest.rs` (and a description
    or select override in `config_schema()` if the generated label is poor), read with
    `self.rest.config_value("a.b")`, push into the runtime in `Gateway::apply_settings()`.
@@ -95,7 +96,7 @@ add_subgoal/evaluate_after_turn/next_continuation_prompt`, `judge_goal`, gates, 
 `apps/desktop/src/store/session-control.ts`,
 `app/session/hooks/use-message-stream/gateway-event/session-control.ts`.
 
-**Current state:** `gateway.rs` answers `slash.exec` for commands starting with `goal` with an
+**Current state:** `gateway/slash.rs` answers `slash.exec` for commands starting with `goal` with an
 empty output, because the page polls each session's goal. Replace that stub.
 
 **Steps:**
@@ -227,7 +228,7 @@ config key is `fallback_model` (single dict or list; `hermes_cli/config.py`) rea
 - **`/api/profiles/sessions/sidebar`** (`api/sessions.ts:337`): a sidebar-sized session list;
   answer it from `session_rows()` with the query's limit. (The `/api/sessions/:id/messages` half
   of the GAPS line is done: `stored_messages`.)
-- **Context window fallback 256k** (`FALLBACK_CONTEXT` in `gateway.rs`): when the provider's model
+- **Context window fallback 256k** (`FALLBACK_CONTEXT` in `gateway/settings.rs`): when the provider's model
   list has no context length, ask the endpoint (Ollama `/api/show`, llama.cpp `/props`,
   LM Studio `/api/v0/models`) in `model_facts`, cache it, else keep 256k.
 - **Other unanswered session RPCs** worth a look: `session.undo` (alias of rewind),
