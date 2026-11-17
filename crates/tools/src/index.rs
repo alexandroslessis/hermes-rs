@@ -1078,14 +1078,15 @@ pub(super) mod tests {
     use std::time::Duration;
 
     struct Fixture {
-        _dir: tempfile::TempDir,
         skills: Arc<SkillStore>,
         memory: Arc<MemoryStore>,
         index: Arc<LocalIndex>,
+        // Last: fields drop in order, so the stores let go of their files first.
+        _dir: hermes_testdir::TestDir,
     }
 
     fn fixture() -> Fixture {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let skills = Arc::new(SkillStore::new(
             dir.path().join("skills"),
             Default::default(),
@@ -1365,7 +1366,7 @@ pub(super) mod tests {
 
     #[test]
     fn project_name_is_the_git_root_folder_or_the_cwd() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let repo = dir.path().join("my-repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::create_dir_all(repo.join("src/deep")).unwrap();
@@ -1790,7 +1791,7 @@ pub(super) mod tests {
         let f = fixture();
         f.index.attach();
         f.index.refresh().unwrap();
-        let external = tempfile::tempdir().unwrap();
+        let external = hermes_testdir::tempdir().unwrap();
         let dir = external.path().join("zebra-care");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -1829,7 +1830,7 @@ pub(super) mod tests {
     #[test]
     fn the_first_copy_of_a_name_is_the_one_served() {
         let f = fixture();
-        let external = tempfile::tempdir().unwrap();
+        let external = hermes_testdir::tempdir().unwrap();
         let mut config = f.skills.config();
         config.external_dirs.push(external.path().to_path_buf());
         f.skills.set_config(config);
@@ -1916,7 +1917,7 @@ pub(super) mod tests {
 
     #[test]
     fn a_stale_schema_or_a_corrupt_file_is_rebuilt() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let skills = Arc::new(SkillStore::new(
             dir.path().join("skills"),
             Default::default(),

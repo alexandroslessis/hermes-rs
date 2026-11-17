@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn a_second_holder_is_refused_until_the_first_lets_go() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let first = TurnLock::acquire(dir.path(), "ses_1").unwrap();
         let refused = TurnLock::acquire(dir.path(), "ses_1").err().unwrap();
         assert!(

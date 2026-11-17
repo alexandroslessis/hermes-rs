@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn documents_open_and_programs_are_only_shown() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let doc = dir.path().join("my report.md");
         let script = dir.path().join("setup.PS1");
         std::fs::write(&doc, "# hi").unwrap();
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn reveal_shows_what_is_there_and_refuses_the_rest() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let doc = dir.path().join("my report.md");
         std::fs::write(&doc, "# hi").unwrap();
         assert_eq!(reveal_plan(&link_to(&doc)), Ok(Open::Reveal(doc)));

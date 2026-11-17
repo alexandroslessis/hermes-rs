@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn memory_status_and_reset() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let folder = dir.path().join("memories");
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("MEMORY.md"), "abc").unwrap();
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn pausing_the_curator_is_kept() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let skills = SkillStore::new(dir.path().join("skills"), Default::default());
         assert_eq!(curator_status(&skills)["paused"], false);
         set_curator_paused(&skills, true);

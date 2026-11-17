@@ -184,8 +184,8 @@ struct Agent {
     answered: HashSet<String>,
     next_id: u64,
     model: Model,
-    home: tempfile::TempDir,
-    work: tempfile::TempDir,
+    home: hermes_testdir::TestDir,
+    work: hermes_testdir::TestDir,
 }
 
 impl Agent {
@@ -200,8 +200,8 @@ impl Agent {
 
     async fn start_profile(replies: Vec<String>, delay: Duration, profile: &str) -> Self {
         let model = Model::start(replies, delay).await;
-        let home = tempfile::tempdir().unwrap();
-        let work = tempfile::tempdir().unwrap();
+        let home = hermes_testdir::tempdir().unwrap();
+        let work = hermes_testdir::tempdir().unwrap();
         let config = json!({
             "providers": [{"id": "mock", "name": "Mock", "base_url": format!("{}/v1", model.server.uri())}],
             "provider": "mock", "model": "mock",
@@ -222,12 +222,12 @@ impl Agent {
         let model = Model::start(Vec::new(), Duration::ZERO).await;
         Self::spawn(
             model,
-            tempfile::tempdir().unwrap(),
-            tempfile::tempdir().unwrap(),
+            hermes_testdir::tempdir().unwrap(),
+            hermes_testdir::tempdir().unwrap(),
         )
     }
 
-    fn spawn(model: Model, home: tempfile::TempDir, work: tempfile::TempDir) -> Self {
+    fn spawn(model: Model, home: hermes_testdir::TestDir, work: hermes_testdir::TestDir) -> Self {
         let data = home.path().to_path_buf();
         Self::spawn_at(model, home, work, &data)
     }
@@ -238,16 +238,16 @@ impl Agent {
         let data = first.home.path().to_path_buf();
         Self::spawn_at(
             model,
-            tempfile::tempdir().unwrap(),
-            tempfile::tempdir().unwrap(),
+            hermes_testdir::tempdir().unwrap(),
+            hermes_testdir::tempdir().unwrap(),
             &data,
         )
     }
 
     fn spawn_at(
         model: Model,
-        home: tempfile::TempDir,
-        work: tempfile::TempDir,
+        home: hermes_testdir::TestDir,
+        work: hermes_testdir::TestDir,
         data: &Path,
     ) -> Self {
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_hermes-acp"))

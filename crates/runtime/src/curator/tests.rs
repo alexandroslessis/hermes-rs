@@ -454,13 +454,14 @@ fn a_repair_keeps_one_skill_and_archives_nothing() {
 // ---- proposals: staging, auto-apply, refusals ---------------------------------------------------
 
 struct World {
-    _dir: tempfile::TempDir,
     data: PathBuf,
     skills: SkillStore,
+    // Last: fields drop in order, so the stores let go of their files first.
+    _dir: hermes_testdir::TestDir,
 }
 
 fn world() -> World {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let data = dir.path().to_path_buf();
     let skills = SkillStore::new(data.join("skills"), SkillsConfig::default());
     World {

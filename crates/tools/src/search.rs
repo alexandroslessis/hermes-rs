@@ -347,7 +347,7 @@ mod tests {
     use super::*;
     use crate::tests::tools_in;
 
-    fn setup() -> (tempfile::TempDir, SessionTools) {
+    fn setup() -> (hermes_testdir::TestDir, SessionTools) {
         let (dir, tools) = tools_in();
         let root = dir.path();
         std::fs::create_dir_all(root.join("src")).unwrap();

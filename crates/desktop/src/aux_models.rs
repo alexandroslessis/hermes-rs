@@ -438,8 +438,8 @@ fn write_config(data_dir: &Path, config: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn home() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+    fn home() -> hermes_testdir::TestDir {
+        let dir = hermes_testdir::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.json"),
             r#"{"providers":[{"id":"local","name":"Local","base_url":"http://127.0.0.1:11434/v1"},
@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(config["aux_models"]["curator"]["model"], "c");
     }
 
-    fn list_of(dir: &tempfile::TempDir) -> Value {
+    fn list_of(dir: &hermes_testdir::TestDir) -> Value {
         list(dir.path())
     }
 
@@ -652,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn one_click_sets_every_job_to_a_configured_local_server() {
         let server = models_server(&["nomic-embed-text", "qwen-small", "zed"]).await;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let url = format!("{}/v1", server.uri());
         std::fs::write(
             dir.path().join("config.json"),
@@ -691,7 +691,7 @@ mod tests {
     #[tokio::test]
     async fn a_server_on_a_well_known_port_is_added_as_a_provider() {
         let server = models_server(&["llama3"]).await;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), json!({"providers": [], "window": {"w": 1}}).to_string()).unwrap();
         let url = format!("{}/v1", server.uri());
         let known = [("ollama", "Ollama", url.as_str()), ("lm-studio", "LM Studio", "http://127.0.0.1:1/v1")];
@@ -710,7 +710,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_no_local_server_up_nothing_changes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         // A configured local server that is down, and a well-known one that is down too.
         std::fs::write(
             dir.path().join("config.json"),
@@ -737,7 +737,7 @@ mod tests {
     /// when there are two of them (probed side by side).
     #[tokio::test]
     async fn hung_servers_are_bounded_by_the_probe_timeout() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), json!({"providers": []}).to_string()).unwrap();
         // Listening (the OS completes the handshake) but nobody reads or answers.
         let hung: Vec<std::net::TcpListener> =

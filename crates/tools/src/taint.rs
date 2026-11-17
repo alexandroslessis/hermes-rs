@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn the_session_level_is_saved_loaded_and_forgotten() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         assert!(load(dir.path(), "s1").is_none());
         save(dir.path(), "s1", &["a web page".to_string()]);
         save(dir.path(), "s2", &["results from MCP server x".to_string()]);

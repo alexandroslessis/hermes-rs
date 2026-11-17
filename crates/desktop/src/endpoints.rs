@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn the_daily_request_limit_is_saved_listed_cleared_and_not_wiped_by_an_older_page() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let save_body = |body: Value| {
             let (status, answer) = save(dir.path(), &body);
             assert_eq!(status, 200, "{answer}");
@@ -412,7 +412,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_edit_default_and_delete_keep_the_rest_of_the_config() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.json"),
             r#"{"theme": "One Dark", "providers": [{"id": "ollama", "name": "Ollama", "base_url": "http://localhost:11434/v1"}], "provider": "ollama", "model": "qwen"}"#,

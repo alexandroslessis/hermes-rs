@@ -29,8 +29,8 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 /// A repository with a few commits, a README, AGENTS.md, a .gitignore and some folders.
-fn repo() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
+fn repo() -> (hermes_testdir::TestDir, PathBuf) {
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = ps::canonical(dir.path()).unwrap();
     git(&root, &["init", "-q", "-b", "main"]);
     std::fs::write(root.join("README.md"), "# Demo\n\nA demo project.\n").unwrap();
@@ -94,7 +94,7 @@ fn the_cache_is_per_head_and_status_and_corrupt_entries_are_tolerated() {
         return;
     }
     let (_dir, root) = repo();
-    let cache = tempfile::tempdir().unwrap();
+    let cache = hermes_testdir::tempdir().unwrap();
     pack(&root, Some(cache.path())).unwrap();
     let files = || -> Vec<PathBuf> {
         std::fs::read_dir(cache.path())
@@ -156,7 +156,7 @@ fn a_cache_file_edited_by_hand_cannot_forge_the_elements_tags() {
         return;
     }
     let (_dir, root) = repo();
-    let cache = tempfile::tempdir().unwrap();
+    let cache = hermes_testdir::tempdir().unwrap();
     pack(&root, Some(cache.path())).unwrap();
     let file = std::fs::read_dir(cache.path()).unwrap().flatten().next().unwrap().path();
     let mut entry: Cached = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
@@ -170,7 +170,7 @@ fn a_cache_file_edited_by_hand_cannot_forge_the_elements_tags() {
 
 #[test]
 fn the_cache_keeps_a_bounded_number_of_files() {
-    let cache = tempfile::tempdir().unwrap();
+    let cache = hermes_testdir::tempdir().unwrap();
     // A temporary file a crash left behind goes once it is old; a fresh one (a write under way) stays.
     let stale = cache.path().join(".0000000000000000.1.0.tmp");
     let fresh = cache.path().join(".0000000000000001.1.0.tmp");
@@ -248,7 +248,7 @@ fn a_huge_repository_gives_a_capped_pack_in_bounded_time() {
 #[test]
 fn a_big_flat_tree_falls_back_to_shallower_levels_then_cuts() {
     // 5 levels deep is cut at 3; many folders force the level down.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = dir.path();
     for a in 0..40 {
         for b in 0..40 {
@@ -263,7 +263,7 @@ fn a_big_flat_tree_falls_back_to_shallower_levels_then_cuts() {
 
 #[test]
 fn without_git_the_git_parts_are_left_out_and_nothing_hangs() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = ps::canonical(dir.path()).unwrap();
     std::fs::write(root.join("README.md"), "hello readme\n").unwrap();
     std::fs::create_dir(root.join("src")).unwrap();
@@ -279,7 +279,7 @@ fn without_git_the_git_parts_are_left_out_and_nothing_hangs() {
     assert!(!text.contains("Branch:") && !text.contains("<commits>") && !text.contains("<changes>"), "{text}");
     assert!(text.contains("hello readme") && text.contains("src/"), "{text}");
     // Nothing at all to say: no pack.
-    let empty = tempfile::tempdir().unwrap();
+    let empty = hermes_testdir::tempdir().unwrap();
     assert!(collect_pack(
         &ps::canonical(empty.path()).unwrap(),
         empty.path(),
@@ -383,7 +383,7 @@ fn a_readme_with_an_injection_phrase_is_not_loaded() {
 
 #[test]
 fn a_long_readme_is_cut_and_a_binary_one_is_skipped() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = ps::canonical(dir.path()).unwrap();
     std::fs::write(root.join("README.md"), "line of text\n".repeat(2000)).unwrap();
     let (name, head) = readme_head(&root).unwrap();
@@ -398,11 +398,11 @@ fn a_long_readme_is_cut_and_a_binary_one_is_skipped() {
 
 #[test]
 fn a_readme_that_is_a_link_is_not_read_and_a_linked_folder_is_not_entered() {
-    let outside = tempfile::tempdir().unwrap();
+    let outside = hermes_testdir::tempdir().unwrap();
     std::fs::write(outside.path().join("secret.txt"), "TOP-SECRET-TEXT").unwrap();
     std::fs::create_dir(outside.path().join("inner")).unwrap();
     std::fs::write(outside.path().join("inner/leak.txt"), "x").unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = ps::canonical(dir.path()).unwrap();
     // A symlink to a file (may need a privilege on Windows) and a junction to a folder.
     let linked = std::os::windows::fs::symlink_file(outside.path().join("secret.txt"), root.join("README.md")).is_ok();
@@ -432,11 +432,11 @@ fn an_empty_repository_a_detached_head_and_a_worktree_each_give_a_pack() {
         return;
     }
     // No commit yet: no HEAD, no commits section, nothing cached, still a pack.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = ps::canonical(dir.path()).unwrap();
     git(&root, &["init", "-q", "-b", "trunk"]);
     std::fs::write(root.join("a.txt"), "x").unwrap();
-    let cache = tempfile::tempdir().unwrap();
+    let cache = hermes_testdir::tempdir().unwrap();
     let text = pack(&root, Some(cache.path())).unwrap();
     assert!(text.contains("Branch: No commits yet on trunk"), "{text}");
     assert!(text.contains("?? a.txt") && !text.contains("<commits>"), "{text}");
@@ -578,7 +578,7 @@ fn control_and_bidi_characters_are_replaced() {
 
 #[test]
 fn the_tree_marks_what_a_folder_hides_and_sorts_by_name() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir(root.join("b")).unwrap();
     std::fs::create_dir(root.join("a")).unwrap();
@@ -604,7 +604,7 @@ async fn the_async_wrapper_returns_the_pack_or_nothing() {
         return;
     }
     let (_dir, root) = repo();
-    let cache = tempfile::tempdir().unwrap();
+    let cache = hermes_testdir::tempdir().unwrap();
     let text = build(root.clone(), root.clone(), Some(cache.path().to_path_buf()), Git::system()).await;
     assert!(text.unwrap().contains("Branch: main"));
     let none = build(

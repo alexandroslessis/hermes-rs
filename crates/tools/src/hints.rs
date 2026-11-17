@@ -330,8 +330,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn project() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+    fn project() -> hermes_testdir::TestDir {
+        let dir = hermes_testdir::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "root rules").unwrap();
         std::fs::create_dir_all(dir.path().join("app/src")).unwrap();
         std::fs::write(dir.path().join("app/AGENTS.md"), "app rules").unwrap();
@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn a_file_in_a_subdirectory_loads_its_hint_once() {
         let dir = project();
-        let home = tempfile::tempdir().unwrap();
+        let home = hermes_testdir::tempdir().unwrap();
         let mut tracker = HintTracker::new(dir.path(), home.path());
         let args = json!({"path": "app/src/main.rs"});
         let hint = tracker.check("read_file", &args, dir.path()).unwrap();
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn cd_operands_and_excluded_trees() {
         let dir = project();
-        let home = tempfile::tempdir().unwrap();
+        let home = hermes_testdir::tempdir().unwrap();
         let mut tracker = HintTracker::new(dir.path(), home.path());
         let args = json!({"command": "cd node_modules/x && ls"});
         assert!(tracker.check("terminal", &args, dir.path()).is_none());

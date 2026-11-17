@@ -1665,8 +1665,8 @@ mod tests {
 
     const SKILL: &str = "---\nname: deploy\ndescription: Use when deploying the app. Runs the script.\n---\n# Deploy\nRun `make deploy`.\n";
 
-    fn store() -> (tempfile::TempDir, SkillStore) {
-        let dir = tempfile::tempdir().unwrap();
+    fn store() -> (hermes_testdir::TestDir, SkillStore) {
+        let dir = hermes_testdir::tempdir().unwrap();
         let store = SkillStore::new(dir.path().join("skills"), SkillsConfig::default());
         (dir, store)
     }

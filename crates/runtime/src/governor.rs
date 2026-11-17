@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn the_governor_reads_the_ledger() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let ledger = Ledger::open(dir.path().join("requests.json"));
         let governor = Governor::new(ledger.clone());
         let now = 1_794_484_800;

@@ -1080,7 +1080,7 @@ mod tests {
 
     #[test]
     fn long_output_keeps_head_and_tail_and_saves_the_rest() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let output = format!("START{}END", "x".repeat(50_000));
         let (limited, saved) = limit_output(output.clone(), dir.path());
         assert!(limited.starts_with("START") && limited.ends_with("END"));
@@ -1092,7 +1092,7 @@ mod tests {
     /// thousands of spaces wide per row).
     #[tokio::test]
     async fn a_powershell_table_has_no_trailing_padding() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let shell = ShellSession::new(
             ShellKind::PowerShell,
             dir.path().to_path_buf(),
@@ -1117,7 +1117,7 @@ mod tests {
     /// A command Windows PowerShell can't parse (`&&`) says why, instead of returning nothing.
     #[tokio::test]
     async fn a_powershell_syntax_error_is_reported() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let shell = ShellSession::new(
             ShellKind::PowerShell,
             dir.path().to_path_buf(),
@@ -1145,7 +1145,7 @@ mod tests {
     /// would flash in the relay).
     #[tokio::test]
     async fn the_powershell_relay_takes_whole_lines_without_the_sentinel() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let shell = ShellSession::new(
             ShellKind::PowerShell,
             dir.path().to_path_buf(),

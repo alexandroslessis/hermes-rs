@@ -320,7 +320,7 @@ mod tests {
         assert!(is_sensitive(Path::new("C:/repo/.env.local")));
         assert!(is_sensitive(Path::new("C:/home/mcp-tokens/server.json")));
         assert!(!is_sensitive(Path::new("C:/repo/src/env.rs")));
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let env = dir.path().join(".env");
         std::fs::write(&env, "KEY=1").unwrap();
         assert_eq!(read_text(&env).0, 403);
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn a_file_is_read_edited_and_saved() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let file = dir.path().join("main.rs");
         std::fs::write(&file, "fn main() {}\n").unwrap();
         let (status, read) = read_text(&file);
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn folders_and_git_roots() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let made = dir.path().join("a/b");
         assert_eq!(mkdir(&made).0, 200);
         assert!(made.is_dir());

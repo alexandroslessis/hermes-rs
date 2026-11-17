@@ -758,15 +758,16 @@ mod tests {
     const SKILL: &str = "---\nname: deploy\ndescription: Use when deploying the app. Runs the script.\n---\n# Deploy\nRun `make deploy`.\n";
 
     struct Fixture {
-        _dir: tempfile::TempDir,
         staging: StagingStore,
         memory: MemoryStore,
         skills: SkillStore,
         meta: Meta,
+        // Last: fields drop in order, so the stores let go of their files first.
+        _dir: hermes_testdir::TestDir,
     }
 
     fn fixture() -> Fixture {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         Fixture {
             staging: StagingStore::new(dir.path()),
             memory: MemoryStore::new(dir.path().join("memories"), MemoryConfig::default()),

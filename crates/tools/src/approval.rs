@@ -1209,7 +1209,7 @@ mod tests {
 
     #[test]
     fn the_gate_blocks_asks_and_remembers() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let store = ApprovalStore::new(dir.path());
         let mut session = std::collections::HashSet::new();
         assert!(

@@ -339,8 +339,8 @@ mod tests {
     use crate::SessionToolsConfig;
     use crate::skills::{SkillStore, SkillsConfig};
 
-    fn review_tools(attended: bool) -> (tempfile::TempDir, ReviewTools, Arc<SkillStore>) {
-        let dir = tempfile::tempdir().unwrap();
+    fn review_tools(attended: bool) -> (hermes_testdir::TestDir, ReviewTools, Arc<SkillStore>) {
+        let dir = hermes_testdir::tempdir().unwrap();
         let skills = Arc::new(SkillStore::new(
             dir.path().join("skills"),
             SkillsConfig::default(),

@@ -3072,6 +3072,7 @@ dependencies = [
  "hermes_prompts",
  "hermes_runtime",
  "hermes_store",
+ "hermes_testdir",
  "hermes_tools",
  "keyring",
  "portable-pty",
@@ -3269,6 +3270,7 @@ dependencies = [
  "hermes_memory",
  "hermes_prompts",
  "hermes_store",
+ "hermes_testdir",
  "hermes_tools",
  "http",
  "ignore",
@@ -3305,6 +3307,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermes_testdir"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "hermes_themes"
 version = "0.1.0"
 dependencies = [
@@ -3335,6 +3344,7 @@ dependencies = [
  "hermes_memory",
  "hermes_prompts",
  "hermes_store",
+ "hermes_testdir",
  "ignore",
  "image",
  "parking_lot",

@@ -1493,3 +1493,43 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   behaviour is `turns.rs` (unchanged by CP13e). A change to the loop should be compared with a golden trace (every
   request body, agent event and queued store write per test, before and after): the method is in
   `docs/backend/progress/phase-13.md`, CP13e.
+
+## Test folders that do not go away (2026-11-17, `crates/testdir`)
+
+**What happened.** The user's `%TEMP%` filled with ~50,000 folders named `.tmpXXXXXX` and 300 GB
+of disk. Each held a complete test data directory: `sessions.db`, `memory.db`, `index.db`,
+`requests.json`, `running/` and a full copy of the bundled skills (about 4 MB, 690 files). They
+were made by *tests* (the app itself creates none; its only temp folders are the lint scratch
+folder and the skill-batch backup, both removed when done). One run of the `turns` suite left ~340
+of them (1.3 GB), the `acp` test ~60 (216 MB), `hermes_tools` ~60 (28 MB): a few hundred runs by
+a person and by the agents did the rest.
+
+**Why.** `tempfile::TempDir` removes its folder in `Drop` with one `remove_dir_all` and ignores the
+result. On Windows `remove_dir_all` stops at the first file that is still open, and SQLite opens
+its files without delete-sharing, so a runtime, store or thread still holding `index.db` kept the
+whole folder, skills included. Two things made it common: struct fields drop in declaration order
+and the fixtures declared the `TempDir` BEFORE the runtime or stores that use it (so the folder was
+removed while the files were open); and some owners outlive the test (the ledger thread keeps
+`requests.json` open until the process exits).
+
+**Rules**
+- In `hermes_tools`, `hermes_runtime` and `hermes-desktop` tests, make folders with
+  `hermes_testdir::tempdir()` (a drop-in for `tempfile::tempdir()`; the type is
+  `hermes_testdir::TestDir`), never `tempfile` directly. It deletes everything it can, retries
+  for ~1.5 s while a file's owner lets go, and prints `hermes_testdir: could not remove ...` when
+  something is left, so a leak shows in the test output. Production code keeps using `tempfile`.
+- In a fixture struct, declare the `TestDir` field LAST (after the runtime, stores, servers: they
+  drop first and release their files). A comment on the field says why.
+- Its folder name stays `tempfile`'s default `.tmpXXXXXX` on purpose: the local skill retrieval
+  reads the workspace folder's name as words, and a prefix such as `hermes-test-` made "hello"
+  attach the `test-driven-development` skill (four `turns` scenarios failed).
+- Do NOT point `TEMP` at another folder to catch leaks: `hermes_tools`'s taint test treats paths
+  under `%TEMP%` as scratch and fails when the whole test area is under it.
+- What still stays (~0.4 MB per affected test: the database files a thread holds until the test
+  process exits, ~85 MB per `turns` run) is swept with
+  `powershell -NoProfile -File scripts/clean-test-temp.ps1 -Delete` (dry run without `-Delete`;
+  it only touches `.tmp` + 6 characters folders directly under `%TEMP%` older than 10 minutes).
+  Run it after test runs, and before reporting disk numbers.
+- A leak check: run a suite and count `.tmp*` folders in `%TEMP%` before and after (the 2026-11-17
+  numbers: `turns` 326 folders / 1.31 GB before, 212 / 84 MB after; `hermes_tools` 59 → 0; the
+  runtime lib 7 → 0; `acp` 59 / 216 MB → 22 / 7 MB; `hermes-desktop` lib 8 → 3).

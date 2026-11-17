@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn archiving_survives_a_restart_and_deleting_forgets_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let archive = Archive::load(dir.path());
         assert!(archive.set("a", true, 1));
         assert!(
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn the_sweep_hides_idle_unpinned_sessions_once_a_day() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let archive = Archive::load(dir.path());
         let now = 100 * DAY;
         let mut pinned = candidate("pinned", now - 10 * DAY);
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn a_swept_session_comes_back_when_used_but_a_users_archive_stays() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let archive = Archive::load(dir.path());
         archive.sweep(&[candidate("idle", 0)], 3.0, 10 * DAY);
         archive.set("mine", true, 10 * DAY);

@@ -24,7 +24,7 @@ fn eventually(mut done: impl FnMut() -> bool) -> bool {
 
 #[test]
 fn the_first_session_attached_is_kept_and_answered_to_both() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let (_, first) = open_session(dir.path());
     let (_, second) = open_session(dir.path());
     let handle = handle();
@@ -37,7 +37,7 @@ fn the_first_session_attached_is_kept_and_answered_to_both() {
 
 #[test]
 fn an_answered_command_is_in_the_status_the_caller_reads_next() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let (_, open) = open_session(dir.path());
     let handle = handle();
     for _ in 0..200 {
@@ -50,7 +50,7 @@ fn an_answered_command_is_in_the_status_the_caller_reads_next() {
 
 #[test]
 fn commands_from_one_sender_are_handled_in_the_order_sent() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let (_, open) = open_session(dir.path());
     let handle = handle();
     // Fire-and-forget attach, detach, attach: whatever the timing, the last one wins.
@@ -98,7 +98,7 @@ fn many_threads_each_keep_their_own_order() {
 
 #[test]
 fn a_panicking_handler_answers_an_error_and_the_actor_goes_on() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let (_, open) = open_session(dir.path());
     let handle = handle();
     handle.attach(open.clone(), Default::default()).unwrap();
@@ -201,7 +201,7 @@ fn a_call_from_the_actors_own_thread_is_refused_not_deadlocked() {
 
 #[test]
 fn the_actor_ends_when_the_last_handle_is_dropped() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let (_, open) = open_session(dir.path());
     let weak = Arc::downgrade(&open);
     let handle = handle();
@@ -339,7 +339,7 @@ fn the_turn_state_is_published_with_the_claim_and_gone_with_the_release() {
 
 #[test]
 fn detaching_an_idle_only_session_is_refused_while_a_turn_runs() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let (_, open) = open_session(dir.path());
     let handle = handle();
     handle.attach(open, Default::default()).unwrap();
@@ -528,7 +528,7 @@ fn the_review_claim_and_the_schedulers_claim_always_see_each_other() {
 
 #[test]
 fn the_review_counters_start_with_the_load_and_count_turns() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let (_, open) = open_session(dir.path());
     let (_, other) = open_session(dir.path());
     let handle = handle();
@@ -690,7 +690,7 @@ fn effort_revision_and_images_are_kept_per_session() {
 
 #[test]
 fn the_pages_state_outlives_a_close_but_not_a_delete() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let (_, open) = open_session(dir.path());
     let registry = SessionRegistry::default();
     let handle = registry.get_or_spawn("s").unwrap();
@@ -711,7 +711,7 @@ fn the_pages_state_outlives_a_close_but_not_a_delete() {
 
 #[test]
 fn a_losing_load_gets_its_copy_back_to_drop_on_its_own_thread() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let (_, first) = open_session(dir.path());
     let (_, second) = open_session(dir.path());
     let handle = handle();

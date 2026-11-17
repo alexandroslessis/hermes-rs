@@ -34,7 +34,7 @@ fn names(entries: &[SkillEntry]) -> Vec<&str> {
 
 #[test]
 fn the_root_is_the_nearest_git_folder_above_the_real_working_folder() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let outer = repo(dir.path(), "outer");
     std::fs::create_dir_all(outer.join("src/deep")).unwrap();
     assert_eq!(find_root(&outer.join("src/deep")), Some(outer.clone()));
@@ -58,7 +58,7 @@ fn the_root_is_the_nearest_git_folder_above_the_real_working_folder() {
 
 #[test]
 fn a_junction_into_a_repository_is_resolved_to_the_repository_it_really_is() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let real = repo(dir.path(), "real");
     let plain = dir.path().join("plain");
     std::fs::create_dir_all(&plain).unwrap();
@@ -76,7 +76,7 @@ fn a_junction_into_a_repository_is_resolved_to_the_repository_it_really_is() {
 
 #[test]
 fn the_three_folders_are_read_in_the_order_of_the_decision() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = repo(dir.path(), "r");
     add_skill(&root, ".claude/skills", "shared", "From claude.");
     add_skill(&root, ".hermes/skills", "shared", "From hermes.");
@@ -106,7 +106,7 @@ fn the_three_folders_are_read_in_the_order_of_the_decision() {
 
 #[test]
 fn a_category_folder_nests_under_project() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = repo(dir.path(), "r");
     add_skill(&root, ".agents/skills/ci", "release", "Cut a release.");
     let found = catalog(&root);
@@ -115,7 +115,7 @@ fn a_category_folder_nests_under_project() {
 
 #[test]
 fn a_folder_that_is_not_a_repository_root_has_no_skills() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = repo(dir.path(), "r");
     add_skill(&root, ".agents/skills", "x", "X.");
     let sub = root.join("sub");
@@ -130,7 +130,7 @@ fn a_folder_that_is_not_a_repository_root_has_no_skills() {
 
 #[test]
 fn hostile_skills_are_not_loaded() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = repo(dir.path(), "r");
     add_skill(&root, ".agents/skills", "fine", "A fine skill.");
     // Prompt injection and a name that is a path.
@@ -168,7 +168,7 @@ fn hostile_skills_are_not_loaded() {
 
 #[test]
 fn links_are_never_followed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = repo(dir.path(), "r");
     let elsewhere = dir.path().join("elsewhere");
     add_skill(&elsewhere, "", "stolen", "Not the repository's.");
@@ -181,7 +181,7 @@ fn links_are_never_followed() {
     add_skill(&root, ".agents/skills", "plain", "A plain one.");
     assert_eq!(names(&catalog(&root)), ["plain"]);
     // The whole `.agents` folder being a junction: no project folder.
-    let other = tempfile::tempdir().unwrap();
+    let other = hermes_testdir::tempdir().unwrap();
     let root2 = repo(other.path(), "r2");
     add_skill(&elsewhere, "skills", "stolen2", "Elsewhere.");
     assert!(junction(&root2.join(".agents"), &elsewhere));
@@ -192,7 +192,7 @@ fn links_are_never_followed() {
 
 #[test]
 fn a_link_loop_in_a_skill_does_not_loop() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = repo(dir.path(), "r");
     let skill = add_skill(&root, ".agents/skills", "loopy", "Has a loop.");
     std::fs::create_dir_all(skill.join("references")).unwrap();
@@ -207,7 +207,7 @@ fn a_link_loop_in_a_skill_does_not_loop() {
 
 #[test]
 fn writes_stay_inside_the_skill() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = repo(dir.path(), "r");
     let skill = add_skill(&root, ".agents/skills", "x", "X.");
     assert!(ensure_inside(&skill, &skill.join("references/new.md")).is_ok());
@@ -219,7 +219,7 @@ fn writes_stay_inside_the_skill() {
 
 #[test]
 fn a_changed_file_is_scanned_again() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = repo(dir.path(), "r");
     let skill = add_skill(&root, ".agents/skills", "x", "X.");
     assert_eq!(names(&catalog(&root)), ["x"]);
@@ -241,15 +241,16 @@ mod scoped {
     use std::sync::Arc;
 
     struct World {
-        dir: tempfile::TempDir,
         skills: Arc<SkillStore>,
         a: PathBuf,
         b: PathBuf,
+        // Last: fields drop in order, so the stores let go of their files first.
+        dir: hermes_testdir::TestDir,
     }
 
     /// The user's library with one skill, and two repositories with one skill of their own each.
     fn world() -> World {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let skills = Arc::new(SkillStore::new(dir.path().join("data/skills"), SkillsConfig::default()));
         let made = skills.manage_tool(&json!({"operations": [{"action": "create", "name": "release-notes",
             "content": skill_text("release-notes", "Write release notes for the changelog.")}]}));
@@ -653,7 +654,7 @@ mod scoped {
 
     #[test]
     fn a_tree_of_empty_folders_is_walked_only_so_far() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let root = repo(dir.path(), "r");
         let base = root.join(".agents/skills");
         for i in 0..40 {
@@ -674,7 +675,7 @@ mod scoped {
 #[test]
 fn project_memory_follows_the_same_root_as_project_skills() {
     use hermes_memory::{MemoryStore, Target, TurnFailures};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let outer = repo(dir.path(), "outer");
     std::fs::create_dir_all(outer.join("src/deep")).unwrap();
     let inner = repo(&outer, "vendor-inner");
@@ -734,7 +735,7 @@ fn project_memory_follows_the_same_root_as_project_skills() {
 /// per checkout. A submodule, a forged pointer and a bare repository's worktree stay their own.
 #[test]
 fn a_linked_worktree_shares_its_main_checkouts_memory_scope() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let main = repo(dir.path(), "main");
     let worktree = |name: &str, absolute: bool| {
         let tree = dir.path().join(name);

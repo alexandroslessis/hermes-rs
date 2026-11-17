@@ -421,7 +421,7 @@ fn tool_call(name: &str, args: serde_json::Value) -> Message {
 #[test]
 fn the_default_scope_is_project_only_when_every_file_is_in_the_one_repository() {
     use hermes_tools::skill_manage::SkillScope::{Global, Project};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let root = hermes_tools::project_skills::canonical(dir.path()).unwrap();
     std::fs::create_dir_all(root.join("repo/.git")).unwrap();
     std::fs::create_dir_all(root.join("repo/src")).unwrap();
@@ -511,12 +511,13 @@ fn a_project_create_is_applied_staged_or_refused_by_the_session() {
 // ---- apply ---------------------------------------------------------------------------------
 
 struct Stores {
-    _dir: tempfile::TempDir,
     ctx: ApplyContext,
+    // Last: fields drop in order, so the stores let go of their files first.
+    _dir: hermes_testdir::TestDir,
 }
 
 fn stores() -> Stores {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let memory = Arc::new(MemoryStore::new(
         dir.path().join("memories"),
         MemoryConfig::default(),

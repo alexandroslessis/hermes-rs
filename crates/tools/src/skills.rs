@@ -1165,7 +1165,7 @@ mod tests {
 
     #[test]
     fn skills_import_from_another_install() {
-        let source = tempfile::tempdir().unwrap();
+        let source = hermes_testdir::tempdir().unwrap();
         let skill = |rel: &str, body: &str| {
             let dir = source.path().join(rel);
             std::fs::create_dir_all(&dir).unwrap();
@@ -1186,7 +1186,7 @@ mod tests {
         );
         std::fs::write(source.path().join(".bundled_manifest"), "plan:abc123\n").unwrap();
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let store = SkillStore::new(dir.path().join("skills"), SkillsConfig::default());
         let report = store.import_from(source.path());
         assert_eq!(report.imported, vec!["deploy-notes"]);
@@ -1232,7 +1232,7 @@ mod tests {
 
     #[test]
     fn background_seeding_has_the_files_now_and_commits_before_any_write() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let store = std::sync::Arc::new(SkillStore::new(
             dir.path().join("skills"),
             SkillsConfig::default(),
@@ -1256,7 +1256,7 @@ mod tests {
 
     #[test]
     fn only_untouched_bundled_scripts_count_as_stock() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let root = dir.path().join("skills");
         let store = SkillStore::new(root.clone(), SkillsConfig::default());
         store.seed_bundled();
@@ -1281,7 +1281,7 @@ mod tests {
 
     #[test]
     fn bundled_skills_seed_index_and_survive_edits() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let store = SkillStore::new(dir.path().join("skills"), SkillsConfig::default());
         store.seed_bundled();
         let catalog = store.catalog();
@@ -1349,7 +1349,7 @@ mod tests {
     /// a parameter added to a schema without a word in the guide fails here.
     #[test]
     fn the_tools_guide_is_bundled_and_documents_every_parameter_of_its_four_tools() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let store = SkillStore::new(dir.path().join("skills"), SkillsConfig::default());
         store.seed_bundled();
         let entry = store.find("hermes-tools-guide").expect("bundled skill");
@@ -1397,7 +1397,7 @@ mod tests {
 
     #[test]
     fn view_returns_content_linked_files_and_invocations() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let root = dir.path().join("skills");
         let skill = root.join("devops").join("deploy");
         std::fs::create_dir_all(skill.join("references")).unwrap();

@@ -63,8 +63,8 @@ fn assert_off_the_worker(what: &str, took: Duration, longest: Duration) {
 }
 
 /// Tools with a memory folder, a session database and a skills folder, all real.
-fn full_tools(session_id: &str) -> (tempfile::TempDir, SessionTools) {
-    let dir = tempfile::tempdir().unwrap();
+fn full_tools(session_id: &str) -> (hermes_testdir::TestDir, SessionTools) {
+    let dir = hermes_testdir::tempdir().unwrap();
     let skills = Arc::new(SkillStore::new(dir.path().join("skills"), Default::default()));
     let memory = Arc::new(hermes_memory::MemoryStore::new(
         dir.path().join("memories"),

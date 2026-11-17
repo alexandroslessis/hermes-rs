@@ -894,7 +894,7 @@ mod tests {
 
     #[tokio::test]
     async fn paths_mask_secrets_per_file_and_taint_only_outside_files_that_were_read() {
-        let elsewhere = tempfile::tempdir().unwrap();
+        let elsewhere = hermes_testdir::tempdir().unwrap();
         let outside = elsewhere.path().join("o.txt");
         std::fs::write(&outside, "outside text").unwrap();
         let (dir, tools) = tools_in();

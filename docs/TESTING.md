@@ -293,6 +293,25 @@ app in two minutes: where to click, what to type, what they should see. Include 
 ("switch Terminal off, ask for `dir`: the reply says the tool is switched off"). Say which build to
 run (they must rebuild/restart their app; your `target/claude` build isn't theirs).
 
+## 5. Temp folders and leaks
+
+Tests make their folders with `hermes_testdir::tempdir()` (crate `crates/testdir`), not
+`tempfile::tempdir()`, in `hermes_tools`, `hermes_runtime` and `hermes-desktop`; a fixture struct
+declares the `TestDir` field last. Why, and the numbers: docs/PITFALLS.md, "Test folders that do not
+go away" (a test run used to leave ~1.6 GB in `%TEMP%`; 300 GB over a few hundred runs).
+
+After a round of test runs, sweep what is left (small database files a thread holds until the test
+process exits):
+
+```powershell
+powershell -NoProfile -File scripts/clean-test-temp.ps1            # dry run: count and size
+powershell -NoProfile -File scripts/clean-test-temp.ps1 -Delete    # remove
+```
+
+Do not redirect `TEMP` for a test run (the taint test treats paths under it as scratch). A line
+`hermes_testdir: could not remove ...` in test output is a leak: fix the field order or the owner of
+the open file.
+
 ## Before you commit
 
 ```powershell

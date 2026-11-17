@@ -57,5 +57,6 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
+hermes_testdir.workspace = true
 tempfile.workspace = true
 wiremock = "0.6"

@@ -1019,8 +1019,8 @@ mod tests {
     use super::*;
 
     /// A repository with one commit, and git's identity set for it.
-    fn repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+    fn repo() -> hermes_testdir::TestDir {
+        let dir = hermes_testdir::tempdir().unwrap();
         let cwd = dir.path();
         git_ok(cwd, &["init", "-q", "-b", "main"]).unwrap();
         git_ok(cwd, &["config", "user.email", "test@example.com"]).unwrap();
@@ -1156,7 +1156,7 @@ mod tests {
 
     #[test]
     fn a_folder_that_is_not_a_repository_reads_empty() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         assert_eq!(
             review_list(dir.path(), "uncommitted", None)["files"],
             json!([])

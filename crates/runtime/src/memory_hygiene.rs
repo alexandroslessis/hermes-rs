@@ -82,8 +82,8 @@ mod tests {
 
     const DAY: i64 = 86_400;
 
-    fn world() -> (tempfile::TempDir, MemoryStore, StagingStore) {
-        let dir = tempfile::tempdir().unwrap();
+    fn world() -> (hermes_testdir::TestDir, MemoryStore, StagingStore) {
+        let dir = hermes_testdir::tempdir().unwrap();
         let memory = MemoryStore::new(dir.path().join("memories"), MemoryConfig::default());
         let staging = StagingStore::new(dir.path());
         (dir, memory, staging)

@@ -1039,7 +1039,7 @@ mod tests {
 
     #[test]
     fn oversized_results_are_spilled_with_a_preview() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let line = "0123456789".repeat(9) + "\n";
         let big = line.repeat(200);
         assert!(spill_oversized(&big, "terminal", "call_1", 100_000, dir.path()).is_none());
@@ -1101,7 +1101,7 @@ mod tests {
 
     /// Calls `name` through `GuardedTools` over a canned provider; returns the session's tools.
     async fn guarded_call(name: &str, error: bool) -> Arc<hermes_tools::SessionTools> {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let tools = Arc::new(hermes_tools::SessionTools::new(
             hermes_tools::SessionToolsConfig {
                 session_id: "s1".into(),

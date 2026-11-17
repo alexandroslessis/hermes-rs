@@ -915,8 +915,8 @@ mod tests {
         }
     }
 
-    fn guarded(bridge: Arc<dyn UserBridge>) -> (tempfile::TempDir, SessionTools) {
-        let dir = tempfile::tempdir().unwrap();
+    fn guarded(bridge: Arc<dyn UserBridge>) -> (hermes_testdir::TestDir, SessionTools) {
+        let dir = hermes_testdir::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
         let tools = SessionTools::new(SessionToolsConfig {
@@ -1441,7 +1441,7 @@ mod tests {
 
     #[test]
     fn a_missing_uv_or_bash_is_a_clear_error_not_a_fallback() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         assert!(find_uv(&[dir.path().to_path_buf()], &[dir.path().join("none.exe")]).is_none());
         std::fs::write(dir.path().join("uv.exe"), "").unwrap();
         assert_eq!(find_uv(&[dir.path().to_path_buf()], &[]), Some(dir.path().join("uv.exe")));
@@ -1501,7 +1501,7 @@ mod tests {
 
     #[test]
     fn the_script_file_cannot_be_changed_while_it_is_held() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let run = RunDir::create(dir.path(), "ps1", b"Write-Output checked").unwrap();
         // Another process (a parallel script) tries to replace, append to, delete or move it.
         assert!(std::fs::write(&run.file, "iex $x").is_err());
@@ -1523,7 +1523,7 @@ mod tests {
 
     #[test]
     fn a_junction_as_the_scripts_folder_is_refused_and_stale_runs_are_swept() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let elsewhere = dir.path().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
         let scratch = dir.path().join("scratch");

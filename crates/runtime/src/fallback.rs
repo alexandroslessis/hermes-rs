@@ -148,8 +148,8 @@ pub(crate) fn build(
 mod tests {
     use super::*;
 
-    fn ledger() -> (tempfile::TempDir, Ledger) {
-        let dir = tempfile::tempdir().unwrap();
+    fn ledger() -> (hermes_testdir::TestDir, Ledger) {
+        let dir = hermes_testdir::tempdir().unwrap();
         let ledger = Ledger::open(dir.path().join("requests.json"));
         (dir, ledger)
     }

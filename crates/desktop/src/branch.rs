@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn links_survive_a_restart() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         Links::load(dir.path()).link("child", "parent");
         assert_eq!(
             Links::load(dir.path()).parent("child").as_deref(),

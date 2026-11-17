@@ -78,7 +78,11 @@ scope still holds; `PLAN.md`'s milestones are history. `GAPS.md` is the live to-
    next session.
 9. **Tests and a live check for every feature.** Unit tests in the module; a runtime turn test when
    the agent loop is involved; a `scripts/perf/*-check.mjs` live check against a separate
-   instance for anything the page calls. See [docs/TESTING.md](docs/TESTING.md).
+   instance for anything the page calls. See [docs/TESTING.md](docs/TESTING.md). Tests make their
+   folders with `hermes_testdir::tempdir()` (not `tempfile` directly; the `TestDir` field goes
+   LAST in a fixture) and `scripts/clean-test-temp.ps1 -Delete` sweeps what is left: leaked test
+   folders once filled 300 GB of the user's disk (docs/PITFALLS.md, "Test folders that do not go
+   away").
 10. **Leave the docs true.** A feature commit also updates `GAPS.md` (✅ + date), `PORTING.md`
     (map row), `scripts/perf/README.md` (new check), `crates/desktop/patches/README.md` (new
     patch), and any doc it makes stale.

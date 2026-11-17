@@ -12,12 +12,13 @@ use super::*;
 use crate::skills::SkillStore;
 
 struct World {
-    dir: tempfile::TempDir,
     skills: Arc<SkillStore>,
     memory: Arc<MemoryStore>,
     index: Arc<LocalIndex>,
     a: PathBuf,
     b: PathBuf,
+    // Last: fields drop in order, so the stores let go of their files first.
+    dir: hermes_testdir::TestDir,
 }
 
 fn repo(parent: &Path, name: &str) -> PathBuf {
@@ -31,7 +32,7 @@ fn world() -> World {
 }
 
 fn world_with(config: MemoryConfig) -> World {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let skills = Arc::new(SkillStore::new(dir.path().join("skills"), Default::default()));
     let memory = Arc::new(MemoryStore::new(dir.path().join("memories"), config));
     let index = LocalIndex::open(&dir.path().join("index.db"), skills.clone(), memory.clone()).unwrap();

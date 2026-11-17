@@ -617,7 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn changes_are_written_after_the_debounce_and_on_drop_and_survive_a_restart() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let path = dir.path().join("requests.json");
         let ledger = Ledger::open_with(path.clone(), Duration::from_millis(100));
         ledger.record_at("p", Purpose::Main, NOON);
@@ -643,7 +643,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_burst_of_requests_from_many_threads_loses_none() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let ledger = Ledger::open_with(dir.path().join("requests.json"), Duration::from_secs(60));
         let threads: Vec<_> = (0..8)
             .map(|_| {
@@ -663,7 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreadable_file_is_set_aside_and_counting_starts_again() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let path = dir.path().join("requests.json");
         std::fs::write(&path, "{ not json").unwrap();
         let ledger = Ledger::open(path.clone());
@@ -676,7 +676,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_write_is_tried_again_at_the_next_interval() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let path = dir.path().join("requests.json");
         // The temp file's name is taken by a folder: writing fails until it is gone.
         let blocker = path.with_extension("json.tmp");
@@ -696,7 +696,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_file_that_exists_but_cannot_be_read_is_set_aside_not_overwritten() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let path = dir.path().join("requests.json");
         // A folder in the file's place: reading fails with something other than "not found".
         std::fs::create_dir(&path).unwrap();
@@ -727,7 +727,7 @@ mod tests {
         state.learn_limit("p", 900);
         state.learn_limit("p", 0);
         assert_eq!(state.providers["p"].learned_limit, Some(900));
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let ledger = Ledger::open(dir.path().join("requests.json"));
         ledger.learn_limit("p", 800);
         ledger.set_limit("p", Some(500));
@@ -775,7 +775,7 @@ mod tests {
         assert_eq!(next_reset(NOON, 0), NOON + 12 * 3600);
         assert_eq!(next_reset(NOON, 120), NOON + 10 * 3600);
         assert_eq!(next_reset(NOON, -300), NOON + 17 * 3600);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let ledger = Ledger::open(dir.path().join("requests.json"));
         assert_eq!(ledger.usage_at("none", NOON).resets_at, NOON + 12 * 3600);
         assert_eq!(ledger.usage_at("none", NOON).limit, None);
@@ -783,7 +783,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_observer_counts_requests_and_429s_for_the_providers_in_the_context() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let ledger = Ledger::open(dir.path().join("requests.json"));
         let observer = ledger.observer();
         let meta = |provider: &'static str, purpose| RequestMeta {

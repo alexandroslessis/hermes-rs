@@ -186,12 +186,16 @@ fn tool_reply(calls: &[(&str, &str, Value)]) -> String {
 
 struct Harness {
     _server: MockServer,
-    data: tempfile::TempDir,
-    work: tempfile::TempDir,
     runtime: Runtime,
     provider: ProviderConfig,
     requests: Arc<Mutex<Vec<Value>>>,
     counts: Arc<Mutex<HashMap<String, usize>>>,
+    // LAST: fields drop in this order, and the runtime holds `sessions.db`, `memory.db` and
+    // `index.db` open. A folder removed before the runtime let go stayed behind on Windows, 4 MB
+    // each (a full skills copy), ~340 per run of this suite: docs/PITFALLS.md, "Test folders that
+    // do not go away".
+    data: hermes_testdir::TestDir,
+    work: hermes_testdir::TestDir,
 }
 
 async fn harness(replies: Vec<String>) -> Harness {
@@ -273,8 +277,8 @@ async fn harness_scripted(
     by_purpose: HashMap<&str, Vec<String>>,
     delays: HashMap<&str, Duration>,
 ) -> Harness {
-    let data = tempfile::tempdir().unwrap();
-    let work = tempfile::tempdir().unwrap();
+    let data = hermes_testdir::tempdir().unwrap();
+    let work = hermes_testdir::tempdir().unwrap();
     let replies = replies(data.path());
     let server = MockServer::start().await;
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -611,8 +615,8 @@ async fn a_daily_limit_429_ends_the_turn_instead_of_retrying_for_hours() {
         })
         .mount(&server)
         .await;
-    let data = tempfile::tempdir().unwrap();
-    let work = tempfile::tempdir().unwrap();
+    let data = hermes_testdir::tempdir().unwrap();
+    let work = hermes_testdir::tempdir().unwrap();
     let runtime = runtime_with(data.path(), Arc::new(Bridge));
     let provider = ProviderConfig {
         id: "mock".into(),
@@ -1669,8 +1673,8 @@ async fn live_refine_saves_something() {
     ) else {
         panic!("set HERMES_LIVE_BASE_URL and HERMES_LIVE_MODEL");
     };
-    let data = tempfile::tempdir().unwrap();
-    let work = tempfile::tempdir().unwrap();
+    let data = hermes_testdir::tempdir().unwrap();
+    let work = hermes_testdir::tempdir().unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let runtime = runtime_with(data.path(), Arc::new(ReviewBridge(tx)));
     let provider = ProviderConfig {
@@ -1996,8 +2000,8 @@ async fn live_compress_keeps_what_matters() {
     ) else {
         panic!("set HERMES_LIVE_BASE_URL and HERMES_LIVE_MODEL");
     };
-    let data = tempfile::tempdir().unwrap();
-    let work = tempfile::tempdir().unwrap();
+    let data = hermes_testdir::tempdir().unwrap();
+    let work = hermes_testdir::tempdir().unwrap();
     let runtime = runtime_in(data.path());
     let provider = ProviderConfig {
         id: "live".into(),
@@ -2416,8 +2420,8 @@ async fn live_vision_sees_attached_and_loaded_images() {
     let key = base_url
         .contains("openrouter.ai")
         .then(|| std::env::var("hermes_rs_or_api_key").expect("set hermes_rs_or_api_key"));
-    let data = tempfile::tempdir().unwrap();
-    let work = tempfile::tempdir().unwrap();
+    let data = hermes_testdir::tempdir().unwrap();
+    let work = hermes_testdir::tempdir().unwrap();
     std::fs::write(work.path().join("swatch.png"), solid_png([0, 0, 255])).unwrap();
     let runtime = runtime_in(data.path());
     let provider = ProviderConfig {
@@ -2800,8 +2804,8 @@ async fn live_delegate_task_counts_files_in_a_subagent() {
     ) else {
         panic!("set HERMES_LIVE_BASE_URL and HERMES_LIVE_MODEL");
     };
-    let data = tempfile::tempdir().unwrap();
-    let work = tempfile::tempdir().unwrap();
+    let data = hermes_testdir::tempdir().unwrap();
+    let work = hermes_testdir::tempdir().unwrap();
     for name in ["a.txt", "b.txt", "c.txt", "notes.md"] {
         std::fs::write(work.path().join(name), "x").unwrap();
     }
@@ -2956,8 +2960,8 @@ async fn live_mcp_stdio_server_is_used_by_a_real_model() {
     let server = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/debug/examples/mcp_calculator.exe");
     assert!(server.exists(), "build the mcp_calculator example first");
-    let data = tempfile::tempdir().unwrap();
-    let work = tempfile::tempdir().unwrap();
+    let data = hermes_testdir::tempdir().unwrap();
+    let work = hermes_testdir::tempdir().unwrap();
     let runtime = runtime_in(data.path());
     let servers = hermes_runtime::mcp::parse_servers(
         &json!({"calc": {"command": server.display().to_string()}}).to_string(),
@@ -4039,8 +4043,8 @@ async fn a_daily_limit_429_teaches_the_ledger_the_providers_limit() {
         })
         .mount(&server)
         .await;
-    let data = tempfile::tempdir().unwrap();
-    let work = tempfile::tempdir().unwrap();
+    let data = hermes_testdir::tempdir().unwrap();
+    let work = hermes_testdir::tempdir().unwrap();
     let runtime = runtime_with(data.path(), Arc::new(Bridge));
     let provider = ProviderConfig {
         id: "mock".into(),
@@ -5194,7 +5198,7 @@ async fn a_trusted_mcp_server_does_not_taint_the_session() {
 async fn reading_a_file_outside_the_working_folder_taints_the_session() {
     use hermes_tools::ApprovalMode;
     use hermes_tools::approval::ApprovalChoice;
-    let elsewhere = tempfile::tempdir().unwrap();
+    let elsewhere = hermes_testdir::tempdir().unwrap();
     let outside = elsewhere.path().join("notes.txt");
     std::fs::write(&outside, "hello").unwrap();
     let (h, asked) = taint_harness(
@@ -6310,7 +6314,7 @@ async fn an_injection_in_the_evidence_gets_only_validated_operations_through() {
 
 #[tokio::test]
 async fn a_tainted_sessions_review_stages_everything() {
-    let elsewhere = tempfile::tempdir().unwrap();
+    let elsewhere = hermes_testdir::tempdir().unwrap();
     let outside = elsewhere.path().join("notes.txt");
     std::fs::write(&outside, "Use pnpm.").unwrap();
     let h = review_harness(
@@ -9058,7 +9062,7 @@ async fn s1_takes_two_main_requests_with_one_script_and_three_with_parallel_or_m
 
 #[tokio::test]
 async fn a_multi_path_read_taints_only_for_the_outside_files_it_read() {
-    let elsewhere = tempfile::tempdir().unwrap();
+    let elsewhere = hermes_testdir::tempdir().unwrap();
     let outside = elsewhere.path().join("o.txt");
     std::fs::write(&outside, "from outside").unwrap();
     let missing = elsewhere.path().join("missing.txt");
@@ -10069,13 +10073,14 @@ fn error_status(status: u16, message: &str) -> ResponseTemplate {
 
 struct Duo {
     runtime: Runtime,
-    data: tempfile::TempDir,
-    work: tempfile::TempDir,
     _servers: Vec<MockServer>,
     a: ProviderConfig,
     b: ProviderConfig,
     a_log: Arc<Mutex<Vec<(String, Value)>>>,
     b_log: Arc<Mutex<Vec<(String, Value)>>>,
+    // Last, so the runtime lets go of its files first (see `Harness`).
+    data: hermes_testdir::TestDir,
+    work: hermes_testdir::TestDir,
 }
 
 /// One more mock provider with its own request log.
@@ -10106,8 +10111,8 @@ async fn mock_provider(
 async fn duo(a: Handler, b: Handler, http_retries: usize) -> Duo {
     let (sa, a_cfg, a_log) = mock_provider("a", a).await;
     let (sb, b_cfg, b_log) = mock_provider("b", b).await;
-    let data = tempfile::tempdir().unwrap();
-    let work = tempfile::tempdir().unwrap();
+    let data = hermes_testdir::tempdir().unwrap();
+    let work = hermes_testdir::tempdir().unwrap();
     let budget = BudgetKnobs {
         http_retries,
         ..test_budget(None)

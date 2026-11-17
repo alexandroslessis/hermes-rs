@@ -292,7 +292,7 @@ mod tests {
 
     #[tokio::test]
     async fn sources() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         std::fs::write(dir.path().join("a.png"), png(4, 4)).unwrap();
         assert!(load_source("a.png", dir.path(), dir.path()).await.is_ok());
         let data = format!(

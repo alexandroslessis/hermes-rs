@@ -572,7 +572,7 @@ mod tests {
 
     #[test]
     fn a_snapshot_shares_the_messages_and_does_not_see_later_changes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let (runtime, session) = open_session(dir.path());
         let snapshot = session.snapshot();
         for (live, seen) in session
@@ -615,7 +615,7 @@ mod tests {
 
     #[test]
     fn dropping_trailing_errors_leaves_a_snapshot_whole() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let (runtime, session) = open_session(dir.path());
         let error = hermes_llm::errors::ProviderError::RequestFailed("boom".into());
         session

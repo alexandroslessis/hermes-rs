@@ -988,7 +988,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_web_search_and_extract() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let web = Web::new(dir.path().to_path_buf());
         for _ in 0..RING.len() {
             let found = web.search("rust programming language", Some(3)).await;
@@ -1007,7 +1007,7 @@ mod tests {
 
     #[tokio::test]
     async fn long_pages_get_a_window_and_a_saved_copy() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let web = Web::new(dir.path().to_path_buf());
         let page: String = (0..3000).map(|i| format!("line {i}\n")).collect();
         let text = web.truncate_with_footer(&page, "https://example.com/a", 2_000);

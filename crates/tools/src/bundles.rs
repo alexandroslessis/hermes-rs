@@ -297,8 +297,8 @@ mod tests {
     use crate::skills::SkillsConfig;
     use serde_json::json;
 
-    fn store() -> (tempfile::TempDir, SkillStore) {
-        let dir = tempfile::tempdir().unwrap();
+    fn store() -> (hermes_testdir::TestDir, SkillStore) {
+        let dir = hermes_testdir::tempdir().unwrap();
         let store = SkillStore::new(dir.path().join("skills"), SkillsConfig::default());
         for (name, body) in [("alpha", "Do A."), ("beta", "Do B.")] {
             let content = format!(

@@ -22,6 +22,7 @@ hermes_prompts = { path = "crates/prompts" }
 hermes_runtime = { path = "crates/runtime" }
 hermes_store = { path = "crates/store" }
 hermes_tools = { path = "crates/tools" }
+hermes_testdir = { path = "crates/testdir" }
 markdown = { path = "crates/markdown" }
 # Vendored Zed crates only we use (the generated block lists those Zed crates need).
 fuzzy = { path = "vendor/zed/fuzzy" }

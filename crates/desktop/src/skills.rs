@@ -193,8 +193,8 @@ mod tests {
     const SKILL: &str =
         "---\nname: deploy\ndescription: Ships the app.\n---\n\n# Deploy\n\nSteps.\n";
 
-    fn setup() -> (tempfile::TempDir, SkillStore, Rest) {
-        let dir = tempfile::tempdir().unwrap();
+    fn setup() -> (hermes_testdir::TestDir, SkillStore, Rest) {
+        let dir = hermes_testdir::tempdir().unwrap();
         let store = SkillStore::new(dir.path().join("skills"), SkillsConfig::default());
         let rest = Rest::new(dir.path().to_path_buf());
         (dir, store, rest)

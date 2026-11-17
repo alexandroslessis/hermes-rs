@@ -675,7 +675,7 @@ mod whole_loop {
 
     #[tokio::test]
     async fn stop_during_the_deferred_lookup_answers_the_call_as_interrupted() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let (runtime, session) = open_session(dir.path());
         // A deferred session: its frozen prompt holds the sealed block.
         let block = hermes_prompts::deferred::block(&[], &[]);
@@ -713,7 +713,7 @@ mod whole_loop {
 
     #[tokio::test]
     async fn an_error_after_stop_is_a_stop() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let (runtime, _session) = open_session(dir.path());
         let cancel = CancellationToken::new();
         let mut setup = Setup::new(
@@ -734,7 +734,7 @@ mod whole_loop {
 
     #[tokio::test]
     async fn an_error_without_stop_ends_the_run_as_it_stands() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let (runtime, _session) = open_session(dir.path());
         let setup = Setup::new(Arc::new(Fails { stop: None }), &["echo"]);
         seed(&runtime, [user("go"), call("c1", "echo")]);
@@ -747,7 +747,7 @@ mod whole_loop {
 
     #[tokio::test]
     async fn unanswered_calls_are_answered_before_a_steer_is_delivered() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let (runtime, _session) = open_session(dir.path());
         let setup = Setup::new(Arc::new(Echo), &["echo"]);
         // A batch with a real call (answered) and an invented one (not), and a steer waiting.
@@ -790,7 +790,7 @@ mod whole_loop {
 
     #[tokio::test]
     async fn a_spent_budget_lets_pending_calls_run_then_asks_for_the_summary() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let (runtime, _session) = open_session(dir.path());
         let mut setup = Setup::new(Arc::new(Echo), &["echo"]);
         setup.max_iterations = 1;
@@ -808,7 +808,7 @@ mod whole_loop {
 
     #[test]
     fn each_load_takes_the_one_shot_output_cap() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let (runtime, _session) = open_session(dir.path());
         runtime.state.lock().max_tokens = Some(8192);
         assert_eq!(runtime.load().max_tokens, Some(8192));

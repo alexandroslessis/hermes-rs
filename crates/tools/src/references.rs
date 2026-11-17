@@ -687,8 +687,8 @@ mod tests {
 
     #[test]
     fn files_folders_and_refusals() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
+        let home = hermes_testdir::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/lib.rs"), "one\ntwo\nthree\n").unwrap();
         std::fs::write(dir.path().join(".env"), "KEY=x").unwrap();
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn too_much_context_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         std::fs::write(dir.path().join("big.txt"), "x".repeat(4_000)).unwrap();
         // Over half of a 1k window: the file goes on disk as a pointer.
         let expanded = expand(

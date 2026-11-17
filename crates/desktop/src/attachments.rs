@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn an_uploaded_image_is_saved_and_read_back_with_the_prompt() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let (status, body) = upload_image(
             dir.path(),
             &json!({"data_url": format!("data:image/png;base64,{PNG}"), "filename": "shot.png"}),
@@ -388,8 +388,8 @@ mod tests {
 
     #[test]
     fn an_uploaded_file_is_copied_into_the_session_and_referenced() {
-        let data = tempfile::tempdir().unwrap();
-        let session = tempfile::tempdir().unwrap();
+        let data = hermes_testdir::tempdir().unwrap();
+        let session = hermes_testdir::tempdir().unwrap();
         let (status, body) = store_upload(data.path(), "my notes.txt", b"hello");
         assert_eq!(status, 200);
         let staged = body["staged_upload"].clone();

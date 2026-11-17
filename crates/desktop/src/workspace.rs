@@ -183,8 +183,8 @@ mod tests {
     }
 
     /// A tempdir that is a git repository on `feature`, with one commit (a branch needs one).
-    fn repo() -> (tempfile::TempDir, String) {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn repo() -> (hermes_testdir::TestDir, String) {
+        let dir = hermes_testdir::tempdir().expect("tempdir");
         git(dir.path(), &["init", "-b", "feature"]);
         git(dir.path(), &["config", "user.email", "test@example.com"]);
         git(dir.path(), &["config", "user.name", "test"]);
@@ -219,10 +219,10 @@ mod tests {
 
     #[test]
     fn a_move_replaces_the_cwd_and_carries_the_git_identity() {
-        let data = tempfile::tempdir().expect("tempdir");
+        let data = hermes_testdir::tempdir().expect("tempdir");
         let store = store_in(&data.path());
         let workspaces = Workspaces::load(data.path());
-        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let elsewhere = hermes_testdir::tempdir().expect("tempdir");
         let from = elsewhere.path().join("old-home");
         std::fs::create_dir(&from).expect("made the old folder");
         let id = session_in(&store, &from.display().to_string());
@@ -247,13 +247,13 @@ mod tests {
 
     #[test]
     fn a_move_into_a_plain_folder_replaces_the_identity_with_none() {
-        let data = tempfile::tempdir().expect("tempdir");
+        let data = hermes_testdir::tempdir().expect("tempdir");
         let store = store_in(&data.path());
         let workspaces = Workspaces::load(data.path());
         let (repo_dir, repo_path) = repo();
         let id = session_in(&store, &repo_path);
 
-        let plain = tempfile::tempdir().expect("tempdir");
+        let plain = hermes_testdir::tempdir().expect("tempdir");
         let plain_path = dunce(plain.path());
         let (cwd, branch, root) =
             move_session(&store, &workspaces, &id, &plain_path).expect("moved");
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn an_unknown_folder_is_refused_and_writes_nothing() {
-        let data = tempfile::tempdir().expect("tempdir");
+        let data = hermes_testdir::tempdir().expect("tempdir");
         let store = store_in(&data.path());
         let workspaces = Workspaces::load(data.path());
         let id = session_in(&store, "C:\\was\\here");
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn a_linked_worktree_reports_the_main_repo_root() {
         let (main_dir, main_path) = repo();
-        let worktree = tempfile::tempdir().expect("tempdir");
+        let worktree = hermes_testdir::tempdir().expect("tempdir");
         let name = worktree.path().join("linked");
         git(
             main_dir.path(),

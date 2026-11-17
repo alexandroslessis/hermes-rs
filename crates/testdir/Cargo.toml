@@ -1,0 +1,13 @@
+[package]
+name = "hermes_testdir"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Test-only temporary folders that really get removed on Windows (dev-dependency)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tempfile.workspace = true

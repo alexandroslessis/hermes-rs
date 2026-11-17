@@ -519,8 +519,8 @@ pub fn edit(skills: &SkillStore, memory: &MemoryStore, id: &str, content: &str) 
 mod tests {
     use super::*;
 
-    fn stores() -> (tempfile::TempDir, SkillStore, MemoryStore) {
-        let dir = tempfile::tempdir().unwrap();
+    fn stores() -> (hermes_testdir::TestDir, SkillStore, MemoryStore) {
+        let dir = hermes_testdir::tempdir().unwrap();
         let skills = SkillStore::new(dir.path().join("skills"), Default::default());
         let memory = MemoryStore::new(dir.path().join("memories"), Default::default());
         (dir, skills, memory)

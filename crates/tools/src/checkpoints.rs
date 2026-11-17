@@ -1021,9 +1021,9 @@ pub fn is_destructive_command(command: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn setup() -> (tempfile::TempDir, tempfile::TempDir, Checkpoints) {
-        let data = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
+    fn setup() -> (hermes_testdir::TestDir, hermes_testdir::TestDir, Checkpoints) {
+        let data = hermes_testdir::tempdir().unwrap();
+        let project = hermes_testdir::tempdir().unwrap();
         std::fs::write(project.path().join("Cargo.toml"), "[package]").unwrap();
         std::fs::write(project.path().join("a.txt"), "one\n").unwrap();
         let checkpoints = Checkpoints::new(data.path().join("checkpoints"), true);

@@ -929,8 +929,8 @@ mod tests {
     use super::*;
     use crate::skills::SkillsConfig;
 
-    fn store_with(names: &[&str], origin: WriteOrigin) -> (tempfile::TempDir, SkillStore) {
-        let dir = tempfile::tempdir().unwrap();
+    fn store_with(names: &[&str], origin: WriteOrigin) -> (hermes_testdir::TestDir, SkillStore) {
+        let dir = hermes_testdir::tempdir().unwrap();
         let store = SkillStore::new(dir.path().join("skills"), SkillsConfig::default());
         for name in names {
             let content = format!(

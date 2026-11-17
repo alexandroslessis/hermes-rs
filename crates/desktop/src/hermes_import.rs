@@ -755,7 +755,7 @@ mod tests {
 
     #[test]
     fn homes_and_profiles_are_found() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let home = dir.path().join("hermes");
         std::fs::create_dir_all(home.join("profiles/work")).unwrap();
         std::fs::create_dir_all(home.join("profiles/.staging")).unwrap();

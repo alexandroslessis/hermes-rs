@@ -1424,8 +1424,8 @@ pub(crate) mod tests {
         }
     }
 
-    pub fn tools_with_bridge(bridge: Arc<dyn UserBridge>) -> (tempfile::TempDir, SessionTools) {
-        let dir = tempfile::tempdir().unwrap();
+    pub fn tools_with_bridge(bridge: Arc<dyn UserBridge>) -> (hermes_testdir::TestDir, SessionTools) {
+        let dir = hermes_testdir::tempdir().unwrap();
         let tools = SessionTools::new(SessionToolsConfig {
             session_id: "ses_test".into(),
             cwd: dir.path().to_path_buf(),
@@ -1445,7 +1445,7 @@ pub(crate) mod tests {
         (dir, tools)
     }
 
-    pub fn tools_in() -> (tempfile::TempDir, SessionTools) {
+    pub fn tools_in() -> (hermes_testdir::TestDir, SessionTools) {
         tools_with_bridge(Arc::new(TestBridge::default()))
     }
 
@@ -1554,7 +1554,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn edits_outside_the_workspace_ask_except_in_yolo() {
-        let elsewhere = tempfile::tempdir().unwrap();
+        let elsewhere = hermes_testdir::tempdir().unwrap();
         for (mode, asks) in [
             (ApprovalMode::AcceptEdits, true),
             (ApprovalMode::Auto, true),
@@ -1601,8 +1601,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn guarded(bridge: Arc<dyn UserBridge>) -> (tempfile::TempDir, SessionTools) {
-        let dir = tempfile::tempdir().unwrap();
+    fn guarded(bridge: Arc<dyn UserBridge>) -> (hermes_testdir::TestDir, SessionTools) {
+        let dir = hermes_testdir::tempdir().unwrap();
         let tools = SessionTools::new(SessionToolsConfig {
             session_id: "ses_test".into(),
             cwd: dir.path().to_path_buf(),
@@ -1722,7 +1722,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn viewing_a_project_skill_taints_the_session_but_listing_does_not() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let root = project(dir.path(), "repo", "build-it");
         let (_skills, tools) = project_tools(dir.path(), &root, Arc::new(TestBridge::default()));
         assert_eq!(tools.project_root(), Some(root.clone()));
@@ -1734,7 +1734,7 @@ pub(crate) mod tests {
         assert!(tools.taint().is_tainted());
         assert!(tools.taint().sources[0].contains("project skill (build-it)"));
         // A failed view (no such skill) is not a read.
-        let other_data = tempfile::tempdir().unwrap();
+        let other_data = hermes_testdir::tempdir().unwrap();
         let (_skills, fresh) = project_tools(other_data.path(), &root, Arc::new(TestBridge::default()));
         fresh.dispatch("skill_view", json!({"name": "nope"}), None).await;
         assert!(!fresh.taint().is_tainted());
@@ -1742,7 +1742,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn the_scope_is_fixed_at_the_start_and_a_child_takes_its_parents() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let a = project(dir.path(), "repo-a", "skill-in-a");
         let b = project(dir.path(), "repo-b", "skill-in-b");
         let (_skills, parent) = project_tools(dir.path(), &a, Arc::new(TestBridge::default()));
@@ -1771,7 +1771,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_project_skills_script_asks_like_a_script_the_agent_wrote() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let root = project(dir.path(), "repo", "build-it");
         let bridge = AskBridge::new(approval::ApprovalChoice::Once);
         let (_skills, tools) = project_tools(dir.path(), &root, bridge.clone());
@@ -1800,7 +1800,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_tainted_sessions_skill_write_is_staged_with_the_projects_scope() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let root = project(dir.path(), "repo", "build-it");
         let (skills, tools) = project_tools(dir.path(), &root, Arc::new(TestBridge::default()));
         tools.mark_tainted("a web page".into()).await;
@@ -1965,7 +1965,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_write_outside_the_workspace_on_a_tainted_session_asks_or_warns() {
-        let elsewhere = tempfile::tempdir().unwrap();
+        let elsewhere = hermes_testdir::tempdir().unwrap();
         let file = |name: &str| elsewhere.path().join(name).display().to_string();
         for (mode, target) in [
             (ApprovalMode::AcceptEdits, file("a.txt")),
@@ -2003,7 +2003,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn web_tools_web_images_and_outside_reads_taint_but_failures_and_workspace_reads_do_not()
     {
-        let elsewhere = tempfile::tempdir().unwrap();
+        let elsewhere = hermes_testdir::tempdir().unwrap();
         std::fs::write(elsewhere.path().join("a.txt"), "hello").unwrap();
         let outside = elsewhere.path().join("a.txt").display().to_string();
         let (dir, tools) = tools_in();
@@ -2086,7 +2086,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn the_session_level_survives_the_next_turn_and_a_reopened_session() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = hermes_testdir::tempdir().unwrap();
         let make = || {
             SessionTools::new(SessionToolsConfig {
                 session_id: "ses_keep".into(),

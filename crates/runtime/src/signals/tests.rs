@@ -798,7 +798,7 @@ fn explicit_signals_trigger_and_survive_the_cap() {
 
 #[test]
 fn the_file_round_trips_and_a_damaged_one_starts_afresh() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let mut stored = SessionSignals::default();
     stored.add(correction(1.5), 7);
     stored.add(
@@ -831,7 +831,7 @@ fn the_file_round_trips_and_a_damaged_one_starts_afresh() {
 
 #[tokio::test]
 async fn the_store_applies_changes_in_order_and_survives_a_restart() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let store = SignalStore::open(dir.path().to_path_buf());
     let history = vec![user("x"), assistant("y")];
     store.record(
@@ -1154,7 +1154,7 @@ fn probing_and_unrelated_commands_are_not_workarounds() {
 
 #[test]
 fn a_file_from_a_newer_version_is_left_alone() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = hermes_testdir::tempdir().unwrap();
     let newer = r#"{"v": 99, "signals": [{"kind": "something_new", "weight": 1.0}]}"#;
     std::fs::write(dir.path().join("s1.json"), newer).unwrap();
     let history = vec![user("x"), assistant("y")];

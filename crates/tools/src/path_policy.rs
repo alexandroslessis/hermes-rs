@@ -502,13 +502,13 @@ mod tests {
     use super::*;
 
     struct Fixture {
-        _root: tempfile::TempDir,
+        _root: hermes_testdir::TestDir,
         ctx: PolicyContext,
     }
 
     impl Fixture {
         fn new() -> Self {
-            let root = tempfile::tempdir().unwrap();
+            let root = hermes_testdir::tempdir().unwrap();
             let base = root.path().canonicalize().unwrap();
             let base = strip_verbatim(&base);
             let ctx = PolicyContext {

@@ -84,7 +84,7 @@ mod tests {
 
     #[test]
     fn the_default_profile_reads_and_writes_the_soul() {
-        let data = tempfile::tempdir().unwrap();
+        let data = hermes_testdir::tempdir().unwrap();
         std::fs::write(data.path().join("SOUL.md"), "You are terse.").unwrap();
 
         let (status, body) = soul(data.path(), "default");
@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn a_never_written_soul_reads_as_missing() {
-        let data = tempfile::tempdir().unwrap();
+        let data = hermes_testdir::tempdir().unwrap();
         let (status, body) = soul(data.path(), "default");
         assert_eq!(status, 200);
         assert_eq!(body["content"], "");
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn saving_creates_a_missing_soul() {
-        let data = tempfile::tempdir().unwrap();
+        let data = hermes_testdir::tempdir().unwrap();
         let (status, body) = save_soul(data.path(), "default", "First write.");
         assert_eq!(status, 200);
         assert_eq!(body["ok"], true);
@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn a_utf8_bom_is_stripped_from_the_read() {
-        let data = tempfile::tempdir().unwrap();
+        let data = hermes_testdir::tempdir().unwrap();
         std::fs::write(data.path().join("SOUL.md"), "\u{feff}Bom persona.").unwrap();
         let (_, body) = soul(data.path(), "default");
         assert_eq!(body["content"], "Bom persona.");
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn another_profile_name_is_refused_like_hermes() {
-        let data = tempfile::tempdir().unwrap();
+        let data = hermes_testdir::tempdir().unwrap();
         for name in ["second", "Default", "../data", "default/x"] {
             let (status, body) = soul(data.path(), name);
             assert_eq!(status, 404, "GET {name}");

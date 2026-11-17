@@ -45,4 +45,5 @@ windows = { workspace = true, features = ["Win32_System_JobObjects"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
+hermes_testdir.workspace = true
 tempfile.workspace = true
