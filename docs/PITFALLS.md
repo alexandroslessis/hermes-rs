@@ -1577,25 +1577,97 @@ removed while the files were open); and some owners outlive the test (the ledger
   numbers: `turns` 326 folders / 1.31 GB before, 212 / 84 MB after; `hermes_tools` 59 → 0; the
   runtime lib 7 → 0; `acp` 59 / 216 MB → 22 / 7 MB; `hermes-desktop` lib 8 → 3).
 
-## The shell sandbox (Phase 15 CP15.1, `crates/tools/src/sandbox.rs`)
+## The shell sandbox (Phase 15, `crates/tools/src/sandbox.rs`, `sandbox_labels.rs`)
 
-- **`terminal.sandbox` is config-only** (`desktop-config.json`, `"terminal": {"sandbox": "low"}`), like
-  `terminal.env_passthrough`: no Settings field. `off` (the default, also for any unknown value) is
-  tokio's spawn as before. It is read at each spawn; a running Git Bash started at another level is
-  killed and restarted on the next command (exported variables are lost).
+- **`terminal.sandbox` is config-only** (`desktop-config.json`, `"terminal": {"sandbox": "low",
+  "sandbox_grants": ["D:\\data"]}`), like `terminal.env_passthrough`: no Settings field. `off` (the
+  default, also for any unknown value) is tokio's spawn as before: no label, no note, no variable.
+  The level is read at each spawn. `/sandbox` shows the level, the grants and the folders labelled;
+  `/sandbox remove-labels` puts them back.
 - **Git Bash does not start at Low.** Every MSYS program (Git's `bash.exe` and everything in Git's
   `usr\bin`: `ls`, `sed`, MSYS `whoami`...) dies at start with `NtCreateDirectoryObject(\BaseNamedObjects\
   msys-2.0S5-<hash>): 0xC0000022` (exit 0xC0000142). `\BaseNamedObjects` itself is labelled Low
   (a Low process *can* create a new directory there), but that directory is shared by every MSYS
   program of the same Git install (the hash is of the install path) and already exists, labelled
   Medium, whenever any unsandboxed MSYS program runs (the user's Git Bash, an `off` terminal):
-  opening it for write is "no write up". The terminal discards bash's own stderr, so it answers
-  `MSYS_AT_LOW_ERROR` (`shell.rs`) when bash exits 0xC0000142 under `low` before printing anything.
-  Native programs (`git.exe`, `cargo`, PowerShell, `whoami.exe`) run. A copy of Git's `usr\bin` in
-  another folder (another hash, so its own directory, made Low) does start at Low (checked by hand
-  2026-11-17 by CP15.1's reviewer). To decide in CP15.2.
-- **Under `low` nothing is writable yet but `%USERPROFILE%\AppData\LocalLow`** and folders already
-  labelled Low: the workspace, scratch (`TEMP`) and caches are labelled in CP15.2.
+  opening it for write is "no write up". Native programs (`git.exe`, `cargo`, PowerShell,
+  `whoami.exe`) run. A copy of Git's `usr\bin` in another folder (another hash, so its own
+  directory, made Low) does start at Low (checked by hand 2026-11-17), but is not used.
+  **Decision (CP15.2): under `low` every command runs in PowerShell**, also when the terminal is Git
+  Bash: the terminal (a bash started before `low` was turned on is stopped: it ran unsandboxed;
+  the folder carries over, exported variables don't), background processes, and `run_script`
+  refuses `language: bash` up front. Each result says `sandbox=low: ran in PowerShell, not bash`
+  (the `sandbox` field), so a bash-syntax failure is understandable. The system prompt and the
+  tool descriptions still say bash (rule 8: they are frozen for the session); only the results
+  say otherwise. Git commands that run `sh` (hooks, an editor, `git difftool`) fail at Low too.
+- **What `low` may write:** the session's workspace (the repository root, else the folder it
+  started in), its scratch folder (`TEMP` / `TMP`), the shared cache folder
+  (`<data>\sandbox-cache`) and the grants, each labelled Low by the first `low` command
+  (`sandbox_labels::prepare`, idempotent, on a blocking thread), plus whatever Windows already
+  labels Low (`AppData\LocalLow`). Refused (said in the result's `sandbox` field, the command
+  still runs), after the path is made canonical (so 8.3 short names, `\\?\`, case and `..` don't
+  dodge it): drive roots; the profile, the data folder, `APPDATA`, `LOCALAPPDATA` and every folder
+  on `PATH` (and any folder containing one of them: `C:\Users`, `AppData`); `Windows`, `Program
+  Files`, `ProgramData`, `PUBLIC`, `~\.ssh`, `~\.cargo`, `~\.rustup`, the Start Menu (Startup)
+  and PowerShell's profile folders in Documents (and anything in or around them); any other folder
+  under `C:\Users` than your own profile; anything inside the data folder but scratch and cache;
+  and folders that already have a label we didn't set. Why the extra places (CP15.2 review): a
+  Low-writable folder is one a sandboxed command can plant a file in, and these are where a
+  planted file would later run at the user's own level. The same holds, by design, for the
+  workspace: a sandboxed command can edit `build.rs`, `package.json` scripts or `.git\hooks`, which
+  run unsandboxed when *you* build or commit. The sandbox stops writes outside the workspace, not
+  what you later run from it. A session started in the profile itself, or in a folder containing
+  the data folder, gets no writable workspace.
+- **Labels are set one object at a time through a handle (`SetKernelObjectSecurity`: what
+  `SetFileSecurityW` does after opening the file), never `SetNamedSecurityInfoW` or `icacls`.**
+  Those re-run Windows' inheritance over the tree and rewrite DACLs on the way (they
+  mark them auto-inherited, `D:AI`; `SetNamedSecurityInfoW` also turned inherited entries into
+  explicit ones on this machine's folders, whose DACLs are not marked auto-inherited), so the
+  descriptors could not be put back. Our walk gives every file and folder inside the inherited
+  label (`(ML;ID;NW;;;LW)`, `(ML;OICIID;NW;;;LW)`) and nothing else; removal takes those off
+  deepest first and puts the folder's own label back from the record. Every object is opened with
+  `FILE_FLAG_OPEN_REPARSE_POINT` (a link is opened as itself), skipped if it is a reparse point,
+  and skipped unless the handle's real path (`GetFinalPathNameByHandleW`) is still under the
+  recorded folder; the label is then read and set through that same handle. So a folder that a
+  sandboxed command swaps for a junction mid-walk (it can, inside a Low folder) never gets a label
+  applied through it, and removal never follows one either: a recorded folder that is now a link
+  or leads elsewhere is reported as changed and forgotten, untouched. The walk also stops at labels
+  that aren't ours. Checked again in the CP15.2 review: `icacls /setintegritylevel (OI)(CI)low` on
+  a fresh folder turned `D:(...)` into `D:AI(...)` on every object below it.
+  Read descriptors with `GetFileSecurityW` too: `GetNamedSecurityInfoW` shows inheritance it
+  computes (`ID` flags) that isn't what is stored.
+- **One difference after removal:** an object that had no SACL at all reads `S:NO_ACCESS_CONTROL`
+  afterwards (an empty SACL: no label, no audit, the same meaning). Removing it needs
+  `SeSecurityPrivilege` (`SACL_SECURITY_INFORMATION`), which the user doesn't hold. The tests
+  compare everything else exactly.
+- **The first `low` command in a large workspace is slow:** the walk reads and sets the label of
+  every file (a `target\` with 100k files takes seconds to a minute). It runs once per folder (the
+  record marks it complete; a walk cut short is finished by the next command). The record's lock
+  is held meanwhile, so another session's first `low` command waits (the walk runs on a blocking
+  thread, not the async workers; there is no time limit). The lock is this process's mutex plus an
+  exclusive lock on `sandbox-labels.lock` in the data folder, since the desktop app and
+  `hermes-acp.exe` share the record; the record is written to a temporary file and renamed.
+- **Hard-linked files are not labelled.** A label belongs to the file, not to one of its names: a
+  file hard-linked into the workspace (pnpm's store, some build caches) would become Low-writable
+  under its other names too, outside the workspace. Files with more than one name are left as
+  they are (read-only to commands, which can still delete and recreate them), and the first `low`
+  command says how many.
+- **Caches** (tested at Low on this machine, CP15.2): cargo builds from crates it already has but
+  can't download into `~\.cargo\registry` ("Access is denied"); npm fails outright (`EPERM` on
+  `%LOCALAPPDATA%\npm-cache`); uv fails outright ("Failed to initialize cache"). So under `low`
+  `CARGO_HOME`, `npm_config_cache`, `YARN_CACHE_FOLDER`, `UV_CACHE_DIR`, `PIP_CACHE_DIR`,
+  `GOCACHE`, `GOMODCACHE` point into `<data>\sandbox-cache` (shared by the sessions, so crates are
+  downloaded once, not per session; pip and go were not installed here and are set on their
+  documentation). The user's `~\.cargo\config.toml` is copied along, without `credentials.toml`
+  and without any `token`, `secret-key` or `secret-key-subject` key (a credential should not live
+  in a second, Low-writable place and outlive its rotation; a config that isn't TOML is not
+  copied). npm's and pip's own config files are not copied (only their cache folders move).
+- **A blocked write** shows in the result's `sandbox` field as "blocked by sandbox: <path>; grant the
+  folder in Settings (terminal.sandbox_grants in desktop-config.json) or move the work into the
+  workspace", when the output has "Access is denied", "Access to the path", "Permission denied",
+  "os error 5", `EPERM` or `UnauthorizedAccessException` on a path outside the writable folders
+  (a locked file in the workspace says "Access is denied" too: no hint then). Read from the
+  terminal's and `run_script`'s output; a background process's output is not read for it.
 - **`whoami` in a test is Git's** when Git's `usr\bin` is on PATH: call
   `%SystemRoot%\System32\whoami.exe` to read a token's label (`/groups`: Low is `S-1-16-4096`,
   Medium `S-1-16-8192`, High `S-1-16-12288`; the SIDs don't depend on the Windows language).
@@ -1611,3 +1683,7 @@ removed while the files were open); and some owners outlive the test (the ledger
   `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` with a helper process that never spawns anything).
   `sandboxed_spawns_leak_no_handles` counts the process's handles over 30 runs each of a command,
   a piped-stdin spawn and a failing `CreateProcessAsUserW`, in a child test process.
+- **Tests label only their own folders.** Under `cfg(test)`, `ensure_low` panics on any folder
+  outside the temp folder; every test that labels holds an `Unlabel` guard that runs
+  `remove_all` on its own record when it ends (also on a panic). The level and the grants are
+  process-wide, so tests set them per shell (`set_sandbox_override`, `set_grants_override`).

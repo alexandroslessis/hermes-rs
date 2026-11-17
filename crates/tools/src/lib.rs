@@ -24,6 +24,7 @@ pub mod redact;
 pub mod references;
 mod review;
 mod sandbox;
+pub mod sandbox_labels;
 mod script;
 mod script_guard;
 mod search;
@@ -60,7 +61,8 @@ pub use clarify::{
 };
 pub use process::ProcessNotice;
 pub use review::ReviewTools;
-pub use sandbox::{Sandbox, set_sandbox};
+pub use sandbox::{Sandbox, sandbox as sandbox_level, set_sandbox};
+pub use sandbox_labels::set_sandbox_grants;
 pub use shell::{ShellKind, detect_shell, set_env_passthrough};
 pub use skill_manage::{
     FileBase, PendingSkillWrite, SkillOp, SkillPlan, StagedSkillError, WriteOrigin,
@@ -311,13 +313,17 @@ impl SessionTools {
             warnings: Vec::new(),
         };
         let project = project_skills::find_root(&config.cwd);
+        // The folder `terminal.sandbox = "low"` labels writable: the repository, else the
+        // folder the session started in.
+        let workspace = project.clone().unwrap_or_else(|| config.cwd.clone());
         Self {
             project: parking_lot::Mutex::new(project),
             hints: Arc::new(parking_lot::Mutex::new(hints::HintTracker::new(
                 &config.cwd,
                 &config.home,
             ))),
-            shell: shell::ShellSession::new(config.shell, config.cwd, config.scratch_dir.clone()),
+            shell: shell::ShellSession::new(config.shell, config.cwd, config.scratch_dir.clone())
+                .with_sandbox_folders(config.data_dir.clone(), workspace),
             processes: process::ProcessRegistry::default(),
             files: files::FileState::default(),
             todos: todo::TodoList::new(config.todos),

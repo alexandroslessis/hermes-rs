@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 
-use crate::sandbox::{self, Spawned, Spec, Writer};
+use crate::sandbox::{self, Sandbox, Spawned, Spec, Writer};
 use crate::shell::{ProcessTree, ShellKind, command, command_for_powershell, encode_powershell};
 use crate::{SessionTools, ToolOutput, display_path, parse_args};
 
@@ -214,7 +214,23 @@ pub async fn spawn(
     let cwd = workdir.unwrap_or_else(|| tools.cwd());
     let scratch = tools.scratch_dir.clone();
     let _ = tokio::fs::create_dir_all(&scratch).await;
-    let mut builder = match tools.shell.kind() {
+    let level = tools.shell.sandbox();
+    // `terminal.sandbox = "low"`: folders labelled, caches redirected, and PowerShell whatever
+    // the configured shell (Git Bash can't start at Low), as the terminal (`shell::run_low`).
+    let low = match level {
+        Sandbox::Low => Some(tools.shell.prepare_low().await),
+        Sandbox::Off => None,
+    };
+    let mut notes: Vec<String> = Vec::new();
+    let kind = match (tools.shell.kind(), level) {
+        (ShellKind::GitBash(_), Sandbox::Low) => {
+            notes.push(crate::shell::RAN_IN_POWERSHELL.to_string());
+            &ShellKind::PowerShell
+        }
+        (kind, _) => kind,
+    };
+    notes.extend(low.iter().flat_map(|low| low.notes.iter().cloned()));
+    let mut builder = match kind {
         ShellKind::GitBash(bash) => {
             let mut builder = command(bash, &cwd, &scratch);
             builder.args(["--noprofile", "--norc", "-c", command_line]);
@@ -235,6 +251,9 @@ pub async fn spawn(
             builder
         }
     };
+    if let Some(low) = &low {
+        low.apply(&mut builder);
+    }
     // Background processes outlive the tool call; the registry kills them at session end.
     let spec = Spec {
         stdin_piped: true,
@@ -246,7 +265,7 @@ pub async fn spawn(
         stdout,
         stderr,
         tree,
-    } = match sandbox::spawn(&mut builder, spec, tools.shell.sandbox()) {
+    } = match sandbox::spawn(&mut builder, spec, level) {
         Ok(spawned) => spawned,
         Err(error) => return ToolOutput::error(format!("Could not start the process: {error}")),
     };
@@ -304,13 +323,17 @@ pub async fn spawn(
         }
     });
 
-    ToolOutput::ok(json!({
+    let mut value = json!({
         "session_id": id,
         "status": "running",
         "cwd": display_path(&cwd),
         "notify": notify,
         "hint": "Check on it with process_manage (poll, log, wait, kill).",
-    }))
+    });
+    if !notes.is_empty() {
+        value["sandbox"] = json!(notes.join("\n"));
+    }
+    ToolOutput::ok(value)
 }
 
 #[derive(Deserialize)]

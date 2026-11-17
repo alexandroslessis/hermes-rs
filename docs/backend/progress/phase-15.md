@@ -158,3 +158,218 @@ Tests (reviewer, `CARGO_TARGET_DIR=target/claude`): `hermes_tools` 351 passed / 
 `hermes_runtime --lib` 265; `--test turns` 258 passed / 7 ignored; `hermes-desktop` 191 lib + 68 acp;
 `cargo build --workspace --locked` OK, no warnings. `scripts/clean-test-temp.ps1 -Delete` run after; no probe file left in
 `%USERPROFILE%`.
+
+## CP15.2 — labels, caches, grants, errors
+Worktree: C:\Users\alexandros\repos\hermes-rs-p15   Branch: backend/p15-sandbox   Model: Opus 5.5 (subagent)
+On top of 497b24c (CP15.1). Not committed.
+Done:
+- **`crates/tools/src/sandbox_labels.rs`** (new): the folders a `low` command may write to.
+  - `prepare(data, workspace, scratch, grants)` (called by `ShellSession::prepare_low` on a blocking thread before every `low`
+    spawn: terminal, background process, `run_script`): labels the workspace (repository root, else the session's start folder;
+    `SessionTools::new` passes it via `ShellSession::with_sandbox_folders`), the session's scratch (`<data>\scratch\<id>`, where
+    `TEMP`/`TMP` already point), the shared cache folder `<data>\sandbox-cache` and `terminal.sandbox_grants`; returns the cache
+    variables, the writable folders and notes (a refused or missing folder: said in the result, the command still runs).
+  - `ensure_low`: canonical path -> refusal check -> (tests: must be inside the temp folder, else panic) -> record lock -> read the
+    label -> by state: none: **record first** (`sandbox-labels.json` in the data folder: path, original label SDDL, kind,
+    time, `complete: false`), then our explicit label `S:(ML;OICI;NW;;;LW)` on the folder, then `label_tree` gives everything
+    inside the inherited label (`(ML;ID;NW;;;LW)` files, `(ML;OICIID;NW;;;LW)` folders), then `complete: true`; ours and
+    recorded and complete: nothing; ours but not complete (walk cut short): the walk again; inherited Low (inside a grant,
+    `LocalLow`): nothing, not recorded; ours-shaped but not recorded (e.g. icacls), or any other label: refused.
+  - Refusals (`Protected::refusal`): not absolute, drive root, the profile (`USERPROFILE` and `dirs::home_dir`) and the data
+    folder and anything containing them (so `C:\Users` too), `SystemRoot`/`windir`/`ProgramFiles*`/`ProgramData` and anything
+    containing them or inside them, anything inside the data folder except a session folder under `scratch\` and
+    `sandbox-cache`.
+  - `remove_all` (deepest recorded folder first): gone -> forgotten; ours (or never set) -> `unlabel_tree` (inherited labels
+    off, deepest first, so a removal cut short can run again) and the original label back; someone else's label now -> left,
+    forgotten, reported; failures stay recorded. `list` for `/sandbox`.
+  - **Win32 (`mod win`)**: `GetFileSecurityW` / `SetFileSecurityW` with `LABEL_SECURITY_INFORMATION`, one object at a time,
+    plus the SDDL conversions; `Local` frees what Windows allocated. **Not `SetNamedSecurityInfoW`** (the plan's call): tried
+    first, it rewrote the DACLs of the folder and everything under it (inherited ACEs became explicit: this machine's repos
+    have DACLs without the auto-inherited flag); `icacls /setintegritylevel` marks every DACL `D:AI`. Either way removal
+    could not restore the descriptor. The walk skips reparse points (junctions, symlinks: not followed, not labelled) and
+    stops at labels that aren't ours and protected SACLs.
+  - `blocked_hint`: under `low`, an output line with "access is denied", "access to the path", "permission denied",
+    "os error 5", "eperm" or "unauthorizedaccessexception" gives "blocked by sandbox: <path>; grant the folder in Settings
+    (terminal.sandbox_grants in desktop-config.json) or move the work into the workspace"; the path is the first Windows path
+    on that line (quoted or up to a space), "(a path the output does not show)" when none; no hint when the path is inside a
+    writable folder (a locked file in the workspace).
+  - `cache_env`: `CARGO_HOME`, `npm_config_cache`, `YARN_CACHE_FOLDER`, `UV_CACHE_DIR`, `PIP_CACHE_DIR`, `GOCACHE`,
+    `GOMODCACHE` -> `<data>\sandbox-cache\...`; the user's cargo `config.toml`/`config` copied into the new `CARGO_HOME`
+    (not `credentials`).
+- **What breaks at Low, tested on this machine** (a throw-away ignored probe test, removed): `cargo build` of a dependency-
+  free crate and of one whose crate is already cached: work with the default `CARGO_HOME`; a crate to download: "failed to
+  write cache ... Access is denied" (fails); with `CARGO_HOME` in a Low folder: works (rustup's proxy fine). npm install:
+  `EPERM` on `%LOCALAPPDATA%\npm-cache` (fails); with `npm_config_cache` moved: works. `uv run`: "Failed to initialize
+  cache" (fails); with `UV_CACHE_DIR` moved: works. `git init/add/commit/status` (no hooks): work. pip, go, dotnet: not
+  installed here (pip/go variables set from their docs; dotnet not handled).
+- **Git Bash (orchestrator's decision)**: under `low` every command runs in PowerShell: `ShellSession::run` -> `run_low`
+  (a running Medium bash is shut down first; `cwd` carries over), `process::spawn` builds PowerShell, `run_script` refuses
+  `language: bash` up front. The result's new `sandbox` field (terminal, background start, `run_script`) carries
+  `sandbox=low: ran in PowerShell, not bash`, label notes and the blocked hint. System prompt and tool descriptions are not
+  touched (rule 8). `MSYS_AT_LOW_ERROR` / `msys_died_at_low` and the bash level-restart are gone (bash never starts at Low
+  now); the relocated-`usr\bin` option is not implemented.
+- `RunResult.sandbox: Vec<String>` (empty under `off`); `ShellSession::{with_sandbox_folders, prepare_low, run_low}`;
+  `LowStart {env, notes, writable}`; test-only `set_grants_override`.
+- **Setting / exposure**: `terminal.sandbox` stays default `off`. `terminal.sandbox_grants` (config record only, list of
+  absolute paths) read by `apply_settings` -> `hermes_tools::set_sandbox_grants`; labelled by the next `low` command.
+  **Removal is exposed as a slash command of ours**, `/sandbox` (level, grants, labelled folders) and
+  `/sandbox remove-labels`, answered by `Gateway::builtin_command` through the existing `slash.exec` (`{"type":"exec",
+  "output"}`, the shape `/import-hermes` uses) and listed in the `/` menu (`commands.rs`). No new method, route or Settings
+  field; no page protocol shape added.
+- `crates/tools/Cargo.toml`: `windows` feature `Win32_Security_Authorization` (no `Cargo.lock` change).
+- Docs: PITFALLS "The shell sandbox" (rewritten for CP15.2: decision, what is labelled and refused, why `SetFileSecurityW`,
+  the `S:NO_ACCESS_CONTROL` difference, slow first walk, hard links, caches, the hint, test guards), ARCHITECTURE (tools row
+  and feature map row), PORTING `sandbox.rs` row (CP15.2 sentence), `crates/desktop/README.md` "Shell sandbox" (how to turn
+  it on), module docs (`sandbox.rs`, `shell.rs`, `sandbox_labels.rs`). GAPS: no row (not a Hermes gap).
+Live check: none. The page calls nothing new (`/sandbox` goes through `slash.exec`, whose answer shape is unchanged);
+`gateway::tests::the_sandbox_command_reports_and_removes_labels` drives it through `Gateway::call`.
+Tests (`CARGO_TARGET_DIR=target/claude`): `cargo test -p hermes_tools` 367 passed / 2 ignored (was 351; two full runs green);
+`hermes_runtime --lib` 265; `--test turns` 258 passed / 7 ignored (unchanged); `hermes-desktop` 193 lib + 68 acp (three runs);
+`cargo build --workspace` OK, no warnings. `cargo clippy -p hermes_tools -p hermes-desktop --tests`: nothing new in the touched
+files (the `shell.rs` `redundant_locals` and the other files' findings are older). `scripts/clean-test-temp.ps1 -Delete` run
+after (441 folders); no probe file left in `%USERPROFILE%`.
+New tests:
+- `sandbox_labels_tests.rs` (9): SDDL classification; refusals (drive root, profile, `C:\Users`, Windows and inside, Program
+  Files and inside, the data folder, inside it, the scratch root, a folder containing the data folder; pure checks only, and
+  `ensure_low` on the profile refuses before touching the record); **round trip**: every object of a small tree (folder,
+  subfolders, files) read with `GetFileSecurityW` before, labelled (folder explicit, everything inside inherited, owner/group/
+  DACL unchanged), removed -> equal to before (modulo `S:NO_ACCESS_CONTROL`, see below), twice; idempotence (`AlreadyOurs`,
+  one record), a folder inside a labelled one is `AlreadyLow` and not recorded; foreign labels (explicit Medium, and our exact
+  label set by hand) refused and left unchanged; removal with one folder deleted (`gone`), one relabelled by someone else
+  (`changed`, left as is) and one restored; an unreadable record stops labelling (and removal); a junction inside a labelled
+  folder is not followed (its target's descriptors unchanged through label and removal); an unfinished labelling
+  (`complete: false`) is finished next time; `prepare` (workspace, scratch, cache, grant labelled, missing and relative grants
+  noted, cache variables, a workspace containing the data folder refused); `blocked_hint` on PowerShell, cmd, git, cargo,
+  Python, npm lines, and none for a path inside the workspace.
+- `sandbox_tests.rs` (end to end, real `SessionTools` laid out as `<temp>\ws`, `<temp>\data`, `<temp>\data\scratch\ses_test`,
+  with an `Unlabel` guard): workspace and `TEMP` writable, `%USERPROFILE%\<probe>` denied (absent afterwards) with the
+  "blocked by sandbox: <probe>" note; `git init/add/commit/status/log` in the workspace; `cargo build --offline` of a
+  dependency-free crate with `CARGO_HOME` in `sandbox-cache` and `CARGO_TARGET_DIR` in the workspace, and the exe runs; a grant
+  is labelled and writable, a sibling folder is not; `off` labels nothing, writes no record, adds no `sandbox` field, runs Git
+  Bash at Medium; a Git Bash session under `low` runs in PowerShell with the note (profile write denied); off -> low -> off
+  moves a Git Bash session to PowerShell and back (folder carried over); a Git Bash session's background process under `low`
+  runs in PowerShell with the note; background process and `run_script` at Low get the cache variables, `run_script` bash
+  refused. Replaced CP15.1's two Git-Bash-at-Low tests (the case can no longer happen).
+- `gateway::tests`: `/sandbox`, `/sandbox remove-labels`, an unknown argument through `slash.exec`; the grants' config parser.
+Request counts: unchanged (no request-building code touched; `turns` passes unchanged).
+Deviations from the plan / the brief:
+- **`SetFileSecurityW` and our own inheritance walk instead of `SetNamedSecurityInfoW`** (reason above: it rewrote DACLs).
+- **Caches go to a shared `<data>\sandbox-cache`, not the per-session scratch**: per session, every new session would download
+  every crate / npm package again (and scratch folders are never cleaned). The cost: sandboxed sessions share (and could
+  poison) one cache; unsandboxed use (`~\.cargo`, the user's own npm) is unaffected. `TEMP`/`TMP` stay per session.
+- **Not exactly byte-for-byte**: an object that had no SACL reads `S:NO_ACCESS_CONTROL` after removal (an empty SACL: same
+  meaning). Removing it needs `SeSecurityPrivilege`. Tests compare everything else exactly.
+- Grants are labelled by the next `low` command, not at the moment the config changes (they need nothing before a
+  sandboxed command runs, and `off` labels nothing). Removing a grant from the config doesn't unlabel it:
+  `/sandbox remove-labels` does.
+- The hint says "grant the folder in Settings (terminal.sandbox_grants in desktop-config.json)": there is no Settings field.
+For the reviewer:
+- Labels only on recorded folders: the record is written (and saved) before the first `SetFileSecurityW` on the root; children
+  get only *inherited* labels and only under a recorded root; removal touches only inherited labels below recorded roots and
+  the roots' own label. Check `ensure_low` / `remove_all` / `label_tree` / `unlabel_tree` against that; and the refusal list
+  (is anything missing? e.g. other users' profiles are covered only as "contains `C:\Users`"... a folder *inside* another
+  user's profile is not refused, nor `AppData` subfolders of our own profile).
+- The first `low` command in a large workspace walks every file under the record's lock (other sessions' `low` commands
+  wait). Not measured on a big repo (no perf work asked); hermes-rs itself with `target\` would be the test.
+- A file hard-linked into the workspace (pnpm, some cargo setups) is labelled for all its links.
+- The workspace is the repository root (`find_root`) or the start folder; a `cd` elsewhere is not labelled. A session started
+  in the profile or in a folder that contains the data folder gets "the workspace folder is not writable" on every command.
+- The hint's path extraction is heuristic (first `X:\` path on the line); a path with spaces and no quotes is cut at the space.
+- `run_low` shuts down a running Medium Git Bash (exported variables lost) before each `low` command; `off` again starts a new
+  bash in the folder PowerShell left.
+- Background processes' output is not scanned for the hint (only the terminal and `run_script`).
+- Not verified: the desktop app end to end with `terminal.sandbox = "low"` (no live check, the page calls nothing new);
+  ACP shares the same `Gateway`, so `/sandbox` works there too (catalog entry), not tried.
+
+### Review (Opus 5.5)
+`main` had not moved (fc466d9). Read by hand (the `/code-review` skill was not run inside this subagent), with the review
+focus "labels only on recorded folders, removal restores exactly" attacked case by case.
+Checked and found right: the record is saved before the first label is set and the entry dropped again if that set fails
+(a crash in between leaves a record without a label, which the next command finishes or removal skips, never the
+reverse); a second run never overwrites the recorded original (`recorded.is_none()` guards the push; an incomplete or
+relabelled entry keeps its first `original`); a walk cut short is resumed (`complete: false`); a corrupt record stops
+labelling and removal; a missing record is empty (nothing to remove); the record is written to a temp file and renamed;
+deleted folders are forgotten; someone else's label (explicit Medium, or our exact SDDL set by `icacls`) is refused and
+left; nested grants (a grant inside a labelled folder is `AlreadyLow`, not recorded; a labelled folder inside a later one is
+skipped by the outer walk and restored on its own, deepest first). **The `SetNamedSecurityInfoW`/`icacls` claim, checked
+independently**: `icacls /setintegritylevel (OI)(CI)low` on a fresh `%TEMP%` folder turned every DACL below it from
+`D:(...)` into `D:AI(...)` (read with `Get-Acl`, folder deleted after). The `S:NO_ACCESS_CONTROL` difference is real and
+harmless (an empty SACL); no code path writes owner, group or DACL (only `LABEL_SECURITY_INFORMATION` is ever passed to a
+set call). Files a Low command creates get the *inherited* label and removal clears them (new end-to-end assertion). `off`
+paths: the same builder calls as 497b24c; nothing labelled, no record, no `sandbox` field (test). System prompt and tool
+descriptions untouched; the `sandbox` field appears only under `low`; `/sandbox` is a user-typed `slash.exec` command (the
+model has no tool that reaches it), listed in the `/` menu and, through `commands.catalog`'s pairs, to ACP editors like
+`/import-hermes`; labelling and removal run on blocking threads (rule 7).
+Fixed:
+- **TOCTOU through junctions.** The walk listed entries with `read_dir`, then labelled by *path* with `SetFileSecurityW`,
+  which follows reparse points; removal checked `exists()` and walked the path. A sandboxed command can rename a folder
+  inside a Low folder and put a junction in its place (it holds `FILE_DELETE_CHILD` there), so a walk running at that
+  moment (a grant or another session's scratch being labelled while a Low command runs) could label the junction's target,
+  e.g. `Documents`, and descend into it; removal could walk a recorded folder that is now a junction. Now every object is
+  opened with `FILE_FLAG_OPEN_REPARSE_POINT` (a link is opened as itself and skipped), its real path is read from the
+  handle (`GetFinalPathNameByHandleW`) and must still be under the root, and the label is read and set through that same
+  handle (`GetKernelObjectSecurity` / `SetKernelObjectSecurity`, label only: what `SetFileSecurityW` does after its own
+  open). The root is opened the same way after `canonical`; removal reports a recorded folder that is now a link or leads
+  elsewhere as `changed` and leaves it. Tests: `an_entry_reached_through_a_junction_is_skipped` (an entry under a junction
+  is `Skip`), `removal_does_not_follow_a_recorded_folder_replaced_by_a_junction` (the target's descriptors unchanged; the
+  old code reported it `restored`).
+- **Hard links.** A file hard-linked into the workspace was labelled for all its names (pnpm's store, or a file outside the
+  workspace, became Low-writable). Files with more than one name are now left unlabelled and counted; `ensure_low`
+  answers `Partly(why)` (the folder still counts as writable; the note says how many). Before, any failed item made
+  `ensure_low` an error, so a labelled workspace was left out of `writable` and the hint fired on its own paths. Test
+  `hard_linked_files_are_left_alone`.
+- **Refusal list.** A session started in `AppData`, `Documents`, `~\.cargo` or a repository holding a `PATH` folder would
+  have labelled places a planted file runs from later at Medium (Startup, `Documents\WindowsPowerShell\profile.ps1`,
+  `~\.cargo\bin\cargo.exe`, anything on `PATH`), and `C:\Users\Public` / another profile were allowed. Added: `APPDATA`,
+  `LOCALAPPDATA` and every absolute `PATH` folder (is or contains); `PUBLIC`, `~\.ssh`, `~\.cargo`, `~\.rustup`, the Start
+  Menu, `Documents\WindowsPowerShell` and `Documents\PowerShell` (is, contains or inside); anything under the profiles'
+  parent but outside the user's own profile. The data folder's scratch/cache exception is checked first (it sits in
+  `APPDATA`). Spellings (8.3 short name from `%TEMP%`, `\\?\`, upper case, `\.`, `..`) all reach the refusal through
+  `canonical`. Tests `other_spellings_of_the_profile_are_refused_too`,
+  `appdata_path_folders_startup_and_other_profiles_are_refused`.
+- **Cross-process lock.** `RECORD_LOCK` was in-process only; the desktop app and `hermes-acp.exe` share the data folder, so
+  two read-modify-writes could lose a folder from the record (a label without a record). Now the mutex plus an exclusive
+  `File::lock` on `sandbox-labels.lock`.
+- **Cargo credentials.** `config.toml` was copied verbatim into the Low-writable `sandbox-cache\cargo`; a `[registry]` /
+  `[registries.x]` `token`, `secret-key` or `secret-key-subject` (inline tables too) is now dropped (`without_credentials`,
+  `toml` parse; unparsable: not copied; a source config that is gone removes the copy). `credentials.toml` never was. npm
+  and pip configs are not copied (only cache folders move). Test `the_cargo_config_copy_has_no_credentials`.
+- Independent DACL check added to the round-trip test: `icacls <ws> /t` (read only) prints the same before labelling and
+  after removal. `/sandbox remove-labels` says a moved folder keeps its label where it is now. Docs: PITFALLS (refusals,
+  handles, hard links, lock, cargo config, the workspace-planting limit), module doc, `crates/desktop/README.md`, PORTING.
+Left (noted, not worth it now or by design):
+- A sandboxed command can still change files in the workspace that the user later runs at Medium (`build.rs`, npm
+  scripts, `.git\hooks`): inherent to a writable workspace; said in PITFALLS and the README.
+- The first walk of a large workspace holds the record lock with no time limit (blocking thread, not the async workers).
+- Reparse points that aren't links (OneDrive placeholders) are skipped like links (read-only to commands).
+- A moved recorded folder keeps its label at its new place (forgotten as `gone`).
+- `blocked_hint` heuristics as the implementer described (an unquoted path with spaces is cut; a false hint costs one line).
+- The pipe-inheritance window (CP15.1).
+Tests (reviewer, `CARGO_TARGET_DIR=target/claude`): TESTS_PLACEHOLDER
+`scripts/clean-test-temp.ps1 -Delete` run after. Checked after the runs: `%USERPROFILE%`, both checkouts and the
+data folder carry no mandatory label and their DACL flags are unchanged (`D:P`, `D:`, `D:`; the data folder's `D:AI` is
+`%APPDATA%`'s own); no `hermes-sandbox-probe*` in `%USERPROFILE%`; no `sandbox-labels.json` in `%APPDATA%\hermes-rs`.
+
+### USER CHECKLIST (Phase 15)
+1. Close the app. Open `%APPDATA%\hermes-rs\desktop-config.json` in an editor and add, at the top level (or merge into an
+   existing `"terminal"` object): `"terminal": { "sandbox": "low" }`. Optionally add folders commands may also write to:
+   `"terminal": { "sandbox": "low", "sandbox_grants": ["D:\\datasets"] }` (absolute paths, doubled backslashes). Save,
+   start the app.
+2. Open a chat in a repository folder (e.g. a throw-away clone) and type `/sandbox`. Expected: `terminal.sandbox: low`,
+   your grants, "No folder is labelled Low by this app." (nothing is labelled before the first command).
+3. Ask the agent to run `whoami /groups` (Windows' own: `C:\Windows\System32\whoami.exe /groups`). Expected: the
+   result's `sandbox` field says "sandbox=low: ran in PowerShell, not bash" (if your terminal is Git Bash), and the
+   groups list "Mandatory Label\Low Mandatory Level". The first command in a big repository may take a while (labelling).
+4. Type `/sandbox` again. Expected: the repository folder (`workspace`), the chat's scratch folder, `sandbox-cache` and
+   your grants listed as labelled.
+5. Ask it to create a file in the repository (works) and one in your user folder, e.g.
+   `Set-Content $env:USERPROFILE\sandbox-test.txt x` (fails: "Access to the path ... is denied", and the result says
+   "blocked by sandbox: C:\Users\...\sandbox-test.txt; grant the folder ..."). Check that file does not exist.
+6. Ask it to run `git status` and a `git commit` in the repository, and `cargo build` (or `npm install`, `uv run`) in a
+   project there: they should work (downloads go to `%APPDATA%\hermes-rs\sandbox-cache`). Git hooks or an editor that
+   need `sh` will fail at Low.
+7. To turn it off: close the app, set `"sandbox": "off"` (or remove it), start the app. Then type
+   `/sandbox remove-labels`. Expected: "Sandbox labels removed: N folder(s) put back as they were." and the folders
+   listed; `/sandbox` then says nothing is labelled. (Removing the labels while still on `low` works too, but the next
+   command labels the folders again.)
+8. Optional: `icacls <your repo>` before step 3 and after step 7 should print the same lines (no "Mandatory Label").

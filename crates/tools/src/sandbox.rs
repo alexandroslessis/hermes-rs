@@ -15,10 +15,18 @@
 //! read on blocking threads too), and the process handle is wrapped in [`LowChild`] so the
 //! callers' `try_wait` / `wait` / kill-on-drop work unchanged.
 //!
-//! CP15.1 of `docs/backend/PHASES.md` Phase 15 stops at the token: no folder is labelled Low
-//! yet (CP15.2), so under `low` a command can write only where Windows already allows Low
-//! (`%USERPROFILE%\AppData\LocalLow`). The setting is read from the config record only (no
-//! Settings field), as `terminal.env_passthrough` is.
+//! Under `low` a command can write only to folders labelled Low: the session's workspace,
+//! scratch and cache folders and the user's grants, which `sandbox_labels.rs` labels (and
+//! records, so `/sandbox remove-labels` can undo it) before the command starts, and where
+//! Windows already allows Low (`%USERPROFILE%\AppData\LocalLow`).
+//!
+//! **Git Bash does not start at Low** (its MSYS runtime's object directory, PITFALLS "The shell
+//! sandbox"), so under `low` every command runs in PowerShell, also when the terminal is Git
+//! Bash, and the result says `sandbox=low: ran in PowerShell, not bash` (`shell::run_low`,
+//! `process::spawn`; `run_script` refuses bash). The system prompt is not changed (rule 8).
+//!
+//! The setting is read from the config record only (no Settings field), as
+//! `terminal.env_passthrough` is.
 //!
 //! Hermes: none. Hermes has no OS sandbox for its local terminal backend
 //! (`tools/environments/local.py` runs commands with the user's full rights); this is ours.

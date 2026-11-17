@@ -50,6 +50,35 @@ and the model gets Hermes's summary and what followed, as it did in Hermes. Each
 `src/hermes_import.rs`; `scripts/perf/import-check.mjs` checks it against a home built by
 Hermes's own code (`scripts/perf/make-hermes-db.py`).
 
+## Shell sandbox (optional, off by default)
+
+With the sandbox on, the commands the agent runs (terminal, background processes, `run_script`)
+can't write outside the session's folder, its scratch folder, a shared cache folder and the
+folders you grant; reading is not restricted. To turn it on, close the app, open
+`%APPDATA%\hermes-rs\desktop-config.json` and add (or merge into an existing `"terminal"`):
+
+```json
+"terminal": { "sandbox": "low", "sandbox_grants": ["D:\\datasets"] }
+```
+
+then start the app again. `sandbox_grants` is optional: folders (absolute paths) commands may also
+write to. With `"low"`:
+- commands run in **PowerShell even if your terminal is Git Bash** (Git Bash can't start sandboxed);
+  each result tells the model "sandbox=low: ran in PowerShell, not bash";
+- the first command labels the session's folder (the repository root) "Low integrity" so commands
+  can write there; a large folder takes a moment, once;
+- a refused write ends with "blocked by sandbox: <path>; grant the folder ...";
+- type `/sandbox` to see what is labelled, and `/sandbox remove-labels` to put every folder back as
+  it was (set `"sandbox": "off"` first, or the next command labels them again).
+
+Never labelled: the app's own folder, your user profile folder itself, `AppData`, folders on
+`PATH`, `.ssh`, `.cargo`, `.rustup`, the Startup and PowerShell profile folders, other users'
+folders, Windows, Program Files and ProgramData (a session started in one of those gets a note and
+no writable folder). Hard-linked files inside the workspace stay read-only to commands. A
+sandboxed command can still change files *inside* the workspace that you later run yourself
+(build scripts, git hooks): the sandbox stops writes elsewhere, not that.
+Details: `docs/PITFALLS.md`, "The shell sandbox".
+
 ## Status
 
 Works: startup, the session list and search, transcripts, prompts with streamed reasoning, text

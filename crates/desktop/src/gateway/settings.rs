@@ -172,8 +172,18 @@ impl Gateway {
         // low-integrity token, backend v2 Phase 15). Config record only, no Settings field, so
         // it takes effect at startup (a hand edit of desktop-config.json needs a restart); the
         // level is read at each spawn, so it applies to the next command.
+        // Under "low" the configured Git Bash is replaced by PowerShell (Git Bash can't start at
+        // low integrity; each result says "sandbox=low: ran in PowerShell, not bash"), and the
+        // workspace, scratch and cache folders are labelled Low (`sandbox-labels.json`; undone
+        // with `/sandbox remove-labels`).
         hermes_tools::set_sandbox(hermes_tools::Sandbox::from_config(
             &self.rest.config_value("terminal.sandbox"),
+        ));
+        // Folders the user lets sandboxed commands write to (`terminal.sandbox_grants`: a list of
+        // absolute paths; config record only): labelled Low by the next `low` command, with the
+        // same record and refusals as the workspace.
+        hermes_tools::set_sandbox_grants(sandbox_grants(
+            &self.rest.config_value("terminal.sandbox_grants"),
         ));
         // Each provider's daily request limit and where its day starts, for the request ledger
         // and its governor (`provider_limits`).
@@ -615,4 +625,19 @@ mod provider_limit_tests {
             assert_eq!(s.providers[0].daily_request_limit, None, "{bad}");
         }
     }
+}
+
+/// `terminal.sandbox_grants`: the non-empty strings of a list, trimmed (anything else: none).
+pub(super) fn sandbox_grants(value: &Value) -> Vec<std::path::PathBuf> {
+    value
+        .as_array()
+        .map(|folders| {
+            folders
+                .iter()
+                .filter_map(|folder| folder.as_str())
+                .filter(|folder| !folder.trim().is_empty())
+                .map(|folder| std::path::PathBuf::from(folder.trim()))
+                .collect()
+        })
+        .unwrap_or_default()
 }

@@ -41,7 +41,7 @@ similar.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
-windows = { workspace = true, features = ["Win32_System_JobObjects", "Win32_System_Pipes"] }
+windows = { workspace = true, features = ["Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Pipes"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]

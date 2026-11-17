@@ -56,7 +56,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 13b | Perf: store writer actor — ✅ 2026-11-17 (74ac1f7) | M | 0 | **Opus** | C |
 | 13d/e | Perf: session actor, explicit agent loop — ✅ 2026-11-17 (acad3ca, a110767) | L | all others | **Opus** | last, alone |
 | 14 | Trim `hermes_llm` — ✅ 2026-11-17 (a7c24dc, CP14.2: the `backend p14 cp2` commit) | S–M | 2, 12 | Sonnet | filler |
-| 15 | OS sandbox for the shell | L | 1, 6 | **Opus** | C |
+| 15 | OS sandbox for the shell — ✅ 2026-11-17 (497b24c, CP15.2: the `backend p15 cp2` commit) | L | 1, 6 | **Opus** | C |
 
 Phase 1 is independent of the request work and can start while Phase 0 is in review. Lanes and
 fillers are explained in the next section.
@@ -1028,6 +1028,40 @@ network but needs per-tool grants and breaks more; not planned unless `low` prov
 **Tests:** spawn a sandboxed shell, try to write to `%USERPROFILE%\x.txt` → denied; write in
 workspace → works; `git status`, `git commit` in the workspace, and `cargo build` with
 `CARGO_HOME`/`CARGO_TARGET_DIR` in scratch/workspace work.
+
+**Done 2026-11-17** ([progress](progress/phase-15.md)), on branch `backend/p15-sandbox`: CP15.1
+low-integrity token 497b24c, CP15.2 labels, caches, grants, errors (the `backend p15 cp2` commit).
+`terminal.sandbox = "low"` runs the terminal, background processes and `run_script` with a Low copy
+of the app's token (`CreateProcessAsUserW`, suspended, in the job object, resumed); the session's
+workspace, scratch, `<data>\sandbox-cache` and `terminal.sandbox_grants` are labelled Low (recorded
+first in `sandbox-labels.json`, removed by `/sandbox remove-labels`), package-manager caches point
+into `sandbox-cache`, a refused write gets "blocked by sandbox: <path>". All the plan's tests pass on
+this machine (profile write denied, workspace write, `git init/add/commit/status`, `cargo build`
+with `CARGO_HOME` in the cache). Notes for later phases:
+- **The default stays `off`** (D4's "default `off` for the first release"). `off` is the old spawn
+  path (the CP15.1 and CP15.2 reviews diffed it): no label, no record, no `sandbox` field. Turning
+  the default to `low` is a separate decision, after the user has run it for a while.
+- **Git Bash runs as PowerShell under `low`** (Git Bash's MSYS runtime can't start at Low while any
+  unsandboxed MSYS program runs: PITFALLS "The shell sandbox"). The system prompt and tool
+  descriptions still say bash (rule 8); only the results' `sandbox` field says "ran in PowerShell,
+  not bash"; `run_script` refuses bash. A relocated, Low-labelled copy of Git's `usr\bin` would let
+  bash run at Low (checked by hand) and is the way back to bash if wanted.
+- **Not run end to end in the desktop app or ACP**: no live check (the page calls nothing new;
+  `/sandbox` goes through `slash.exec` with `/import-hermes`'s answer shape). The tools tests run
+  real Low processes against real labelled folders; the user checklist in the progress note is the
+  first run in the app.
+- **The pipe-inheritance window** (CP15.1): a `std::process` spawn on another thread during a `low`
+  spawn can inherit the child's pipe ends, so a reader may see EOF late. The readers no longer
+  depend on EOF; closing the window needs a broker process.
+- Labels are set through handles that never follow a link, checked against the handle's real path
+  (`SetKernelObjectSecurity`, not `SetNamedSecurityInfoW`/`icacls`, which rewrite DACLs); hard-linked
+  files are left unlabelled; the refusal list keeps out the profile, AppData, `PATH` folders,
+  Startup, PowerShell profiles, `.cargo`, `.rustup`, `.ssh`, system folders and other users'
+  folders. By design a sandboxed command can still change files in the workspace that the user
+  later runs unsandboxed (build scripts, git hooks). Reads and network are not restricted
+  (AppContainer would be the next step, not planned).
+- The first `low` command in a large workspace walks every file once (no time limit, on a blocking
+  thread, under the record's lock); not measured on a big repository (no performance checks).
 
 ---
 

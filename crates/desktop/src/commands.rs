@@ -12,9 +12,9 @@ use hermes_tools::SkillStore;
 use serde_json::{Value, json};
 
 /// The built-in commands this backend runs and offers in the `/` menu: Hermes's coding commands
-/// (`coding_command`), as `hermes_cli/commands.py` describes them, and `/import-hermes`
-/// (`Gateway::builtin_command`).
-const CODING_COMMANDS: [(&str, &str); 5] = [
+/// (`coding_command`), as `hermes_cli/commands.py` describes them, and `/import-hermes` and
+/// `/sandbox` (`Gateway::builtin_command`; ours).
+const CODING_COMMANDS: [(&str, &str); 6] = [
     (
         "plan",
         "Write a markdown implementation plan to .hermes/plans/ without executing anything",
@@ -34,6 +34,10 @@ const CODING_COMMANDS: [(&str, &str); 5] = [
     (
         "import-hermes",
         "Import every session from the original Hermes on this computer",
+    ),
+    (
+        "sandbox",
+        "Show the shell sandbox's folders; /sandbox remove-labels puts their labels back",
     ),
 ];
 

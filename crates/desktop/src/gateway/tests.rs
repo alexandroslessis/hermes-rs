@@ -259,3 +259,50 @@ async fn staging_over_rest_mirrors_the_methods() {
             .is_none()
     );
 }
+
+/// `/sandbox` (Phase 15): the level and the labelled folders; `/sandbox remove-labels` with
+/// nothing recorded removes nothing. (The labelling itself is tested in `hermes_tools`. The
+/// level and the grants are process-wide and every gateway made by a test beside this one sets
+/// them from its own config, so the grants are checked on their parser.)
+#[tokio::test]
+async fn the_sandbox_command_reports_and_removes_labels() {
+    let dir = hermes_testdir::tempdir().unwrap();
+    let gateway = gateway(dir.path());
+    let status = call(&gateway, "slash.exec", json!({"command": "sandbox"}))
+        .await
+        .unwrap();
+    let text = status["output"].as_str().unwrap();
+    assert!(text.contains("terminal.sandbox: off"), "{text}");
+    assert!(text.contains("Granted folders"), "{text}");
+    assert!(text.contains("No folder is labelled Low"), "{text}");
+    let removed = call(
+        &gateway,
+        "slash.exec",
+        json!({"command": "/sandbox remove-labels"}),
+    )
+    .await
+    .unwrap();
+    let text = removed["output"].as_str().unwrap();
+    assert!(text.contains("0 folder(s) put back"), "{text}");
+    let unknown = call(&gateway, "slash.exec", json!({"command": "/sandbox nope"}))
+        .await
+        .unwrap();
+    assert!(
+        unknown["output"].as_str().unwrap().contains("remove-labels"),
+        "{unknown:?}"
+    );
+}
+
+#[test]
+fn sandbox_grants_are_read_from_the_config_list() {
+    use super::settings::sandbox_grants;
+    assert_eq!(
+        sandbox_grants(&json!([" D:\\data ", "", 3, "E:\\x"])),
+        [
+            std::path::PathBuf::from("D:\\data"),
+            std::path::PathBuf::from("E:\\x")
+        ]
+    );
+    assert!(sandbox_grants(&json!("D:\\data")).is_empty());
+    assert!(sandbox_grants(&Value::Null).is_empty());
+}

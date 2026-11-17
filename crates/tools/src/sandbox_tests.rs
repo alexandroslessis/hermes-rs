@@ -13,29 +13,6 @@ use crate::shell::{ShellKind, ShellSession};
 use crate::tests::TestBridge;
 use crate::{SessionTools, SessionToolsConfig};
 
-/// A session whose terminal is PowerShell whatever this machine has (Git Bash doesn't start at
-/// Low; see `a_low_git_bash_writes_nothing_to_the_user_profile`).
-fn powershell_tools() -> (hermes_testdir::TestDir, SessionTools) {
-    let dir = hermes_testdir::tempdir().unwrap();
-    let tools = SessionTools::new(SessionToolsConfig {
-        session_id: "ses_test".into(),
-        cwd: dir.path().to_path_buf(),
-        home: dir.path().to_path_buf(),
-        data_dir: dir.path().join(".data"),
-        scratch_dir: dir.path().join(".scratch"),
-        shell: ShellKind::PowerShell,
-        bridge: std::sync::Arc::new(TestBridge::default()),
-        todos: Vec::new(),
-        memory: None,
-        history: None,
-        skills: None,
-        approvals: None,
-        checkpoints: None,
-        web: None,
-    });
-    (dir, tools)
-}
-
 /// `whoami /groups` lists the token's label by SID: Low is `S-1-16-4096`, Medium
 /// `S-1-16-8192`, High (an elevated app) `S-1-16-12288`. The SIDs don't depend on the
 /// language Windows is in; the label's name does.
@@ -90,8 +67,8 @@ impl Drop for Probe {
     }
 }
 
-/// Labels a test folder Low (inherited by what is made in it), as CP15.2 will label the
-/// workspace. Test-only, through `icacls`; `false` when that isn't possible here.
+/// Labels a test folder Low (inherited by what is made in it) by hand, independent of
+/// `sandbox_labels`: through `icacls`; `false` when that isn't possible here.
 fn label_low(dir: &Path) -> bool {
     use std::os::windows::process::CommandExt as _;
     std::process::Command::new("icacls")
@@ -272,22 +249,11 @@ fn git_bash_shell(dir: &Path) -> Option<ShellSession> {
     ))
 }
 
-/// The persistent bash ended before running the command: what a Git Bash at Low does (its
-/// runtime's error goes to bash's stderr, which the terminal discards); the terminal then says
-/// why (`MSYS_AT_LOW_ERROR`).
-fn bash_died_at_start(result: &crate::shell::RunResult) -> bool {
-    result.exit_code.is_none()
-        && result.shell_restarted
-        && result.output == crate::shell::MSYS_AT_LOW_ERROR
-}
-
-/// Git Bash does not start at Low (CP15.1 finding, see the progress note): the MSYS runtime
-/// dies creating `\BaseNamedObjects\msys-2.0S5-<hash>`. This pins what happens today: the
-/// command doesn't run, nothing is written, the model gets `MSYS_AT_LOW_ERROR` with the "shell
-/// exited" note, and the next call tries again. Should Git Bash ever start at Low, the test checks the label and
-/// the denial instead.
+/// Git Bash does not start at Low (CP15.1 finding, see the progress note and
+/// `msys_programs_do_not_start_at_low`), so under `low` a Git Bash session's commands run in
+/// PowerShell and the result says so (`RAN_IN_POWERSHELL`); nothing reaches the profile.
 #[tokio::test]
-async fn a_low_git_bash_writes_nothing_to_the_user_profile() {
+async fn a_low_git_bash_session_runs_in_powershell_and_says_so() {
     let dir = hermes_testdir::tempdir().unwrap();
     let Some(shell) = git_bash_shell(dir.path()) else {
         return;
@@ -295,8 +261,8 @@ async fn a_low_git_bash_writes_nothing_to_the_user_profile() {
     shell.set_sandbox_override(Some(Sandbox::Low));
     let probe = Probe::new();
     let command = format!(
-        "echo x > '{}' && echo profile=written || echo profile=denied; {WHOAMI_BASH}",
-        crate::display_path(&probe.0)
+        "try {{ Set-Content -LiteralPath {} -Value x -ErrorAction Stop; 'profile=written' }} catch {{ 'profile=denied' }}\n{WHOAMI_PS}",
+        crate::shell::powershell_quote(&probe.0.display().to_string()),
     );
     let result = run(&shell, &command).await;
     let exists = probe.0.exists();
@@ -304,44 +270,308 @@ async fn a_low_git_bash_writes_nothing_to_the_user_profile() {
     shell.shutdown().await;
     assert!(
         !exists,
-        "the sandboxed bash wrote to %USERPROFILE%: {}",
+        "the sandboxed shell wrote to %USERPROFILE%: {}",
         result.output
     );
-    if bash_died_at_start(&result) {
-        eprintln!("Git Bash does not start at Low: {result:?}");
-        return;
-    }
-    assert!(
-        result.output.contains("profile=denied"),
-        "{}",
-        result.output
-    );
+    assert!(result.output.contains("profile=denied"), "{}", result.output);
     assert!(result.output.contains(LOW_SID), "{}", result.output);
+    assert_eq!(
+        result.sandbox.first().map(String::as_str),
+        Some(crate::shell::RAN_IN_POWERSHELL),
+        "{result:?}"
+    );
 }
 
+/// `off` -> `low` -> `off` on a Git Bash session: bash at the app's level, then PowerShell at
+/// Low (the bash started before is stopped: it ran unsandboxed), then bash again, in the folder
+/// the PowerShell command moved to.
 #[tokio::test]
-async fn changing_the_level_restarts_a_running_git_bash() {
+async fn switching_low_on_and_off_moves_a_git_bash_session_between_shells() {
     let dir = hermes_testdir::tempdir().unwrap();
     let Some(shell) = git_bash_shell(dir.path()) else {
         return;
     };
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
     shell.set_sandbox_override(Some(Sandbox::Off));
     let off = run(&shell, WHOAMI_BASH).await;
     assert_eq!(off.exit_code, Some(0), "{off:?}");
     assert!(!off.output.contains(LOW_SID), "{}", off.output);
+    assert!(off.sandbox.is_empty(), "{off:?}");
     shell.set_sandbox_override(Some(Sandbox::Low));
-    let low = run(&shell, WHOAMI_BASH).await;
-    // A new shell started at Low (or failed to: see the test above); the Medium one is gone.
-    assert!(!low.output.contains(MEDIUM_SID), "{low:?}");
-    assert!(
-        low.output.contains(LOW_SID) || bash_died_at_start(&low),
-        "{low:?}"
-    );
+    let low = run(&shell, &format!("Set-Location sub\n{WHOAMI_PS}")).await;
+    assert!(low.output.contains(LOW_SID), "{low:?}");
+    assert_eq!(low.sandbox, [crate::shell::RAN_IN_POWERSHELL], "{low:?}");
     shell.set_sandbox_override(Some(Sandbox::Off));
-    let back = run(&shell, WHOAMI_BASH).await;
+    let back = run(&shell, &format!("pwd; {WHOAMI_BASH}")).await;
     shell.shutdown().await;
     assert_eq!(back.exit_code, Some(0), "{back:?}");
     assert!(!back.output.contains(LOW_SID), "{}", back.output);
+    assert!(back.output.contains("sub"), "{}", back.output);
+    assert!(back.sandbox.is_empty(), "{back:?}");
+}
+
+/// A session as the app makes one, laid out so the folders `low` labels are the test's own:
+/// `<temp>/ws` (workspace), `<temp>/data` (data folder), `<temp>/data/scratch/ses_test`.
+/// Fields drop in order: the tools, then the guard that removes every label the session set,
+/// then the folder.
+struct LowSession {
+    tools: SessionTools,
+    ws: PathBuf,
+    data: PathBuf,
+    _unlabel: Unlabel,
+    dir: hermes_testdir::TestDir,
+}
+
+/// Puts back every folder the test's record lists, on drop (also when the test panics).
+struct Unlabel(PathBuf);
+
+impl Drop for Unlabel {
+    fn drop(&mut self) {
+        if let Err(error) = crate::sandbox_labels::remove_all(&self.0) {
+            eprintln!("could not remove the test's sandbox labels: {error}");
+        }
+    }
+}
+
+fn low_session(shell: ShellKind, level: Sandbox) -> LowSession {
+    let dir = hermes_testdir::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let tools = SessionTools::new(SessionToolsConfig {
+        session_id: "ses_test".into(),
+        cwd: ws.clone(),
+        home: dir.path().to_path_buf(),
+        data_dir: data.clone(),
+        scratch_dir: data.join("scratch").join("ses_test"),
+        shell,
+        bridge: std::sync::Arc::new(TestBridge::default()),
+        todos: Vec::new(),
+        memory: None,
+        history: None,
+        skills: None,
+        approvals: None,
+        checkpoints: None,
+        web: None,
+    });
+    tools.shell.set_sandbox_override(Some(level));
+    tools.shell.set_grants_override(Vec::new());
+    LowSession {
+        tools,
+        ws,
+        _unlabel: Unlabel(data.clone()),
+        data,
+        dir,
+    }
+}
+
+async fn terminal(session: &LowSession, command: &str) -> crate::ToolOutput {
+    crate::shell::terminal(
+        &session.tools,
+        json!({"command": command, "timeout": 300}),
+        None,
+    )
+    .await
+}
+
+fn output(result: &crate::ToolOutput) -> String {
+    result.value["output"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_low_session_writes_in_its_workspace_and_scratch_but_not_the_profile() {
+    let session = low_session(ShellKind::PowerShell, Sandbox::Low);
+    let probe = Probe::new();
+    let command = format!(
+        "Set-Content -LiteralPath {} -Value x\n\
+         try {{ Set-Content -LiteralPath ws.txt -Value x -ErrorAction Stop; 'ws=written' }} catch {{ \"ws=denied $_\" }}\n\
+         try {{ Set-Content -LiteralPath (Join-Path $env:TEMP t.txt) -Value x -ErrorAction Stop; 'temp=written' }} catch {{ \"temp=denied $_\" }}\n\
+         New-Item -ItemType Directory -Path made\\deeper | Out-Null\n\
+         Set-Content -LiteralPath made\\deeper\\inner.txt -Value x",
+        crate::shell::powershell_quote(&probe.0.display().to_string()),
+    );
+    let result = terminal(&session, &command).await;
+    let exists = probe.0.exists();
+    let probe_path = probe.0.display().to_string();
+    drop(probe);
+    let text = output(&result);
+    assert!(!exists, "the sandboxed shell wrote to %USERPROFILE%: {text}");
+    assert!(text.contains("ws=written"), "{text}");
+    assert!(text.contains("temp=written"), "{text}");
+    assert!(session.ws.join("ws.txt").is_file());
+    // The refused write is named, with what to do about it.
+    let note = result.value["sandbox"].as_str().unwrap_or_default();
+    assert!(
+        note.contains(&format!("blocked by sandbox: {probe_path}; grant the folder")),
+        "{:?}",
+        result.value
+    );
+    // The workspace, the scratch and the cache folders are recorded.
+    let kinds: Vec<String> = crate::sandbox_labels::list(&session.data)
+        .unwrap()
+        .into_iter()
+        .map(|f| f.kind)
+        .collect();
+    assert_eq!(kinds, ["workspace", "scratch", "cache"]);
+    // What the Low command made carries the inherited label, and removal takes it off as well
+    // as the workspace's own: nothing in the workspace stays Low.
+    let made = [
+        session.ws.clone(),
+        session.ws.join("ws.txt"),
+        session.ws.join("made"),
+        session.ws.join("made").join("deeper"),
+        session.ws.join("made").join("deeper").join("inner.txt"),
+    ];
+    let label = |path: &Path| {
+        crate::sandbox_labels::classify(&crate::sandbox_labels::win::read_label(path).unwrap())
+    };
+    for path in &made[1..] {
+        assert_eq!(
+            label(path),
+            crate::sandbox_labels::Label::LowInherited,
+            "{}",
+            path.display()
+        );
+    }
+    let removal = crate::sandbox_labels::remove_all(&session.data).unwrap();
+    assert!(removal.failed.is_empty(), "{removal:?}");
+    for path in &made {
+        assert_eq!(
+            label(path),
+            crate::sandbox_labels::Label::None,
+            "{}",
+            path.display()
+        );
+    }
+}
+
+#[tokio::test]
+async fn git_status_and_commit_work_in_a_low_workspace() {
+    let session = low_session(ShellKind::PowerShell, Sandbox::Low);
+    let command = "git init -q 2>&1\n\
+         Set-Content -LiteralPath a.txt -Value one\n\
+         git add a.txt 2>&1\n\
+         git -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false commit -q -m first 2>&1\n\
+         \"commit=$LASTEXITCODE\"\n\
+         Set-Content -LiteralPath a.txt -Value two\n\
+         git status --porcelain 2>&1\n\
+         git log --oneline 2>&1";
+    let result = terminal(&session, command).await;
+    let text = output(&result);
+    assert!(text.contains("commit=0"), "{text}");
+    assert!(text.contains(" M a.txt"), "{text}");
+    assert!(text.contains("first"), "{text}");
+    assert!(result.value.get("sandbox").is_none(), "{:?}", result.value);
+}
+
+/// `cargo build` of a crate with no dependencies, offline, with `CARGO_HOME` in the cache folder
+/// (`prepare` sets it) and `CARGO_TARGET_DIR` in the workspace.
+#[tokio::test]
+async fn cargo_builds_in_a_low_workspace() {
+    let has_cargo = std::process::Command::new("cargo")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !has_cargo {
+        eprintln!("no cargo here; skipped");
+        return;
+    }
+    let session = low_session(ShellKind::PowerShell, Sandbox::Low);
+    let krate = session.ws.join("tiny");
+    std::fs::create_dir_all(krate.join("src")).unwrap();
+    std::fs::write(
+        krate.join("Cargo.toml"),
+        "[package]\nname = \"tiny\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        krate.join("src").join("main.rs"),
+        "fn main() { println!(\"tiny ran\"); }\n",
+    )
+    .unwrap();
+    let command = "Set-Location tiny\n\
+         $env:CARGO_TARGET_DIR = Join-Path (Get-Location) target\n\
+         \"home=$env:CARGO_HOME\"\n\
+         cargo build --offline 2>&1 | ForEach-Object { \"$_\" }\n\
+         \"build=$LASTEXITCODE\"\n\
+         & .\\target\\debug\\tiny.exe";
+    let result = terminal(&session, command).await;
+    let text = output(&result);
+    assert!(text.contains("build=0"), "{text}");
+    assert!(text.contains("tiny ran"), "{text}");
+    let cargo_home = session
+        .data
+        .join(crate::sandbox_labels::CACHE_DIR)
+        .join("cargo");
+    assert!(
+        text.contains(&format!("home={}", cargo_home.display())),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn granted_folders_are_labelled_and_writable() {
+    let session = low_session(ShellKind::PowerShell, Sandbox::Low);
+    let granted = session.dir.path().join("granted");
+    let other = session.dir.path().join("other");
+    std::fs::create_dir_all(&granted).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    session
+        .tools
+        .shell
+        .set_grants_override(vec![granted.clone()]);
+    let quote =
+        |p: &Path| crate::shell::powershell_quote(&p.join("f.txt").display().to_string());
+    let command = format!(
+        "try {{ Set-Content -LiteralPath {} -Value x -ErrorAction Stop; 'granted=written' }} catch {{ 'granted=denied' }}\n\
+         try {{ Set-Content -LiteralPath {} -Value x -ErrorAction Stop; 'other=written' }} catch {{ 'other=denied' }}",
+        quote(&granted),
+        quote(&other),
+    );
+    let result = terminal(&session, &command).await;
+    let text = output(&result);
+    assert!(text.contains("granted=written"), "{text}");
+    assert!(text.contains("other=denied"), "{text}");
+    let granted = crate::project_skills::canonical(&granted).unwrap();
+    let folders = crate::sandbox_labels::list(&session.data).unwrap();
+    assert!(
+        folders
+            .iter()
+            .any(|f| f.kind == "grant" && f.path == granted),
+        "{folders:?}"
+    );
+}
+
+/// `off` with the same session layout: no label, no record, no note, the app's own level, and
+/// Git Bash stays Git Bash.
+#[tokio::test]
+async fn off_labels_nothing_and_adds_nothing() {
+    let session = low_session(crate::shell::detect_shell(), Sandbox::Off);
+    let command = match session.tools.shell.kind() {
+        ShellKind::GitBash(_) => WHOAMI_BASH,
+        ShellKind::PowerShell => WHOAMI_PS,
+    };
+    let result = terminal(&session, command).await;
+    let text = output(&result);
+    assert_eq!(result.value["exit_code"], 0, "{:?}", result.value);
+    assert!(!text.contains(LOW_SID), "{text}");
+    assert!(result.value.get("sandbox").is_none(), "{:?}", result.value);
+    assert!(
+        !session
+            .data
+            .join(crate::sandbox_labels::RECORD_FILE)
+            .exists()
+    );
+    let label = crate::sandbox_labels::win::read_label(&session.ws).unwrap();
+    assert_eq!(
+        crate::sandbox_labels::classify(&label),
+        crate::sandbox_labels::Label::None
+    );
+    session.tools.shutdown().await;
 }
 
 /// MSYS programs started from a Low PowerShell fail the same way (Git's `usr\bin` tools on
@@ -413,17 +643,17 @@ async fn a_low_command_is_killed_on_timeout_and_on_stop() {
 
 #[tokio::test]
 async fn background_processes_and_scripts_run_sandboxed_too() {
-    let (_dir, tools) = powershell_tools();
-    tools.shell.set_sandbox_override(Some(Sandbox::Low));
+    let session = low_session(ShellKind::PowerShell, Sandbox::Low);
+    let tools = &session.tools;
     let started = crate::shell::terminal(
-        &tools,
+        tools,
         json!({"command": WHOAMI_PS, "background": true}),
         None,
     )
     .await;
     let id = started.value["session_id"].as_str().unwrap().to_string();
     let waited = crate::process::process_manage(
-        &tools,
+        tools,
         json!({"action": "wait", "session_id": id, "timeout": 60}),
     )
     .await;
@@ -432,15 +662,58 @@ async fn background_processes_and_scripts_run_sandboxed_too() {
     assert!(output.contains(LOW_SID), "{output}");
 
     let script = crate::script::run_script(
-        &tools,
-        json!({"language": "powershell", "code": WHOAMI_PS}),
+        tools,
+        json!({"language": "powershell", "code": format!("{WHOAMI_PS}\n$env:UV_CACHE_DIR")}),
         None,
     )
     .await;
     assert_eq!(script.value["exit_code"], 0, "{:?}", script.value);
     let output = script.value["output"].as_str().unwrap_or_default();
     assert!(output.contains(LOW_SID), "{output}");
+    // The cache variables reach scripts too.
+    assert!(
+        output.contains(crate::sandbox_labels::CACHE_DIR),
+        "{output}"
+    );
+    // Bash scripts are refused up front under `low` (Git Bash can't start at Low).
+    let bash = crate::script::run_script(
+        tools,
+        json!({"language": "bash", "code": "echo hi"}),
+        None,
+    )
+    .await;
+    assert!(bash.is_error, "{:?}", bash.value);
     tools.shutdown().await;
+}
+
+/// Under `low`, a Git Bash session's background processes run in PowerShell too, and say so.
+#[tokio::test]
+async fn a_low_git_bash_session_starts_background_processes_in_powershell() {
+    let ShellKind::GitBash(bash) = crate::shell::detect_shell() else {
+        return;
+    };
+    let session = low_session(ShellKind::GitBash(bash), Sandbox::Low);
+    let started = crate::shell::terminal(
+        &session.tools,
+        json!({"command": WHOAMI_PS, "background": true}),
+        None,
+    )
+    .await;
+    assert_eq!(
+        started.value["sandbox"].as_str(),
+        Some(crate::shell::RAN_IN_POWERSHELL),
+        "{:?}",
+        started.value
+    );
+    let id = started.value["session_id"].as_str().unwrap().to_string();
+    let waited = crate::process::process_manage(
+        &session.tools,
+        json!({"action": "wait", "session_id": id, "timeout": 60}),
+    )
+    .await;
+    let output = waited.value["new_output"].as_str().unwrap_or_default();
+    assert!(output.contains(LOW_SID), "{output}");
+    session.tools.shutdown().await;
 }
 
 /// The handle count of this process after many sandboxed spawns doesn't grow with them. Runs
@@ -555,3 +828,4 @@ fn handle_count_child() {
         "handles grew from {before} to {after} over {RUNS} failed spawns"
     );
 }
+

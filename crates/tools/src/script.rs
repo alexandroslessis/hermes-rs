@@ -44,7 +44,7 @@ use tokio::task::JoinHandle;
 use crate::approval::{self, ApprovalChoice, CommandApproval};
 use crate::path_policy;
 use crate::script_guard::{self, Analysis, Language};
-use crate::sandbox::{self, Spawned, Spec};
+use crate::sandbox::{self, Sandbox, Spawned, Spec};
 use crate::shell::{self, KillOnDrop, ShellKind};
 use crate::{ApprovalMode, SessionTools, ToolOutput, display_path, parse_args};
 
@@ -513,6 +513,14 @@ pub(crate) async fn run_script(
         Ok(launch) => launch,
         Err(message) => return ToolOutput::error(message),
     };
+    let level = tools.shell.sandbox();
+    // Git Bash can't start at Low (PITFALLS, "The shell sandbox"): said before anything runs.
+    if level == Sandbox::Low && language == Language::Bash {
+        return ToolOutput::error(
+            "sandbox=low: bash scripts can't run (Git Bash does not start at low integrity); \
+             use language powershell or python.",
+        );
+    }
     let analysis = {
         let code = code.clone();
         match tokio::task::spawn_blocking(move || script_guard::analyze(language, &code)).await {
@@ -590,8 +598,16 @@ pub(crate) async fn run_script(
             command.args(&launch.prefix).arg(display_path(&file));
         }
     }
+    // `low`: the folders labelled and the cache variables set, as the terminal does.
+    let low = match level {
+        Sandbox::Low => Some(tools.shell.prepare_low().await),
+        Sandbox::Off => None,
+    };
+    if let Some(low) = &low {
+        low.apply(&mut command);
+    }
     let spec = Spec { stdin_piped: false, kill_on_drop: true };
-    let spawned = sandbox::spawn(&mut command, spec, tools.shell.sandbox());
+    let spawned = sandbox::spawn(&mut command, spec, level);
     let Spawned { mut child, stdout, stderr, tree, .. } = match spawned {
         Ok(spawned) => spawned,
         Err(error) => {
@@ -654,6 +670,13 @@ pub(crate) async fn run_script(
     }
     if let Some(path) = saved {
         value["output_file"] = json!(display_path(&path));
+    }
+    if let Some(low) = &low {
+        let mut notes = low.notes.clone();
+        notes.extend(low.blocked(&format!("{out_text}\n{err_text}")));
+        if !notes.is_empty() {
+            value["sandbox"] = json!(notes.join("\n"));
+        }
     }
     match outcome {
         Outcome::TimedOut => {

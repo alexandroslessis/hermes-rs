@@ -7,6 +7,11 @@
 //! in the same directory. Without Git Bash, each command runs in a fresh PowerShell and only the
 //! working directory carries over.
 //!
+//! Under `terminal.sandbox = "low"` (`sandbox.rs`) every command runs in a fresh PowerShell at low
+//! integrity, Git Bash or not (Git Bash can't start at Low), after the session's folders are
+//! labelled (`sandbox_labels.rs`); the result's `sandbox` field says so ("sandbox=low: ran in
+//! PowerShell, not bash"), and names a write the sandbox blocked.
+//!
 //! Hermes: `tools/terminal_tool.py`.
 
 use std::os::windows::process::CommandExt as _;
@@ -28,26 +33,11 @@ use crate::sandbox::{self, Child, Reader, Sandbox, Spawned, Spec, Writer};
 use crate::{SessionTools, ToolOutput, display_path, parse_args};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-/// `STATUS_DLL_INIT_FAILED` (0xC0000142): how an MSYS program (Git Bash) exits at Low.
-const STATUS_DLL_INIT_FAILED: i32 = 0xC000_0142_u32 as i32;
-/// The terminal's answer when Git Bash can't start under `terminal.sandbox = "low"`.
-pub(crate) const MSYS_AT_LOW_ERROR: &str = "Git Bash could not start: terminal.sandbox is \"low\", and \
-     Git Bash's MSYS runtime can't run at low integrity while a Git Bash program is running \
-     unsandboxed (status 0xC0000142). The command did not run. Native programs (git.exe, cargo) \
-     work from PowerShell; the user can set terminal.sandbox to \"off\" in desktop-config.json \
-     and restart the app.";
-
-/// Whether a bash that ended before answering was Git Bash dying at Low (see
-/// [`MSYS_AT_LOW_ERROR`]): only asked under `low`, the exit status read within 2 s.
-async fn msys_died_at_low(child: &mut Child, level: Sandbox) -> bool {
-    if level != Sandbox::Low {
-        return false;
-    }
-    matches!(
-        tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
-        Ok(Ok(status)) if status.code() == Some(STATUS_DLL_INIT_FAILED)
-    )
-}
+/// The line a `terminal` result (and a background process) gets when the configured Git Bash
+/// was replaced by PowerShell under `terminal.sandbox = "low"`: Git Bash's MSYS runtime can't
+/// start at low integrity while an unsandboxed MSYS program runs (PITFALLS, "The shell
+/// sandbox"). Said in the result, never in the system prompt (rule 8: the prompt is frozen).
+pub(crate) const RAN_IN_POWERSHELL: &str = "sandbox=low: ran in PowerShell, not bash";
 const DEFAULT_TIMEOUT_SECS: u64 = 180;
 const MAX_TIMEOUT_SECS: u64 = 600;
 const MAX_OUTPUT_CHARS: usize = 30_000;
@@ -265,8 +255,6 @@ struct BashProcess {
     stdin: Writer,
     stdout: BufReader<Reader>,
     tree: ProcessTree,
-    /// The sandbox level it was started at: a change in Settings restarts the shell.
-    level: Sandbox,
 }
 
 pub struct ShellSession {
@@ -274,10 +262,16 @@ pub struct ShellSession {
     cwd: parking_lot::Mutex<PathBuf>,
     scratch_dir: PathBuf,
     process: tokio::sync::Mutex<Option<BashProcess>>,
+    /// The app's data folder and the session's workspace, for `terminal.sandbox = "low"`'s
+    /// labels (`sandbox_labels.rs`); `None` (a bare shell in tests): nothing is labelled.
+    sandbox_folders: Option<(PathBuf, PathBuf)>,
     /// A test's own sandbox level, so a test never changes the process-wide setting under the
     /// tests running beside it. `None`: Settings' `terminal.sandbox`.
     #[cfg(test)]
     sandbox_override: parking_lot::Mutex<Option<Sandbox>>,
+    /// A test's own grants (`terminal.sandbox_grants` is process-wide, as the level).
+    #[cfg(test)]
+    grants_override: parking_lot::Mutex<Option<Vec<PathBuf>>>,
 }
 
 #[derive(Debug)]
@@ -289,6 +283,31 @@ pub struct RunResult {
     pub shell_restarted: bool,
     /// The turn was stopped while the command ran; the output is what it had printed.
     pub interrupted: bool,
+    /// Under `terminal.sandbox = "low"`: lines for the model (ran in PowerShell, a folder that
+    /// could not be labelled, a write the sandbox blocked).
+    pub sandbox: Vec<String>,
+}
+
+/// What a sandboxed (`low`) command gets before it starts: see [`ShellSession::prepare_low`].
+#[derive(Debug, Default)]
+pub(crate) struct LowStart {
+    /// The cache variables (`sandbox_labels::cache_env`), set on the command.
+    pub(crate) env: Vec<(&'static str, PathBuf)>,
+    /// Lines for the tool result.
+    pub(crate) notes: Vec<String>,
+    /// The folders the command may write to (for [`LowStart::blocked`]).
+    pub(crate) writable: Vec<PathBuf>,
+}
+
+impl LowStart {
+    pub(crate) fn apply(&self, command: &mut Command) {
+        command.envs(self.env.iter().map(|(name, value)| (*name, value)));
+    }
+
+    /// The "blocked by sandbox" hint when `output` shows a write the sandbox refused.
+    pub(crate) fn blocked(&self, output: &str) -> Option<String> {
+        crate::sandbox_labels::blocked_hint(output, &self.writable)
+    }
 }
 
 fn bash_quote(text: &str) -> String {
@@ -315,13 +334,48 @@ impl ShellSession {
             cwd: parking_lot::Mutex::new(cwd),
             scratch_dir,
             process: tokio::sync::Mutex::new(None),
+            sandbox_folders: None,
             #[cfg(test)]
             sandbox_override: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            grants_override: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// The data folder (where the label record lives) and the workspace `low` labels.
+    pub(crate) fn with_sandbox_folders(mut self, data_dir: PathBuf, workspace: PathBuf) -> Self {
+        self.sandbox_folders = Some((data_dir, workspace));
+        self
     }
 
     pub fn kind(&self) -> &ShellKind {
         &self.kind
+    }
+
+    /// Before a `low` command: labels the workspace, scratch, cache and granted folders Low
+    /// (idempotent; recorded in `sandbox-labels.json`) and gives the cache variables. Off the
+    /// async workers: the first labelling of a large workspace walks every file in it.
+    pub(crate) async fn prepare_low(&self) -> LowStart {
+        let Some((data_dir, workspace)) = self.sandbox_folders.clone() else {
+            return LowStart::default();
+        };
+        let scratch = self.scratch_dir.clone();
+        let grants = self.grants();
+        let prepared = tokio::task::spawn_blocking(move || {
+            crate::sandbox_labels::prepare(&data_dir, &workspace, &scratch, &grants)
+        })
+        .await;
+        match prepared {
+            Ok(prepared) => LowStart {
+                env: prepared.env,
+                notes: prepared.notes,
+                writable: prepared.writable,
+            },
+            Err(error) => LowStart {
+                notes: vec![format!("sandbox: the folders could not be prepared: {error}")],
+                ..LowStart::default()
+            },
+        }
     }
 
     /// The sandbox level the next command starts at (`terminal.sandbox`, read at each spawn).
@@ -336,6 +390,20 @@ impl ShellSession {
     #[cfg(test)]
     pub(crate) fn set_sandbox_override(&self, level: Option<Sandbox>) {
         *self.sandbox_override.lock() = level;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_grants_override(&self, grants: Vec<PathBuf>) {
+        *self.grants_override.lock() = Some(grants);
+    }
+
+    /// `terminal.sandbox_grants` (or, in a test, the shell's own list).
+    fn grants(&self) -> Vec<PathBuf> {
+        #[cfg(test)]
+        if let Some(grants) = self.grants_override.lock().clone() {
+            return grants;
+        }
+        crate::sandbox_labels::grants()
     }
 
     pub fn cwd(&self) -> PathBuf {
@@ -362,19 +430,62 @@ impl ShellSession {
         on_chunk: &(dyn Fn(&str) + Send + Sync),
     ) -> RunResult {
         let _ = tokio::fs::create_dir_all(&self.scratch_dir).await;
+        let level = self.sandbox();
+        if level == Sandbox::Low {
+            return self
+                .run_low(command, workdir, timeout, cancel, on_chunk)
+                .await;
+        }
         match &self.kind {
             ShellKind::GitBash(bash) => {
                 self.run_bash(bash, command, workdir, timeout, cancel, on_chunk)
                     .await
             }
             ShellKind::PowerShell => {
-                self.run_powershell(command, workdir, timeout, cancel, on_chunk)
+                self.run_powershell(command, workdir, timeout, cancel, on_chunk, level, None)
                     .await
             }
         }
     }
 
-    async fn spawn_bash(&self, bash: &Path, level: Sandbox) -> std::io::Result<BashProcess> {
+    /// A command under `terminal.sandbox = "low"`: always PowerShell (Git Bash can't start at
+    /// Low; the result says so), after the folders are labelled, with the cache variables, and
+    /// with the "blocked by sandbox" hint when the output shows a refused write.
+    async fn run_low(
+        &self,
+        command: &str,
+        workdir: Option<&Path>,
+        timeout: Duration,
+        cancel: Option<&CancellationToken>,
+        on_chunk: &(dyn Fn(&str) + Send + Sync),
+    ) -> RunResult {
+        let start = self.prepare_low().await;
+        let mut notes = Vec::new();
+        if matches!(self.kind, ShellKind::GitBash(_)) {
+            // A bash started before `low` was turned on runs unsandboxed: it goes (the folder
+            // is kept in `cwd`; exported variables are lost, as on any restart).
+            self.shutdown().await;
+            notes.push(RAN_IN_POWERSHELL.to_string());
+        }
+        notes.extend(start.notes.iter().cloned());
+        let mut result = self
+            .run_powershell(
+                command,
+                workdir,
+                timeout,
+                cancel,
+                on_chunk,
+                Sandbox::Low,
+                Some(&start),
+            )
+            .await;
+        notes.extend(start.blocked(&result.output));
+        result.sandbox = notes;
+        result
+    }
+
+    /// Git Bash runs only at `off` (under `low` commands go to PowerShell: [`Self::run_low`]).
+    async fn spawn_bash(&self, bash: &Path) -> std::io::Result<BashProcess> {
         let mut builder = command(bash, &self.cwd(), &self.scratch_dir);
         builder.args(["--noprofile", "--norc"]);
         let spec = Spec {
@@ -387,7 +498,7 @@ impl ShellSession {
             stdout,
             mut stderr,
             tree,
-        } = sandbox::spawn(&mut builder, spec, level)?;
+        } = sandbox::spawn(&mut builder, spec, Sandbox::Off)?;
         let stdin = stdin.expect("piped stdin");
         let stdout = BufReader::new(stdout);
         // The wrapper sends command output to stdout; anything bash itself prints is discarded.
@@ -400,7 +511,6 @@ impl ShellSession {
             stdin,
             stdout,
             tree,
-            level,
         })
     }
 
@@ -414,19 +524,13 @@ impl ShellSession {
         on_chunk: &(dyn Fn(&str) + Send + Sync),
     ) -> RunResult {
         let mut slot = self.process.lock().await;
-        let level = self.sandbox();
         if let Some(process) = slot.as_mut() {
             if !matches!(process.child.try_wait(), Ok(None)) {
-                *slot = None;
-            } else if process.level != level {
-                // `terminal.sandbox` changed: the running shell keeps the token it started
-                // with, so it goes, and the next one starts at the new level.
-                process.tree.kill();
                 *slot = None;
             }
         }
         if slot.is_none() {
-            match self.spawn_bash(bash, level).await {
+            match self.spawn_bash(bash).await {
                 Ok(process) => *slot = Some(process),
                 Err(error) => {
                     return RunResult {
@@ -435,6 +539,7 @@ impl ShellSession {
                         timed_out: false,
                         shell_restarted: false,
                         interrupted: false,
+                        sandbox: Vec::new(),
                     };
                 }
             }
@@ -456,11 +561,7 @@ impl ShellSession {
         if process.stdin.write_all(script.as_bytes()).await.is_err()
             || process.stdin.flush().await.is_err()
         {
-            let output = if msys_died_at_low(&mut process.child, level).await {
-                MSYS_AT_LOW_ERROR
-            } else {
-                "The shell had exited; it was restarted. Run the command again."
-            };
+            let output = "The shell had exited; it was restarted. Run the command again.";
             process.tree.kill();
             *slot = None;
             return RunResult {
@@ -469,6 +570,7 @@ impl ShellSession {
                 timed_out: false,
                 shell_restarted: true,
                 interrupted: false,
+                sandbox: Vec::new(),
             };
         }
 
@@ -536,19 +638,10 @@ impl ShellSession {
                     timed_out: false,
                     shell_restarted: false,
                     interrupted: false,
+                    sandbox: Vec::new(),
                 }
             }
             None => {
-                // Git Bash at Low dies in its MSYS runtime's start-up (STATUS_DLL_INIT_FAILED;
-                // its message goes to bash's stderr, which is discarded): say why, or the model
-                // sees only an empty output and "the shell exited" on every call.
-                if !timed_out
-                    && !interrupted
-                    && output.is_empty()
-                    && msys_died_at_low(&mut process.child, level).await
-                {
-                    output = MSYS_AT_LOW_ERROR.to_string();
-                }
                 drop(killer);
                 *slot = None;
                 RunResult {
@@ -557,6 +650,7 @@ impl ShellSession {
                     timed_out,
                     shell_restarted: true,
                     interrupted,
+                    sandbox: Vec::new(),
                 }
             }
         }
@@ -569,6 +663,8 @@ impl ShellSession {
         timeout: Duration,
         cancel: Option<&CancellationToken>,
         on_chunk: &(dyn Fn(&str) + Send + Sync),
+        level: Sandbox,
+        low: Option<&LowStart>,
     ) -> RunResult {
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let sentinel = format!("__HERMES_DONE_{nonce}__ ");
@@ -592,11 +688,13 @@ impl ShellSession {
                 "-EncodedCommand",
             ])
             .arg(encode_powershell(&script));
+        if let Some(low) = low {
+            low.apply(&mut builder);
+        }
         let spec = Spec {
             stdin_piped: false,
             kill_on_drop: true,
         };
-        let level = self.sandbox();
         let spawned = sandbox::spawn(&mut builder, spec, level);
         let Spawned {
             mut child,
@@ -613,6 +711,7 @@ impl ShellSession {
                     timed_out: false,
                     shell_restarted: false,
                     interrupted: false,
+                    sandbox: Vec::new(),
                 };
             }
         };
@@ -755,6 +854,7 @@ impl ShellSession {
             timed_out,
             shell_restarted: false,
             interrupted,
+            sandbox: Vec::new(),
         }
     }
 }
@@ -973,6 +1073,11 @@ pub async fn terminal(
     }
     if let Some(path) = saved {
         value["output_file"] = json!(display_path(&path));
+    }
+    // `terminal.sandbox = "low"`: ran in PowerShell instead of Git Bash, a folder that could not
+    // be labelled, a write the sandbox blocked (only under `low`; `off` never has any).
+    if !result.sandbox.is_empty() {
+        value["sandbox"] = json!(result.sandbox.join("\n"));
     }
     if result.timed_out {
         value["timed_out"] = json!(true);

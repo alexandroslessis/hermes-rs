@@ -268,6 +268,16 @@ impl Gateway {
                 }
                 Err(e) => Err(e),
             },
+            // The shell sandbox (`terminal.sandbox`, Phase 15): what is set and labelled, and
+            // `/sandbox remove-labels`, which puts back every folder's label as it was. The
+            // record and the labels are files: off the async workers.
+            "sandbox" => {
+                let data_dir = self.data_dir.clone();
+                let arg = arg.to_string();
+                tokio::task::spawn_blocking(move || sandbox_text(&data_dir, &arg))
+                    .await
+                    .map_err(|e| RpcError::server(e.to_string()))
+            }
             "status" => match need_id() {
                 Ok(id) => self.status_text(&id).await,
                 Err(e) => Err(e),
@@ -383,5 +393,91 @@ impl Gateway {
             _ => return None,
         };
         Some(output.map(|output| json!({"type": "exec", "output": output})))
+    }
+}
+
+/// `/sandbox` (the level, the grants and the labelled folders) and `/sandbox remove-labels`.
+pub(crate) fn sandbox_text(data_dir: &std::path::Path, arg: &str) -> String {
+    use hermes_tools::sandbox_labels;
+    let level = match hermes_tools::sandbox_level() {
+        hermes_tools::Sandbox::Low => "low",
+        hermes_tools::Sandbox::Off => "off",
+    };
+    match arg.trim() {
+        "remove-labels" | "remove" | "unlabel" => match sandbox_labels::remove_all(data_dir) {
+            Ok(removal) => {
+                let mut out = vec![format!(
+                    "Sandbox labels removed: {} folder(s) put back as they were.",
+                    removal.restored.len()
+                )];
+                out.extend(removal.restored.iter().map(|p| format!("  {}", p.display())));
+                if !removal.gone.is_empty() {
+                    out.push(format!(
+                        "{} folder(s) no longer exist (forgotten; a folder that was moved keeps \
+                         its label where it is now):",
+                        removal.gone.len()
+                    ));
+                    out.extend(removal.gone.iter().map(|p| format!("  {}", p.display())));
+                }
+                if !removal.changed.is_empty() {
+                    out.push(format!(
+                        "{} folder(s) carry a label someone else set since (left as they are):",
+                        removal.changed.len()
+                    ));
+                    out.extend(removal.changed.iter().map(|p| format!("  {}", p.display())));
+                }
+                if !removal.failed.is_empty() {
+                    out.push(format!(
+                        "{} folder(s) could not be put back (still recorded; try again):",
+                        removal.failed.len()
+                    ));
+                    out.extend(
+                        removal
+                            .failed
+                            .iter()
+                            .map(|(p, e)| format!("  {}: {e}", p.display())),
+                    );
+                }
+                if level == "low" {
+                    out.push(
+                        "terminal.sandbox is still \"low\": the next command labels its folders \
+                         again. Set it to \"off\" in desktop-config.json (and restart) to stop."
+                            .into(),
+                    );
+                }
+                out.join("\n")
+            }
+            Err(e) => format!("Could not read the sandbox label record: {e}"),
+        },
+        "" => {
+            let mut out = vec![format!(
+                "terminal.sandbox: {level} (desktop-config.json; \"low\" runs commands at low \
+                 integrity, in PowerShell even when the terminal is Git Bash)."
+            )];
+            let grants = sandbox_labels::grants();
+            if grants.is_empty() {
+                out.push("Granted folders (terminal.sandbox_grants): none.".into());
+            } else {
+                out.push("Granted folders (terminal.sandbox_grants):".into());
+                out.extend(grants.iter().map(|p| format!("  {}", p.display())));
+            }
+            match sandbox_labels::list(data_dir) {
+                Ok(folders) if folders.is_empty() => {
+                    out.push("No folder is labelled Low by this app.".into())
+                }
+                Ok(folders) => {
+                    out.push(format!("Folders labelled Low by this app ({}):", folders.len()));
+                    out.extend(
+                        folders
+                            .iter()
+                            .map(|f| format!("  {}  ({})", f.path.display(), f.kind)),
+                    );
+                    out.push("Put them back as they were with /sandbox remove-labels.".into());
+                }
+                Err(e) => out.push(format!("The label record could not be read: {e}")),
+            }
+            out.join("\n")
+        }
+        other => format!("Unknown /sandbox argument '{other}'. Use /sandbox or /sandbox remove-labels."),
     }
 }
