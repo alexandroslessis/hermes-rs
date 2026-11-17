@@ -188,6 +188,28 @@ struct Agent {
     work: hermes_testdir::TestDir,
 }
 
+impl Drop for Agent {
+    /// Ends the agent process AND what it started, and waits for them, before the folders below
+    /// are removed. `kill_on_drop` alone kills only the process: its background `git init` of the
+    /// skills folder kept running and made `skills/.git` again after `hermes_testdir` had removed
+    /// the folder, leaving one `.tmpXXXXXX` per test in %TEMP% (2026-11-18).
+    fn drop(&mut self) {
+        if let Some(pid) = self.child.id() {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output();
+        }
+        for _ in 0..60 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // A grandchild may outlive the tree walk by a moment: give it time to finish.
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 impl Agent {
     async fn start(replies: Vec<String>) -> Self {
         Self::start_with(replies, Duration::ZERO).await

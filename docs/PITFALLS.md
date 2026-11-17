@@ -1621,6 +1621,11 @@ removed while the files were open); and some owners outlive the test (the ledger
 - A leak check: run a suite and count `.tmp*` folders in `%TEMP%` before and after (the 2026-11-17
   numbers: `turns` 326 folders / 1.31 GB before, 212 / 84 MB after; `hermes_tools` 59 → 0; the
   runtime lib 7 → 0; `acp` 59 / 216 MB → 22 / 7 MB; `hermes-desktop` lib 8 → 3).
+- A test that spawns a process on its folder must end the process AND its children, and wait,
+  before the folder is removed (2026-11-18): `acp.rs`'s `Agent` only had `kill_on_drop`, which
+  kills the process but not the `git init` it started on the skills folder; that git re-created
+  `skills/.git` after `hermes_testdir` had cleaned up, one empty-looking `.tmpXXXXXX` per test
+  (45 in a few runs). `Agent::drop` now runs `taskkill /T /F` and waits. `acp` leaves 0 folders.
 
 ## The shell sandbox (Phase 15, `crates/tools/src/sandbox.rs`, `sandbox_labels.rs`)
 
