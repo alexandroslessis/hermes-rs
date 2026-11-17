@@ -138,7 +138,7 @@ powershell -File scripts/perf/perf.ps1 -Do stop
 Tools on this machine: Node 26 in `tools/node` (not on PATH: call `tools/node/node.exe`); Python
 via `~/.local/bin/uv.exe run --no-project ...` (`python` on PATH is the Microsoft Store stub);
 `git`; no `gh`. Package names: `hermes-desktop`, `hermes_runtime`, `hermes_tools`,
-`hermes_memory`, `hermes_store`, `hermes_prompts`, `hermes_llm`, `hermes_agent`.
+`hermes_memory`, `hermes_store`, `hermes_prompts`, `hermes_llm`, `hermes_agent`, `hermes-native`.
 
 ## Where things are
 
@@ -148,6 +148,7 @@ via `~/.local/bin/uv.exe run --no-project ...` (`python` on PATH is the Microsof
 | `crates/desktop/patches/` | Our patches to Hermes's frontend, applied in name order by the webapp build |
 | `crates/desktop/plugins/hermes-rs/` | `hide.css` + `plugin.js`: hides features we don't serve |
 | `crates/runtime/` | Sessions, turns, delegation/subagents, compression, review, curator, MCP |
+| `crates/native/` | The native UI on GPUI Kit (`hermes-native.exe`, [docs/native-ui/](docs/native-ui/README.md)); for now CP0.1's spike window on fake data |
 | `crates/tools/` | The agent's tools (terminal, files, search, skills, web, vision, checkpoints…) |
 | `crates/memory/` | MEMORY.md / USER.md store and the memory tool |
 | `crates/store/` | SQLite: sessions, messages, usage, projects |

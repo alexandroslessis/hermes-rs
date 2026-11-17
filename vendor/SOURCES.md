@@ -25,6 +25,19 @@ Commit `015845a19fc31752c02367567d3b8900a406f9da` from https://github.com/zed-in
 (Apache-2.0 OR MIT), in `vendor/async-task`. Used through `[patch.crates-io]` because GPUI's
 scheduler depends on the fork's changes.
 
+## GPUI Kit
+
+`gpui-kit` **0.10.0** from crates.io (https://github.com/longbridge/gpui-kit, Apache-2.0), a
+dependency of `crates/native`, pinned `=0.10.0` (the exception to "copy, never depend" in
+AGENTS.md ground rule 3; upgrade on purpose, like a Hermes update). Not copied: it is an ordinary
+locked dependency. It brings `gpui-base` 0.10.0, `gpui-component` 0.10.0, `gpui-kit-assets` 0.10.0
+and GPUI as the `gpui-pre*` crates **0.3.12**, "a gpui-pre snapshot of zed@d2a4fb6" (Zed commit
+`d2a4fb6`, per `gpui-pre`'s description); the vendored Zed above is `ba63a022`, a different commit.
+Features: `syntect` (code highlighting; the `tree-sitter` features clash with `crates/highlight`,
+see `crates/native/Cargo.toml`). The workspace's `[patch.crates-io]` for `async-task` applies to
+`gpui-pre-scheduler` too, so GPUI Kit's GPUI runs on Zed's async-task fork while `crates/app`
+exists.
+
 ## Hermes Agent
 
 Commit `c419cf7c864ac0ee511dbd9f7091a8bba0b567ee` from https://github.com/NousResearch/hermes-agent

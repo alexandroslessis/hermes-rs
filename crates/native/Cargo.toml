@@ -1,0 +1,24 @@
+[package]
+name = "hermes-native"
+version = "0.4.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hermes-native"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+# Pinned exactly (AGENTS.md ground rule 3, the GPUI Kit exception); vendor/SOURCES.md records it.
+# `syntect` highlights fenced code: GPUI Kit's `tree-sitter` features pull tree-sitter 0.26,
+# which Cargo refuses next to crates/highlight's 0.27 (both declare `links = "tree-sitter"`).
+gpui-kit = { version = "=0.10.0", features = ["syntect"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+gpui-kit = { version = "=0.10.0", features = ["syntect", "test-support"] }
+
+[lints]
+workspace = true
