@@ -168,6 +168,13 @@ impl Gateway {
                 })
                 .unwrap_or_default(),
         );
+        // The shell's OS sandbox (`terminal.sandbox`: "off", the default, or "low": a
+        // low-integrity token, backend v2 Phase 15). Config record only, no Settings field, so
+        // it takes effect at startup (a hand edit of desktop-config.json needs a restart); the
+        // level is read at each spawn, so it applies to the next command.
+        hermes_tools::set_sandbox(hermes_tools::Sandbox::from_config(
+            &self.rest.config_value("terminal.sandbox"),
+        ));
         // Each provider's daily request limit and where its day starts, for the request ledger
         // and its governor (`provider_limits`).
         self.runtime.ledger().configure(provider_limits(

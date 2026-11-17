@@ -1576,3 +1576,38 @@ removed while the files were open); and some owners outlive the test (the ledger
 - A leak check: run a suite and count `.tmp*` folders in `%TEMP%` before and after (the 2026-11-17
   numbers: `turns` 326 folders / 1.31 GB before, 212 / 84 MB after; `hermes_tools` 59 → 0; the
   runtime lib 7 → 0; `acp` 59 / 216 MB → 22 / 7 MB; `hermes-desktop` lib 8 → 3).
+
+## The shell sandbox (Phase 15 CP15.1, `crates/tools/src/sandbox.rs`)
+
+- **`terminal.sandbox` is config-only** (`desktop-config.json`, `"terminal": {"sandbox": "low"}`), like
+  `terminal.env_passthrough`: no Settings field. `off` (the default, also for any unknown value) is
+  tokio's spawn as before. It is read at each spawn; a running Git Bash started at another level is
+  killed and restarted on the next command (exported variables are lost).
+- **Git Bash does not start at Low.** Every MSYS program (Git's `bash.exe` and everything in Git's
+  `usr\bin`: `ls`, `sed`, MSYS `whoami`...) dies at start with `NtCreateDirectoryObject(\BaseNamedObjects\
+  msys-2.0S5-<hash>): 0xC0000022` (exit 0xC0000142). `\BaseNamedObjects` itself is labelled Low
+  (a Low process *can* create a new directory there), but that directory is shared by every MSYS
+  program of the same Git install (the hash is of the install path) and already exists, labelled
+  Medium, whenever any unsandboxed MSYS program runs (the user's Git Bash, an `off` terminal):
+  opening it for write is "no write up". The terminal discards bash's own stderr, so it answers
+  `MSYS_AT_LOW_ERROR` (`shell.rs`) when bash exits 0xC0000142 under `low` before printing anything.
+  Native programs (`git.exe`, `cargo`, PowerShell, `whoami.exe`) run. A copy of Git's `usr\bin` in
+  another folder (another hash, so its own directory, made Low) does start at Low (checked by hand
+  2026-11-17 by CP15.1's reviewer). To decide in CP15.2.
+- **Under `low` nothing is writable yet but `%USERPROFILE%\AppData\LocalLow`** and folders already
+  labelled Low: the workspace, scratch (`TEMP`) and caches are labelled in CP15.2.
+- **`whoami` in a test is Git's** when Git's `usr\bin` is on PATH: call
+  `%SystemRoot%\System32\whoami.exe` to read a token's label (`/groups`: Low is `S-1-16-4096`,
+  Medium `S-1-16-8192`, High `S-1-16-12288`; the SIDs don't depend on the Windows language).
+- **Handles.** The `low` spawn makes its pipes non-inheritable, makes the child's ends inheritable only
+  around `CreateProcessAsUserW` and passes them in a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. A
+  `std::process` spawn on another thread in that window can still inherit them (std holds its own
+  lock, which we can't take; Windows requires the listed handles to be inheritable): the cost is a
+  pipe that ends late, not a leak. It does happen: `cargo test -p hermes_tools` (many `off` shells
+  spawning beside the `low` tests) once lost a `run_script` output to it. So the readers don't
+  depend on EOF: the bash path reads to its sentinel; the PowerShell path, under `low`, stops
+  reading 1 s after PowerShell exits; `run_script` keeps what it read when its 5 s drain gives up
+  (it used to return nothing). Closing the window itself needs a broker process (or
+  `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` with a helper process that never spawns anything).
+  `sandboxed_spawns_leak_no_handles` counts the process's handles over 30 runs each of a command,
+  a piped-stdin spawn and a failing `CreateProcessAsUserW`, in a child test process.

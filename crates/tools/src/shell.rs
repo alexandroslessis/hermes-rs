@@ -20,13 +20,34 @@ use hermes_agent::operation::Emitter;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::job::Job;
+use crate::sandbox::{self, Child, Reader, Sandbox, Spawned, Spec, Writer};
 use crate::{SessionTools, ToolOutput, display_path, parse_args};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// `STATUS_DLL_INIT_FAILED` (0xC0000142): how an MSYS program (Git Bash) exits at Low.
+const STATUS_DLL_INIT_FAILED: i32 = 0xC000_0142_u32 as i32;
+/// The terminal's answer when Git Bash can't start under `terminal.sandbox = "low"`.
+pub(crate) const MSYS_AT_LOW_ERROR: &str = "Git Bash could not start: terminal.sandbox is \"low\", and \
+     Git Bash's MSYS runtime can't run at low integrity while a Git Bash program is running \
+     unsandboxed (status 0xC0000142). The command did not run. Native programs (git.exe, cargo) \
+     work from PowerShell; the user can set terminal.sandbox to \"off\" in desktop-config.json \
+     and restart the app.";
+
+/// Whether a bash that ended before answering was Git Bash dying at Low (see
+/// [`MSYS_AT_LOW_ERROR`]): only asked under `low`, the exit status read within 2 s.
+async fn msys_died_at_low(child: &mut Child, level: Sandbox) -> bool {
+    if level != Sandbox::Low {
+        return false;
+    }
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
+        Ok(Ok(status)) if status.code() == Some(STATUS_DLL_INIT_FAILED)
+    )
+}
 const DEFAULT_TIMEOUT_SECS: u64 = 180;
 const MAX_TIMEOUT_SECS: u64 = 600;
 const MAX_OUTPUT_CHARS: usize = 30_000;
@@ -198,6 +219,15 @@ impl ProcessTree {
         Self { pid, job }
     }
 
+    /// A process the sandbox's spawn already put in `job` (`None`: the job couldn't be made,
+    /// so killing falls back to `taskkill`, as [`ProcessTree::contain`] does).
+    pub(crate) fn with_job(pid: u32, job: Option<Job>) -> Self {
+        Self {
+            pid: Some(pid),
+            job: job.map(Arc::new),
+        }
+    }
+
     pub(crate) fn kill(&self) {
         match (&self.job, self.pid) {
             (Some(job), _) => job.terminate(),
@@ -232,9 +262,11 @@ impl Drop for KillOnDrop {
 
 struct BashProcess {
     child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdin: Writer,
+    stdout: BufReader<Reader>,
     tree: ProcessTree,
+    /// The sandbox level it was started at: a change in Settings restarts the shell.
+    level: Sandbox,
 }
 
 pub struct ShellSession {
@@ -242,6 +274,10 @@ pub struct ShellSession {
     cwd: parking_lot::Mutex<PathBuf>,
     scratch_dir: PathBuf,
     process: tokio::sync::Mutex<Option<BashProcess>>,
+    /// A test's own sandbox level, so a test never changes the process-wide setting under the
+    /// tests running beside it. `None`: Settings' `terminal.sandbox`.
+    #[cfg(test)]
+    sandbox_override: parking_lot::Mutex<Option<Sandbox>>,
 }
 
 #[derive(Debug)]
@@ -279,11 +315,27 @@ impl ShellSession {
             cwd: parking_lot::Mutex::new(cwd),
             scratch_dir,
             process: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            sandbox_override: parking_lot::Mutex::new(None),
         }
     }
 
     pub fn kind(&self) -> &ShellKind {
         &self.kind
+    }
+
+    /// The sandbox level the next command starts at (`terminal.sandbox`, read at each spawn).
+    pub(crate) fn sandbox(&self) -> Sandbox {
+        #[cfg(test)]
+        if let Some(level) = *self.sandbox_override.lock() {
+            return level;
+        }
+        sandbox::sandbox()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sandbox_override(&self, level: Option<Sandbox>) {
+        *self.sandbox_override.lock() = level;
     }
 
     pub fn cwd(&self) -> PathBuf {
@@ -322,17 +374,22 @@ impl ShellSession {
         }
     }
 
-    async fn spawn_bash(&self, bash: &Path) -> std::io::Result<BashProcess> {
-        let mut child = command(bash, &self.cwd(), &self.scratch_dir)
-            .args(["--noprofile", "--norc"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let tree = ProcessTree::contain(child.id());
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
-        let mut stderr = child.stderr.take().expect("piped stderr");
+    async fn spawn_bash(&self, bash: &Path, level: Sandbox) -> std::io::Result<BashProcess> {
+        let mut builder = command(bash, &self.cwd(), &self.scratch_dir);
+        builder.args(["--noprofile", "--norc"]);
+        let spec = Spec {
+            stdin_piped: true,
+            kill_on_drop: true,
+        };
+        let Spawned {
+            child,
+            stdin,
+            stdout,
+            mut stderr,
+            tree,
+        } = sandbox::spawn(&mut builder, spec, level)?;
+        let stdin = stdin.expect("piped stdin");
+        let stdout = BufReader::new(stdout);
         // The wrapper sends command output to stdout; anything bash itself prints is discarded.
         tokio::spawn(async move {
             let mut sink = Vec::new();
@@ -343,6 +400,7 @@ impl ShellSession {
             stdin,
             stdout,
             tree,
+            level,
         })
     }
 
@@ -356,13 +414,19 @@ impl ShellSession {
         on_chunk: &(dyn Fn(&str) + Send + Sync),
     ) -> RunResult {
         let mut slot = self.process.lock().await;
+        let level = self.sandbox();
         if let Some(process) = slot.as_mut() {
             if !matches!(process.child.try_wait(), Ok(None)) {
+                *slot = None;
+            } else if process.level != level {
+                // `terminal.sandbox` changed: the running shell keeps the token it started
+                // with, so it goes, and the next one starts at the new level.
+                process.tree.kill();
                 *slot = None;
             }
         }
         if slot.is_none() {
-            match self.spawn_bash(bash).await {
+            match self.spawn_bash(bash, level).await {
                 Ok(process) => *slot = Some(process),
                 Err(error) => {
                     return RunResult {
@@ -392,10 +456,15 @@ impl ShellSession {
         if process.stdin.write_all(script.as_bytes()).await.is_err()
             || process.stdin.flush().await.is_err()
         {
+            let output = if msys_died_at_low(&mut process.child, level).await {
+                MSYS_AT_LOW_ERROR
+            } else {
+                "The shell had exited; it was restarted. Run the command again."
+            };
             process.tree.kill();
             *slot = None;
             return RunResult {
-                output: "The shell had exited; it was restarted. Run the command again.".into(),
+                output: output.into(),
                 exit_code: None,
                 timed_out: false,
                 shell_restarted: true,
@@ -470,6 +539,16 @@ impl ShellSession {
                 }
             }
             None => {
+                // Git Bash at Low dies in its MSYS runtime's start-up (STATUS_DLL_INIT_FAILED;
+                // its message goes to bash's stderr, which is discarded): say why, or the model
+                // sees only an empty output and "the shell exited" on every call.
+                if !timed_out
+                    && !interrupted
+                    && output.is_empty()
+                    && msys_died_at_low(&mut process.child, level).await
+                {
+                    output = MSYS_AT_LOW_ERROR.to_string();
+                }
                 drop(killer);
                 *slot = None;
                 RunResult {
@@ -502,7 +581,8 @@ impl ShellSession {
              \"{sentinel}$hermesExit $((Get-Location).Path)\"\n",
             powershell_quote(&cwd.display().to_string())
         );
-        let spawned = command_for_powershell(&cwd, &self.scratch_dir)
+        let mut builder = command_for_powershell(&cwd, &self.scratch_dir);
+        builder
             .args([
                 "-NoLogo",
                 "-NoProfile",
@@ -511,13 +591,21 @@ impl ShellSession {
                 "Bypass",
                 "-EncodedCommand",
             ])
-            .arg(encode_powershell(&script))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
-        let mut child = match spawned {
-            Ok(child) => child,
+            .arg(encode_powershell(&script));
+        let spec = Spec {
+            stdin_piped: false,
+            kill_on_drop: true,
+        };
+        let level = self.sandbox();
+        let spawned = sandbox::spawn(&mut builder, spec, level);
+        let Spawned {
+            mut child,
+            mut stdout,
+            stderr,
+            tree,
+            ..
+        } = match spawned {
+            Ok(spawned) => spawned,
             Err(error) => {
                 return RunResult {
                     output: format!("Could not start PowerShell: {error}"),
@@ -528,13 +616,10 @@ impl ShellSession {
                 };
             }
         };
-        let mut killer = KillOnDrop {
-            tree: Some(ProcessTree::contain(child.id())),
-        };
-        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut killer = KillOnDrop { tree: Some(tree) };
         // PowerShell's own errors (a script that doesn't parse never prints the sentinel) come on
         // stderr, as CLIXML: kept, a little of it, to tell the model why nothing ran.
-        let stderr_task = child.stderr.take().map(|mut stderr| {
+        let stderr_task = Some(stderr).map(|mut stderr| {
             tokio::spawn(async move {
                 let mut kept = Vec::new();
                 let mut chunk = [0u8; 4096];
@@ -588,11 +673,23 @@ impl ShellSession {
                 }
             }
         };
+        // Under `low`, a `std` spawn elsewhere during the launch can inherit the pipe's write end
+        // (PITFALLS, "The shell sandbox"), so EOF may come only when that other process exits:
+        // once PowerShell has exited, what it printed is taken after a short grace.
+        let exited = async {
+            if level == Sandbox::Low {
+                let _ = child.wait().await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         let (timed_out, interrupted) = match tokio::time::timeout(timeout, async {
             tokio::select! {
                 biased;
                 _ = read => false,
                 _ = stopped(cancel) => true,
+                _ = exited => false,
             }
         })
         .await

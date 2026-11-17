@@ -4,7 +4,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,9 +11,9 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
-use tokio::process::ChildStdin;
 use tokio::sync::watch;
 
+use crate::sandbox::{self, Spawned, Spec, Writer};
 use crate::shell::{ProcessTree, ShellKind, command, command_for_powershell, encode_powershell};
 use crate::{SessionTools, ToolOutput, display_path, parse_args};
 
@@ -83,7 +82,7 @@ struct BackgroundProcess {
     started: Instant,
     output: Mutex<OutputBuffer>,
     poll_cursor: Mutex<usize>,
-    stdin: tokio::sync::Mutex<Option<ChildStdin>>,
+    stdin: tokio::sync::Mutex<Option<Writer>>,
     exit: watch::Receiver<Option<Option<i32>>>,
 }
 
@@ -237,14 +236,18 @@ pub async fn spawn(
         }
     };
     // Background processes outlive the tool call; the registry kills them at session end.
-    builder.kill_on_drop(false);
-    let mut child = match builder
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
+    let spec = Spec {
+        stdin_piped: true,
+        kill_on_drop: false,
+    };
+    let Spawned {
+        mut child,
+        stdin,
+        stdout,
+        stderr,
+        tree,
+    } = match sandbox::spawn(&mut builder, spec, tools.shell.sandbox()) {
+        Ok(spawned) => spawned,
         Err(error) => return ToolOutput::error(format!("Could not start the process: {error}")),
     };
 
@@ -254,15 +257,15 @@ pub async fn spawn(
         id: id.clone(),
         command: command_line.to_string(),
         cwd: cwd.clone(),
-        tree: ProcessTree::contain(child.id()),
+        tree,
         started: Instant::now(),
         output: Mutex::new(OutputBuffer::default()),
         poll_cursor: Mutex::new(0),
-        stdin: tokio::sync::Mutex::new(child.stdin.take()),
+        stdin: tokio::sync::Mutex::new(stdin),
         exit: exit_rx,
     });
-    let stdout = read_lines(child.stdout.take().expect("piped stdout"), process.clone());
-    let stderr = read_lines(child.stderr.take().expect("piped stderr"), process.clone());
+    let stdout = read_lines(stdout, process.clone());
+    let stderr = read_lines(stderr, process.clone());
     tools
         .processes
         .processes

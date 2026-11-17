@@ -43,6 +43,13 @@ impl Job {
         }
     }
 
+    /// Puts a process we hold a handle to into the job (the sandbox's spawn assigns it while it
+    /// is still suspended, so nothing it starts runs outside the job).
+    pub fn assign_handle(&self, process: HANDLE) -> windows::core::Result<()> {
+        // SAFETY: both handles are open: the job is ours until `Drop`, `process` the caller's.
+        unsafe { AssignProcessToJobObject(self.0, process) }
+    }
+
     pub fn terminate(&self) {
         unsafe {
             let _ = TerminateJobObject(self.0, 1);

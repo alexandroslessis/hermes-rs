@@ -32,6 +32,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hermes_agent::operation::Emitter;
@@ -43,7 +44,8 @@ use tokio::task::JoinHandle;
 use crate::approval::{self, ApprovalChoice, CommandApproval};
 use crate::path_policy;
 use crate::script_guard::{self, Analysis, Language};
-use crate::shell::{self, KillOnDrop, ProcessTree, ShellKind};
+use crate::sandbox::{self, Spawned, Spec};
+use crate::shell::{self, KillOnDrop, ShellKind};
 use crate::{ApprovalMode, SessionTools, ToolOutput, display_path, parse_args};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
@@ -379,42 +381,51 @@ fn sweep_stale(scripts: &Path) {
 
 // --- Capturing output --------------------------------------------------------------------------
 
-/// Reads a pipe to its end, keeping the first `cap` bytes; returns them and how many were dropped.
-fn read_capped(mut reader: impl AsyncRead + Unpin + Send + 'static, cap: usize) -> JoinHandle<(Vec<u8>, usize)> {
-    tokio::spawn(async move {
-        let mut kept = Vec::new();
-        let mut dropped = 0usize;
+/// A pipe being read: the bytes kept so far (the first `cap`) and how many were dropped.
+struct Capped {
+    task: JoinHandle<()>,
+    read: Arc<parking_lot::Mutex<(Vec<u8>, usize)>>,
+}
+
+/// Reads a pipe to its end, keeping the first `cap` bytes and counting the rest.
+fn read_capped(mut reader: impl AsyncRead + Unpin + Send + 'static, cap: usize) -> Capped {
+    let read = Arc::new(parking_lot::Mutex::new((Vec::new(), 0usize)));
+    let shared = read.clone();
+    let task = tokio::spawn(async move {
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
             match reader.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let keep = n.min(cap.saturating_sub(kept.len()));
-                    kept.extend_from_slice(&chunk[..keep]);
-                    dropped += n - keep;
+                    let mut read = shared.lock();
+                    let keep = n.min(cap.saturating_sub(read.0.len()));
+                    read.0.extend_from_slice(&chunk[..keep]);
+                    read.1 += n - keep;
                 }
             }
         }
-        (kept, dropped)
-    })
+    });
+    Capped { task, read }
 }
 
-async fn finished(handle: JoinHandle<(Vec<u8>, usize)>) -> (String, usize) {
-    // The tree is dead, so the pipe ends at once; the wait is for a process that escaped the job.
-    match tokio::time::timeout(Duration::from_secs(5), handle).await {
-        Ok(Ok((bytes, dropped))) => {
-            let text = String::from_utf8_lossy(&bytes);
-            let text = text.trim_start_matches('\u{feff}');
-            // PowerShell wraps some of what it writes to stderr in CLIXML.
-            let text = if text.starts_with("#< CLIXML") {
-                shell::powershell_errors(&bytes)
-            } else {
-                text.replace("\r\n", "\n")
-            };
-            (text, dropped)
-        }
-        _ => (String::new(), 0),
+async fn finished(capped: Capped) -> (String, usize) {
+    // The tree is dead, so the pipe ends at once; the wait is for a process that escaped the job,
+    // or one that inherited the pipe (a `std` spawn elsewhere during a `low` launch: PITFALLS,
+    // "The shell sandbox"). Then what was read is kept rather than lost.
+    let Capped { mut task, read } = capped;
+    if tokio::time::timeout(Duration::from_secs(5), &mut task).await.is_err() {
+        task.abort();
     }
+    let (bytes, dropped) = std::mem::take(&mut *read.lock());
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim_start_matches('\u{feff}');
+    // PowerShell wraps some of what it writes to stderr in CLIXML.
+    let text = if text.starts_with("#< CLIXML") {
+        shell::powershell_errors(&bytes)
+    } else {
+        text.replace("\r\n", "\n")
+    };
+    (text, dropped)
 }
 
 /// Head and tail of a long text with a note between them.
@@ -579,22 +590,18 @@ pub(crate) async fn run_script(
             command.args(&launch.prefix).arg(display_path(&file));
         }
     }
-    let spawned = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let mut child = match spawned {
-        Ok(child) => child,
+    let spec = Spec { stdin_piped: false, kill_on_drop: true };
+    let spawned = sandbox::spawn(&mut command, spec, tools.shell.sandbox());
+    let Spawned { mut child, stdout, stderr, tree, .. } = match spawned {
+        Ok(spawned) => spawned,
         Err(error) => {
             dir.remove().await;
             return ToolOutput::error(format!("Could not start {}: {error}", program.display()));
         }
     };
-    let tree = ProcessTree::contain(child.id());
     let mut killer = KillOnDrop::new(tree.clone());
-    let stdout = read_capped(child.stdout.take().expect("piped stdout"), MAX_STDOUT_BYTES);
-    let stderr = read_capped(child.stderr.take().expect("piped stderr"), MAX_STDERR_BYTES);
+    let stdout = read_capped(stdout, MAX_STDOUT_BYTES);
+    let stderr = read_capped(stderr, MAX_STDERR_BYTES);
     let cancel = live.map(|(_, emit)| emit.cancel_token());
     let outcome = tokio::select! {
         biased;

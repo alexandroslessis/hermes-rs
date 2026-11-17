@@ -23,6 +23,7 @@ mod recall;
 pub mod redact;
 pub mod references;
 mod review;
+mod sandbox;
 mod script;
 mod script_guard;
 mod search;
@@ -59,6 +60,7 @@ pub use clarify::{
 };
 pub use process::ProcessNotice;
 pub use review::ReviewTools;
+pub use sandbox::{Sandbox, set_sandbox};
 pub use shell::{ShellKind, detect_shell, set_env_passthrough};
 pub use skill_manage::{
     FileBase, PendingSkillWrite, SkillOp, SkillPlan, StagedSkillError, WriteOrigin,
