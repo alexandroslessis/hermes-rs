@@ -40,6 +40,7 @@ A Windows desktop app that runs **Hermes** (NousResearch's agent, `../hermes-age
 | Backend v2 (request-frugal agent, self-improvement, security, Rust cleanup) | [docs/backend/PHASES.md](docs/backend/PHASES.md) — planned 2026-11-11; phase by phase, with checkpoints |
 | ACP (using the agent from Zed / t3code: `hermes-acp.exe`) | [docs/acp/README.md](docs/acp/README.md), then [docs/acp/PHASES.md](docs/acp/PHASES.md) — built 2026-11-10 (Zed; t3code later) |
 | opencode plugin (Hermes memory, skills, self-improvement inside opencode: `hermes-opencode.exe` + TS shim) | [docs/opencode/README.md](docs/opencode/README.md), then [docs/opencode/PHASES.md](docs/opencode/PHASES.md) — planned 2026-11-11, not built |
+| Native UI (a Rust/GPUI app in t3code's shape, replacing the Tauri frontend: `hermes-native.exe`) | [docs/native-ui/README.md](docs/native-ui/README.md), then [docs/native-ui/PHASES.md](docs/native-ui/PHASES.md) — planned 2026-11-17, not built; ships as v0.5 |
 
 `PLAN.md` and `FEATURES.md` are from the GPUI era (2026-10/11). `FEATURES.md`'s keep/later/drop
 scope still holds; `PLAN.md`'s milestones are history. `GAPS.md` is the live to-do list.
@@ -52,6 +53,8 @@ scope still holds; `PLAN.md`'s milestones are history. `GAPS.md` is the live to-
      its Python) and port the shapes. A wrong shape is worse than none (rule 5).
    - *Backend:* the agent's behaviour (loop, tools, review, curator, memory, prompts) is ours and
      may deviate from Hermes where that helps (see [docs/backend/PHASES.md](docs/backend/PHASES.md)).
+   - *Native UI* (`crates/native`, [docs/native-ui/](docs/native-ui/README.md)): has no protocol;
+     it calls `hermes_core` in-process. The protocol rule applies to the Tauri page only.
      When we deviate, the module doc says so and why, and the `PORTING.md` row is marked
      `diverged`, so a Hermes update knows not to re-port it. See
      [docs/WORKFLOW.md](docs/WORKFLOW.md).
@@ -60,7 +63,9 @@ scope still holds; `PLAN.md`'s milestones are history. `GAPS.md` is the live to-
    Hermes updates tractable. Add a row to `PORTING.md` for a new module.
 3. **Copy, never depend.** Code from Hermes, Goose or Zed is copied in and adapted; never add a
    dependency on their repos or published crates. Ordinary crates.io crates are fine — prefer one
-   already in `Cargo.lock`.
+   already in `Cargo.lock`. One exception (user, 2026-11-17): the native UI depends on `gpui-kit`
+   and the GPUI snapshot crates it pins (`gpui-pre*`), pinned to exact versions (`=x.y.z`) and
+   upgraded on purpose. No other Zed code in `crates/native` or `hermes_core`.
 4. **Don't touch Hermes's tree.** `../hermes-agent` is read-only. The frontend is rebuilt from it
    by `git archive`; changes go in `crates/desktop/patches/` (rare, small, documented) or
    `plugins/hermes-rs/` (hiding).
@@ -98,7 +103,10 @@ scope still holds; `PLAN.md`'s milestones are history. `GAPS.md` is the live to-
   (`scripts/perf/perf.ps1`, data in `target/perf`, port 47810), and only ever stop processes whose
   path is under `target\claude` (`perf.ps1 -Do stop` does exactly that).
 - Don't screenshot or drive the user's app. Automated checks run against your own instance through
-  its DevTools port (text and DOM, not screenshots). After a UI-affecting change, end with a
+  its DevTools port (text and DOM, not screenshots). The native UI is checked with layout
+  assertions and image snapshots of your own instance only (data in `target/native-test`), as
+  cropped images, reviewed by a subagent ([docs/native-ui/README.md](docs/native-ui/README.md),
+  "The dev loop"). After a UI-affecting change, end with a
   numbered checklist for the user: where to click, what should happen.
 - An API key for real-model tests may be in the environment variable `hermes_rs_or_api_key`
   (OpenRouter). Never print it, log it or write it to a file. Prefer the mock providers.
