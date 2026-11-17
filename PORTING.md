@@ -52,6 +52,13 @@ Not from Hermes, so not in the map:
   `ConfigKey`, the unused `Provider` trait methods (OAuth, modes, thinking-effort and permission routing),
   and in `crates/agent` the `skills`, `compaction` and `subagent` modules and `ToolOperation`'s typed-tool
   registration (only `with_provider` remains). A Goose update must not bring them back.
+  **Diverged** (Phase 14 CP14.2): the model catalog `crates/llm/src/canonical/data/canonical_models.json` is a
+  trimmed copy (8,744 -> 1,371 rows: only the providers our lookups can reach, only the fields we read; made
+  by `scripts/trim-model-registry.py`); `canonical/models_dev.rs` (the models.dev converter), the remote catalog
+  fetch / cache in `registry.rs`, `canonical_mapping_report.json`, `recommended_models_from_registry`,
+  `provider_wire_name`, `ModelMapping`, `Provider::fetch_recommended_models` / `map_to_canonical_model` /
+  `skip_canonical_filtering`, `PricingTier`, `ThinkingMode`, `Pricing::estimate_cost` are gone. A Goose update
+  must not bring the full catalog or those back; to add a provider rerun the script with it listed.
 - `crates/app`, `crates/themes`, `crates/highlight`, `crates/markdown`, `vendor/zed`: the GPUI app
   and Zed's UI code. The GPUI app is frozen (kept as a fallback, no new features).
 

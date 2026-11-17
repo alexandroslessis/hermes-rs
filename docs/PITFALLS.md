@@ -1518,6 +1518,25 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   `rest_blocking` (CP13c) are in `mod.rs` / `rest.rs`; the off-worker rules did not change.
 - **`scripts/contract.mjs` reads `gateway/rpc.rs`** (`rename = "<method>"`) to say which contract methods are served.
 
+## The model catalog (Phase 14, `crates/llm/src/canonical/`)
+
+- **It is a trimmed copy.** `data/canonical_models.json` holds 1,371 rows of 27 catalog providers (the script lists 32 names; `mistral`, `qwen`, `meta-llama`, `amazon` and
+  `microsoft` have no rows of their own) and 10 fields, made from
+  Goose's full models.dev catalog (8,744 rows, last in git at `a7c24dc`) by `scripts/trim-model-registry.py`. A lookup
+  under a provider that is not in the script's `PROVIDERS` finds nothing and falls through to `name_builder.rs`'s
+  inference rules, silently. So: a new name in `discovery::catalog_provider_for`, `map_provider_name`,
+  `infer_provider_from_model`, `extract_provider_prefix` or `is_meta_provider` must be added to `PROVIDERS` and the JSON
+  regenerated from the full catalog; a new field read from `CanonicalModel` must be added to the script's `trim`.
+- **What the app looks up**: the model picker, context lengths and prices come from `discovery::list_models`, which uses
+  `catalog_provider_for(base_url)` (a fixed host table; every local or unknown endpoint is `"openai"`), never the endpoint's
+  id; `formats/openai.rs` / `model.rs` use the fixed `"openai"`. The endpoint id the user typed (`Provider::get_name`)
+  reaches only `model_info_for_provider_model` (`fetch_model_info`), of which only `resolved_model` (always `None`) is read.
+  So an endpoint named like a dropped gateway (`poe`, `requesty`) changes nothing visible.
+- **Checking a catalog change**: build `crates/llm/examples/registry_probe.rs` before and after (it compiles at
+  `a7c24dc` too), run both on the same provider and model lists, `cmp` the outputs.
+- No remote refresh: Goose's models.dev fetch/cache was never called here and is deleted; nothing writes a catalog file
+  into the data folder.
+
 ## Test folders that do not go away (2026-11-17, `crates/testdir`)
 
 **What happened.** The user's `%TEMP%` filled with ~50,000 folders named `.tmpXXXXXX` and 300 GB

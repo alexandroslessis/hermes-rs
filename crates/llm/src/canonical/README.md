@@ -1,23 +1,14 @@
-# Canonical Model System
+# Canonical model registry
 
-Provides a unified view of model metadata (pricing, capabilities, context limits) across different LLM providers. 
-Normalizes provider-specific model names (e.g., `claude-sonnet-4-5-20250929`)
-to canonical IDs (e.g., `anthropic/claude-sonnet-4.5`).
+Model metadata (context limit, max output, prices, reasoning and tool-call flags, input
+modalities) looked up by `(provider, model)`. `name_builder.rs` normalizes provider model names
+(e.g. `claude-sonnet-4-5-20250929`) to catalog ids (`anthropic/claude-sonnet-4.5`).
 
-## Build Canonical Models
-Fetches latest model metadata from OpenRouter and validates provider mappings:
-```bash
-cargo run --bin build_canonical_models              # Build and check (default)
-cargo run --bin build_canonical_models --no-check   # Build only, skip checker
-```
+The catalog is `data/canonical_models.json`, compiled in (zstd-compressed by `build.rs`). It is a
+**trimmed copy** of Goose's catalog (models.dev data): only the providers and fields this app
+reads. Regenerate it from a full catalog with `scripts/trim-model-registry.py`; the provider list
+and the field list are documented at the top of that script. The last full copy is in git at
+`a7c24dc` (`crates/llm/src/canonical/data/canonical_models.json`).
 
-This script performs two operations by default:
-1. **Builds canonical models** - Fetches from OpenRouter API and updates the registry
-   - Writes to: `crates/goose-provider-types/src/canonical/data/canonical_models.json`
-2. **Checks model mappings** (unless `--no-check` is passed) - Tests provider mappings and tracks changes over time
-   - Reports unmapped models
-   - Compares with previous runs (like a lock file)
-   - Shows changed/added/removed mappings
-   - Writes to: `crates/goose-provider-types/src/canonical/data/canonical_mapping_report.json`
-
-The script is currently built from `crates/goose/src/bin/build_canonical_models.rs` and writes into this crate's `src/canonical/data` directory.
+`examples/registry_probe.rs` prints everything the app reads for a list of (provider, model)
+pairs; run it before and after a catalog change and `diff` the outputs.

@@ -348,105 +348,6 @@ pub trait Provider: Send + Sync {
         Ok(model_info_for_provider_model(self.get_name(), model_name))
     }
 
-    fn skip_canonical_filtering(&self) -> bool {
-        false
-    }
-
-    /// Fetch inventory models filtered by canonical registry and usability.
-    ///
-    /// When `toolshim` is true, models that lack native tool-call support are
-    /// retained because the toolshim layer emulates tool calling.
-    async fn fetch_recommended_models(&self, toolshim: bool) -> Result<Vec<String>, ProviderError> {
-        let all_models = self.fetch_supported_models().await?;
-
-        if self.skip_canonical_filtering() {
-            return Ok(all_models);
-        }
-
-        let registry = CanonicalModelRegistry::bundled().map_err(|e| {
-            ProviderError::ExecutionError(format!("Failed to load canonical registry: {}", e))
-        })?;
-
-        let provider_name = self.get_name();
-
-        // Get all text-capable models with their release dates
-        let mut models_with_dates: Vec<(String, Option<String>)> = all_models
-            .iter()
-            .filter_map(|model| {
-                let canonical_model = map_to_canonical_model(provider_name, model, &registry)
-                    .and_then(|canonical_id| {
-                        let (provider, model_name) = canonical_id.split_once('/')?;
-                        registry.get(provider, model_name)
-                    });
-                let Some(canonical_model) = canonical_model else {
-                    return Some((model.clone(), None));
-                };
-
-                if !canonical_model
-                    .modalities
-                    .input
-                    .contains(&crate::canonical::Modality::Text)
-                {
-                    return None;
-                }
-
-                if !canonical_model.tool_call && !toolshim {
-                    return None;
-                }
-
-                let release_date = canonical_model.release_date.clone();
-
-                Some((model.clone(), release_date))
-            })
-            .collect();
-
-        // Sort by release date (most recent first), then alphabetically for models without dates
-        models_with_dates.sort_by(|a, b| match (&a.1, &b.1) {
-            (Some(date_a), Some(date_b)) => date_b.cmp(date_a),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.0.cmp(&b.0),
-        });
-
-        let inventory_models: Vec<String> = models_with_dates
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
-
-        if inventory_models.is_empty() {
-            Ok(all_models)
-        } else {
-            Ok(inventory_models)
-        }
-    }
-
-    async fn fetch_recommended_model_info(
-        &self,
-        toolshim: bool,
-    ) -> Result<Vec<ModelInfo>, ProviderError> {
-        Ok(self
-            .fetch_recommended_models(toolshim)
-            .await?
-            .iter()
-            .map(|model_name| model_info_for_provider_model(self.get_name(), model_name))
-            .collect())
-    }
-
-    async fn map_to_canonical_model(
-        &self,
-        provider_model: &str,
-    ) -> Result<Option<String>, ProviderError> {
-        let registry = CanonicalModelRegistry::bundled().map_err(|e| {
-            ProviderError::ExecutionError(format!("Failed to load canonical registry: {}", e))
-        })?;
-
-        Ok(map_to_canonical_model(
-            self.get_name(),
-            provider_model,
-            &registry,
-        ))
-    }
-
     /// Whether the provider manages its own conversation context (e.g. CLI
     /// wrappers like Claude Code or Gemini CLI). When true, goose-side
     /// context management such as tool-pair summarization is skipped because
@@ -496,31 +397,6 @@ mod tests {
             merged[1].context_limit,
             model_info_for_provider_model("openai", "gpt-4o").context_limit
         );
-    }
-
-    struct ModelInventoryProvider {
-        models: Vec<String>,
-    }
-
-    #[async_trait]
-    impl Provider for ModelInventoryProvider {
-        fn get_name(&self) -> &str {
-            "xai"
-        }
-
-        async fn stream(
-            &self,
-            _model_config: &ModelConfig,
-            _system: &str,
-            _messages: &[Arc<Message>],
-            _tools: &[Tool],
-        ) -> Result<MessageStream, ProviderError> {
-            unimplemented!()
-        }
-
-        async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
-            Ok(self.models.clone())
-        }
     }
 
     fn content_from_str(s: String) -> MessageContentBlock {
@@ -787,23 +663,6 @@ mod tests {
             }
             other => panic!("expected Thinking, Thinking, Text, got {:?}", other),
         }
-    }
-
-    #[tokio::test]
-    async fn recommended_models_preserve_unknown_future_models() {
-        let provider = ModelInventoryProvider {
-            models: vec![
-                "grok-4.5".to_string(),
-                "grok-future-unlisted".to_string(),
-                "grok-4.20-multi-agent".to_string(),
-            ],
-        };
-
-        let models = provider.fetch_recommended_models(false).await.unwrap();
-
-        assert!(models.contains(&"grok-4.5".to_string()));
-        assert!(models.contains(&"grok-future-unlisted".to_string()));
-        assert!(!models.contains(&"grok-4.20-multi-agent".to_string()));
     }
 
     #[test]

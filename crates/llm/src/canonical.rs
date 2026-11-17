@@ -1,156 +1,13 @@
 mod model;
-pub mod models_dev;
 mod name_builder;
 mod registry;
 
-pub use model::{CanonicalModel, Limit, Modalities, Modality, Pricing, PricingTier, ThinkingMode};
+pub use model::{CanonicalModel, Limit, Modalities, Modality, Pricing};
 pub use name_builder::{
     canonical_name, map_provider_name, map_to_canonical_model, strip_openrouter_variant,
     strip_version_suffix,
 };
-pub use registry::{
-    fetch_remote_catalog, load_cached_catalog, CanonicalModelRegistry, RemoteCatalog,
-};
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ModelMapping {
-    pub provider_model: String,
-    pub canonical_model: String,
-}
-
-impl ModelMapping {
-    pub fn new(provider_model: impl Into<String>, canonical_model: impl Into<String>) -> Self {
-        Self {
-            provider_model: provider_model.into(),
-            canonical_model: canonical_model.into(),
-        }
-    }
-}
-
-/// Return recommended model names for a provider using only the bundled canonical registry.
-///
-/// This avoids network calls by looking up all known models for the provider,
-/// filtering to text-input + tool-calling models, and sorting by release date.
-/// The returned names are the canonical short names (e.g. "claude-sonnet-4.5").
-///
-/// TODO: This trades speed for correctness — the canonical registry may not perfectly
-/// match what the provider API returns (new models not yet in the registry, deprecated
-/// models still listed, or locally-installed models for providers like Ollama). Consider
-/// whether to reconcile with a live API call in the background.
-pub fn recommended_models_from_registry(provider: &str) -> Vec<String> {
-    let registry = match CanonicalModelRegistry::bundled() {
-        Ok(r) => r,
-        Err(_) => return vec![],
-    };
-
-    let registry_provider = map_provider_name(provider);
-    let all = registry.get_all_models_for_provider(registry_provider);
-
-    let mut models_with_dates: Vec<(String, Option<String>)> = all
-        .iter()
-        .filter(|m| m.modalities.input.contains(&Modality::Text) && m.tool_call)
-        .filter(|m| match registry_provider {
-            "openai" => !m.id.contains("realtime"),
-            "google" => !m.id.contains("deep-research") && !m.id.contains("live"),
-            _ => true,
-        })
-        .filter_map(|m| {
-            let (_, name) = m.id.split_once('/')?;
-            Some((
-                provider_wire_name(provider, &m.id, name),
-                m.release_date.clone(),
-            ))
-        })
-        .collect();
-
-    if matches!(provider, "google" | "xai") {
-        models_with_dates.extend(
-            mapping_report()["all_mappings"][provider]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|mapping| mapping["provider_model"].as_str())
-                .filter(|name| provider != "google" || google_generate_content_model(name))
-                .map(|name| (name.to_string(), None)),
-        );
-    }
-
-    models_with_dates.sort_by(|a, b| {
-        let date_order = match (&a.1, &b.1) {
-            (Some(date_a), Some(date_b)) => date_b.cmp(date_a),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        };
-        date_order.then_with(|| a.0.cmp(&b.0))
-    });
-
-    let mut seen = std::collections::HashSet::new();
-    models_with_dates.retain(|(name, _)| seen.insert(name.clone()));
-    models_with_dates
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect()
-}
-
-fn google_generate_content_model(name: &str) -> bool {
-    !name.contains("deep-research")
-        && !name.contains("live")
-        && !name.contains("image")
-        && !name.contains("tts")
-        && !name.contains("embedding")
-}
-
-fn mapping_report() -> &'static serde_json::Value {
-    static REPORT: once_cell::sync::Lazy<serde_json::Value> = once_cell::sync::Lazy::new(|| {
-        serde_json::from_str(include_str!("canonical/data/canonical_mapping_report.json"))
-            .expect("bundled canonical mapping report must be valid")
-    });
-    &REPORT
-}
-
-pub fn provider_wire_name(provider: &str, canonical_id: &str, canonical_name: &str) -> String {
-    if map_provider_name(provider) == "anthropic" {
-        return dotted_version_to_dash(canonical_name);
-    }
-
-    let mapped = mapping_report()["all_mappings"][provider]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|mapping| mapping["canonical_model"].as_str() == Some(canonical_id))
-        .filter_map(|mapping| mapping["provider_model"].as_str())
-        .min_by_key(|name| (!name.ends_with("-latest"), name.len(), *name));
-    mapped
-        .or_else(|| {
-            mapping_report()["unmapped_models"]
-                .as_array()?
-                .iter()
-                .filter(|model| model["provider"].as_str() == Some(provider))
-                .filter_map(|model| model["model"].as_str())
-                .find(|name| name.strip_suffix("-latest") == Some(canonical_name))
-        })
-        .unwrap_or(canonical_name)
-        .to_string()
-}
-
-fn dotted_version_to_dash(name: &str) -> String {
-    let bytes = name.as_bytes();
-    let mut out = String::with_capacity(name.len());
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'.'
-            && i > 0
-            && i + 1 < bytes.len()
-            && bytes[i - 1].is_ascii_digit()
-            && bytes[i + 1].is_ascii_digit()
-        {
-            out.push('-');
-        } else {
-            out.push(b as char);
-        }
-    }
-    out
-}
+pub use registry::CanonicalModelRegistry;
 
 /// Catalog pricing is not valid for local inference: models served via ollama or a
 /// local runtime are actually free to run, so any catalog price would be misleading.
@@ -310,17 +167,6 @@ mod tests {
         assert_eq!(free.limit.context, paid.limit.context);
         assert_eq!(free.cost.input, Some(0.0));
         assert_eq!(free.cost.output, Some(0.0));
-        assert_eq!(free.cost.cache_read, None);
-        assert_eq!(free.cost.cache_write, None);
-        assert!(free.cost.tiers.is_empty());
-        let usage = crate::conversation::token_usage::Usage {
-            input_tokens: Some(1_000_000),
-            output_tokens: Some(1_000_000),
-            total_tokens: None,
-            cache_read_input_tokens: Some(100_000),
-            cache_write_input_tokens: Some(100_000),
-        };
-        assert_eq!(free.cost.estimate_cost(&usage), Some(0.0));
     }
 
     #[test_case::test_case("deepseek/deepseek-v4-flash:batch"; "batch")]
@@ -329,15 +175,6 @@ mod tests {
         let canonical = maybe_get_canonical_model("openrouter", model).unwrap();
         assert_eq!(canonical.cost.input, None);
         assert_eq!(canonical.cost.output, None);
-        assert_eq!(canonical.cost.cache_read, None);
-        assert_eq!(canonical.cost.cache_write, None);
-        assert!(canonical.cost.tiers.is_empty());
-        assert_eq!(
-            canonical
-                .cost
-                .estimate_cost(&crate::conversation::token_usage::Usage::default()),
-            None
-        );
     }
 
     #[test_case::test_case("ollama")]
@@ -398,16 +235,12 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_opus_5_5_resolves_with_always_on_adaptive_thinking() {
+    fn anthropic_opus_5_5_resolves() {
         let canonical = maybe_get_canonical_model("anthropic", "claude-opus-5-5")
             .expect("claude-opus-5-5 should resolve");
         assert_eq!(canonical.id, "anthropic/claude-opus-5.5");
         assert_eq!(canonical.limit.context, 1_000_000);
         assert_eq!(canonical.limit.output, Some(128_000));
-        assert_eq!(
-            canonical.thinking_mode,
-            Some(ThinkingMode::AlwaysOnAdaptive)
-        );
         assert_eq!(canonical.cost.input, Some(4.0));
         assert_eq!(canonical.cost.output, Some(20.0));
     }
@@ -430,54 +263,5 @@ mod tests {
             .expect("kimi_code/k3 should resolve via kimi-code-plan-cn provider mapping");
         assert_eq!(canonical.limit.context, 1_048_576);
         assert_eq!(canonical.reasoning, Some(true));
-        assert_eq!(canonical.temperature, Some(false));
-    }
-
-    #[test]
-    fn recommended_google_models_use_generate_content() {
-        let models = recommended_models_from_registry("google");
-        assert!(!models.iter().any(|model| model.contains("deep-research")));
-        assert!(!models.iter().any(|model| model.contains("live")));
-        assert!(models.iter().any(|model| model == "gemini-2.5-pro"));
-        assert!(models.iter().any(|model| model == "gemini-2.0-flash"));
-        assert!(models.iter().any(|model| model == "gemini-2.0-flash-lite"));
-        assert!(models.iter().any(|model| model == "gemini-3-pro-preview"));
-    }
-
-    #[test]
-    fn anthropic_wire_name_uses_dashed_versions() {
-        assert_eq!(
-            provider_wire_name(
-                "anthropic",
-                "anthropic/claude-sonnet-4.5",
-                "claude-sonnet-4.5"
-            ),
-            "claude-sonnet-4-5"
-        );
-        assert_eq!(
-            provider_wire_name("anthropic", "anthropic/claude-opus-5", "claude-opus-5"),
-            "claude-opus-5"
-        );
-        assert_eq!(
-            provider_wire_name("openai", "openai/gpt-5.2", "gpt-5.2"),
-            "gpt-5.2"
-        );
-        assert_eq!(
-            provider_wire_name("openai", "openai/gpt-5.2-chat", "gpt-5.2-chat"),
-            "gpt-5.2-chat-latest"
-        );
-        assert_eq!(
-            provider_wire_name("openai", "openai/gpt-5.3-chat", "gpt-5.3-chat"),
-            "gpt-5.3-chat-latest"
-        );
-    }
-
-    #[test]
-    fn xai_models_include_provider_inventory_aliases() {
-        let models = recommended_models_from_registry("xai");
-        assert!(models.iter().any(|model| model == "grok-3"));
-        assert!(models.iter().any(|model| model == "grok-3-mini"));
-        assert!(models.iter().any(|model| model == "grok-4-0709"));
-        assert!(models.iter().any(|model| model == "grok-code-fast-1"));
     }
 }

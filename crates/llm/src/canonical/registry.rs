@@ -1,36 +1,17 @@
 use super::CanonicalModel;
 use anyhow::{bail, Context, Result};
-use futures::StreamExt;
 use once_cell::sync::Lazy;
-use reqwest::header::{ETAG, IF_NONE_MATCH};
 use std::collections::{HashMap, HashSet};
-use std::ops::Deref;
-use std::path::{Path, PathBuf};
-use std::sync::{RwLock, RwLockReadGuard};
-use std::time::Duration;
 
-const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
-const CATALOG_FILENAME: &str = "models_dev_api.json";
-const ETAG_FILENAME: &str = "models_dev_api.etag";
-
-static ACTIVE_REGISTRY: Lazy<RwLock<Result<CanonicalModelRegistry>>> = Lazy::new(|| {
-    let bundled = zstd::decode_all(
+/// The catalog compiled into the binary (`data/canonical_models.json`, zstd-compressed by
+/// `build.rs`), parsed once on first use.
+static BUNDLED: Lazy<Result<CanonicalModelRegistry>> = Lazy::new(|| {
+    zstd::decode_all(
         include_bytes!(concat!(env!("OUT_DIR"), "/canonical_models.json.zst")).as_slice(),
     )
     .context("Failed to decompress bundled canonical models JSON")
-    .and_then(|json| CanonicalModelRegistry::from_json(std::str::from_utf8(&json)?));
-    RwLock::new(bundled)
+    .and_then(|json| CanonicalModelRegistry::from_json(std::str::from_utf8(&json)?))
 });
-
-pub struct CanonicalModelRegistryGuard(RwLockReadGuard<'static, Result<CanonicalModelRegistry>>);
-
-impl Deref for CanonicalModelRegistryGuard {
-    type Target = CanonicalModelRegistry;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref().expect("validated registry")
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct CanonicalModelRegistry {
@@ -44,14 +25,8 @@ impl CanonicalModelRegistry {
         }
     }
 
-    pub fn bundled() -> Result<CanonicalModelRegistryGuard> {
-        let guard = ACTIVE_REGISTRY
-            .read()
-            .map_err(|_| anyhow::anyhow!("canonical model registry lock poisoned"))?;
-        if let Err(error) = &*guard {
-            anyhow::bail!("{error}");
-        }
-        Ok(CanonicalModelRegistryGuard(guard))
+    pub fn bundled() -> Result<&'static CanonicalModelRegistry> {
+        BUNDLED.as_ref().map_err(|error| anyhow::anyhow!("{error}"))
     }
 
     pub fn from_json(content: &str) -> Result<Self> {
@@ -106,92 +81,6 @@ impl Default for CanonicalModelRegistry {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn activate(registry: CanonicalModelRegistry) -> Result<()> {
-    *ACTIVE_REGISTRY
-        .write()
-        .map_err(|_| anyhow::anyhow!("canonical model registry lock poisoned"))? = Ok(registry);
-    Ok(())
-}
-
-pub fn load_cached_catalog(cache_dir: &Path) -> Result<bool> {
-    let path = cache_dir.join(CATALOG_FILENAME);
-    if !path.exists() {
-        return Ok(false);
-    }
-    let content = std::fs::read_to_string(path)?;
-    activate(super::models_dev::from_models_dev(&content)?)?;
-    Ok(true)
-}
-
-pub struct RemoteCatalog {
-    body: Vec<u8>,
-    etag: Option<String>,
-}
-
-/// Returns `None` when the cached catalog is still current.
-pub async fn fetch_remote_catalog(url: &str, cache_dir: &Path) -> Result<Option<RemoteCatalog>> {
-    let client = reqwest::Client::builder().build()?;
-    let etag_path = cache_dir.join(ETAG_FILENAME);
-    let mut request = client.get(url).timeout(Duration::from_secs(15)).header(
-        "User-Agent",
-        "goose/model-catalog (https://github.com/aaif-goose/goose)",
-    );
-    if let Ok(etag) = std::fs::read_to_string(&etag_path) {
-        request = request.header(IF_NONE_MATCH, etag);
-    }
-
-    let response = request.send().await?.error_for_status()?;
-    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-        return Ok(None);
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_CATALOG_BYTES as u64)
-    {
-        bail!("remote canonical model catalog exceeds size limit");
-    }
-    let etag = response
-        .headers()
-        .get(ETAG)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if body.len() + chunk.len() > MAX_CATALOG_BYTES {
-            bail!("remote canonical model catalog exceeds size limit");
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(Some(RemoteCatalog { body, etag }))
-}
-
-impl RemoteCatalog {
-    pub fn install(self, cache_dir: &Path) -> Result<()> {
-        let content =
-            std::str::from_utf8(&self.body).context("canonical model catalog is not UTF-8")?;
-        let registry = super::models_dev::from_models_dev(content)?;
-
-        std::fs::create_dir_all(cache_dir)?;
-        atomic_write(cache_dir.join(CATALOG_FILENAME), &self.body)?;
-        if let Some(etag) = self.etag {
-            atomic_write(cache_dir.join(ETAG_FILENAME), etag.as_bytes())?;
-        }
-        activate(registry)
-    }
-}
-
-fn atomic_write(destination: PathBuf, content: &[u8]) -> Result<()> {
-    let temporary = destination.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-    std::fs::write(&temporary, content)?;
-    if let Err(error) = std::fs::rename(&temporary, &destination) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    Ok(())
 }
 
 #[cfg(test)]

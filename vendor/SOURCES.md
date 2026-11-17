@@ -12,6 +12,7 @@ Commit `b23d21cabd9b4de0c045dcdd731821a3a15c2bfc` from https://github.com/aaif-g
 |---|---|---|
 | `crates/goose-provider-types/src/` | `crates/llm/src/` | Kept only the OpenAI chat-completions format (removed anthropic, databricks, google, ollama, openai_responses, snowflake). Restored the thinking-signature retry check inline in `retry.rs`. 7 image-path tests ignored on Windows (`/`-rooted paths only). |
 | `crates/goose-provider-types/build.rs` | `crates/llm/build.rs` | none |
+| `crates/goose-provider-types/src/canonical/data/canonical_models.json` | `crates/llm/src/canonical/data/canonical_models.json` | Trimmed (Phase 14 CP14.2): 1,371 of 8,744 rows, 10 fields; `scripts/trim-model-registry.py`. The mapping report and `provider_metadata.json` are deleted. |
 | `crates/goose-providers/src/{api_client,http_status,openai_compatible}.rs` | `crates/llm/src/` | Removed the Responses API streaming path. |
 | `crates/goose-agent/src/` | `crates/agent/src/` | `goose_provider_types` → `hermes_llm`; `ToolOperation::run` executes a response's tool calls concurrently (`join_all`) instead of one by one. Phase 14 CP14.1 deleted the unused `skills` (with its `goose-sdk-types` copy) and `subagent` modules, the typed-tool registration and every `wasm32` branch. |
 | `crates/goose/src/agents/state_machine/ops_{empty_response,exit_on_error,maxturns,remaining_tool_calls}.rs` | `crates/runtime/src/ops.rs` | Adapted to our session/effect types; max turns doesn't fire on a finished answer; unanswered calls name the available tools. |

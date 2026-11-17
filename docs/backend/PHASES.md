@@ -55,7 +55,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 13a/c/f | Perf: `Arc<Message>`, `spawn_blocking`, typed dispatch — ✅ 2026-11-17 (20f3724, 8e3d12d, CP13f: the `backend p13 cp13f` commit) | M | 0 | Sonnet | filler |
 | 13b | Perf: store writer actor — ✅ 2026-11-17 (74ac1f7) | M | 0 | **Opus** | C |
 | 13d/e | Perf: session actor, explicit agent loop — ✅ 2026-11-17 (acad3ca, a110767) | L | all others | **Opus** | last, alone |
-| 14 | Trim `hermes_llm` | S–M | 2, 12 | Sonnet | filler |
+| 14 | Trim `hermes_llm` — ✅ 2026-11-17 (a7c24dc, CP14.2: the `backend p14 cp2` commit) | S–M | 2, 12 | Sonnet | filler |
 | 15 | OS sandbox for the shell | L | 1, 6 | **Opus** | C |
 
 Phase 1 is independent of the request work and can start while Phase 0 is in review. Lanes and
@@ -967,6 +967,27 @@ for later phases:
 
 **Tests:** whole workspace builds (`cargo build --workspace`), all tests green; binary size before/after
 recorded here.
+
+**Done 2026-11-17** ([progress](progress/phase-14.md)), on branch `backend/p14-trim`: CP14.1 unused
+code a7c24dc, CP14.2 model registry and notices (the `backend p14 cp2` commit). No behaviour change by
+design, except the Retry-After cap the CP14.1 review moved into the live retry loop (a hint above
+600 s now sleeps 600 s, as GAPS.md "Done 2026-11-06" always said). `crates/llm` 25,014 -> 22,667
+lines (with the new probe example), `crates/agent` 4,336 -> 1,957; the catalog JSON 5,778,517 B (8,744 rows) -> 335,439 B (1,371
+rows, 10 fields; 150,101 -> 19,819 B compressed in the exe). Binary sizes (`hermes-desktop.exe`,
+built with a one-file stub webapp, so absolute sizes are below a real build; the difference is what
+counts): release 43,018,752 -> 42,993,152 (CP14.1) -> 42,801,664 B (CP14.2), -217,088 B in all;
+debug 64,207,360 -> 64,111,616 -> 63,899,648 B. The linker had already dropped most unused code; the
+gain is the registry parsed at first lookup (5.8 MB of JSON -> 0.34 MB) and the repository. The
+safety net was a probe (`crates/llm/examples/registry_probe.rs`) run on the old and new code for every
+provider name the app's lookups can reach and every catalog id with variants: byte-identical
+(implementer: 57 providers x 38,501 names; reviewer, independently: 27 x 61,680). Notes for later
+phases:
+- A new provider name in `discovery::catalog_provider_for` / `name_builder.rs`, or a new
+  `CanonicalModel` field read, needs `scripts/trim-model-registry.py` updated and the JSON regenerated
+  from the full catalog (PITFALLS "The model catalog"). There is no remote catalog refresh any more.
+- `is_openai_responses_model` keeps its Goose name although we have no Responses path: it feeds the
+  request body (reasoning effort, max-tokens field), so a rename must keep the bodies byte-identical.
+- `cargo bloat` / `cargo udeps` were not installed; a later trim could use them.
 
 ---
 

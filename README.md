@@ -51,7 +51,7 @@ For another OpenAI-compatible server set `HERMES_BASE_URL` (e.g. `http://localho
 | `crates/prompts` | System-prompt builder and tool schemas (`prompts/tools`) |
 | `crates/store` | SQLite sessions, messages, usage |
 | `crates/agent` | Agent steps (streaming a reply, running tool calls) (from Goose); the loop is `crates/runtime/src/agent_loop.rs` |
-| `crates/llm` | Messages, OpenAI-compatible provider, model catalog and discovery (from Goose) |
+| `crates/llm` | Messages, OpenAI-compatible provider, a trimmed model catalog (models.dev data via Goose) and discovery (from Goose) |
 | `vendor/zed` | GPUI, `ui`, `theme` and support crates copied from Zed (`scripts/vendor_zed.py`) |
 | `HERMES_COMMIT` | The Hermes commit this tree ports ([PORTING.md](PORTING.md)) |
 | `prompts/hermes` | Hermes prompts and tool schemas (`scripts/extract_hermes_prompts.py`) |
