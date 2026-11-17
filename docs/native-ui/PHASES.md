@@ -35,7 +35,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 
 | # | Phase | Size | Depends on |
 |---|---|---|---|
-| 0 | Spike and dev loop: GPUI Kit on Windows, layout dump, snapshots, gallery | M | — |
+| 0 | Spike and dev loop: GPUI Kit on Windows, layout dump, snapshots, gallery — ✅ 2026-11-18 | M | — |
 | 1 | `hermes_core`: the backend's application layer, extracted from `crates/desktop` | L | — |
 | 2 | Design system and app frame: themes, tokens, design layer, window, palette, keymap | M–L | 0 |
 | 3 | Sidebar: projects and threads | M | 1 (CP1.1), 2 |

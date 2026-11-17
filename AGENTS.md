@@ -125,6 +125,7 @@ $env:CARGO_TARGET_DIR = "target/claude"
 cargo build -p hermes-desktop                    # the app (debug)
 cargo test -p hermes-desktop                     # desktop backend unit tests
 cargo test -p hermes_runtime --test turns        # agent-loop tests against a mock HTTP provider
+powershell -NoProfile -File scripts/native/check.ps1   # native UI: build, layout tests, snapshots (docs/TESTING.md §6)
 cargo test -p hermes_tools -p hermes_memory -p hermes_store -p hermes_prompts
 cargo build --workspace                          # everything, including the frozen GPUI app
 
@@ -148,7 +149,7 @@ via `~/.local/bin/uv.exe run --no-project ...` (`python` on PATH is the Microsof
 | `crates/desktop/patches/` | Our patches to Hermes's frontend, applied in name order by the webapp build |
 | `crates/desktop/plugins/hermes-rs/` | `hide.css` + `plugin.js`: hides features we don't serve |
 | `crates/runtime/` | Sessions, turns, delegation/subagents, compression, review, curator, MCP |
-| `crates/native/` | The native UI on GPUI Kit (`hermes-native.exe`, [docs/native-ui/](docs/native-ui/README.md)); for now CP0.1's spike window on fake data |
+| `crates/native/` | The native UI on GPUI Kit (`hermes-native.exe`, [docs/native-ui/](docs/native-ui/README.md)); for now CP0.1's spike window on fake data, plus `hermes-native-gallery.exe` (stories), the element dump and layout checks (`src/dev/`, `src/testing.rs`) and snapshot baselines (`snapshots/`) |
 | `crates/tools/` | The agent's tools (terminal, files, search, skills, web, vision, checkpoints…) |
 | `crates/memory/` | MEMORY.md / USER.md store and the memory tool |
 | `crates/store/` | SQLite: sessions, messages, usage, projects |

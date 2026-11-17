@@ -325,6 +325,81 @@ Do not redirect `TEMP` for a test run (the taint test treats paths under it as s
 `hermes_testdir: could not remove ...` in test output is a leak: fix the field order or the owner of
 the open file.
 
+## 6. Native UI (`crates/native`)
+
+The native UI ([docs/native-ui/](native-ui/README.md)) has no protocol, so no `*-check.mjs`. Its
+checks are three kinds, cheapest first, all run by one script:
+
+```powershell
+powershell -NoProfile -File scripts/native/check.ps1           # build (--features dev), tests, snapshots
+powershell -NoProfile -File scripts/native/check.ps1 -Update   # accept the rendered snapshots
+```
+
+It builds into `target/claude`, sets `HERMES_RS_HOME=target/native-test`, opens no window, and
+prints only failures, the `*.diff.png` / `*.actual.png` paths to look at, and a summary line.
+
+**1. Layout checks (text; every change).** Name the elements a check needs with `.probe()` (any
+element with an id; Kit's own controls such as `Button` are named by their id already;
+`.probe_text(text)` on a one-line label also records the width its text needs). A test opens the
+view in a headless window and asserts on the element dump of its last frame
+(`crates/native/src/testing.rs`):
+
+```rust
+let mut cx = headless_app();                     // real DirectWrite text, Kit's assets
+let window = open_window(&mut cx, size(px(800.), px(600.)), |_, cx| cx.new(|_| MyView));
+let layout = layout(&mut cx, window.into());
+let mut check = layout.check();
+check.same_row("save", "cancel").same_height(&["save", "cancel"])
+     .inside("save/caption", "save").no_overflow("toolbar")
+     .background("save", theme.button_hover).text_color("save/caption", theme.foreground)
+     .state("save", Some(true), None, Some(false));          // hovered, focused, disabled
+check.assert();                                  // every failure at once, plus the dump
+```
+
+Names are an id or the last ids of a path (`"toolbar/save"`) and must match one element.
+`Layout::of(window)` works inside `#[gpui_kit::test]` too, but `TestAppContext`'s text system is
+GPUI's fixed-width fake: use `headless_app()` whenever a check depends on text width. Gallery
+stories get there with `gallery::open_story(cx, story, state, theme)` (it applies the state's
+hover, press or focus). The same dump comes from a running instance: build with
+`--features dev`, then `--dump <file>` (written half a second after start) or F12 (writes
+`layout-dump.txt` in `HERMES_RS_HOME`). One line per element, indented under its parent:
+
+```
+# window 160x60  pointer 65,28
+story  0,0 130x56 bg=#ffffffff fg=#0a0a0aff hovered
+  button  12,12 106x32 bg=#e5e5e580 hovered label="Save changes"
+    label/caption  23,19 84x17.5 fg=#0a0a0aff text_w=83.4 hovered
+```
+
+`bg` is the element's own solid background (its computed style, else the topmost painted quad of
+exactly its bounds, which is how a Kit button's is read), `fg` the text colour its content gets
+(probed elements only), `hovered` the pointer over its hitbox. `cargo test -p hermes-native --lib
+the_dump -- --nocapture` prints this one.
+
+**2. Snapshots (images, no tokens unless something changed).** Each story registered in
+`crates/native/src/gallery/mod.rs` (`register_stories!`) is rendered off-screen in each of its
+states, in Kit's light and dark theme, cropped to the story's element, states side by side, and
+compared with `crates/native/snapshots/<story>-<light|dark>.png` (a pixel counts as changed when a
+channel moves by more than 8). On a difference the test writes `<name>.actual.png` and
+`<name>.diff.png` (changed pixels red over the faded baseline) to `target/claude/snapshots/` and
+fails; a story with no baseline writes only `.actual.png`. Images are at scale 2 (the test
+window's). Run alone: `cargo test -p hermes-native --features snapshots`.
+
+To accept: look at (or have a subagent look at) the `.actual.png`, then `check.ps1 -Update` (or
+`UPDATE_SNAPSHOTS=1` on the cargo command) and commit the changed files in
+`crates/native/snapshots/` with the change that caused them; the reviewer sees them in the diff.
+
+**3. A subagent reviews the images.** Images never enter the orchestrating session. When
+`check.ps1` lists diff or new images, a Haiku subagent opens only those (`.diff.png` first, then the
+`.actual.png` beside it) and writes one verdict per image under the checkpoint in the progress note:
+"expected: <what changed and why>" or "unexpected: <what is wrong, where>" (e.g. "state 3: focus
+ring missing", "dark: label clipped on the right"). The reviewer reads verdicts, and opens an image
+only for an "unexpected" one. Full-window captures of our own instance are for the end of a phase.
+
+**The gallery** (`hermes-native-gallery.exe`, `cargo run -p hermes-native --bin
+hermes-native-gallery`): every story in every state, with GPUI Kit / Zed One and light / dark
+switches, for a person to judge hover, press and focus by hand (the user's checklist).
+
 ## Before you commit
 
 ```powershell

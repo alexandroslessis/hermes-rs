@@ -38,6 +38,12 @@ see `crates/native/Cargo.toml`). The workspace's `[patch.crates-io]` for `async-
 `gpui-pre-scheduler` too, so GPUI Kit's GPUI runs on Zed's async-task fork while `crates/app`
 exists.
 
+`crates/native` also depends directly on **`gpui-pre-wgpu` =0.3.12** (the same snapshot, already
+in the lock through GPUI Kit), only under its `snapshots` feature, for the off-screen renderer the
+snapshot tests use on Windows (`gpui-pre-platform` wires it on Linux only; docs/PITFALLS.md,
+*Native UI*). Its `wgpu-hal` needs `gpu-allocator` built against `windows` 0.62; that entry in
+`Cargo.lock` was set by hand (CP0.2).
+
 ## Hermes Agent
 
 Commit `c419cf7c864ac0ee511dbd9f7091a8bba0b567ee` from https://github.com/NousResearch/hermes-agent

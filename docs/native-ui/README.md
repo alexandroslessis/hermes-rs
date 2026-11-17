@@ -202,10 +202,11 @@ subagent.
 6. **The user's checklist** at the end of each checkpoint, for what only a person can judge (feel
    of hover, scrolling, animation).
 
-How images are made is CP0.2's first question: GPUI on Windows renders through DirectX into a
-window, so either GPUI Kit's test support renders off-screen, or the harness opens a window of its
-own instance off-screen and captures it (`PrintWindow` / Windows Graphics Capture). Never the user's
-window.
+How images are made (decided in CP0.2): **off-screen, no window.** GPUI's test platform renders
+through `gpui-pre-wgpu`'s headless renderer (Vulkan or DirectX 12), with the real DirectWrite text
+system; GPUI Kit's own image tests skip Windows only because GPUI wires that renderer on Linux.
+The harness crops each story to its element. Never the user's window, and no `PrintWindow`
+fallback was needed. How to run and read the checks: [docs/TESTING.md](../TESTING.md) §6.
 
 ## Effort
 
@@ -222,5 +223,5 @@ with the Tauri app, plus the `hermes_core` extraction (a refactor of about 10,00
 | Windows-specific GPUI bugs (IME, DPI changes, custom title bar, focus) | CP0.1 spike covers IME and DPI; title bar in CP2.2 |
 | Selecting text across several messages | Not built in GPUI: selection works within a message; copy buttons per message and per thread. Revisit only if the user needs it |
 | Terminal emulator is large | Its own checkpoint (CP6.3); the drawer can ship later than the rest |
-| Off-screen rendering for snapshots | CP0.2 decides; fallback: capture of our own on-screen instance |
+| Off-screen rendering for snapshots | Works (CP0.2: wgpu headless renderer on Windows); fallback if a GPUI update breaks it: capture of our own on-screen instance |
 | `hermes_core` extraction breaks the page or ACP | Pure refactor: `gateway/rpc_table_tests.rs`, the ACP tests and the live checks must stay green at every checkpoint |

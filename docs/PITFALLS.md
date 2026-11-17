@@ -169,6 +169,51 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **Native dialogs** (folder pick, save as) come through patches 0002/0008 and the window bridge;
   the browser's own pickers don't give paths.
 
+## Native UI (`crates/native`, GPUI Kit; [docs/native-ui/](native-ui/README.md))
+
+- **Debug builds overflowed the main thread's 1 MB stack** before the first frame ("thread 'main'
+  has overflowed its stack"). `crates/native/build.rs` links the binaries with an 8 MB stack, as
+  Zed does. Tests were unaffected (test threads have their own stacks).
+- **`#[gpui_kit::test]` and a glob import:** `use gpui_kit::*` (directly or through `use
+  super::*`) brings GPUI's `test` attribute, which shadows the built-in `#[test]` the macro expands
+  to ("recursion limit reached while expanding `#[test]`"). Test modules import
+  `core::prelude::v1::test` explicitly, or write `#[core::prelude::v1::test]`.
+- **Headless means fake text on Windows.** `gpui_kit::platform::current_platform(true)` is
+  `WindowsPlatform::new(headless)`, whose text system is GPUI's `NoopTextSystem` (fixed advances,
+  no glyphs), and `TestAppContext` (`#[gpui_kit::test]`) uses the same fake. Layout of text is
+  then wrong and nothing is drawn. For real DirectWrite, take the text system of
+  `current_platform(false)` (`testing::text_system()`; no window is opened) and build a
+  `HeadlessAppContext` with it (`testing::headless_app()`).
+- **Off-screen rendering on Windows** goes through `gpui-pre-wgpu`'s `WgpuHeadlessRenderer`
+  (Vulkan or DirectX 12; it picked the NVIDIA card over Vulkan here). `gpui-pre-platform`'s
+  `current_headless_renderer()` returns `None` on Windows and GPUI Kit's own `rendering` tests
+  skip Windows, but the wgpu renderer builds and renders there; `crates/native` depends on it
+  directly under the `snapshots` feature. GPUI's test windows have a scale factor of 2 and
+  `render_to_image` sizes the image by the platform window's factor, so don't change only
+  `Window::set_scale_factor` (the scene and the image would disagree).
+- **`gpu-allocator` and `windows` in `Cargo.lock`.** `wgpu-hal` 30 (DX12 backend) needs
+  `gpu-allocator` built against `windows` 0.62, but the lock had resolved `gpu-allocator 0.28`
+  (which accepts 0.53–0.62) to `windows 0.57`, and `wgpu-hal` failed to compile with mismatched
+  `ID3D12Heap` types. `cargo update -p gpu-allocator` picks 0.58 and touches unrelated packages;
+  the lock's `gpu-allocator` entry was edited to `windows 0.62.2` by hand (CP0.2). Keep it there
+  on a lock refresh.
+- **GPUI Kit's resizable panels shift space onto the far pane.** In `h_resizable`, dragging a
+  border into a pane past that pane's minimum takes the rest from the pane beyond it (dragging the
+  right border left shrank the sidebar), the shrinking branch never clamps the growing pane to its
+  maximum, and every panel has `flex-grow: 1`, so the excess a capped pane can't take went to the
+  other growing panes: the left pane grew when the right border was dragged too far (the user's
+  CP0.1 report). `resizable_panel().fixed()` on the side panes (they then neither grow nor give
+  space to another border's drag) plus a `size_range` minimum on the middle pane fixes it
+  (`spike.rs`, test `dragging_a_border_past_its_limit_leaves_the_other_side_pane_alone`). Phase 2's
+  frame does the same, or uses `resize_handle` on its own sidebar.
+- **Kit's `ElementSnapshot::focused()` panics** when an element can take focus but no focus
+  binding was observed (its way of flagging `.test_support()` placed after `.track_focus()`). The
+  dump reads focus without panicking; a disabled Kit `Button` tracks no focus at all (`None`).
+- **A Kit button's background is several quads.** Its border is painted as further quads of the
+  same bounds with a transparent fill, on top of the background quad; the dump takes the topmost
+  quad of the element's bounds *with a visible fill*. Kit's hover and active fills are
+  semi-transparent (`#e5e5e580` in the light theme): compare colours as painted, not as opaque.
+
 ## Protocol and page behaviour
 
 - **-32601 / 404 hide features.** If you answer a method with something half-right, the page shows

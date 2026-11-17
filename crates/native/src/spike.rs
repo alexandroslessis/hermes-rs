@@ -7,7 +7,7 @@
 use std::{rc::Rc, time::Duration};
 
 use gpui_kit::component::{
-    ActiveTheme as _, Theme, ThemeMode, ThemeRegistry,
+    ActiveTheme as _,
     button::{Button, ButtonVariants as _},
     h_resizable,
     input::{Textarea, TextareaState},
@@ -18,8 +18,9 @@ use gpui_kit::component::{
 use gpui_kit::{prelude::FluentBuilder as _, *};
 
 use crate::{
+    dev::ProbeExt as _,
     fake::{self, Message, Role},
-    zed_theme,
+    themes::{ThemeChoice, apply_theme},
 };
 
 /// Messages in the fake conversation.
@@ -29,9 +30,8 @@ const STREAM_INTERVAL: Duration = Duration::from_millis(60);
 const WORDS_PER_TICK: usize = 3;
 /// After this many words the streamed message is finished and a new one starts below it.
 const WORDS_PER_MESSAGE: usize = 240;
-
-/// The Zed theme file the spike maps by hand (`assets/themes/one/one.json`, Zed's One theme).
-const ONE_THEME: &str = include_str!("../../../assets/themes/one/one.json");
+/// The narrowest the middle pane gets when a border is dragged into it.
+const MAIN_MIN_WIDTH: f32 = 320.;
 
 /// The spike's root view.
 pub struct Spike {
@@ -184,6 +184,7 @@ impl Spike {
                             .child(format!("Fake thread {ix}"))
                     })),
             )
+            .probe()
     }
 
     fn render_main(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -210,6 +211,7 @@ impl Spike {
                     .border_color(theme.border)
                     .child(Textarea::new(&self.composer)),
             )
+            .probe()
     }
 
     fn render_right(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -251,6 +253,7 @@ impl Spike {
                         cx.notify();
                     })),
             )
+            .probe()
     }
 }
 
@@ -261,19 +264,31 @@ impl Render for Spike {
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
+            // The side panes are `fixed`: GPUI Kit's drag lets the pane beyond the dragged border's
+            // neighbour give up space (dragging the right border past the middle pane's minimum
+            // shrank the sidebar), and lets the right pane's stored size run past its maximum, so
+            // flex-grow handed the excess to every growing pane, the sidebar included. Fixed panes
+            // neither grow nor give space to another border's drag; the middle pane takes the
+            // rest (docs/PITFALLS.md, *Native UI*).
             .child(
                 h_resizable("panes")
                     .child(
                         resizable_panel()
                             .size(px(240.))
                             .size_range(px(160.)..px(420.))
+                            .fixed()
                             .child(self.render_sidebar(cx)),
                     )
-                    .child(resizable_panel().child(self.render_main(cx)))
+                    .child(
+                        resizable_panel()
+                            .size_range(px(MAIN_MIN_WIDTH)..Pixels::MAX)
+                            .child(self.render_main(cx)),
+                    )
                     .child(
                         resizable_panel()
                             .size(px(300.))
                             .size_range(px(200.)..px(520.))
+                            .fixed()
                             .child(self.render_right(cx)),
                     ),
             )
@@ -327,67 +342,6 @@ fn render_row(
                 .child(body),
         )
         .into_any_element()
-}
-
-/// The themes the right panel offers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ThemeChoice {
-    /// GPUI Kit's default dark theme.
-    DefaultDark,
-    /// GPUI Kit's default light theme.
-    DefaultLight,
-    /// Zed's One Dark, mapped by [`zed_theme::kit_theme`].
-    OneDark,
-    /// Zed's One Light, mapped by [`zed_theme::kit_theme`].
-    OneLight,
-}
-
-impl ThemeChoice {
-    const ALL: [ThemeChoice; 4] = [
-        Self::DefaultDark,
-        Self::DefaultLight,
-        Self::OneDark,
-        Self::OneLight,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::DefaultDark => "Default dark",
-            Self::DefaultLight => "Default light",
-            Self::OneDark => "One Dark",
-            Self::OneLight => "One Light",
-        }
-    }
-}
-
-/// Switches the whole app to `choice`.
-pub fn apply_theme(choice: ThemeChoice, cx: &mut App) {
-    let zed_name = match choice {
-        ThemeChoice::OneDark => Some("One Dark"),
-        ThemeChoice::OneLight => Some("One Light"),
-        _ => None,
-    };
-    if let Some(name) = zed_name {
-        match zed_theme::kit_theme(ONE_THEME, name) {
-            Ok(config) => Theme::update(cx, |theme| theme.apply_config(&Rc::new(config))),
-            Err(error) => eprintln!("theme {name}: {error:#}"),
-        }
-        return;
-    }
-    // Put GPUI Kit's own themes back before switching mode, or the mode keeps the Zed colours.
-    let registry = ThemeRegistry::global(cx);
-    let light = registry.default_light_theme().clone();
-    let dark = registry.default_dark_theme().clone();
-    Theme::update(cx, |theme| {
-        theme.light_theme = light;
-        theme.dark_theme = dark;
-    });
-    let mode = if choice == ThemeChoice::DefaultLight {
-        ThemeMode::Light
-    } else {
-        ThemeMode::Dark
-    };
-    Theme::change(mode, None, cx);
 }
 
 #[cfg(test)]
@@ -640,6 +594,63 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// The user's report on CP0.1: dragging the right pane's border far to the left grew the
+    /// LEFT pane and squeezed the middle one. Each border is dragged well past its limits here;
+    /// only the two panes beside it may change, within their size ranges.
+    #[gpui_kit::test]
+    fn dragging_a_border_past_its_limit_leaves_the_other_side_pane_alone(cx: &mut TestAppContext) {
+        use crate::testing::Layout;
+
+        let (_spike, mut cx) = open(cx);
+        let widths = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                window.render_frame(cx);
+                let layout = Layout::of(window);
+                let mut check = layout.check();
+                check
+                    .same_row("sidebar", "main")
+                    .same_row("main", "right-panel")
+                    .no_overflow("sidebar")
+                    .no_overflow("main")
+                    .no_overflow("right-panel");
+                check.assert();
+                let w = |name| layout.bounds(name).size.width.as_f32();
+                (w("sidebar"), w("main"), w("right-panel"), layout)
+            })
+        };
+        let (sidebar, _, right, _) = widths(&mut cx);
+        assert_eq!((sidebar, right), (240., 300.), "the starting sizes");
+
+        // The right pane's border, far to the left.
+        let border = |cx: &mut VisualTestContext, name: &str| {
+            cx.update(|window, _| {
+                let b = Layout::of(window).bounds(name);
+                point(b.origin.x, b.center().y)
+            })
+        };
+        let from = border(&mut cx, "right-panel");
+        cx.update(|window, cx| window.drag(from, point(from.x - px(900.), from.y), cx));
+        let (sidebar, main, right, layout) = widths(&mut cx);
+        let mut check = layout.check();
+        check
+            .width_within("sidebar", 240., 240.)
+            .width_within("right-panel", 200., 520.)
+            .width_within("main", MAIN_MIN_WIDTH, 1200.);
+        check.assert();
+        assert_eq!(sidebar + main + right, 1200., "the panes fill the window");
+
+        // The sidebar's border, far to the right.
+        let from = border(&mut cx, "main");
+        cx.update(|window, cx| window.drag(from, point(from.x + px(900.), from.y), cx));
+        let (_, _, right_after, layout) = widths(&mut cx);
+        let mut check = layout.check();
+        check
+            .width_within("sidebar", 160., 420.)
+            .width_within("main", MAIN_MIN_WIDTH, 1200.);
+        check.assert();
+        assert_eq!(right_after, right, "the right pane kept its width");
     }
 
     fn drag(cx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>) {

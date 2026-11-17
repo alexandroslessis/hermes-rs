@@ -6,17 +6,20 @@
 //! - `--no-stream`: don't start the timer that streams text into the last message (idle memory).
 //! - `--quit-after <seconds>`: quit on its own after that long.
 //! - `--theme <dark|light|one-dark|one-light>`: the theme to start with (default `dark`).
+//! - `--dump <file>` (with `--features dev`): write the element dump once the window has drawn
+//!   (`docs/TESTING.md`, *Native UI*). With `--features dev`, F12 writes it to `layout-dump.txt`
+//!   in `HERMES_RS_HOME`.
 //!
 //! It prints `first-frame-ms=<n>` on stderr once the first frame has been drawn, counted from
 //! the start of `main` (the process's own start-up before `main` is not included).
 
-mod fake;
-mod spike;
-mod zed_theme;
-
 use std::time::{Duration, Instant};
 
 use gpui_kit::*;
+use hermes_native::{
+    spike,
+    themes::{ThemeChoice, apply_theme},
+};
 
 fn main() {
     let started = Instant::now();
@@ -35,15 +38,18 @@ fn main() {
         .and_then(|ix| args.get(ix + 1))
         .map(String::as_str)
     {
-        Some("light") => spike::ThemeChoice::DefaultLight,
-        Some("one-dark") => spike::ThemeChoice::OneDark,
-        Some("one-light") => spike::ThemeChoice::OneLight,
-        _ => spike::ThemeChoice::DefaultDark,
+        Some("light") => ThemeChoice::DefaultLight,
+        Some("one-dark") => ThemeChoice::OneDark,
+        Some("one-light") => ThemeChoice::OneLight,
+        _ => ThemeChoice::DefaultDark,
     };
+    let dump = hermes_native::dev::dump_flag(&args);
 
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
-        spike::apply_theme(theme, cx);
+        #[cfg(feature = "dev")]
+        hermes_native::dev::install(cx);
+        apply_theme(theme, cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -69,10 +75,13 @@ fn main() {
                 cx.new(|cx| spike::Spike::new(stream, window, cx))
             },
         );
-        if let Err(error) = opened {
-            eprintln!("could not open the window: {error:#}");
-            cx.quit();
-            return;
+        match opened {
+            Ok((window, _)) => hermes_native::dev::start_dump(dump, window, cx),
+            Err(error) => {
+                eprintln!("could not open the window: {error:#}");
+                cx.quit();
+                return;
+            }
         }
 
         if let Some(after) = quit_after {
