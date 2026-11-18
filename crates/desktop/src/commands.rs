@@ -154,18 +154,8 @@ pub fn exec(runtime: &Runtime, command: &str) -> Option<Value> {
     dispatch(runtime, name, argument.trim())
 }
 
-/// The command a stored message was typed as (`/name instruction`) when it loads a skill or a
-/// bundle; `None` for an ordinary message. The transcript and titles show the command.
-pub fn typed_command(text: &str) -> Option<String> {
-    use hermes_prompts::{coding, review};
-    let (command, argument) = hermes_tools::describe_bundle_invocation(text)
-        .or_else(|| hermes_tools::skills::describe_invocation(text))
-        // The coding commands send a prompt of their own (`coding_command`).
-        .or_else(|| coding::plan_request(text).map(|task| ("plan".to_string(), task)))
-        .or_else(|| coding::init_request(text).map(|notes| ("init".to_string(), notes)))
-        .or_else(|| review::learn_request(text).map(|request| ("learn".to_string(), request)))?;
-    Some(format!("/{command} {argument}").trim_end().to_string())
-}
+/// What a typed message was as a command (`hermes_core::commands`: the transcript reads it).
+pub use hermes_core::commands::{review_instructions, typed_command};
 
 /// `/plan`, `/init`, `/learn`: Hermes's `send` dispatch, a prompt the page sends as a normal turn
 /// (the agent does the work with its own tools), shown as the command typed. `/review` sends
@@ -190,12 +180,6 @@ pub fn coding_command(
         .trim_end()
         .to_string();
     Some(json!({"type": "send", "message": message, "display": display}))
-}
-
-/// The instructions of a `/review [instructions]` message, `None` for another message.
-pub fn review_instructions(text: &str) -> Option<&str> {
-    let rest = text.trim_start().strip_prefix("/review")?;
-    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
 }
 
 #[cfg(test)]

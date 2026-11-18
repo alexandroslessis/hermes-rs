@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use hermes_desktop::{acp, gateway, hub, server, terminal, wants_git_bash};
+use hermes_desktop::{acp, gateway, server, terminal, wants_git_bash};
 use hermes_runtime::{Runtime, RuntimeConfig};
 use tauri::{WebviewUrl, WebviewWindowBuilder};
 
@@ -49,6 +49,13 @@ fn main() -> Result<()> {
         .build()?;
     let mut config = config?;
     let data_dir = config.data_dir.clone();
+    // One app per data folder (`hermes_core::lock`): a second one says so and exits before it
+    // opens a window. Held until the process ends (Tauri's `run` never returns). The ACP agent
+    // doesn't take it: it runs beside this app.
+    let _app_lock = match hermes_core::AppLock::acquire(&data_dir) {
+        Ok(lock) => lock,
+        Err(error) => already_open(&error.to_string()),
+    };
     // The terminal tool runs PowerShell, Windows' own shell; `terminal.shell: "bash"` in
     // desktop-config.json keeps Git Bash (when installed) instead.
     if !wants_git_bash(&data_dir) {
@@ -93,21 +100,19 @@ fn main() -> Result<()> {
         let exit_ledger = exit_ledger.clone();
         let exit_runtime = exit_runtime.clone();
         tokio.spawn(async move {
+            let handle = tokio::runtime::Handle::current();
             let built = tokio::task::spawn_blocking(move || -> Result<server::ServerState> {
-                // The runtime asks the user (approvals, clarify) through the page following the
-                // session.
-                let hub = Arc::new(hub::Hub::default());
-                let runtime = Arc::new(Runtime::new(
-                    config,
-                    Arc::new(hub::DesktopBridge { hub: hub.clone() }),
-                )?);
+                // The core asks the user (approvals, clarify) through the page following the
+                // session (the gateway's hub).
+                let core = hermes_core::Core::new(config, handle)?;
+                let runtime = core.runtime().clone();
                 runtime.warm_up();
                 let _ = exit_ledger.set(runtime.ledger().clone());
                 let _ = exit_runtime.set(runtime.clone());
                 Ok(server::ServerState {
                     dist: webapp_dist(),
                     gateway: {
-                        let gateway = Arc::new(gateway::Gateway::new(runtime, hub, data_dir));
+                        let gateway = Arc::new(gateway::Gateway::new(core));
                         gateway::Gateway::schedule(&gateway);
                         gateway
                     },
@@ -269,6 +274,17 @@ fn init_logging(data_dir: Option<&std::path::Path>) {
             .init(),
         None => builder.init(),
     }
+}
+
+/// Another Hermes app holds the data folder: say so and quit (nothing was started yet).
+fn already_open(message: &str) -> ! {
+    tracing::warn!("not starting: {message}");
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Info)
+        .set_title("Hermes")
+        .set_description(message)
+        .show();
+    std::process::exit(1)
 }
 
 /// The backend couldn't start (its data folder unreadable, the database locked by a newer

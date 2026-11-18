@@ -1,54 +1,26 @@
-//! The sidebar's Projects view (`projects.tree`; Hermes's `tui_gateway/project_tree.py`): the
-//! user's projects first (from the shared store, the GPUI app's too), each owning the sessions
-//! whose folder lies in one of its folders; then one automatic project per git repository the
-//! other sessions ran in; and a "Home" bucket, first, for the rest. A repository shows as one lane
-//! (Hermes splits lanes by branch and worktree; hermes-rs records neither per session).
+//! The sidebar's Projects view as Hermes's page reads it (`projects.tree`, `ProjectRecord`). The
+//! grouping (projects, automatic repositories, Home) is `hermes_core::projects`; this is its JSON
+//! over the sidebar's session rows.
+//!
+//! Hermes: `tui_gateway/project_tree.py` (`build_tree`, `_project_node`, the field names).
 
-use std::collections::HashMap;
-use std::path::Path;
-
-use hermes_store::{Project, project_for_path};
+use hermes_core::projects::{LANE_LABEL, Node, NodeKind, Repo, RepoKind, TreeRow, base_name};
+use hermes_store::Project;
 use serde_json::{Value, json};
 
-/// Hermes's synthetic bucket for sessions no project claims.
-pub const NO_PROJECT_ID: &str = "__no_project__";
-const NO_PROJECT_LABEL: &str = "Home";
-/// The lane a repository's sessions sit in (`DEFAULT_BRANCH_LABEL`).
-const LANE_LABEL: &str = "main";
+pub use hermes_core::projects::NO_PROJECT_ID;
 
-fn base_name(path: &str) -> String {
-    path.trim_end_matches(['/', '\\'])
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(path)
-        .to_string()
-}
+/// A sidebar row (`session_row`) as the tree reads it.
+struct Row<'a>(&'a Value);
 
-/// A path's identity for grouping (Hermes's `_path_key`): its segments, split on either slash,
-/// case-folded, without a trailing slash. Windows spells one folder `C:\a\b`, `C:/a/b` or
-/// `c:\a\b\` depending on who recorded it (the folder dialog, the page, a terminal); compared as
-/// text they were different folders, and a project showed its folder twice.
-fn path_key(path: &str) -> String {
-    path.split(['/', '\\'])
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_lowercase)
-        .collect::<Vec<_>>()
-        .join("/")
-}
+impl TreeRow for Row<'_> {
+    fn cwd(&self) -> &str {
+        self.0["cwd"].as_str().unwrap_or_default()
+    }
 
-/// The git repository a folder is in (the nearest folder holding `.git`), if any.
-fn git_root(cwd: &str) -> Option<String> {
-    Path::new(cwd)
-        .ancestors()
-        .find(|dir| dir.join(".git").exists())
-        .map(|root| root.display().to_string())
-}
-
-fn last_active(sessions: &[&Value]) -> f64 {
-    sessions
-        .iter()
-        .filter_map(|s| s["last_active"].as_f64())
-        .fold(0.0, f64::max)
+    fn last_active(&self) -> Option<f64> {
+        self.0["last_active"].as_f64()
+    }
 }
 
 /// A project as `projects.list` / `projects.create` describe it (`ProjectRecord`).
@@ -68,48 +40,22 @@ pub fn record(project: &Project) -> Value {
     })
 }
 
-/// `repo → lane → sessions` for one project's sessions, plus a repo for each declared folder no
-/// session covers (so an empty project still shows its folders). `hydrate` false leaves the lanes'
-/// session lists empty but keeps the counts (`_build_repos`, `_seed_folder_repos`).
-fn repos(
-    sessions: &[&Value],
-    folders: &[String],
-    hydrate: bool,
-    roots: &mut HashMap<String, Option<String>>,
-) -> Vec<Value> {
-    let mut order: Vec<String> = Vec::new();
-    let mut by_root: HashMap<String, (bool, Vec<&Value>)> = HashMap::new();
-    for session in sessions {
-        let cwd = session["cwd"].as_str().unwrap_or_default().to_string();
-        let git = roots
-            .entry(cwd.clone())
-            .or_insert_with(|| git_root(&cwd))
-            .clone();
-        let (root, is_git) = match git {
-            Some(root) => (root, true),
-            None => (cwd, false),
-        };
-        let key = path_key(&root);
-        if !by_root.contains_key(&key) {
-            order.push(root.clone());
-        }
-        by_root
-            .entry(key)
-            .or_insert((is_git, Vec::new()))
-            .1
-            .push(session);
-    }
-    let mut out: Vec<Value> = order
-        .iter()
-        .map(|root| {
-            let (is_git, rows) = &by_root[&path_key(root)];
-            let mut rows = rows.clone();
-            rows.sort_by(|a, b| b["last_active"].as_f64().partial_cmp(&a["last_active"].as_f64()).unwrap_or(std::cmp::Ordering::Equal));
+fn rows(rows: &[&Row<'_>]) -> Vec<Value> {
+    rows.iter().map(|row| row.0.clone()).collect()
+}
+
+/// One repository entry (`_build_repos`, `_seed_folder_repos`); `hydrate` false leaves the lanes'
+/// session lists empty but keeps the counts.
+fn repo(repo: &Repo<'_, Row<'_>>, hydrate: bool) -> Value {
+    let sessions = |list: &[&Row<'_>]| if hydrate { rows(list) } else { Vec::new() };
+    match repo.kind {
+        RepoKind::Lane { is_git } => {
+            let root = repo.root.as_deref().unwrap_or_default();
             json!({
                 "id": root,
-                "label": base_name(root),
+                "label": repo.label,
                 "path": root,
-                "sessionCount": rows.len(),
+                "sessionCount": repo.sessions.len(),
                 "groups": [{
                     "id": format!("{root}::branch::{LANE_LABEL}"),
                     "label": LANE_LABEL,
@@ -117,60 +63,48 @@ fn repos(
                     "isMain": true,
                     "isKanban": false,
                     "isGit": is_git,
-                    "sessions": if hydrate { rows.into_iter().cloned().collect() } else { Vec::new() },
+                    "sessions": sessions(&repo.sessions),
                 }],
             })
-        })
-        .collect();
-    for folder in folders {
-        let root =
-            git_root(folder).unwrap_or_else(|| folder.trim_end_matches(['/', '\\']).to_string());
-        if !out.iter().any(|repo| {
-            repo["id"]
-                .as_str()
-                .is_some_and(|id| path_key(id) == path_key(&root))
-        }) {
-            out.push(json!({"id": root, "label": base_name(&root), "path": root, "groups": [], "sessionCount": 0}));
         }
+        RepoKind::Folder => {
+            let root = repo.root.as_deref().unwrap_or_default();
+            json!({"id": root, "label": repo.label, "path": root, "groups": [], "sessionCount": 0})
+        }
+        RepoKind::Home => json!({
+            "id": NO_PROJECT_ID,
+            "label": repo.label,
+            "path": null,
+            "sessionCount": repo.sessions.len(),
+            "groups": [{
+                "id": NO_PROJECT_ID,
+                "label": repo.label,
+                "path": null,
+                "isMain": false,
+                "isKanban": false,
+                "sessions": sessions(&repo.sessions),
+            }],
+        }),
     }
-    out
 }
 
 /// One project node (`_project_node`).
-#[allow(clippy::too_many_arguments)]
-fn node(
-    id: &str,
-    label: &str,
-    path: Option<&str>,
-    repos: Vec<Value>,
-    sessions: &[&Value],
-    preview_limit: usize,
-    is_auto: bool,
-    is_no_project: bool,
-) -> Value {
-    let mut previews = sessions.to_vec();
-    previews.sort_by(|a, b| {
-        b["last_active"]
-            .as_f64()
-            .partial_cmp(&a["last_active"].as_f64())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    previews.truncate(preview_limit);
+fn node(node: &Node<'_, Row<'_>>, preview_limit: usize, hydrate: bool) -> Value {
     json!({
-        "id": id,
-        "label": label,
-        "path": path,
+        "id": node.id,
+        "label": node.label,
+        "path": node.path,
         "color": null,
         "icon": null,
-        "isAuto": is_auto,
-        "isNoProject": is_no_project,
-        "sessionCount": sessions.len(),
-        "lastActive": last_active(sessions),
+        "isAuto": node.kind == NodeKind::Auto,
+        "isNoProject": node.kind == NodeKind::NoProject,
+        "sessionCount": node.sessions.len(),
+        "lastActive": node.last_active(),
         "totalTokens": 0,
         "totalCostUsd": 0,
-        "repos": repos,
-        "previewSessions": previews,
-        "sessionIds": sessions.iter().filter_map(|s| s["id"].as_str()).collect::<Vec<_>>(),
+        "repos": node.repos.iter().map(|r| repo(r, hydrate)).collect::<Vec<_>>(),
+        "previewSessions": rows(&node.previews(preview_limit)),
+        "sessionIds": node.sessions.iter().filter_map(|s| s.0["id"].as_str()).collect::<Vec<_>>(),
     })
 }
 
@@ -181,109 +115,15 @@ pub fn tree(
     preview_limit: usize,
     hydrate: bool,
 ) -> Value {
-    let mut roots: HashMap<String, Option<String>> = HashMap::new();
-    let mut owned: HashMap<&str, Vec<&Value>> = HashMap::new();
-    let mut unowned: Vec<&Value> = Vec::new();
-    for session in sessions {
-        match project_for_path(projects, session["cwd"].as_str().unwrap_or_default()) {
-            Some(project) => owned.entry(project.id.as_str()).or_default().push(session),
-            None => unowned.push(session),
-        }
-    }
-    let mut result = Vec::new();
-    let mut scoped: Vec<Value> = Vec::new();
-    // The user's projects, shown even without sessions.
-    for project in projects {
-        let rows = owned.remove(project.id.as_str()).unwrap_or_default();
-        scoped.extend(rows.iter().map(|s| s["id"].clone()));
-        let repos = repos(&rows, &project.folders, hydrate, &mut roots);
-        result.push(node(
-            &project.id,
-            &project.name,
-            project.primary_folder(),
-            repos,
-            &rows,
-            preview_limit,
-            false,
-            false,
-        ));
-    }
-    // Automatic projects: the git repositories the other sessions ran in.
-    let mut auto_order: Vec<String> = Vec::new();
-    let mut auto: HashMap<String, Vec<&Value>> = HashMap::new();
-    let mut homeless: Vec<&Value> = Vec::new();
-    for session in unowned {
-        let cwd = session["cwd"].as_str().unwrap_or_default().to_string();
-        match roots
-            .entry(cwd.clone())
-            .or_insert_with(|| git_root(&cwd))
-            .clone()
-        {
-            Some(root) => {
-                // One project per folder however it's spelled; shown as first seen.
-                let key = path_key(&root);
-                if !auto.contains_key(&key) {
-                    auto_order.push(root.clone());
-                }
-                auto.entry(key).or_default().push(session);
-            }
-            None => homeless.push(session),
-        }
-    }
-    for root in auto_order {
-        let rows = &auto[&path_key(&root)];
-        scoped.extend(rows.iter().map(|s| s["id"].clone()));
-        let repos = repos(rows, &[], hydrate, &mut roots);
-        result.push(node(
-            &root,
-            &base_name(&root),
-            Some(&root),
-            repos,
-            rows,
-            preview_limit,
-            true,
-            false,
-        ));
-    }
-    // Home leads the list when anything is left for it.
-    if !homeless.is_empty() {
-        scoped.extend(homeless.iter().map(|s| s["id"].clone()));
-        let mut lane_rows = homeless.clone();
-        lane_rows.sort_by(|a, b| {
-            b["last_active"]
-                .as_f64()
-                .partial_cmp(&a["last_active"].as_f64())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let home_repo = json!({
-            "id": NO_PROJECT_ID,
-            "label": NO_PROJECT_LABEL,
-            "path": null,
-            "sessionCount": homeless.len(),
-            "groups": [{
-                "id": NO_PROJECT_ID,
-                "label": NO_PROJECT_LABEL,
-                "path": null,
-                "isMain": false,
-                "isKanban": false,
-                "sessions": if hydrate { lane_rows.into_iter().cloned().collect() } else { Vec::new() },
-            }],
-        });
-        result.insert(
-            0,
-            node(
-                NO_PROJECT_ID,
-                NO_PROJECT_LABEL,
-                None,
-                vec![home_repo],
-                &homeless,
-                preview_limit,
-                false,
-                true,
-            ),
-        );
-    }
-    json!({"projects": result, "scoped_session_ids": scoped})
+    let wrapped: Vec<Row<'_>> = sessions.iter().map(Row).collect();
+    let built = hermes_core::projects::tree(projects, &wrapped);
+    let nodes: Vec<Value> = built
+        .nodes
+        .iter()
+        .map(|n| node(n, preview_limit, hydrate))
+        .collect();
+    let scoped: Vec<Value> = built.scoped.iter().map(|s| s.0["id"].clone()).collect();
+    json!({"projects": nodes, "scoped_session_ids": scoped})
 }
 
 #[cfg(test)]
@@ -291,12 +131,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sessions_go_to_their_project_then_their_repository_then_home() {
+    fn the_tree_is_hermess_shape() {
         let repo = env!("CARGO_MANIFEST_DIR");
-        let elsewhere =
-            std::env::temp_dir().join(format!("hermes-no-repo-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        let elsewhere = elsewhere.display().to_string();
+        let elsewhere = hermes_testdir::tempdir().unwrap();
+        let elsewhere = elsewhere.path().display().to_string();
         let project = Project {
             id: "prj_1".into(),
             name: "Mine".into(),
@@ -311,48 +149,24 @@ mod tests {
         let tree = tree(&[project], &sessions, 3, false);
         let projects = tree["projects"].as_array().unwrap();
         assert_eq!(projects[0]["id"], NO_PROJECT_ID);
+        assert_eq!(projects[0]["isNoProject"], true);
         assert_eq!(projects[0]["sessionIds"], json!(["c"]));
+        assert_eq!(projects[0]["repos"][0]["groups"][0]["sessions"], json!([]));
         assert_eq!(projects[1]["label"], "Mine");
         assert_eq!(projects[1]["sessionIds"], json!(["a"]));
-        // The declared folder shows as a repo, the session's folder under it doesn't add one.
-        assert_eq!(projects[1]["repos"].as_array().unwrap().len(), 2);
+        assert_eq!(projects[1]["previewSessions"][0]["id"], "a");
+        // The declared folder shows as a repo with no lanes.
+        assert_eq!(projects[1]["repos"][1]["groups"], json!([]));
+        assert_eq!(projects[1]["repos"][1]["sessionCount"], 0);
         assert_eq!(projects[2]["isAuto"], true);
         assert_eq!(projects[2]["sessionIds"], json!(["b"]));
         assert_eq!(projects[2]["repos"][0]["groups"][0]["isGit"], true);
-        let _ = std::fs::remove_dir_all(&elsewhere);
-    }
-
-    #[test]
-    fn one_folder_is_one_entry_however_it_is_spelled() {
-        // A declared folder with backslashes; sessions recorded with slashes, other case, a
-        // trailing separator: one repo with all of them, not one per spelling.
-        let project = Project {
-            id: "prj_1".into(),
-            name: "Mine".into(),
-            folders: vec![r"C:\work\mine".into()],
-            created_at: 1,
-        };
-        let sessions = vec![
-            json!({"id": "a", "cwd": "C:/work/mine", "last_active": 2.0}),
-            json!({"id": "b", "cwd": r"c:\Work\Mine\", "last_active": 1.0}),
-        ];
-        let built = tree(&[project], &sessions, 3, true);
-        let mine = &built["projects"][0];
-        assert_eq!(mine["label"], "Mine");
-        let repos = mine["repos"].as_array().unwrap();
-        assert_eq!(repos.len(), 1, "{repos:#?}");
-        assert_eq!(repos[0]["sessionCount"], 2);
-
-        // An automatic project (this repository) reached with both kinds of slashes.
-        let repo = env!("CARGO_MANIFEST_DIR");
-        let sessions = vec![
-            json!({"id": "c", "cwd": repo.replace('\\', "/"), "last_active": 2.0}),
-            json!({"id": "d", "cwd": repo.replace('/', r"\"), "last_active": 1.0}),
-        ];
-        let built = tree(&[], &sessions, 3, true);
-        let projects = built["projects"].as_array().unwrap();
-        assert_eq!(projects.len(), 1, "{projects:#?}");
-        assert_eq!(projects[0]["repos"].as_array().unwrap().len(), 1);
-        assert_eq!(projects[0]["sessionCount"], 2);
+        assert_eq!(tree["scoped_session_ids"], json!(["a", "b", "c"]));
+        // Hydrated, a lane lists its rows as given.
+        let one = super::tree(&[], &sessions[2..], 3, true);
+        assert_eq!(
+            one["projects"][0]["repos"][0]["groups"][0]["sessions"][0]["id"],
+            "c"
+        );
     }
 }

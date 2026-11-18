@@ -3,47 +3,17 @@
 //! changes, and a ref's commit. Each runs system `git` without a window, a prompt or stdin; a folder
 //! that isn't a repository reads as `None`.
 
-use std::os::windows::process::CommandExt as _;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
-pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) use hermes_core::git::{CREATE_NO_WINDOW, git, git_line};
 /// The changed-file list's cap (Hermes's `files[:200]`).
 const FILE_CAP: usize = 200;
 /// Untracked files whose lines are counted (`_UNTRACKED_SCAN_CAP`), and the size past which one
 /// counts as 0 (`_UNTRACKED_LINE_MAX_BYTES`).
 const UNTRACKED_SCAN_CAP: usize = 500;
 const UNTRACKED_LINE_MAX_BYTES: u64 = 1024 * 1024;
-
-/// `(succeeded, stdout)` of `git args` in `cwd`.
-pub(crate) fn git(cwd: &Path, args: &[&str]) -> (bool, String) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    match output {
-        Ok(output) => (
-            output.status.success(),
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-        ),
-        Err(_) => (false, String::new()),
-    }
-}
-
-pub(crate) fn git_line(cwd: &Path, args: &[&str]) -> String {
-    let (ok, out) = git(cwd, args);
-    if ok {
-        out.trim().to_string()
-    } else {
-        String::new()
-    }
-}
 
 /// `git rev-parse <ref>` (HEAD by default): the commit, or `None` outside a repository.
 pub fn rev_parse(cwd: &Path, reference: Option<&str>) -> Option<String> {

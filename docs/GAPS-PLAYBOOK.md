@@ -145,7 +145,7 @@ reviewer subagent's model: the delegator would need a per-child provider).
 
 ## 3.3 Archive / hide sessions and 3.4 Settings ▸ Sessions — ✅ done 2026-11-05
 
-Built as `crates/desktop/src/archive.rs` (+ `scripts/perf/archive-check.mjs`): PATCH `archived`
+Built as `crates/desktop/src/archive.rs` (now `crates/core/src/archive.rs`) (+ `scripts/perf/archive-check.mjs`): PATCH `archived`
 and `session.mutate` `archive` set it, `/api/profiles/sessions?archived=exclude|only|include`
 filters, the project tree leaves archived sessions out, the opt-in sweep (`sessions.auto_archive`,
 `auto_archive_days`) runs hourly at most once a day, and a swept session returns when used.

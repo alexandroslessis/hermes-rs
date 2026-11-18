@@ -4,7 +4,8 @@
 //! `canonical-protocol.ts`). The stored cwd is replaced, never merged, with the new folder's git
 //! identity beside it (the sidebar groups by the row's cwd/git identity); the page refuses a
 //! move while a turn runs. The store's schema (shared with the GPUI app) has no git columns, so
-//! the identity lives in the data folder's `session-workspaces.json`.
+//! the identity lives in the data folder's `session-workspaces.json`. The folder arrives resolved
+//! (the page's spellings, `~` and `file:` links, are the gateway's to read: `files::resolve`).
 //!
 //! Hermes: `gateway/session_mutation_policy.py` (`prepare_workspace` — the folder probe),
 //! `hermes_state_mutation_prepared.py` (`workspace_in_transaction` — the store move, which
@@ -28,6 +29,10 @@ pub enum MoveError {
     InvalidFolder(String),
     /// The store write failed.
     Store(String),
+    /// A turn is running in the session: it moves once idle.
+    Busy,
+    /// The move's thread stopped (a panic): nothing is known about the result.
+    Stopped(String),
 }
 
 /// Per-session git identity (the branch checked out in the session's cwd and the repo root that
@@ -118,14 +123,13 @@ fn to_git_slashes(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// The folder a move lands in: `~` and `file:` links resolved, through its real location so the
-/// stored spelling is one the page's cache compares equal (Hermes's `abspath(expanduser(...))`).
-fn resolve_folder(requested: &str) -> Result<PathBuf, MoveError> {
-    let folder = crate::files::resolve(requested, None);
+/// The folder a move lands in, through its real location so the stored spelling is one the page's
+/// cache compares equal (Hermes's `abspath(expanduser(...))`).
+fn resolve_folder(folder: &Path) -> Result<PathBuf, MoveError> {
     if !folder.is_dir() {
         return Err(MoveError::InvalidFolder(folder.display().to_string()));
     }
-    Ok(real_location(&folder))
+    Ok(real_location(folder))
 }
 
 /// `canonicalize` without the `\\?\` prefix (the same spelling `git_review.rs` compares paths
@@ -147,7 +151,7 @@ pub fn move_session(
     store: &hermes_store::Store,
     workspaces: &Workspaces,
     id: &str,
-    requested: &str,
+    requested: &Path,
 ) -> Result<(String, Option<String>, Option<String>), MoveError> {
     let folder = resolve_folder(requested)?;
     // The probe first: a non-repo folder answers a null identity without touching the store.
@@ -230,7 +234,7 @@ mod tests {
         let (repo_dir, repo_path) = repo();
         let repo_root = repo_path.replace('\\', "/");
         let (cwd, branch, root) =
-            move_session(&store, &workspaces, &id, &repo_path).expect("moved");
+            move_session(&store, &workspaces, &id, Path::new(&repo_path)).expect("moved");
         assert_eq!(cwd, repo_path);
         assert_eq!(branch.as_deref(), Some("feature"));
         assert_eq!(root.as_deref(), Some(repo_root.as_str()));
@@ -240,7 +244,7 @@ mod tests {
         );
         assert_eq!(
             workspaces.identity(&id),
-            Some((Some("feature".to_string()), Some(repo_root.clone())))
+            Some((Some("feature".to_string()), Some(repo_root)))
         );
         drop(repo_dir);
     }
@@ -256,7 +260,7 @@ mod tests {
         let plain = hermes_testdir::tempdir().expect("tempdir");
         let plain_path = dunce(plain.path());
         let (cwd, branch, root) =
-            move_session(&store, &workspaces, &id, &plain_path).expect("moved");
+            move_session(&store, &workspaces, &id, Path::new(&plain_path)).expect("moved");
         assert_eq!(cwd, plain_path);
         assert_eq!(branch, None);
         assert_eq!(root, None);
@@ -273,7 +277,7 @@ mod tests {
         let id = session_in(&store, "C:\\was\\here");
 
         let missing = data.path().join("no-such-folder");
-        match move_session(&store, &workspaces, &id, &missing.display().to_string()) {
+        match move_session(&store, &workspaces, &id, &missing) {
             Err(MoveError::InvalidFolder(_)) => {}
             other => panic!("expected an invalid folder, got {other:?}"),
         }

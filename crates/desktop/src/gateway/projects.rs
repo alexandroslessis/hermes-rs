@@ -16,12 +16,7 @@ impl Gateway {
     pub(super) async fn projects_tree(self: &Arc<Self>, p: ProjectsTree) -> Reply {
         let preview = p.preview_limit;
         let (projects, rows) = self
-            .blocking(|g| {
-                (
-                    g.runtime.store().list_projects().unwrap_or_default(),
-                    g.session_rows(),
-                )
-            })
+            .blocking(|g| (g.core.projects(), g.session_rows()))
             .await?;
         // The tree lists counts; one project's sessions come hydrated.
         let single = p.project_id.clone();
@@ -49,14 +44,9 @@ impl Gateway {
     }
 
     pub(super) async fn projects_create(self: &Arc<Self>, p: ProjectsCreate) -> Reply {
-        let name = p.name;
-        let mut folders = p.folders;
-        if let Some(primary) = p.primary_path.filter(|p| !p.is_empty()) {
-            folders.retain(|f| f != &primary);
-            folders.insert(0, primary);
-        }
+        let (name, folders, primary) = (p.name, p.folders, p.primary_path);
         let project = self
-            .blocking(move |g| g.runtime.store().create_project(&name, &folders))
+            .blocking(move |g| g.core.create_project(&name, folders, primary))
             .await?
             .map_err(RpcError::failed)?;
         if p.activate {
@@ -70,43 +60,23 @@ impl Gateway {
     pub(super) async fn projects_update(self: &Arc<Self>, p: ProjectsEdit) -> Reply {
         let id = p.id.as_str();
         let wanted = id.to_string();
-        let mut project = self
-            .blocking(move |g| {
-                g.runtime
-                    .store()
-                    .list_projects()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|p| p.id == wanted)
-            })
+        let edit = hermes_core::projects::ProjectEdit {
+            name: p.name.clone(),
+            folder: p.path.clone(),
+            primary: p.is_primary,
+        };
+        let project = self
+            .blocking(move |g| g.core.update_project(&wanted, edit))
             .await?
+            .map_err(RpcError::failed)?
             .ok_or(RpcError::server(format!("No project {id}")))?;
-        if let Some(name) = p.name.as_deref() {
-            project.name = name.trim().to_string();
-        }
-        if let Some(path) = p.path.as_deref() {
-            project.folders.retain(|f| f != path);
-            if p.is_primary {
-                project.folders.insert(0, path.to_string());
-            } else {
-                project.folders.push(path.to_string());
-            }
-        }
-        let changed = project.clone();
-        self.blocking(move |g| {
-            g.runtime
-                .store()
-                .update_project(&changed.id, &changed.name, &changed.folders)
-        })
-        .await?
-        .map_err(RpcError::failed)?;
         Ok(json!({"project": crate::projects::record(&project)}))
     }
 
     pub(super) async fn projects_delete(self: &Arc<Self>, p: ProjectId) -> Reply {
         let id = p.id.as_str();
         let gone = id.to_string();
-        self.blocking(move |g| g.runtime.store().delete_project(&gone))
+        self.blocking(move |g| g.core.delete_project(&gone))
             .await?
             .map_err(RpcError::failed)?;
         if self.rest.config_value("projects.active_id") == id {
@@ -127,10 +97,8 @@ impl Gateway {
     /// `projects.list`: the user's projects and the active one.
     pub(super) fn project_list(&self) -> Value {
         let projects: Vec<Value> = self
-            .runtime
-            .store()
-            .list_projects()
-            .unwrap_or_default()
+            .core
+            .projects()
             .iter()
             .map(crate::projects::record)
             .collect();

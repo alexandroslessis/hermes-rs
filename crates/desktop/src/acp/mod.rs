@@ -20,7 +20,7 @@ mod translate;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use hermes_runtime::{Runtime, RuntimeConfig};
+use hermes_runtime::RuntimeConfig;
 
 /// The log: stderr (which the editor keeps) and `logs\acp.log` in the data folder; a log past
 /// 5 MB moves to `acp.log.1` at startup. `RUST_LOG` filters it (default `info`).
@@ -81,21 +81,15 @@ pub fn run() -> Result<()> {
         .enable_all()
         .build()?;
     tokio.block_on(async move {
+        let handle = tokio::runtime::Handle::current();
         let gateway =
             tokio::task::spawn_blocking(move || -> Result<Arc<crate::gateway::Gateway>> {
-                // Approvals and questions go through the gateway's hub, which `AcpServer` reads.
-                let hub = Arc::new(crate::hub::Hub::default());
-                let runtime = Arc::new(
-                    Runtime::new(
-                        config,
-                        Arc::new(crate::hub::DesktopBridge { hub: hub.clone() }),
-                    )
-                    .context("opening the data folder")?,
-                );
-                runtime.warm_up();
-                let gateway = Arc::new(crate::gateway::Gateway::new_for_acp(
-                    runtime, hub, data_dir,
-                ));
+                // Approvals and questions reach `AcpServer` as the gateway's events (the hub).
+                // No app lock (`hermes_core::lock`): this runs beside the desktop app.
+                let core =
+                    hermes_core::Core::new(config, handle).context("opening the data folder")?;
+                core.runtime().warm_up();
+                let gateway = Arc::new(crate::gateway::Gateway::new_for_acp(core));
                 // A thread's background review uses its provider as a turn would (Phase 7).
                 crate::gateway::Gateway::install_review_route(&gateway);
                 Ok(gateway)

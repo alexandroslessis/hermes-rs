@@ -231,6 +231,25 @@ Git review and git reads (`git_review.rs`, `git.rs`), files (`files.rs`, `open_f
 `gateway/slash.rs` minus the shapes), export (`export.rs`), background processes and subagents
 (`gateway/delegation.rs`).
 
+**Carried over from CP1.1 (reviewed 2026-11-18; do these first, and implement them with Opus:
+it is CP1.1's concurrency work).** CP1.1 left the turn in the gateway (progress note, "What stayed
+and why"). Phases 4 and 5 cannot start without:
+
+1. **Turns in core:** `Core::submit(session, SubmitTurn { text, images, ... }) -> Started | Queued`
+   with a typed queue (list, remove, steer, redirect), the turn's event loop (`gateway/turn.rs`
+   `submit` / `run_queued`, the title, the heartbeat) running in core and publishing the stream
+   events itself, plus `TurnStarted` and a `TurnEnded` carrying the persisted rows and the error
+   text. Today only the gateway's loop publishes the stream: a front end with a `Core` and no
+   `Gateway` sees no `TextDelta` at all. The gateway keeps the admission gate, `message.start`,
+   `session.info` and `message.complete` as frames built from those events (the queue items keep
+   the page's params beside the typed fields, or `PageState::queue` becomes typed).
+2. **`/` command dispatch from Rust:** `Core::run_command(session, command, args) -> outcome`
+   (what `gateway/slash.rs` does minus its JSON), with the catalog above.
+
+Done for these: the RPC-table fixture unchanged, `queue-check`, `stop-check`, `coding-commands-check`
+green, and a core test that submits, queues behind a running turn and cancels against the mock
+provider with no `Gateway`.
+
 ### CP1.3 — Settings and Hermes features (M)
 
 Providers and endpoints (`providers.rs`, `endpoints.rs`), auxiliary models, fallbacks, profiles

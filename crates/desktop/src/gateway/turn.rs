@@ -108,7 +108,7 @@ impl Gateway {
         } else {
             p.answer
         };
-        if self.hub.answer(prompt_id, answer) {
+        if self.core.answer(prompt_id, answer) {
             Ok(json!({"resolved": 1}))
         } else {
             Err(RpcError::server(format!("No pending {kind} request")))
@@ -119,19 +119,23 @@ impl Gateway {
     pub(super) fn approval_pending(&self, p: SessionRef) -> Reply {
         let id = p.id()?;
         let approvals: Vec<Value> = self
-            .hub
-            .open_prompts(&id)
+            .core
+            .open_questions(&id)
             .into_iter()
-            .filter(|prompt| prompt["kind"] == "approval")
-            .map(|prompt| {
-                json!({
-                    "request_id": prompt["prompt_id"],
-                    "command": prompt["command"],
-                    "description": prompt["description"],
-                    "choices": prompt["choices"],
+            .filter_map(|question| match question.ask {
+                hermes_core::Ask::Approval {
+                    command,
+                    description,
+                    choices,
+                } => Some(json!({
+                    "request_id": question.prompt_id,
+                    "command": command,
+                    "description": description,
+                    "choices": choices,
                     "allow_permanent": true,
                     "allow_session": true,
-                })
+                })),
+                hermes_core::Ask::Clarify { .. } => None,
             })
             .collect();
         Ok(json!({"approvals": approvals}))
@@ -200,17 +204,15 @@ impl Gateway {
         }
         self.subscribe(&id, outbox);
         self.enqueue(&id, json!({"text": text, "shown": true}), true);
-        self.runtime.cancel(&id);
-        self.hub.cancel_session(&id);
+        // The turn stops and its open questions close (an approval is denied).
+        self.core.stop(&id);
         Ok(json!({"status": "redirected", "session_id": id, "text": text}))
     }
 
     pub(super) fn session_interrupt(&self, p: SessionRef) -> Reply {
         let id = p.id()?;
-        let running = self.runtime.is_running(&id);
+        let running = self.core.stop(&id);
         tracing::info!("stop requested in {id} (a turn was running: {running})");
-        self.runtime.cancel(&id);
-        self.hub.cancel_session(&id);
         Ok(json!({
             "status": if running { "interrupted" } else { "not_interrupted" },
             "interrupted": running,
@@ -369,7 +371,7 @@ impl Gateway {
         };
         let admission_id = admission_id(params).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         // A session the idle sweep archived is back in use: back in the sidebar too.
-        self.archive.reopened(&id);
+        self.core.reopened(&id);
         if self.runtime.is_running(&id) {
             // A rewind can't wait behind the turn: the page interrupts and retries on "busy".
             if params["confirm_truncate"] == true {
@@ -459,11 +461,7 @@ impl Gateway {
             };
             if !title.is_empty() {
                 let _ = self.runtime.store().set_title(&id, &title);
-                self.emit(
-                    &id,
-                    "session.title",
-                    json!({"session_id": id, "title": title}),
-                );
+                self.core.announce_title(&id, &title);
             }
         }
         let provider = settings
@@ -533,7 +531,7 @@ impl Gateway {
             if let Some(started) = started {
                 let _ = started.await;
             }
-            let mut stream = transcript::TurnStream::default();
+            let mut stream = hermes_core::stream::TurnStream::new(&id);
             // message.start first: for a queued prompt it names the admission, and the page turns
             // that queue card into the user's bubble (patches/0001) before the session.info below
             // (whose `pending` no longer lists the prompt) retires the card. The page holds the
@@ -615,85 +613,31 @@ impl Gateway {
                         {
                             this.emit(&id, "session.usage", json!({"usage": snapshot}));
                         }
+                        this.core.publish(hermes_core::CoreEvent::Usage {
+                            session_id: id.clone(),
+                            input_tokens: usage.usage.input_tokens.map(i64::from),
+                            output_tokens: usage.usage.output_tokens.map(i64::from),
+                        });
                     }
                     // A subagent's activity: the page's live subagent rows.
                     RuntimeEvent::Agent(AgentEvent::Subagent { kind, payload }) => {
                         this.emit(&id, kind, payload);
                     }
-                    // A status line for the transcript: the page keeps `fallback` ones as a system
-                    // line (Phase 6 uses it for "ran after reading untrusted content").
-                    RuntimeEvent::Agent(AgentEvent::Status { kind, text }) => {
-                        this.emit(&id, "status.update", json!({"kind": kind, "text": text}));
-                    }
-                    // Live progress from inside a running tool call (the terminal's output
-                    // tail): the running row shows the message beside its timer, and the
-                    // clicked-open row renders it as its output while the call works
-                    // (patches/0017). The payload is the contract's ToolProgressPayload.
-                    RuntimeEvent::Agent(AgentEvent::ToolProgress {
-                        tool_call_id,
-                        name,
-                        progress,
-                        message,
-                    }) => {
-                        this.emit(
-                            &id,
-                            "tool.progress",
-                            json!({
-                                "tool_id": tool_call_id,
-                                "name": name,
-                                "progress": progress,
-                                "total": Value::Null,
-                                "percent": Value::Null,
-                                "message": message,
-                            }),
-                        );
-                    }
-                    // Compression before a model call can take minutes on a local model; the
-                    // page shows its "summarizing" indicator for the `compacting` /
-                    // `compacted` pair, else the turn looks hung (Hermes:
-                    // `tui_gateway/server.py` `_status_update`, `agent/conversation_compression.py`).
-                    RuntimeEvent::Agent(AgentEvent::Compacting) => {
-                        this.emit(
-                            &id,
-                            "status.update",
-                            json!({"kind": "compacting", "text": COMPACTING_TEXT}),
-                        );
-                    }
-                    RuntimeEvent::Agent(AgentEvent::Compacted { .. }) => {
-                        this.emit(
-                            &id,
-                            "status.update",
-                            json!({"kind": "compacted", "text": COMPACTED_TEXT}),
-                        );
-                    }
-                    RuntimeEvent::Agent(AgentEvent::CompactionFailed(error)) => {
-                        let text = match error {
-                            Some(error) => format!(
-                                "Context compression failed ({error}); continuing with the full conversation."
-                            ),
-                            None => {
-                                "Context compression couldn't shorten the conversation; continuing."
-                                    .to_string()
-                            }
-                        };
-                        this.emit(
-                            &id,
-                            "status.update",
-                            json!({"kind": "compacted", "text": text}),
-                        );
-                    }
+                    // The reply, reasoning, tool calls and status lines (a fallback, a taint
+                    // warning, compression, which can take minutes on a local model): the core's
+                    // stream events, which the hub sends as the page's frames.
                     RuntimeEvent::Agent(event) => {
                         if matches!(&event, AgentEvent::Message(m) if m.is_tool_response()) {
                             call_started = std::time::Instant::now();
                         }
-                        for (name, payload) in stream.agent_event(event) {
-                            this.emit(&id, name, payload);
+                        for event in stream.agent_event(event) {
+                            this.core.publish(event);
                         }
                     }
                     // The provider's daily request quota is nearly used up (our own notice: the page
                     // shows `status.update` kinds it knows and ignores the rest; CP2.3 adds the display).
                     RuntimeEvent::Notice(text) => {
-                        this.emit(&id, "status.update", json!({"kind": "quota", "text": text}));
+                        this.core.publish(stream.notice(text));
                     }
                     // A steer the turn ended before reading: it runs next, as Hermes does.
                     RuntimeEvent::SteerUndelivered(text) => {
@@ -706,6 +650,7 @@ impl Gateway {
                             .await;
                     }
                     RuntimeEvent::TurnFinished(status) => {
+                        let ended = status.clone();
                         let (mut status, mut error) = match status {
                             TurnStatus::Completed => ("complete", None),
                             TurnStatus::Cancelled => ("interrupted", None),
@@ -763,6 +708,10 @@ impl Gateway {
                             .blocking(move |g| g.usage_snapshot(&session, last_input))
                             .await
                             .unwrap_or(Value::Null);
+                        this.core.publish(hermes_core::CoreEvent::TurnEnded {
+                            session_id: id.clone(),
+                            status: ended,
+                        });
                         this.emit(
                             &id,
                             "message.complete",
@@ -907,11 +856,7 @@ impl Gateway {
                 let _ = self
                     .blocking(move |g| g.runtime.store().set_title(&session, &new_title))
                     .await;
-                self.emit(
-                    id,
-                    "session.title",
-                    json!({"session_id": id, "title": title}),
-                );
+                self.core.announce_title(id, &title);
                 let session = id.to_string();
                 if let Ok(info) = self.blocking(move |g| g.session_info(&session)).await {
                     self.emit(id, "session.info", info);

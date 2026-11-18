@@ -159,7 +159,9 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **Zoom:** CSS zoom misplaces Radix popovers (they open at the wrong place, clipped). Zoom is
   WebView2's native zoom through the window bridge (patch 0010).
 - **localStorage is per origin**: the port must be stable (`DEFAULT_PORT` 47731) or the page loses
-  its local settings. A second instance gets a random port and empty local settings, by design.
+  its local settings. A second instance on another data folder (`HERMES_RS_HOME`, the perf
+  instance) gets a random port and empty local settings, by design; a second one on the same data
+  folder says "Hermes is already open" and exits (`hermes_core::lock`, native UI CP1.1).
 - **The page uses a HashRouter.** Navigate with `location.hash = '#/settings'`; `pushState` does
   nothing.
 - **The page sees this backend as a remote gateway** (`isRemoteGateway()` is true in the
@@ -1562,6 +1564,31 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   `pub(super)`. The moved code starts with `use super::*;` (it reads as it did in one file). `Gateway::blocking` and
   `rest_blocking` (CP13c) are in `mod.rs` / `rest.rs`; the off-worker rules did not change.
 - **`scripts/contract.mjs` reads `gateway/rpc.rs`** (`rename = "<method>"`) to say which contract methods are served.
+
+## `hermes_core` (native UI Phase 1, `crates/core`)
+
+- **Two kinds of event delivery.** `Core::subscribe()` is a channel (the native UI); a `Listener`
+  (`Core::listen`) is called in the publisher's thread, in order (the gateway's `Hub`). The page's
+  frames must keep their order with the ones the gateway sends itself (`message.start` before the
+  first `message.delta`, `approval.settled` before the next `tool.complete`), so the hub is a
+  listener, not a subscriber. A listener never blocks and never publishes from `deliver`.
+- **A question counts as asked only if a listener showed it** (`publish` returns `true`). The hub
+  shows a session's events only when a socket follows it, so an approval in a session nobody has
+  open is denied at once, as before. A `subscribe()` channel shows everything while its receiver
+  lives: a front end that subscribes and never answers holds approvals open until the turn is
+  stopped.
+- **The app lock is per data folder** (`<data>/app.lock`, held open with no sharing like
+  `turnlock`). The ACP agent does not take it (it runs beside the desktop app); the native app
+  must take it before it opens its window (when it starts using a `Core`, Phase 3). Tests and the
+  perf instance use their own data folders, so they never meet the user's app.
+- **The gateway still runs the turn's loop and queue** (`gateway/turn.rs`) after CP1.1: it publishes
+  the core's stream events and builds `message.complete` / `session.info` itself. A new stream
+  event goes in `hermes_core::stream` and its frame in `hub.rs`. Until that loop moves (CP1.2), a
+  front end that builds a `Core` without a `Gateway` gets no stream events at all: nothing else
+  publishes them.
+- **A question's waiting future cleans up after itself.** If the turn drops it (its cancel token
+  fires without `Core::stop`, an editor closes the thread), the open question is removed and
+  `Settled` published, so `is_waiting` and `session.resume`'s `prompts` never show a dead card.
 
 ## The model catalog (Phase 14, `crates/llm/src/canonical/`)
 

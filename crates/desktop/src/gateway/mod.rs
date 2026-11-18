@@ -69,13 +69,10 @@ pub const EXECUTION_GENERATION: u64 = 0;
 /// in the data folder.
 const GENERATION_FILE: &str = "generation-stats.json";
 
-/// Hermes's compaction status lines (`agent/conversation_compression.py` `COMPACTION_STATUS`,
-/// `COMPACTION_DONE_STATUS`).
-const COMPACTING_TEXT: &str =
-    "🗜️ Compacting context — summarizing earlier conversation so I can continue...";
-const COMPACTED_TEXT: &str = "✓ Context compaction complete — continuing turn...";
-
 pub struct Gateway {
+    /// The application layer (`hermes_core`): sessions, questions, events, the side files.
+    pub core: Arc<hermes_core::Core>,
+    /// `core`'s runtime.
     pub runtime: Arc<Runtime>,
     pub rest: crate::rest::Rest,
     /// Background actions the page follows by name (the curator's run).
@@ -83,7 +80,7 @@ pub struct Gateway {
     data_dir: PathBuf,
     /// Changes when the process restarts, so reconnecting clients reset their replay state.
     replay_epoch: String,
-    /// Event routes and open questions, shared with the runtime's bridge.
+    /// Which socket follows which session; the core's events as the page's frames.
     hub: Arc<Hub>,
     /// Admission id → the started turn waiting for its `prompt.submit` reply to go out first.
     starts: std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
@@ -94,35 +91,33 @@ pub struct Gateway {
     generation: std::sync::Mutex<std::collections::HashMap<String, (u64, f64)>>,
     /// File ticket → the file it opens (download links and media elements).
     file_tickets: std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
-    /// Branch → the session it was branched from (`branch.rs`).
-    branches: crate::branch::Links,
-    /// Session id → the git identity of its workspace (`workspace.rs`), kept beside the store.
-    workspaces: std::sync::Arc<crate::workspace::Workspaces>,
-    /// A branch request's idempotency key → the branch it made (a retried request gets it again).
-    branch_keys: std::sync::Mutex<std::collections::HashMap<String, String>>,
-    /// Archived sessions and the auto-archive sweep (`archive.rs`).
-    archive: crate::archive::Archive,
     /// Each page socket and the session it shows now (its last `session.resume` or
     /// `session.create`): opening another one is "switched away from" the first (Phase 7).
     viewing: std::sync::Mutex<Vec<(Outbox, String)>>,
 }
 
 impl Gateway {
-    pub fn new(runtime: Arc<Runtime>, hub: Arc<Hub>, data_dir: PathBuf) -> Self {
-        Self::build(runtime, hub, data_dir, true)
+    pub fn new(core: Arc<hermes_core::Core>) -> Self {
+        Self::build(core, true)
     }
 
     /// The gateway the `--acp` process (`acp/`) talks to: the same, without the background jobs
     /// (the curator, the auto-archive sweep). The desktop app, which may run at the same time on
     /// the same data folder, owns those.
-    pub fn new_for_acp(runtime: Arc<Runtime>, hub: Arc<Hub>, data_dir: PathBuf) -> Self {
-        Self::build(runtime, hub, data_dir, false)
+    pub fn new_for_acp(core: Arc<hermes_core::Core>) -> Self {
+        Self::build(core, false)
     }
 
-    fn build(runtime: Arc<Runtime>, hub: Arc<Hub>, data_dir: PathBuf, background: bool) -> Self {
+    fn build(core: Arc<hermes_core::Core>, background: bool) -> Self {
+        let data_dir = core.data_dir().to_path_buf();
         let data_dir_for_stats = data_dir.clone();
+        // Every event the core publishes reaches the page through the hub, in order with the
+        // gateway's own frames.
+        let hub = Arc::new(Hub::default());
+        core.listen(hub.clone());
         let gateway = Self {
-            runtime,
+            runtime: core.runtime().clone(),
+            core,
             rest: crate::rest::Rest::new(data_dir.clone()),
             actions: Default::default(),
             data_dir,
@@ -131,12 +126,6 @@ impl Gateway {
             starts: Default::default(),
             context_lengths: Default::default(),
             file_tickets: Default::default(),
-            branches: crate::branch::Links::load(&data_dir_for_stats),
-            workspaces: std::sync::Arc::new(crate::workspace::Workspaces::load(
-                &data_dir_for_stats,
-            )),
-            archive: crate::archive::Archive::load(&data_dir_for_stats),
-            branch_keys: Default::default(),
             viewing: Default::default(),
             generation: std::sync::Mutex::new(
                 std::fs::read(data_dir_for_stats.join(GENERATION_FILE))

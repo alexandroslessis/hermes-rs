@@ -4692,6 +4692,7 @@ dependencies = [
  "dirs 7.0.0",
  "futures",
  "hermes_agent",
+ "hermes_core",
  "hermes_llm",
  "hermes_memory",
  "hermes_prompts",
@@ -4788,6 +4789,28 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-futures",
+ "uuid",
+]
+
+[[package]]
+name = "hermes_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "hermes_agent",
+ "hermes_llm",
+ "hermes_prompts",
+ "hermes_runtime",
+ "hermes_store",
+ "hermes_testdir",
+ "hermes_tools",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
