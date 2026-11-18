@@ -37,26 +37,7 @@ pub fn query_param(query: Option<&str>, name: &str) -> Option<String> {
     })
 }
 
-pub fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => out.push(b' '),
-            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&text[i + 1..i + 3], 16) {
-                Ok(byte) => {
-                    out.push(byte);
-                    i += 2;
-                }
-                Err(_) => out.push(b'%'),
-            },
-            byte => out.push(byte),
-        }
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
+pub use hermes_core::files::percent_decode;
 
 /// Our built-in desktop plugin (`plugins/hermes-rs/plugin.js`).
 const BUILTIN_PLUGIN: &str = include_str!("../plugins/hermes-rs/plugin.js");

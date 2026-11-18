@@ -11,8 +11,11 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 async-trait.workspace = true
 chrono = { workspace = true, features = ["clock"] }
+dirs.workspace = true
+portable-pty = "0.9"
 hermes_agent.workspace = true
 hermes_llm.workspace = true
 hermes_prompts.workspace = true
@@ -28,3 +31,4 @@ uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 hermes_testdir.workspace = true
+wiremock = "0.6"

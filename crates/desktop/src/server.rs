@@ -294,7 +294,9 @@ async fn host_terminal(
     let cols = crate::terminal::dimension(param("cols").as_deref(), 80, 1000);
     let rows = crate::terminal::dimension(param("rows").as_deref(), 24, 500);
     let terminals = state.terminals.clone();
-    upgrade.on_upgrade(move |socket| terminals.serve(socket, attach, action, cols, rows, cwd))
+    upgrade.on_upgrade(move |socket| {
+        crate::terminal::serve(terminals, socket, attach, action, cols, rows, cwd)
+    })
 }
 
 /// `POST /api/chat/file-upload` (multipart, field `file`): a file the composer attaches

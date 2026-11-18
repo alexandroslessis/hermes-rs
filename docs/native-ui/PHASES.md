@@ -250,6 +250,15 @@ Done for these: the RPC-table fixture unchanged, `queue-check`, `stop-check`, `c
 green, and a core test that submits, queues behind a running turn and cancels against the mock
 provider with no `Gateway`.
 
+**Status (CP1.2 implementer, 2026-11-18):** both done. `hermes_core::turns` (`Core::submit`,
+`SubmitTurn`, the typed queue: `queue`, `remove_queued`, `steer_queued`, `replace_queued`,
+`redirect`; the loop with title and heartbeat; `TurnStarted`, `TurnEnded { end: TurnEnd }`,
+`QueueChanged`, `Idle`, `Subagent` events). The page's frames that need the store come from the
+gateway's `TurnHooks` (`gateway/turn.rs` `PageTurn`), not from the events (a listener must not
+block). `Core::run_command` / `dispatch_command` with the catalog in `hermes_core::commands`; what
+needs Settings (context windows, a session's provider, `/import-hermes`) is a `CommandEnv` until
+CP1.3. Tests: `crates/core/src/turns/tests.rs`. Details and doubts: `progress/phase-1.md`, CP1.2.
+
 ### CP1.3 — Settings and Hermes features (M)
 
 Providers and endpoints (`providers.rs`, `endpoints.rs`), auxiliary models, fallbacks, profiles

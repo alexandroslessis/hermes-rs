@@ -1,10 +1,21 @@
 //! The prompt and the turn it starts: `prompt.submit` and the queue behind a running turn,
 //! steering, redirecting, stopping, the page's answers to approval and clarify cards, and the
 //! side questions (`/btw`) and background prompts (`/bg`). Hermes: `tui_gateway/methods_prompt.py`.
+//!
+//! The turn itself (submit, the queue, the turn's loop, the title) is `hermes_core::turns`; the
+//! stream's frames come from the core's events through the hub. What stays here is the page's
+//! side: the params as a `SubmitTurn`, the admission receipt and its gate, and [`PageTurn`], the
+//! turn's hooks that send the frames needing the store (`session.info` with the queue panel's
+//! rows, `session.usage`, `message.complete`).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use hermes_agent::events::AgentEvent;
+use hermes_core::turns::{
+    Outcome, SteerQueued, SubmitError, SubmitTurn, Submitted, Truncate, TurnEnd, TurnHooks,
+    TurnSettings,
+};
+use hermes_store::SessionRecord;
 use serde_json::{Value, json};
 
 use super::rpc::{QueueRef, Reply, Respond, RpcError, SessionRef, SessionSteer, SessionText};
@@ -29,9 +40,28 @@ impl Gateway {
         {
             self.model_facts(&record.provider, &record.model).await;
         }
-        let (s, o) = (settings.clone(), outbox.clone());
-        self.blocking(move |g| g.clone().submit(&params, &s, &o, true))
-            .await?
+        let id = session_id(&params)?;
+        let turn = submit_turn(&params);
+        let hooks = PageTurn::new(self, Some(outbox.clone()), Some(settings.clone()));
+        let session = id.clone();
+        let submitted = self
+            .blocking(move |g| g.core.submit(&session, turn, hooks))
+            .await?;
+        // The canonical protocol's admission receipt: which session took the prompt, under the
+        // id the page gave this send (it drops its optimistic bubble on any other id or status).
+        match submitted {
+            Ok(Submitted::Started { admission_id }) => Ok(json!({
+                "status": "started",
+                "admission_id": admission_id,
+                "ref": {"session_id": id},
+            })),
+            Ok(Submitted::Queued { admission_id }) => Ok(json!({
+                "status": "queued",
+                "admission_id": admission_id,
+                "ref": {"session_id": id},
+            })),
+            Err(error) => Err(submit_error(error)),
+        }
     }
 
     /// `/btw`: a side question about the conversation, answered as `btw.complete`.
@@ -144,7 +174,7 @@ impl Gateway {
     pub(super) fn session_steer(&self, p: SessionSteer) -> Reply {
         let id = p.session.id()?;
         let text = p.text;
-        if self.runtime.steer(&id, &text) {
+        if self.core.steer(&id, &text) {
             Ok(json!({"status": "queued", "session_id": id, "text": text}))
         } else {
             Ok(json!({"status": "rejected", "session_id": id, "text": text}))
@@ -153,40 +183,39 @@ impl Gateway {
 
     /// The queue panel: delete a queued prompt, steer it into the running turn, or edit it
     /// (the edit goes to the back, as a new admission).
-    pub(super) fn prompt_cancel(&self, p: QueueRef) -> Reply {
+    pub(super) fn prompt_cancel(self: &Arc<Self>, p: QueueRef) -> Reply {
         let id = p.session.id()?;
         let admission = p.admission_id.as_str();
-        let cancelled = self.dequeue(&id, admission).is_some();
+        let hooks = PageTurn::new(self, None, None);
+        let cancelled = self.core.remove_queued(&id, admission, &*hooks).is_some();
         Ok(json!({"cancelled": cancelled, "admission_id": admission, "session_id": id}))
     }
 
-    pub(super) fn prompt_steer_queued(&self, p: QueueRef) -> Reply {
+    pub(super) fn prompt_steer_queued(self: &Arc<Self>, p: QueueRef) -> Reply {
         let id = p.session.id()?;
         let admission = p.admission_id.as_str();
-        if !self.runtime.is_running(&id) {
-            return Err(RpcError::server("session_idle"));
+        let hooks = PageTurn::new(self, None, None);
+        match self.core.steer_queued(&id, admission, &*hooks) {
+            Ok(()) => Ok(json!({"status": "steered", "admission_id": admission, "session_id": id})),
+            Err(SteerQueued::Idle) => Err(RpcError::server("session_idle")),
+            Err(SteerQueued::Started) => Err(RpcError::server("admission_started")),
         }
-        let queued = self
-            .dequeue(&id, admission)
-            .ok_or(RpcError::server("admission_started"))?;
-        let text = queued["text"].as_str().unwrap_or_default();
-        if !self.runtime.steer(&id, text) {
-            // The turn ended in between: it runs next after all.
-            self.enqueue(&id, queued.clone(), true);
-        }
-        Ok(json!({"status": "steered", "admission_id": admission, "session_id": id}))
     }
 
-    pub(super) fn prompt_replace_queued(&self, p: QueueRef) -> Reply {
+    pub(super) fn prompt_replace_queued(self: &Arc<Self>, p: QueueRef) -> Reply {
         let id = p.session.id()?;
         let admission = p.admission_id.as_str();
-        self.dequeue(&id, admission)
+        let hooks = PageTurn::new(self, None, None);
+        let replacement = self
+            .core
+            .replace_queued(
+                &id,
+                admission,
+                text_of(&p.text),
+                p.submission_id.as_str().map(str::to_string),
+                &*hooks,
+            )
             .ok_or(RpcError::server("admission_started"))?;
-        let edited = json!({
-            "text": p.text,
-            "submission_id": p.submission_id,
-        });
-        let replacement = self.enqueue(&id, edited, false);
         Ok(json!({
             "status": "queued",
             "admission_id": replacement,
@@ -196,16 +225,13 @@ impl Gateway {
     }
 
     /// Interrupt and send this instead: the text runs first once the turn has stopped.
-    pub(super) fn session_redirect(&self, p: SessionSteer, outbox: &Outbox) -> Reply {
+    pub(super) fn session_redirect(self: &Arc<Self>, p: SessionSteer, outbox: &Outbox) -> Reply {
         let id = p.session.id()?;
         let text = p.text;
-        if !self.runtime.is_running(&id) {
+        let hooks = PageTurn::new(self, Some(outbox.clone()), None);
+        if !self.core.redirect(&id, &text, &*hooks) {
             return Ok(json!({"status": "rejected", "session_id": id, "text": text}));
         }
-        self.subscribe(&id, outbox);
-        self.enqueue(&id, json!({"text": text, "shown": true}), true);
-        // The turn stops and its open questions close (an approval is denied).
-        self.core.stop(&id);
         Ok(json!({"status": "redirected", "session_id": id, "text": text}))
     }
 
@@ -268,28 +294,21 @@ impl Gateway {
     /// Whether the session has a turn in flight as the page sees it: the runtime's turn, or the
     /// gap between a turn and its queued follow-up (the page must not see the turn end there).
     pub(super) fn is_live(&self, id: &str) -> bool {
-        self.runtime
-            .existing_session_handle(id)
-            .is_some_and(|handle| handle.is_live())
+        self.core.is_live(id)
     }
 
     /// The session's queued prompts as Hermes's pending admissions, in the order they'll run.
-    /// (The queue is the session actor's: `PageState::queue`.)
     pub(super) fn pending_rows(&self, id: &str) -> Vec<Value> {
-        let Some(handle) = self.runtime.existing_session_handle(id) else {
-            return Vec::new();
-        };
-        handle
-            .page()
-            .queue
-            .iter()
+        self.core
+            .queue(id)
+            .into_iter()
             // A redirect or a missed steer is on the page already, as the bubble the composer
             // drew: as a card too it would show twice.
-            .filter(|params| params["shown"] != true)
-            .map(|params| {
+            .filter(|turn| !turn.shown)
+            .map(|turn| {
                 json!({
-                    "admission_id": params["submission_id"],
-                    "text": params["text"],
+                    "admission_id": turn.admission_id,
+                    "text": turn.text,
                     "status": "queued",
                     "controls": ["steer", "replace", "cancel"],
                 })
@@ -297,578 +316,233 @@ impl Gateway {
             .collect()
     }
 
-    /// Queues a prompt behind the running turn (at the front for a redirect or a steer the turn
-    /// missed) and tells the page; returns its admission id.
-    pub(super) fn enqueue(&self, id: &str, params: Value, front: bool) -> String {
-        self.enqueue_as(id, params, front, false)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-    }
-
-    /// [`Self::enqueue`] at the back, only while a turn holds the session (checked and queued
-    /// in one step of its actor, so a turn ending in between can't leave the prompt queued with
-    /// nobody to run it); `None` when no turn runs.
-    pub(super) fn enqueue_while_running(&self, id: &str, params: Value) -> Option<String> {
-        self.enqueue_as(id, params, false, true)
-    }
-
-    pub(super) fn enqueue_as(
-        &self,
-        id: &str,
-        mut params: Value,
-        front: bool,
-        only_if_running: bool,
-    ) -> Option<String> {
-        let admission = admission_id(&params).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        params["session_id"] = json!(id);
-        params["submission_id"] = json!(admission);
-        let queued = self
-            .runtime
-            .session_handle(id)
-            .map_err(|e| format!("{e:#}"))
-            .and_then(|handle| {
-                handle
-                    .enqueue(params, front, only_if_running)
-                    .map_err(|e| e.to_string())
-            });
-        match queued {
-            Ok(true) => {}
-            Ok(false) => return None,
-            Err(error) => tracing::warn!("queueing a prompt in {id}: {error}"),
-        }
-        self.emit(id, "session.info", self.session_info(id));
-        Some(admission)
-    }
-
-    /// Takes a queued prompt out by its admission id (`None` when it already ran or never was).
-    pub(super) fn dequeue(&self, id: &str, admission: &str) -> Option<Value> {
-        let taken = self
-            .runtime
-            .existing_session_handle(id)
-            .and_then(|handle| handle.dequeue(admission).ok().flatten());
-        if taken.is_some() {
-            self.emit(id, "session.info", self.session_info(id));
-        }
-        taken
-    }
-
     pub(super) fn subscribe(&self, session_id: &str, outbox: &Outbox) {
         self.hub.subscribe(session_id, outbox);
     }
 
-    /// `prompt.submit`: starts a turn and streams it as Hermes's events.
-    /// `gated`: the page awaits this call's reply, which goes out before the turn's events.
-    pub(super) fn submit(
-        self: Arc<Self>,
-        params: &Value,
-        settings: &Settings,
-        outbox: &Outbox,
-        gated: bool,
-    ) -> Reply {
-        let id = session_id(params)?;
-        let text = match &params["text"] {
-            Value::String(text) => text.clone(),
-            other => other.to_string(),
-        };
-        let admission_id = admission_id(params).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        // A session the idle sweep archived is back in use: back in the sidebar too.
-        self.core.reopened(&id);
-        if self.runtime.is_running(&id) {
-            // A rewind can't wait behind the turn: the page interrupts and retries on "busy".
-            if params["confirm_truncate"] == true {
-                return Err(RpcError::server("session busy"));
-            }
-            // Anything else waits its turn (Hermes's queued admission, listed in the panel).
-            self.subscribe(&id, outbox);
-            if let Some(admission_id) = self.enqueue_while_running(&id, params.clone()) {
-                return Ok(json!({
-                    "status": "queued",
-                    "admission_id": admission_id,
-                    "ref": {"session_id": id},
-                }));
-            }
-            // The turn ended in between: this prompt starts now.
-        }
-        // Restore / edit / regenerate: drop that user turn and everything after it first.
-        // The cut is a stored row (the transcript's `row_id`), else the n-th typed message.
-        if params["confirm_truncate"] == true {
-            let messages = self
-                .runtime
-                .messages(&id)
-                .map_err(|e| RpcError::server(format!("{e:#}")))?;
-            let keep = match (
-                params["truncate_before_row_id"].as_u64(),
-                params["truncate_before_user_ordinal"].as_u64(),
-            ) {
-                (Some(row), _) => {
-                    Some(transcript::kept_before_row(row as usize).min(messages.len()))
-                }
-                (None, Some(ordinal)) => Some(
-                    transcript::user_turn_index(&messages, ordinal as usize)
-                        .unwrap_or(messages.len()),
-                ),
-                (None, None) => None,
-            };
-            if let Some(keep) = keep {
-                self.runtime
-                    .rewind(&id, keep)
-                    .map_err(|e| RpcError::server(format!("{e:#}")))?;
-            }
-        }
-        let record = self
-            .runtime
-            .store()
-            .session(&id)
-            .ok()
-            .flatten()
-            .ok_or(RpcError::invalid(format!("Unknown session {id}")))?;
-        // An untitled session takes its first message's first line as its title until the title
-        // model's arrives (after this turn); a loaded skill counts as the command that loaded it.
-        let shown = commands::typed_command(&text).unwrap_or_else(|| text.clone());
-        // Under `requests` with no auxiliary title model the title comes from the message itself
-        // and no title request is made (Phase 4); an auxiliary model, or another profile, keeps
-        // the model's title.
-        let heuristic_titles = self.runtime.budget().titles
-            == hermes_runtime::budget::TitleMode::Heuristic
-            && settings.aux_models.titles.is_none();
-        let titling = (record.title.is_none() && !heuristic_titles).then(|| {
-            let chosen = settings.aux_models.titles.as_ref().and_then(|choice| {
-                Some((
-                    settings.provider(&choice.provider)?.runtime(),
-                    choice.model.clone(),
-                    choice.effort.clone(),
-                ))
-            });
-            let fallback = settings
-                .provider(&record.provider)
-                .map(|p| (p.runtime(), record.model.clone(), None));
-            (chosen.or(fallback), shown.clone())
-        });
-        if record.title.is_none() {
-            let line = shown
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("")
-                .trim();
-            let heuristic = if heuristic_titles {
-                hermes_runtime::titles::heuristic_title(&shown)
-            } else {
-                String::new()
-            };
-            let title: String = if heuristic.is_empty() {
-                line.chars().take(60).collect()
-            } else {
-                heuristic
-            };
-            if !title.is_empty() {
-                let _ = self.runtime.store().set_title(&id, &title);
-                self.core.announce_title(&id, &title);
-            }
-        }
-        let provider = settings
-            .provider(&record.provider)
-            .or(settings.active())
-            .ok_or(RpcError::server("No provider is configured"))?
-            .runtime();
-        // The turn's rows start here (its receipt names them).
-        let first_row = self.runtime.messages(&id).map(|m| m.len()).unwrap_or(0);
-        let (record_provider, record_model) = (record.provider.clone(), record.model.clone());
-        let options = self.turn_options(&id);
-        // Images attached in the composer (`attachments: [{path, mime}]`, uploaded first through
-        // `/api/chat/image-upload`): their bytes go with the prompt.
-        // Images attached through `image.attach` go with this prompt too.
-        let held: Vec<Value> = self
-            .runtime
-            .existing_session_handle(&id)
-            .and_then(|handle| handle.take_images().ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|path| json!({"path": path}))
-            .collect();
-        let mut listed = params["attachments"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        listed.extend(held);
-        let images = crate::attachments::image_bytes(&Value::Array(listed))
-            .map_err(|e| RpcError::invalid(e))?;
-        let started = if let Some(instructions) = commands::review_instructions(&text) {
-            // `/review`: the turn starts an independent reviewer subagent on the recent
-            // conversation (Hermes's `start_review`), then the model presents its findings.
-            let (goal, context) = self.review_task(&id, instructions);
-            let arguments = json!({"goal": goal, "context": context});
-            self.runtime.start_turn_with_call(
-                &id,
-                &provider,
-                options,
-                &text,
-                "delegate_task",
-                arguments.as_object().cloned().unwrap_or_default(),
-            )
-        } else if images.is_empty() {
-            self.runtime.start_turn(&id, &provider, options, &text)
-        } else {
-            self.runtime
-                .start_turn_with_images(&id, &provider, options, &text, images)
-        };
-        let mut turn = started.map_err(|e| RpcError::server(format!("{e:#}")))?;
-        self.subscribe(&id, outbox);
-        let id_for_receipt = id.clone();
-        // Only a request that named its admission is released by name after its receipt (a
-        // generated one is never looked up, and its turn would wait forever).
-        let named = self::admission_id(params).is_some();
-        let started = (gated && named).then(|| {
-            let (start, started) = tokio::sync::oneshot::channel();
-            if let Ok(mut starts) = self.starts.lock() {
-                starts.insert(admission_id.clone(), start);
-            }
-            started
-        });
-        self.set_live(&id, true);
-        let this = self.clone();
-        let outbox = outbox.clone();
-        let admission = admission_id.clone();
-        tokio::spawn(async move {
-            if let Some(started) = started {
-                let _ = started.await;
-            }
-            let mut stream = hermes_core::stream::TurnStream::new(&id);
-            // message.start first: for a queued prompt it names the admission, and the page turns
-            // that queue card into the user's bubble (patches/0001) before the session.info below
-            // (whose `pending` no longer lists the prompt) retires the card. The page holds the
-            // turn as live from `running: true` until `running: false`.
-            this.emit(
-                &id,
-                "message.start",
-                json!({"turn_id": admission, "admission_id": admission}),
-            );
-            // The session's row and usage: store reads (the prompt was just queued), off the
-            // async workers.
-            let session = id.clone();
-            if let Ok(info) = this.blocking(move |g| g.session_info(&session)).await {
-                this.emit(&id, "session.info", info);
-            }
-            // While the turn runs, a `running: true` heartbeat (Hermes's backend sends one, and
-            // `gateway.ready` says it does) keeps the page holding the turn as live through quiet
-            // stretches: a long think, a retry, a wait on the provider.
-            let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
-            heartbeat.tick().await;
-            // The model's context window, for the gauge (asked once per model, off this path).
-            {
-                let this = this.clone();
-                let (provider, model) = (record_provider.clone(), record_model.clone());
-                tokio::spawn(async move { this.context_length(&provider, &model).await });
-            }
-            // When the current model call began: the turn's start, then each tool result (tool
-            // time isn't generation time). A call's output tokens over its time are its speed.
-            let mut call_started = std::time::Instant::now();
-            let mut last_input: Option<usize> = None;
-            loop {
-                let event = tokio::select! {
-                    event = turn.events.recv() => event,
-                    _ = heartbeat.tick() => {
-                        // Store reads: off the async workers.
-                        let session = id.clone();
-                        if let Ok((info, usage)) = this
-                            .blocking(move |g| {
-                                (g.session_info(&session), g.usage_snapshot(&session, last_input))
-                            })
-                            .await
-                        {
-                            this.emit(&id, "session.info", info);
-                            this.emit(&id, "session.usage", json!({"usage": usage}));
-                        }
-                        continue;
-                    }
-                };
-                let Some(event) = event else {
-                    this.end_live_off_worker(&id).await;
-                    break;
-                };
-                match event {
-                    RuntimeEvent::Agent(AgentEvent::Usage(usage)) => {
-                        let output = usage.usage.output_tokens.unwrap_or(0).max(0) as u64;
-                        // The provider's own timing when it reports one, else the call's.
-                        let seconds = usage
-                            .stats
-                            .as_ref()
-                            .and_then(|stats| stats.elapsed_ms)
-                            .map_or_else(
-                                || call_started.elapsed().as_secs_f64(),
-                                |ms| ms as f64 / 1000.0,
-                            );
-                        last_input = usage
-                            .usage
-                            .input_tokens
-                            .map(|tokens| tokens.max(0) as usize);
-                        call_started = std::time::Instant::now();
-                        // `note_generation` saves a file and the snapshot reads the store: off
-                        // the async workers (in this order, as before).
-                        let session = id.clone();
-                        if let Ok(snapshot) = this
-                            .blocking(move |g| {
-                                g.note_generation(&session, output, seconds);
-                                g.usage_snapshot(&session, last_input)
-                            })
-                            .await
-                        {
-                            this.emit(&id, "session.usage", json!({"usage": snapshot}));
-                        }
-                        this.core.publish(hermes_core::CoreEvent::Usage {
-                            session_id: id.clone(),
-                            input_tokens: usage.usage.input_tokens.map(i64::from),
-                            output_tokens: usage.usage.output_tokens.map(i64::from),
-                        });
-                    }
-                    // A subagent's activity: the page's live subagent rows.
-                    RuntimeEvent::Agent(AgentEvent::Subagent { kind, payload }) => {
-                        this.emit(&id, kind, payload);
-                    }
-                    // The reply, reasoning, tool calls and status lines (a fallback, a taint
-                    // warning, compression, which can take minutes on a local model): the core's
-                    // stream events, which the hub sends as the page's frames.
-                    RuntimeEvent::Agent(event) => {
-                        if matches!(&event, AgentEvent::Message(m) if m.is_tool_response()) {
-                            call_started = std::time::Instant::now();
-                        }
-                        for event in stream.agent_event(event) {
-                            this.core.publish(event);
-                        }
-                    }
-                    // The provider's daily request quota is nearly used up (our own notice: the page
-                    // shows `status.update` kinds it knows and ignores the rest; CP2.3 adds the display).
-                    RuntimeEvent::Notice(text) => {
-                        this.core.publish(stream.notice(text));
-                    }
-                    // A steer the turn ended before reading: it runs next, as Hermes does.
-                    RuntimeEvent::SteerUndelivered(text) => {
-                        // `enqueue` sends the session's info (store reads): off the async workers.
-                        let session = id.clone();
-                        let _ = this
-                            .blocking(move |g| {
-                                g.enqueue(&session, json!({"text": text, "shown": true}), true)
-                            })
-                            .await;
-                    }
-                    RuntimeEvent::TurnFinished(status) => {
-                        let ended = status.clone();
-                        let (mut status, mut error) = match status {
-                            TurnStatus::Completed => ("complete", None),
-                            TurnStatus::Cancelled => ("interrupted", None),
-                            TurnStatus::Failed(error) => ("error", Some(error)),
-                        };
-                        // The stored conversation, and the failed session's provider: store reads,
-                        // off the async workers.
-                        let session = id.clone();
-                        let completed = status == "complete";
-                        let (stored, failed_route) = this
-                            .blocking(move |g| {
-                                let stored = g.runtime.messages(&session).unwrap_or_default();
-                                let route = (completed
-                                    && crate::transcript::message_error(&stored).is_some())
-                                .then(|| g.runtime.store().session(&session).ok().flatten())
-                                .flatten()
-                                .map(|record| (record.provider, record.model));
-                                (stored, route)
-                            })
-                            .await
-                            .unwrap_or_default();
-                        // A turn that ended on a provider error carries it as the conversation's
-                        // last message (ops::ExitOnError yields it). The page's error card keys
-                        // off the failure status, so the turn is reported like Hermes's failed
-                        // turn result: status "error", the provider's text, and the structured
-                        // descriptor the card names the fix from.
-                        let failure = (status == "complete")
-                            .then(|| crate::transcript::message_error(&stored))
-                            .flatten();
-                        if let Some((_kind, text)) = &failure {
-                            status = "error";
-                            error = Some(text.clone());
-                        }
-                        // Which provider and model failed: the card names them.
-                        let (provider, model) = failed_route.unwrap_or_default();
-                        let surface = failure.as_ref().map(|(kind, text)| {
-                            crate::transcript::error_surface(*kind, text, &provider, &model)
-                        });
-                        // A turn that also streamed output keeps it: the text is the user's, not
-                        // the error string (Hermes's partial failure settle). One that streamed
-                        // nothing carries the account instead — the page's completion path
-                        // appends the turn's message only when the frame's text is non-empty, so
-                        // an empty frame would end the turn in silence (no card, no bubble), and
-                        // its partial=false strips the account from the bubble: the card is the
-                        // only thing shown.
-                        let text = match (&failure, stream.text().trim().is_empty()) {
-                            (Some((kind, detail)), true) => {
-                                crate::transcript::turn_error_text(*kind, detail, &provider)
-                            }
-                            _ => stream.text().to_string(),
-                        };
-                        let partial = status == "error" && !stream.text().trim().is_empty();
-                        let session = id.clone();
-                        let usage = this
-                            .blocking(move |g| g.usage_snapshot(&session, last_input))
-                            .await
-                            .unwrap_or(Value::Null);
-                        this.core.publish(hermes_core::CoreEvent::TurnEnded {
-                            session_id: id.clone(),
-                            status: ended,
-                        });
-                        this.emit(
-                            &id,
-                            "message.complete",
-                            json!({
-                                "text": text,
-                                "status": status,
-                                "error": error,
-                                "error_surface": surface,
-                                "partial": partial,
-                                // The rows this turn wrote, so the page can restore or edit them.
-                                "persisted_turn": transcript::persisted_turn(&stored, first_row, &admission),
-                                "usage": usage,
-                            }),
-                        );
-                        // With a prompt queued, the session stays live into its turn: a
-                        // `running: false` in between would end the turn on the page.
-                        if !this.has_queued(&id) {
-                            this.end_live_off_worker(&id).await;
-                        }
-                        if let Some((Some((provider, model, effort)), opening)) = titling {
-                            if status == "complete" {
-                                this.title_session(
-                                    &id,
-                                    &provider,
-                                    &model,
-                                    effort.as_deref(),
-                                    &opening,
-                                )
-                                .await;
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-            // Both read the store (and the next prompt's submit writes it): off the async
-            // workers.
-            let (session, queued_outbox) = (id.clone(), outbox.clone());
-            let _ = this
-                .blocking(move |g| {
-                    g.apply_pending_route(&session);
-                    g.run_queued(&session, &queued_outbox);
-                })
-                .await;
-        });
-        // The canonical protocol's admission receipt: which session took the prompt, under the
-        // id the page gave this send (it drops its optimistic bubble on any other id or status).
-        Ok(json!({
-            "status": "started",
-            "admission_id": admission_id,
-            "ref": {"session_id": id_for_receipt},
-        }))
-    }
-
-    /// Starts the session's next queued prompt, once its turn has finished.
-    pub(super) fn run_queued(self: &Arc<Self>, id: &str, outbox: &Outbox) {
-        let next = self
-            .runtime
-            .existing_session_handle(id)
-            .and_then(|handle| handle.take_next().ok().flatten());
-        let Some(params) = next else {
-            return;
-        };
-        let settings = Settings::load(&self.data_dir);
-        if let Err(error) = self.clone().submit(&params, &settings, outbox, false) {
-            let error = error.message();
-            tracing::warn!("queued prompt in {id}: {error}");
-            self.emit(
-                id,
-                "message.complete",
-                json!({"text": "", "status": "error", "error": error}),
-            );
-            self.end_live(id);
-        }
-    }
-
-    /// Whether prompts wait behind the session's turn.
-    pub(super) fn has_queued(&self, id: &str) -> bool {
-        self.runtime
-            .existing_session_handle(id)
-            .is_some_and(|handle| !handle.page().queue.is_empty())
-    }
-
-    /// Marks the session as having a turn in flight: from the start of a turn through any queued
-    /// prompts that follow it. The page hears `running: false` only when that ends.
-    pub(super) fn set_live(&self, id: &str, live: bool) {
-        // The session's actor holds it (`PageState::live`); clearing it never starts one.
-        let handle = if live {
-            self.runtime.session_handle(id).ok()
-        } else {
-            self.runtime.existing_session_handle(id)
-        };
-        if let Some(Err(error)) = handle.map(|handle| handle.set_live(live)) {
-            tracing::warn!("marking {id}'s turn live={live}: {error}");
-        }
-    }
-
     /// The turn (and its queue) is over: the page settles it.
-    pub(super) fn end_live(&self, id: &str) {
-        self.set_live(id, false);
+    fn settled(&self, id: &str) {
         let mut info = self.session_info(id);
         info["running"] = json!(false);
         self.emit(id, "session.info", info);
     }
 
-    /// [`Self::end_live`] from async code: `session_info` reads the store. Should the thread die,
-    /// the session is still marked as settled.
-    pub(super) async fn end_live_off_worker(self: &Arc<Self>, id: &str) {
-        let session = id.to_string();
-        if self.blocking(move |g| g.end_live(&session)).await.is_err() {
-            self.set_live(id, false);
-        }
-    }
-
-    /// Hermes's auto-title: the title model names the session from its opening message, and the
-    /// page hears the new title through `session.info`.
-    pub(super) async fn title_session(
-        self: &Arc<Self>,
-        id: &str,
-        provider: &hermes_runtime::ProviderConfig,
-        model: &str,
-        effort: Option<&str>,
-        opening: &str,
-    ) {
-        // A title is optional: skipped when the daily request quota is running low.
-        if let hermes_runtime::governor::Verdict::Deny(why) = self
-            .runtime
-            .governor()
-            .check(&provider.id, hermes_llm::observer::Purpose::Title)
-        {
-            tracing::info!("titling {id} skipped: {why}");
-            return;
-        }
-        let titled = self.runtime.ledger().scoped(
-            hermes_llm::observer::Purpose::Title,
-            Some(id),
-            hermes_runtime::generate_title_with_effort(provider, model, effort, opening),
-        );
-        match titled.await {
-            Ok(Some(title)) => {
-                let (session, new_title) = (id.to_string(), title.clone());
-                let _ = self
-                    .blocking(move |g| g.runtime.store().set_title(&session, &new_title))
-                    .await;
-                self.core.announce_title(id, &title);
-                let session = id.to_string();
-                if let Ok(info) = self.blocking(move |g| g.session_info(&session)).await {
-                    self.emit(id, "session.info", info);
-                }
-            }
-            Ok(None) => {}
-            Err(error) => tracing::warn!("titling {id}: {error:#}"),
-        }
-    }
-
     /// Sends a session event to the socket following that session.
     pub(super) fn emit(&self, session_id: &str, event: &str, payload: Value) {
         self.hub.emit(session_id, event, payload);
+    }
+}
+
+/// `prompt.submit`'s params as the core's prompt.
+fn submit_turn(params: &Value) -> SubmitTurn {
+    // Restore / edit / regenerate: the cut is a stored row (the transcript's `row_id`), else the
+    // n-th typed message.
+    let truncate = (params["confirm_truncate"] == true).then(|| {
+        match (
+            params["truncate_before_row_id"].as_u64(),
+            params["truncate_before_user_ordinal"].as_u64(),
+        ) {
+            (Some(row), _) => Truncate::BeforeRow(row as usize),
+            (None, Some(ordinal)) => Truncate::BeforeUserMessage(ordinal as usize),
+            (None, None) => Truncate::Nothing,
+        }
+    });
+    SubmitTurn {
+        admission_id: admission_id(params),
+        text: text_of(&params["text"]),
+        // Images attached in the composer (`attachments: [{path, mime}]`, uploaded first through
+        // `/api/chat/image-upload`): their bytes go with the prompt.
+        images: crate::attachments::image_paths(&params["attachments"]),
+        truncate,
+        shown: params["shown"] == true,
+        // The page awaits this call's reply, which goes out before the turn's events.
+        gated: true,
+    }
+}
+
+/// A prompt's text as the page sent it (anything but a string as its JSON).
+fn text_of(text: &Value) -> String {
+    match text {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn submit_error(error: SubmitError) -> RpcError {
+    match error {
+        SubmitError::Busy => RpcError::server("session busy"),
+        SubmitError::Invalid(text) => RpcError::invalid(text),
+        SubmitError::Failed(text) => RpcError::server(text),
+    }
+}
+
+/// A turn as the page follows it: the socket that sent the prompt, and the frames that need the
+/// store, sent from the core's turn hooks (on blocking threads, in order with the events).
+pub(super) struct PageTurn {
+    gateway: Arc<Gateway>,
+    outbox: Option<Outbox>,
+    /// The Settings `prompt.submit` was answered with: its turn's provider comes from them; a
+    /// queued prompt's turn reads them again when it starts.
+    settings: Mutex<Option<Settings>>,
+}
+
+impl PageTurn {
+    pub(super) fn new(
+        gateway: &Arc<Gateway>,
+        outbox: Option<Outbox>,
+        settings: Option<Settings>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            gateway: gateway.clone(),
+            outbox,
+            settings: Mutex::new(settings),
+        })
+    }
+
+    fn settings(&self) -> Settings {
+        self.settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_else(|| Settings::load(&self.gateway.data_dir))
+    }
+
+    fn info(&self, id: &str) {
+        self.gateway
+            .emit(id, "session.info", self.gateway.session_info(id));
+    }
+}
+
+impl TurnHooks for PageTurn {
+    fn settings(&self, record: &SessionRecord) -> TurnSettings {
+        let settings = self.settings();
+        let chosen = settings.aux_models.titles.as_ref().and_then(|choice| {
+            Some((
+                settings.provider(&choice.provider)?.runtime(),
+                choice.model.clone(),
+                choice.effort.clone(),
+            ))
+        });
+        let fallback = settings
+            .provider(&record.provider)
+            .map(|p| (p.runtime(), record.model.clone(), None));
+        TurnSettings {
+            provider: settings
+                .provider(&record.provider)
+                .or(settings.active())
+                .map(|p| p.runtime()),
+            titles_configured: settings.aux_models.titles.is_some(),
+            title_model: chosen.or(fallback),
+        }
+    }
+
+    fn options(&self, session_id: &str) -> TurnOptions {
+        self.gateway.turn_options(session_id)
+    }
+
+    fn follow(&self, session_id: &str) {
+        if let Some(outbox) = &self.outbox {
+            self.gateway.subscribe(session_id, outbox);
+        }
+    }
+
+    /// The turn's events wait for the `prompt.submit` receipt (released by its admission id in
+    /// `Gateway::handle` / `call`).
+    fn gate(&self, admission_id: &str) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        let (start, started) = tokio::sync::oneshot::channel();
+        if let Ok(mut starts) = self.gateway.starts.lock() {
+            starts.insert(admission_id.to_string(), start);
+        }
+        Some(started)
+    }
+
+    /// After `message.start`: the session's row and usage (the page holds the turn as live from
+    /// `running: true` until `running: false`), and the model's context window for the gauge
+    /// (asked once per model, off this path).
+    fn started(&self, session_id: &str, provider: &str, model: &str) {
+        self.info(session_id);
+        let (this, provider, model) = (
+            self.gateway.clone(),
+            provider.to_string(),
+            model.to_string(),
+        );
+        tokio::spawn(async move { this.context_length(&provider, &model).await });
+    }
+
+    fn changed(&self, session_id: &str) {
+        self.info(session_id);
+    }
+
+    /// A `running: true` heartbeat (Hermes's backend sends one, and `gateway.ready` says it does)
+    /// keeps the page holding the turn as live through quiet stretches.
+    fn heartbeat(&self, session_id: &str, last_input: Option<usize>) {
+        let info = self.gateway.session_info(session_id);
+        let usage = self.gateway.usage_snapshot(session_id, last_input);
+        self.gateway.emit(session_id, "session.info", info);
+        self.gateway
+            .emit(session_id, "session.usage", json!({"usage": usage}));
+    }
+
+    /// The status bar's tokens per second: `note_generation` saves a file and the snapshot reads
+    /// the store (in this order, as before).
+    fn generated(
+        &self,
+        session_id: &str,
+        output_tokens: u64,
+        seconds: f64,
+        last_input: Option<usize>,
+    ) {
+        self.gateway
+            .note_generation(session_id, output_tokens, seconds);
+        let snapshot = self.gateway.usage_snapshot(session_id, last_input);
+        self.gateway
+            .emit(session_id, "session.usage", json!({"usage": snapshot}));
+    }
+
+    /// `message.complete`, like Hermes's turn result. A failed turn carries the error, the
+    /// structured descriptor the card names the fix from, and (when nothing streamed) the account
+    /// as its text: the page's completion path appends the turn's message only when the frame's
+    /// text is non-empty, so an empty frame would end the turn in silence.
+    fn ended(&self, end: &TurnEnd, last_input: Option<usize>) {
+        let usage = self.gateway.usage_snapshot(&end.session_id, last_input);
+        let status = match end.outcome {
+            Outcome::Complete => "complete",
+            Outcome::Interrupted => "interrupted",
+            Outcome::Error => "error",
+        };
+        let surface = end.failure.as_ref().map(|(kind, text)| {
+            crate::transcript::error_surface(*kind, text, &end.failed_provider, &end.failed_model)
+        });
+        self.gateway.emit(
+            &end.session_id,
+            "message.complete",
+            json!({
+                "text": end.text,
+                "status": status,
+                "error": end.error,
+                "error_surface": surface,
+                "partial": end.partial,
+                // The rows this turn wrote, so the page can restore or edit them.
+                "persisted_turn": transcript::persisted_turn_json(&end.persisted, &end.admission_id),
+                "usage": usage,
+            }),
+        );
+    }
+
+    fn queued_failed(&self, session_id: &str, error: &str) {
+        self.gateway.emit(
+            session_id,
+            "message.complete",
+            json!({"text": "", "status": "error", "error": error}),
+        );
+    }
+
+    fn idle(&self, session_id: &str) {
+        self.gateway.settled(session_id);
+    }
+
+    /// A model picked while the turn ran applies now.
+    fn between_turns(&self, session_id: &str) {
+        self.gateway.apply_pending_route(session_id);
     }
 }

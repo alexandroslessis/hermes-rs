@@ -305,3 +305,296 @@ passed. Line counts in the note are right within two lines (`gateway/projects.rs
 
 **Left:** the lock's dialog is not exercised live (it would show a modal on the user's screen);
 it is the user's checklist item 6.
+
+## CP1.2 — Workspace features
+Worktree: C:\Users\alexandros\repos\hermes-rs-n1   Branch: native/p1-core   Model: Opus 5.5 (subagent)
+On top of CP1.1 (2a99eb9). Not committed.
+
+### Verdict
+
+Part A (carried over from CP1.1) is done: the turn runs in the core. `Core::submit` starts a
+prompt or queues it behind the running turn; the turn's loop (stream, heartbeat, usage, end,
+title, the next queued prompt) is `hermes_core::turns` and publishes the stream itself, so a
+front end with a `Core` and no `Gateway` sees the whole turn (`turns/tests.rs`). `/` commands run
+from Rust (`Core::run_command`, `dispatch_command`) with the catalog in `hermes_core::commands`.
+Part B moved the logic of every listed module (git reads and review, files, `open_file`, the
+terminal's shells, attachments, `@` paths, export, processes and subagents); `crates/desktop`
+keeps the routes, the socket protocol and the JSON. A pure refactor for the page and ACP: the
+RPC-table fixture passes **unchanged** (not re-blessed), the ACP suite and the live checks pass
+(below).
+
+### Done
+
+**Part A — turns** (`crates/core/src/turns.rs`, was `gateway/turn.rs` `submit` / `run_queued` /
+`enqueue*` / `dequeue` / `set_live` / `end_live` / `title_session`):
+- `Core::submit(session, SubmitTurn, Arc<dyn TurnHooks>) -> Result<Submitted, SubmitError>`
+  (blocking): `Submitted::{Started, Queued}` with the admission id; `SubmitError::{Busy, Invalid,
+  Failed}` (the gateway maps them to `session busy` / -32602 / -32000 with the same texts).
+  `SubmitTurn { admission_id, text, images, truncate: Option<Truncate>, shown, gated }`.
+- The queue, typed: `queue`, `has_queued`, `enqueue`, `remove_queued`, `steer_queued`
+  (`SteerQueued::{Idle, Started}`), `replace_queued`, `redirect`, `steer`. Storage stays the
+  session actor's `PageState::queue` (JSON values): each item is a `SubmitTurn` serialized under
+  the page's names (`submission_id`, `text`, `shown`), which `dequeue` looks up by. No runtime
+  change.
+- The loop (`TurnRun`): gate, `TurnStarted`, `hooks.started`, then the events (stream through
+  `TurnStream`, `Usage` after `hooks.generated`, `Subagent`, notices, a missed steer queued at the
+  front), then `TurnEnded { status, end: Box<TurnEnd> }` (outcome, error text, the provider error
+  and which provider/model, the text, `partial`, the persisted rows), `hooks.ended`, `Idle` +
+  `hooks.idle` unless a prompt is queued, the title (governor, ledger, `announce_title`,
+  `hooks.changed`), and last `hooks.between_turns` (the model picked mid-turn) and the next
+  queued prompt, on a blocking thread, with the same hooks.
+- `TurnHooks` (the front end's side, every method called on a blocking thread, in order with the
+  events): `settings(record)` (provider, title model: Settings stay the gateway's until CP1.3),
+  `options(session)`, `follow`, `gate`, `started`, `changed`, `heartbeat`, `generated`, `ended`,
+  `queued_failed`, `idle`, `between_turns`. `NoHooks` for a front end with a fixed provider.
+- New `CoreEvent`s: `TurnStarted { admission_id }`, `TurnEnded { end }`, `QueueChanged`, `Idle`,
+  `Subagent { kind, payload }`. The hub sends `TurnStarted` as `message.start` and `Subagent` as
+  its `subagent.*` frame; it ignores the other three.
+- Gateway (`gateway/turn.rs`, 874 → 548 lines): params to `SubmitTurn`, the receipt, the error
+  mapping, `PageTurn` (the hooks: `session.info`, `session.usage`, `message.complete`,
+  `note_generation`, the admission gate in `starts`, `apply_pending_route`), and the queue
+  handlers over the core. `pending_rows` reads `Core::queue`.
+
+**Part A — `/` commands** (`crates/core/src/commands.rs`, was desktop `commands.rs` +
+`gateway/slash.rs`): `entries` / `complete` (typed `CommandEntry { name, description, origin }`),
+`coding_command` (typed `CommandOutcome::{Output, Send, Skill}`), `Core::run_command(session,
+name, args, &dyn CommandEnv)` (coding command, then report, then skill, else `NotACommand`),
+`dispatch_command` (`command.dispatch`: coding, then skill), `status_text`, `context_text`, the
+reports (`/usage`, `/insights`, `/diff`, `/tools`, `/memory`, `/sandbox`, `/refine`),
+`review_task`, `sandbox_text`, `split_command`. `CommandEnv` (the gateway's `PageCommands`):
+`context_length`, `route` (provider + options), `import_hermes`. Desktop `commands.rs` is the JSON
+(`catalog`, `completions`, `outcome`); `slash.rs` maps `CommandError` to the same RPC errors.
+
+**Part B** (logic to `crates/core`, JSON in `crates/desktop`):
+
+| core module | typed API | stays in desktop |
+|---|---|---|
+| `git.rs` (+ the reads) | `repo_status -> RepoStatus { files: Vec<FileStatus>, .. }`, `rev_parse`, `entries`, `renamed_to`, `untracked_lines`, `default_branch` | `git.rs`: `HermesRepoStatus` JSON |
+| `git_review.rs` (`git mv`) | `ReviewList`, `ReviewFile`, `CommitContext`, `GhAuth`, `ShipInfo`, `PullRequests`, `Worktree`, `WorktreeRequest`, `AddedWorktree`, `BranchInfo`, `BaseBranch`; changes answer `Result<_, String>` | `git_review.rs`: `route()` and every route's JSON |
+| `files.rs` (`git mv`) | `resolve`, `is_sensitive`, `mime`, `readable`, `read_text -> TextPreview`, `write_text`, `mkdir`, `git_root`, `FileError`, `percent_decode` (from `rest.rs`, re-exported there) | `files.rs`: statuses and bodies |
+| `open_file.rs` (`git mv`, whole) | already typed (`Open`, `plan`, `reveal_plan`, `run`) | `lib.rs` re-exports it |
+| `terminal.rs` (`git mv`) | `Terminals::new(version)`, `spawn -> Arc<Shell>` / `SpawnError`, `get`, `remove`, `close_all`; `Shell::{attach -> Attachment { viewer, snapshot, truncated, output }, is_current, detach, write, resize, has_exited, exited}` | `terminal.rs`: the socket (`serve`, `pump`, meta frame, resize frames, close codes) |
+| `attachments.rs` | `image_from_data_url`, `image_from_base64 -> SavedImage`, `store_upload -> StagedUpload`, `read_data_url`, `image_bytes`, `attach_file(cwd, name, AttachSource) -> Attached`, `AttachError`; `Core::attach_file`, `hold_image`, `detach_image` | `attachments.rs`: route statuses and JSON, `image_paths`, `attach_source` |
+| `paths.rs` (`git mv`) | `complete -> Vec<PathItem>`, `list_dir -> DirListing` | `paths.rs`: the items' and `/api/fs/list` JSON |
+| `export.rs` (`git mv`) | `Format`, `document` (Markdown, HTML over `transcript::entries`), `file_name`, `clean` | `export.rs`: the JSON snapshot (Hermes's `TranscriptMessage` rows) |
+| `delegation.rs` | `Core::processes`, `kill_process -> KillOutcome`, `stop_processes`, `subagents`, `subagent_tail`, `interrupt_subagent`, `steer_subagent`, `delegation -> Delegation`, `pause_delegation` | `gateway/delegation.rs`: JSON |
+
+Docs: `PORTING.md` (core rows for every moved module, desktop rows say which shape they keep),
+`docs/ARCHITECTURE.md` (crate row, events paragraph, "A turn, end to end" steps 2 and 5, the
+feature map rows), `docs/PITFALLS.md` (`hermes_core` section: the turn in the core, hooks vs
+listener, the queue's JSON names, terminal output), `PHASES.md` (the carried-over block's status).
+
+### Files
+
+New in core: `src/turns.rs`, `src/turns/tests.rs`, `src/attachments.rs`, `src/delegation.rs`.
+Moved with `git mv`, then split: `crates/desktop/src/{git_review,files,open_file,paths,terminal,export}.rs`
+to `crates/core/src/`; desktop got new shape files of the same names (except `open_file.rs`).
+Changed: core `Cargo.toml` (`base64`, `dirs`, `portable-pty`; dev `wiremock`), `lib.rs`,
+`events.rs`, `commands.rs`, `git.rs`; desktop `attachments.rs`, `commands.rs`, `git.rs`,
+`hub.rs`, `lib.rs`, `main.rs`, `rest.rs`, `server.rs`, `transcript.rs`,
+`gateway/{mod,turn,slash,sessions,attachments,delegation}.rs`; `Cargo.lock`; the docs above;
+this note.
+
+`crates/desktop/src` line counts (whole tree 21,613 → 18,101): `gateway/turn.rs` 874 → 548,
+`gateway/slash.rs` 483 → 182, `gateway/sessions.rs` 1,019 → 932, `gateway/attachments.rs` 94 →
+82, `gateway/delegation.rs` 115 → 99, `git_review.rs` 1,167 → 267, `git.rs` 226 → 68, `files.rs`
+370 → 121, `open_file.rs` 204 → 0, `terminal.rs` 546 → 208, `attachments.rs` 427 → 176,
+`paths.rs` 394 → 52, `export.rs` 264 → 103, `commands.rs` 298 → 126, `rest.rs` 727 → 708,
+`hub.rs` 325 → 339, `transcript.rs` 241 → 251. `crates/core/src`: 3,827 → 9,853 lines.
+
+### What stayed in `crates/desktop`, and why
+
+- **The routes, the socket protocol and Hermes's JSON** (by design): `git_review::route`, the
+  terminal's socket, `/api/fs/*` statuses, `TranscriptMessage` rows, the export's JSON snapshot
+  (Hermes's own file format, built from the page's transcript rows).
+- **Settings-dependent pieces of a turn and of the commands**: the provider and title model
+  (`PageTurn::settings`), `turn_options`, context windows and model facts, `provider_for`,
+  `import_route` and the importer: CP1.3 (providers, aux models, fallbacks, settings, import).
+  They reach the core through `TurnHooks` / `CommandEnv`.
+- **`session.info`, `session.usage`, `note_generation`, `usage_snapshot`**: page frames over
+  `usage.rs` (CP1.3); sent from the hooks.
+- **`/btw` and `/bg`** (`prompt_btw`, `prompt_background`): not turns of the session, and their
+  frames (`btw.complete`, `background.complete`) are page-only; the runtime calls they wrap are
+  already typed. Small; can move with CP1.3 if the native UI wants them.
+- **`file_tickets`** (download links, `/api/files/ticket`): a URL the page fetches; nothing the
+  native UI needs.
+- **`Terminals` is not held by `Core`**: the desktop's server state makes it before the core
+  exists (the window and the server start first); the native app makes its own
+  `Terminals::new(version)`.
+
+### Deviations from the plan
+
+- The plan says the gateway keeps `message.start`, `session.info` and `message.complete` "as
+  frames built from those events". `message.start` is (hub, from `TurnStarted`); `session.info`,
+  `session.usage` and `message.complete` are built in `TurnHooks` called by the core's loop with
+  the same typed data (`TurnEnd`), because they read the store and a listener runs on the turn's
+  task (it must not block). The frames keep the order the gateway's loop gave them.
+- `CoreEvent` gained `QueueChanged`, `Idle` and `Subagent` besides the planned `TurnStarted` /
+  `TurnEnded` (the native UI needs to know when the queue changes and when the session settles).
+- Terminal output is a per-shell broadcast stream, not `CoreEvent`s (high volume, one viewer).
+
+### Tests
+
+All with `CARGO_TARGET_DIR=target/claude` (the worktree's).
+
+- `cargo test -p hermes_core`: 80 passed. New: `turns/tests.rs` over a real runtime and a
+  wiremock provider, **no gateway**: `a_prompt_sent_while_a_turn_runs_queues_and_runs_next_with_no_gateway`
+  (first turn delayed; the second queues with its admission; a cut while running is `Busy`; both
+  turns stream `TextDelta`s through the core alone, `TurnStarted` names both admissions,
+  `TurnEnded` carries the text and the persisted rows, `QueueChanged`, then `Idle`) and
+  `a_queued_prompt_is_removed_and_a_stopped_turn_ends_interrupted` (remove, remove again, steer
+  a removed admission gives `Started`, `Core::stop` gives `TurnEnded` interrupted with no text and
+  `Idle`; then steer gives `Idle` and redirect `false`). Moved and typed: `commands` (coding
+  commands, completions, typed commands), `attachments`, `files`, `git` (+ a new untracked-lines
+  test), `git_review`, `paths`, `export`, `terminal` (+ attach, supersede and resize in the shell
+  test), `open_file`; new `delegation` (unknown process and subagent, pause).
+- `cargo test -p hermes-desktop`: lib 155 passed (incl. `rpc_table_tests` against the
+  **unchanged** `tests/fixtures/rpc_table.txt`); shape tests for every split module (`commands`,
+  `attachments`, `files`, `git`, `git_review` routes over a temp repository, `paths`, `export`,
+  `terminal`); `tests/acp.rs` 68 passed.
+- `cargo test -p hermes_runtime --test turns`: 258 passed, 7 ignored.
+- `cargo build --workspace`: passes.
+- `cargo clippy -p hermes_core --all-targets --no-deps`: clean (one moved `sort_by` fixed);
+  desktop: no warning on lines this checkpoint wrote.
+- `cargo fmt -p hermes_core`: done; desktop files written here formatted with `rustfmt` one by
+  one (the untouched not-clean files left alone, as in CP1.1).
+- Live checks, each on a **fresh instance** (debug exe of this worktree, port 47810, data
+  `target/perf/home` deleted before each start, `mock_llm.py` on :47900 for the checks with no
+  provider of their own; temp folders outside any git repository): `queue`, `stop`,
+  `coding-commands`, `rpc-dispatch` (all 80 methods), `workspace`, `tool-stream`,
+  `side-and-branch`, `git` (review pane), `files`, `terminal`, `attach`, `subagents`,
+  `artifacts` (open-file), `file-tree-open`, `archive`, `provider-error`, `rollback`: all passed
+  (exit 0, every line `ok`). Only processes under `target\claude` and the mock this run started
+  were stopped; none left running.
+- `scripts/clean-test-temp.ps1`: dry run 431 folders / 172 MB (mostly the `turns` suite's known
+  leftovers), `-Delete` removed 431, could not remove 0; a second dry run finds 0. No
+  `hermes_testdir: could not remove` line in the test output.
+
+### User's checklist (desktop app built from this branch)
+
+1. Send a message: the reply streams, a tool card shows, the title appears, the status bar's
+   tokens/s and context update.
+2. While a reply runs, send two more: they show as queue cards; steer one into the turn, edit the
+   other, delete it; Stop, then type and use "redirect": the redirected text runs first.
+3. `/` menu: `/status`, `/context`, `/tools`, `/plan something` (sent as a prompt), a skill.
+4. `@` in the composer: `@file:` lists files; `@name` finds a file deep in the project.
+5. Attach an image and a text file; send: the model gets both.
+6. Side panel: open a file, edit and save; Review tab: diff, stage, unstage, commit; worktree and
+   branch pickers list; Terminal: run `echo hi`, reload the page, the output is replayed.
+7. `/save` as Markdown, HTML and JSON (with "redact").
+
+### For the reviewer
+
+1. **Hooks, not events, for the store-reading frames.** `session.info` / `session.usage` /
+   `message.complete` come from `PageTurn` hooks the core's loop awaits on a blocking thread
+   (a listener must not block). Check the order against the old loop: `message.start` (hub, sync
+   on the turn task) → `started` hook (`session.info` + context-length spawn) → stream; `Usage`
+   event after the `generated` hook; `TurnEnded` then `ended` (`message.complete`); the usage
+   snapshot for `message.complete` is now read after `TurnEnded` is published (no frame between).
+2. **Queue storage**: items are `SubmitTurn` JSON with the page's names in `PageState::queue`.
+   `prompt.replace_queued`'s `text` (a raw `Value` in `QueueRef`) is now stringified like
+   `prompt.submit`'s (a missing text becomes `"null"`; before, the card showed the raw value).
+   Only malformed params reach this. `shown` is still read from `prompt.submit` params, as the raw
+   params used to carry it.
+3. **Hooks follow the queue**: a queued prompt starts with the hooks of the turn that ran before
+   it (same socket as before), and its Settings are reloaded then (as `run_queued` did); the first
+   turn uses the Settings `dispatch` loaded (`PageTurn` takes them once).
+4. `session.status` now loads Settings for `PageCommands` (one extra file read; unused there).
+5. `Core::submit` and the queue methods are **blocking** (store reads, actor asks): the native UI
+   must call them from `spawn_blocking`. Queue handlers on the gateway run where they ran before
+   (some on async workers, as before CP1.2).
+6. `Terminals` is a standalone type, not held by `Core` (see "What stayed"); output is a per-shell
+   broadcast stream. `TERM_PROGRAM_VERSION` is passed in (`Terminals::new`) so it stays the
+   desktop's 0.4.0, not the core crate's 0.1.0.
+7. `kill_process` types `command` / `exit_code` (`Option<String>` / `Option<i64>`): a non-integer
+   exit code (never produced) would now read `null`. Process and subagent rows stay the runtime's
+   own JSON, passed through.
+8. `/btw`, `/bg`, `file_tickets`, `turn_options`, model facts and the importer stay in the
+   gateway (CP1.3 or page-only).
+9. `percent_decode` moved to `hermes_core::files` (`rest.rs` re-exports); `open_file.rs` moved
+   whole and is re-exported from desktop's `lib.rs`.
+10. `gh` paths of `git_review` (ship info with a PR, pr-list, create-pr) are typed but, as before,
+    not covered by tests (no GitHub here); `git-check` exercised `ship-info` without a remote.
+
+### Review (Opus 5.5)
+
+Main had not moved since 2a99eb9: no merge. `/code-review` was not run (no Skill pass in this
+subagent); the pass below is by hand.
+
+**Verdict: accepted.** Part A was compared with `gateway/turn.rs` / `gateway/slash.rs` at 2a99eb9
+line by line: the same checks in the same order (archive reopen, busy on a cut, enqueue only while
+running, the cut, the provisional title before the provider check, `first_row`, options, composer
+then held images, `/review`), the same error texts, the same frame order (`message.start` from the
+hub on the turn task, then the `started` hook's `session.info`; `generated` before `Usage`;
+`TurnEnded` then `message.complete`; `Idle`/`running: false` only with nothing queued; the title
+after; `apply_pending_route` then the next queued prompt on one blocking thread). Every hook is
+awaited before the loop reads the next event, so hook frames and hub frames keep their order. No
+core locks are held across a hook or a publish. `TurnEnded` is published once per
+`TurnFinished`, and the runtime sends `TurnFinished` also when its turn task panics (lib.rs, the
+crash guard) and for a provider error (a `Completed` turn whose last message is the error: the
+core turns it into `Outcome::Error` with the error text, as before). The heartbeat is the loop's
+own interval and ends with it; the title runs only after a complete turn. `Core::submit`'s callers
+are `prompt_submit` (through `Gateway::blocking`), `run_queued` (inside the loop's
+`spawn_blocking`) and the tests (`spawn_blocking`): none on an async worker. The queue handlers
+(`prompt.cancel`/`steer_queued`/`replace_queued`, `session.redirect`) run where they ran before.
+The `/` dispatch keeps the old order (coding command, report, skill; `command.dispatch`: coding,
+then skill) and argument trimming. Part B: `files` (statuses map 1:1 to the old codes, the
+sensitive-path and traversal checks untouched), `terminal` (same attach/detach/supersede/exit
+logic and lock order; a lagging viewer skips, a closed feed ends the pump, `remove`/`close_all`
+kill the child; the reader thread holds the shell, so the pseudo-console's handles live until its
+pipe ends, exactly as before the move), `attachments`, `paths`,
+`export` (same output over `transcript::entries`), `delegation`, `git`/`git_review` (string
+literals and git arguments compared old vs. new: none lost). RPC-table fixture: unchanged since
+ceddf45 and the test passes. Store schema untouched; prompt caching untouched; Hermes citations
+moved with the logic; PORTING rows right; new tests use `hermes_testdir`, `TestDir` last.
+
+**Found and fixed**
+- *The core test synchronised on a sleep.* `a_prompt_sent_while_a_turn_runs…` held the first
+  reply 1.5 s and assumed the second prompt queues within that. The mock now holds the first reply
+  until the test releases it (a channel; dropped with the fixture, before the server), so the
+  first turn runs exactly as long as the test needs. The stop test holds it until the fixture
+  drops instead of 20 s. Runs in ~1.4 s; 5 consecutive runs green.
+- *A queued prompt that could not start was invisible without the page's hooks.* `run_queued`
+  told only `TurnHooks::queued_failed` (the page's `message.complete` error); a front end with
+  `NoHooks` saw the prompt leave the queue and `Idle`, never why. New `CoreEvent::QueuedFailed {
+  admission_id, error }` (the hub ignores it: no page change), and `QueueChanged` when a queued
+  item can't be read. Test: `a_queued_prompt_that_cannot_start_says_why_and_the_session_settles`
+  (an attached image gone by the time the prompt runs).
+- Docs: PITFALLS (`QueuedFailed`; the queue races below).
+
+**Checked and left**
+- `prompt.replace_queued` with a non-string `text`: the old code stored the raw value (the card
+  showed `null`) and, when it ran, sent `"null"` to the model (`submit` stringified it). Now the
+  text is stringified when queued, so the card shows `"null"` too. The old code did not reject it,
+  and Hermes's page always sends a string: left as is.
+- Queue races the old gateway had (PITFALLS): a steer, an edit or a redirect landing in the one
+  actor round trip after the turn ended re-queues the prompt with no loop to run it. Same as
+  before; a fix needs an "enqueue only while running, else submit" step: follow-up, not CP1.2.
+- A panic inside the core's own loop task (not the runtime's) leaves the session live with no
+  `TurnEnded`; the old gateway loop had the same gap. Follow-up if the native UI wants a guard.
+- Line counts: the note's `crates/core/src` "before" is 3,892 lines at 2a99eb9 (it says 3,827);
+  after this review 9,919. The desktop numbers are right (18,102 now).
+
+**Deviations: accepted.** Hooks instead of events for `session.info` / `session.usage` /
+`message.complete`: right, those read the store and a listener must not block; the typed data
+(`TurnEnd`, `Usage`, `QueueChanged`, `Idle`) is in the events, so the native UI loses nothing. The
+queue as `SubmitTurn` JSON in the actor: typed at the API (`Core::queue`), and PITFALLS warns
+about renaming fields. `/btw`, `/bg`, `file_tickets` in desktop: page-only frames over typed
+runtime calls; move with CP1.3 if the native composer wants `/btw`. `Terminals` outside `Core`:
+fine (one per app; the native app builds its own). With a `Core` and no `Gateway` the native UI
+(Phases 4–6) has: `Core::submit` with `NoHooks` or its own hooks (provider and options from its
+side until CP1.3 moves Settings), `queue` / `remove_queued` / `steer_queued` / `replace_queued` /
+`redirect` / `steer`, `Core::stop`, the whole stream plus `TurnStarted` / `TurnEnded` /
+`QueueChanged` / `QueuedFailed` / `Idle`, `run_command` with a `CommandEnv` it implements
+(context window, route, import), and `Terminals`. Nothing material is missing for CP1.3.
+
+**Re-run by the reviewer** (`CARGO_TARGET_DIR=target/claude`): `cargo test -p hermes_core` 81
+passed (the three `turns` tests 5 times in a row, ~1.4 s each); `-p hermes-desktop` lib 155
+(RPC table unchanged) and `tests/acp.rs` 68 passed; `cargo test -p hermes_runtime --test turns`
+258 passed, 7 ignored; `cargo build --workspace` passes; clippy on `hermes_core` clean. Live,
+each on a fresh instance (debug exe of this branch, port 47810, `target/perf` home deleted before
+each, `mock_llm.py` where a check has no provider; temp folders in `%TEMP%`): `queue`, `stop`,
+`coding-commands`, `rpc-dispatch`, `tool-stream`, `git`, `files`, `terminal`, `attach`,
+`subagents`: all exit 0. Only this build's processes and the mock were stopped; none left.
+`clean-test-temp.ps1`: 216 folders / 88.7 MB, all removed, a second dry run finds 0; the checks'
+own temp folders removed too.

@@ -228,8 +228,23 @@ impl Listener for Hub {
                 &format!("{}.settled", kind.as_str()),
                 json!({"prompt_id": prompt_id, "kind": kind.as_str()}),
             ),
+            // The page turns a queued prompt's card into the user's bubble on the admission it
+            // names (patches/0001), before `session.info` retires the card.
+            CoreEvent::TurnStarted { admission_id, .. } => self.emit(
+                id,
+                "message.start",
+                json!({"turn_id": admission_id, "admission_id": admission_id}),
+            ),
+            // A subagent's activity: the page's live subagent rows (the runtime builds Hermes's
+            // payload).
+            CoreEvent::Subagent { kind, payload, .. } => self.emit(id, kind, payload.clone()),
+            // The gateway's own frames (`session.usage`, `message.complete`, `session.info`),
+            // built from more than the event by its turn hooks (`gateway/turn.rs`).
             CoreEvent::Usage { .. }
             | CoreEvent::TurnEnded { .. }
+            | CoreEvent::QueueChanged { .. }
+            | CoreEvent::QueuedFailed { .. }
+            | CoreEvent::Idle { .. }
             | CoreEvent::ProcessFinished { .. }
             | CoreEvent::ReviewFinished { .. } => false,
         }

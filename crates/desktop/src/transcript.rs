@@ -86,7 +86,17 @@ fn message_row(message: MessageEntry, provider: &str, model: &str) -> Value {
 /// `start` on), its typed rows (the prompt and steers) and its final reply, so the page can
 /// address them (restore, edit) without reloading the transcript.
 pub fn persisted_turn(messages: &[Message], start: usize, submission_id: &str) -> Value {
-    let turn = hermes_core::transcript::persisted_turn(messages, start);
+    persisted_turn_json(
+        &hermes_core::transcript::persisted_turn(messages, start),
+        submission_id,
+    )
+}
+
+/// [`persisted_turn`] from the core's reading of it (a finished turn's `TurnEnd`).
+pub fn persisted_turn_json(
+    turn: &hermes_core::transcript::PersistedTurn,
+    submission_id: &str,
+) -> Value {
     json!({
         "row_ids": turn.row_ids,
         "complete": true,

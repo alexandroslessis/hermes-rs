@@ -17,7 +17,9 @@
 //! | `transcript.rs` | a stored conversation as the user sees it, its rows, a failed turn's error |
 //! | `projects.rs` | the sidebar's project tree |
 //! | `branch.rs`, `archive.rs`, `workspace.rs` | the side files |
-//! | `commands.rs` | what a typed message was as a command (the rest of the `/` menu: CP1.2) |
+//! | `turns.rs` | a prompt and its turn: submit, the queue, the turn's loop, titles |
+//! | `commands.rs` | the `/` menu: catalog, completion, running a command; what a message was |
+//! | `attachments.rs` | images and files attached in the composer |
 //! | `lock.rs` | "Hermes is already open": one app per data folder |
 //! | `git.rs` | running `git` quietly |
 //!
@@ -27,16 +29,25 @@
 //! `blocking` does; the `async` ones do their own.
 
 pub mod archive;
+pub mod attachments;
 pub mod branch;
 pub mod commands;
+pub mod delegation;
 pub mod events;
+pub mod export;
+pub mod files;
 pub mod git;
+pub mod git_review;
 pub mod lock;
+pub mod open_file;
+pub mod paths;
 pub mod projects;
 pub mod questions;
 pub mod sessions;
 pub mod stream;
+pub mod terminal;
 pub mod transcript;
+pub mod turns;
 pub mod workspace;
 
 use std::collections::HashMap;
@@ -52,6 +63,10 @@ pub use events::{CoreEvent, EventBus, Listener, QuestionKind};
 pub use lock::{AppLock, LockError};
 pub use questions::{APPROVAL_CHOICES, Ask, OpenQuestion};
 pub use sessions::{Branch, BranchError, BranchPoint, BranchRequest, NewSession, SessionSummary};
+pub use turns::{
+    NoHooks, Outcome, SubmitError, SubmitTurn, Submitted, Truncate, TurnEnd, TurnHooks,
+    TurnSettings,
+};
 
 /// The application layer over one data folder's runtime.
 pub struct Core {

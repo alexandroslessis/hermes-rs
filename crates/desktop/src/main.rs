@@ -86,7 +86,7 @@ fn main() -> Result<()> {
     // WebView2 is up, and its first requests wait in the bound port's queue until it serves.
     // (Built in sequence, the window started ~130ms later on every launch, ~1.9s on a first run.)
     // The side panel's shells (`terminal.rs`), ended when the window closes.
-    let terminals = Arc::new(terminal::Terminals::default());
+    let terminals = Arc::new(terminal::Terminals::new(env!("CARGO_PKG_VERSION")));
     // The request ledger, once the backend is built: written out when the app exits (Tauri's
     // `run` never returns, so nothing after it would run).
     let exit_ledger: Arc<std::sync::OnceLock<hermes_runtime::ledger::Ledger>> = Arc::default();

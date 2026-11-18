@@ -22,6 +22,8 @@ use hermes_runtime::{ProcessNotice, TurnStatus};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use crate::turns::TurnEnd;
+
 /// The two kinds of question the agent asks the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuestionKind {
@@ -83,10 +85,35 @@ pub enum CoreEvent {
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
     },
-    /// The turn ended (completed, stopped, or failed with the runtime's error).
+    /// A turn started (`admission_id`: the front end's id for the prompt that started it).
+    TurnStarted {
+        session_id: String,
+        admission_id: String,
+    },
+    /// The turn ended (completed, stopped, or failed with the runtime's error): what it said, the
+    /// error, the rows it stored (`turns::TurnEnd`).
     TurnEnded {
         session_id: String,
         status: TurnStatus,
+        end: Box<TurnEnd>,
+    },
+    /// The prompts queued behind the session's turn changed (`Core::queue` lists them).
+    QueueChanged { session_id: String },
+    /// A queued prompt was taken off the queue to run, but its turn couldn't start (`error`
+    /// says why): no `TurnStarted` / `TurnEnded` follows for it.
+    QueuedFailed {
+        session_id: String,
+        admission_id: String,
+        error: String,
+    },
+    /// The session's turn and every prompt queued behind it are done.
+    Idle { session_id: String },
+    /// A `delegate_task` child's activity: `kind` is `start`, `tool`, `thinking`, `progress` or
+    /// `complete`; `payload` is Hermes's `SubagentEventPayload` (the runtime builds it).
+    Subagent {
+        session_id: String,
+        kind: &'static str,
+        payload: Value,
     },
     /// The session has a new title.
     TitleChanged { session_id: String, title: String },
@@ -139,7 +166,12 @@ impl CoreEvent {
             | CoreEvent::ToolCompleted { session_id, .. }
             | CoreEvent::Status { session_id, .. }
             | CoreEvent::Usage { session_id, .. }
+            | CoreEvent::TurnStarted { session_id, .. }
             | CoreEvent::TurnEnded { session_id, .. }
+            | CoreEvent::QueueChanged { session_id }
+            | CoreEvent::QueuedFailed { session_id, .. }
+            | CoreEvent::Idle { session_id }
+            | CoreEvent::Subagent { session_id, .. }
             | CoreEvent::TitleChanged { session_id, .. }
             | CoreEvent::ApprovalRequested { session_id, .. }
             | CoreEvent::ClarifyRequested { session_id, .. }

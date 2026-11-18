@@ -545,90 +545,6 @@ impl Gateway {
         }
     }
 
-    /// The session model's context window, as the gauge shows it.
-    pub(super) async fn window_for(self: &Arc<Self>, id: &str) -> Option<usize> {
-        let session = id.to_string();
-        let record = self
-            .blocking(move |g| g.runtime.store().session(&session).ok().flatten())
-            .await
-            .ok()
-            .flatten()?;
-        Some(self.context_length(&record.provider, &record.model).await)
-    }
-
-    /// `/status`: the session, its model and folder, tokens so far, the context in use.
-    pub(super) async fn status_text(self: &Arc<Self>, id: &str) -> Result<String, RpcError> {
-        // The session's rows and the size of its request: store reads, off the async workers.
-        let session = id.to_string();
-        let (record, totals, messages, used) = self
-            .blocking(move |g| {
-                let store = g.runtime.store();
-                let record = store
-                    .session(&session)
-                    .map_err(|e| RpcError::server(format!("{e:#}")))?
-                    .ok_or(RpcError::server(format!("Session {session} not found")))?;
-                let totals = store.usage_totals(&session).unwrap_or_default();
-                let messages = store.message_count(&session).unwrap_or(0);
-                let used = g
-                    .runtime
-                    .context_breakdown(&session)
-                    .map(|b| b.total())
-                    .unwrap_or(0);
-                Ok::<_, RpcError>((record, totals, messages, used))
-            })
-            .await??;
-        let window = self.context_length(&record.provider, &record.model).await;
-        Ok([
-            format!(
-                "Session: {} ({})",
-                record.title.as_deref().unwrap_or("Untitled"),
-                record.id
-            ),
-            format!("Model: {} via {}", record.model, record.provider),
-            format!("Folder: {}", record.cwd),
-            format!("Messages: {messages}"),
-            format!(
-                "Tokens: {} in, {} out over {} calls",
-                totals.input_tokens, totals.output_tokens, totals.calls
-            ),
-            format!(
-                "Context: ~{used} of {window} ({}%)",
-                (used * 100).checked_div(window).unwrap_or(0)
-            ),
-        ]
-        .join("\n"))
-    }
-
-    /// `/context`: what the next request is made of, by part, against the model's window.
-    pub(super) async fn context_text(self: &Arc<Self>, id: &str) -> Result<String, RpcError> {
-        let session = id.to_string();
-        let b = self
-            .blocking(move |g| g.runtime.context_breakdown(&session))
-            .await?
-            .map_err(|e| RpcError::server(format!("{e:#}")))?;
-        let window = self.window_for(id).await.unwrap_or(FALLBACK_CONTEXT);
-        let total = b.total();
-        let row = |name: &str, n: usize| {
-            format!(
-                "  {name:<18}~{n:>8}  {:>3}%",
-                (n * 100).checked_div(total).unwrap_or(0)
-            )
-        };
-        Ok([
-            format!(
-                "Context: ~{total} of {window} tokens ({}% of the window)",
-                (total * 100).checked_div(window).unwrap_or(0)
-            ),
-            row("System prompt", b.system_prompt),
-            row("Tool definitions", b.tool_definitions),
-            row("Skills", b.skills),
-            row("Memory", b.memory),
-            row("Conversation", b.conversation),
-            "Estimates (characters / 4); /compress summarizes the conversation now.".into(),
-        ]
-        .join("\n"))
-    }
-
     /// `/compress [focus]` (`session.compress`): summarizes the conversation now, as Hermes's
     /// context compression does when the window fills, and answers with the shorter transcript
     /// the page shows from then on.
@@ -729,21 +645,18 @@ impl Gateway {
     /// the page saves it through a Save As dialog.
     pub(super) fn export_session(&self, params: &Value) -> Reply {
         let id = session_id(params)?;
-        let format = crate::export::Format::parse(params["format"].as_str().unwrap_or("json"))
-            .ok_or(RpcError::invalid("format is json, md or html"))?;
+        let format =
+            hermes_core::export::Format::parse(params["format"].as_str().unwrap_or("json"))
+                .ok_or(RpcError::invalid("format is json, md or html"))?;
         let store = self.runtime.store();
         let error = |e: anyhow::Error| RpcError::server(format!("{e:#}"));
         let record = store
             .session(&id)
             .map_err(error)?
             .ok_or(RpcError::server(format!("Session {id} not found")))?;
-        let rows = transcript::messages(
-            &store.load_messages(&id).map_err(error)?,
-            &record.provider,
-            &record.model,
-        );
+        let messages = store.load_messages(&id).map_err(error)?;
         let (content, filename) =
-            crate::export::export(&record, &rows, format, params["redact"] == true);
+            crate::export::export(&record, &messages, format, params["redact"] == true);
         Ok(json!({"content": content, "filename": filename, "format": format.extension()}))
     }
 

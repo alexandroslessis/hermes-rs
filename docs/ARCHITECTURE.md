@@ -40,7 +40,7 @@ it calls into. Everything runs in one process.
 | Crate | Package | Role | Notes |
 |---|---|---|---|
 | `crates/desktop` | `hermes-desktop` | The app: Tauri window, axum server, the protocol layer | The main app. Most feature work lands here. |
-| `crates/core` | `hermes_core` | The application layer (native UI Phase 1): `Core` over the runtime, typed `CoreEvent`s, the questions (`CoreBridge`, the runtime's `UserBridge`), sessions, the side files, the app lock | CP1.1 moved sessions, questions, events, the transcript reading, projects, branch/archive/workspace here; `crates/desktop` keeps the protocol's shapes. Not yet: the turn's event loop and queue, settings, the workspace features (CP1.2, CP1.3) |
+| `crates/core` | `hermes_core` | The application layer (native UI Phase 1): `Core` over the runtime, typed `CoreEvent`s, the questions (`CoreBridge`, the runtime's `UserBridge`), sessions, the side files, the app lock | CP1.1 moved sessions, questions, events, the transcript reading, projects, branch/archive/workspace here; CP1.2 the turn (`turns.rs`: submit, the queue, the turn's loop, titles), the `/` menu (`commands.rs`), attachments, `@` paths, files, `open_file.rs`, git reads and the review pane (`git.rs`, `git_review.rs`), the terminal's shells (`terminal.rs`), export, processes and subagents (`delegation.rs`); `crates/desktop` keeps the protocol's shapes. Not yet: settings, providers, usage, skills and the rest of CP1.3 |
 | `crates/runtime` | `hermes_runtime` | Sessions and turns over the agent: `Runtime` | `lib.rs` (API), `session.rs`, `session_actor.rs` (each session's actor: run slot, review slot, the page's state; Phase 13d), `agent_loop.rs` (the agent loop: passes over the checks, Stop, `Next`; Phase 13e), `ops.rs` (the loop's checks: retry and continuation rules, per-turn tool guards), `delegate.rs` + `subagents.rs`, `compress.rs`, `review.rs` (background review), `signals.rs` (learning signals: what each turn says is worth learning, scored locally into `signals/<id>.json`), `skill_outcomes.rs` (how the turns a skill was used in went, into `.usage.json`), `review_once.rs` (the evidence review: one request with a packet of signals, skills and memory; a JSON reply validated and applied or staged), `review_schedule.rs` (when it runs: per-session idle timers, switched-away/closed, one review at a time, back-off, hourly cap), `curator.rs` + `curator/` (the curator: the agent loop of `balanced`, and per-cluster proposals under `requests`), `mcp.rs`, `commands.rs` (`/diff`, `/usage`…), `guards.rs`, `changes.rs` |
 | `crates/agent` | `hermes_agent` | The agent's steps (from Goose): stream a reply (`inference.rs`, with the fallback chain), run tool calls (`tool.rs`); the loop that drives them is the runtime's `agent_loop.rs` since Phase 13e | `events.rs` has `AgentEvent` |
 | `crates/llm` | `hermes_llm` | Messages, the OpenAI-compatible provider, retries (from Goose) | `conversation::message::{Message, MessageContent}`; `observer.rs` is where every model POST is reported (purpose, session, provider) to the request ledger; `discovery.rs` lists an endpoint's `/models` and fills gaps from `canonical/` (a trimmed, compiled-in model catalog since Phase 14: see PITFALLS.md "The model catalog") |
@@ -124,14 +124,16 @@ is the contract (257 methods), `apps/desktop/src/api/` is how the page calls the
 - **Events** go out as `{"method":"event","params":{"type":…,"session_id":…,"payload":…}}` via
   `self.emit(session_id, event, payload)`. Delivery goes through `Hub` (`hub.rs`): each socket
   subscribes to the sessions it opened (`subscribe`), so a session's events reach whichever
-  window shows it. Turn events are translated from `RuntimeEvent`/`AgentEvent` in `submit`
-  (`message.start`, `message.complete`, `subagent.*`, `btw.complete`, `background.complete`,
-  `session.info`, …) and, since native UI CP1.1, partly by `hermes_core`: the stream
-  (`stream.rs`: text, reasoning, tool calls, status lines), titles and the questions are
-  `CoreEvent`s published on the core's bus, and the `Hub` is a listener on it that sends each as
-  the page's frame (`message.delta`, `reasoning.delta`, `tool.start`, `tool.progress`,
-  `tool.complete`, `status.update`, `session.title`, `approval.request`, `clarify.request`,
-  `*.settled`) in the publisher's thread, so they keep their order with the gateway's own.
+  window shows it. Since native UI CP1.2 the turn runs in `hermes_core::turns` (`Core::submit`):
+  its stream (`stream.rs`: text, reasoning, tool calls, status lines), `TurnStarted`, subagent
+  rows, titles and the questions are `CoreEvent`s on the core's bus, and the `Hub` is a listener
+  on it that sends each as the page's frame (`message.start`, `message.delta`, `reasoning.delta`,
+  `tool.start`, `tool.progress`, `tool.complete`, `status.update`, `subagent.*`,
+  `session.title`, `approval.request`, `clarify.request`, `*.settled`) in the publisher's thread,
+  so they keep their order with the gateway's own. The frames that need the store
+  (`session.info` with the queue panel, `session.usage`, `message.complete`) come from the
+  gateway's `TurnHooks` (`gateway/turn.rs` `PageTurn`), which the core's loop calls on a
+  blocking thread at those points. `btw.complete` and `background.complete` are the gateway's.
 - Bigger features live in their own module and `dispatch` has a one-line arm calling it
   (e.g. `Request::SessionBranch(..) => self.session_branch(...)`, `crate::git_review::route`).
 
@@ -181,20 +183,20 @@ Where to look first for each thing the user sees. (`gw` = a handler in `gateway/
 | Chat: send, stream, stop, queue, steer | gw `submit`, `transcript.rs`, runtime `start_turn` | `prompt.submit`, `session.interrupt`, `session.steer`, `prompt.*_queued` | `smoke.mjs`, `stop-check.mjs`, `provider-error-check.mjs` |
 | Approvals, clarify | `hermes_core` `questions.rs` (`CoreBridge`), `hub.rs` (the cards' JSON), `hermes_tools::approval` | `approval.respond`, `clarify.respond` | `smoke.mjs` |
 | Sidebar: sessions, search, pin, rename, delete | gw `session_list`, `session_route` | `/api/profiles/sessions`, `/api/sessions/*` | — |
-| Artifacts (sidebar), `file:` links | page over `stored_messages`; `open_file.rs` (patch 0013) | `/api/sessions/{id}/messages`, `/api/hermes-rs/open-file` | `artifacts-check.mjs` |
+| Artifacts (sidebar), `file:` links | page over `stored_messages`; `hermes_core` `open_file.rs` (patch 0013) | `/api/sessions/{id}/messages`, `/api/hermes-rs/open-file` | `artifacts-check.mjs` |
 | Archive, Settings ▸ Sessions | `hermes_core` `archive.rs`, `sessions.rs`, gw `set_archived`, `auto_archive` | PATCH `archived`, `session.mutate archive`, `?archived=` | `archive-check.mjs` |
 | Projects view | `hermes_core` `projects.rs` (grouping), `projects.rs` (JSON) | `projects.tree`, `projects.*` | — |
-| `/` menu, skills commands | `commands.rs` | `commands.catalog`, `complete.slash`, `slash.exec`, `command.dispatch` | — |
-| Built-in commands (`/status`, `/compress`, `/diff`…) | gw `builtin_command`, runtime `commands.rs` | `slash.exec` | — |
-| `/plan`, `/init`, `/review`, `/learn`, `/import-hermes` | `commands.rs` `coding_command`, gw `review_task` | `slash.exec` | `coding-commands-check.mjs` |
+| `/` menu, skills commands | `hermes_core` `commands.rs`, `commands.rs` (JSON), gw `slash.rs` | `commands.catalog`, `complete.slash`, `slash.exec`, `command.dispatch` | — |
+| Built-in commands (`/status`, `/compress`, `/diff`…) | `hermes_core` `commands.rs` (`Core::run_command`), runtime `commands.rs` | `slash.exec` | — |
+| `/plan`, `/init`, `/review`, `/learn`, `/import-hermes` | `hermes_core` `commands.rs` (`coding_command`, `review_task`), gw `slash.rs` (`import_hermes`) | `slash.exec` | `coding-commands-check.mjs` |
 | `/branch`, `/btw`, `/bg` | `hermes_core` `branch.rs`, `sessions.rs`, runtime `side_question`/`background` | `session.branch*`, `prompt.btw`, `prompt.background` | `side-and-branch-check.mjs` |
 | `/undo`, `/retry`, restore, `/rollback` | gw `rewind_turn`, `rollback`, `hermes_tools::checkpoints` | `session.rewind`, `session.mutate`, `rollback.*` | `rollback-check.mjs` |
-| `/save` | `export.rs` | `session.export` | — |
-| `@` completions | `paths.rs` | `complete.path` | — |
-| Attachments | `attachments.rs`, `server.rs` upload | `/api/chat/image-upload`, `/api/chat/file-upload`, `image.attach`, `file.attach` | `attach-check.mjs` |
-| Side panel: file preview/edit | `files.rs`, `server.rs` `file_bytes` | `/api/fs/*`, `/api/files/*` | `files-check.mjs` |
-| Side panel: git review, coding rail | `git_review.rs`, `git.rs` | `/api/git/*` | `git-check.mjs` |
-| Side panel: terminal | `terminal.rs`, `server.rs` | `/api/host-terminal` (PTY socket) | `terminal-check.mjs` |
+| `/save` | `hermes_core` `export.rs`, `export.rs` (JSON) | `session.export` | — |
+| `@` completions | `hermes_core` `paths.rs`, `paths.rs` (JSON) | `complete.path` | — |
+| Attachments | `hermes_core` `attachments.rs`, `attachments.rs` (JSON), `server.rs` upload | `/api/chat/image-upload`, `/api/chat/file-upload`, `image.attach`, `file.attach` | `attach-check.mjs` |
+| Side panel: file preview/edit | `hermes_core` `files.rs`, `files.rs` (JSON), `server.rs` `file_bytes` | `/api/fs/*`, `/api/files/*` | `files-check.mjs` |
+| Side panel: git review, coding rail | `hermes_core` `git_review.rs`, `git.rs`; `git_review.rs`, `git.rs` (routes, JSON) | `/api/git/*` | `git-check.mjs` |
+| Side panel: terminal | `hermes_core` `terminal.rs` (shells), `terminal.rs` (socket), `server.rs` | `/api/host-terminal` (PTY socket) | `terminal-check.mjs` |
 | Subagents | runtime `delegate.rs`, `subagents.rs`; gw `subagent.*` | `subagent.*`, `delegation.*` | `subagents-check.mjs` |
 | Model picker, effort | gw `model_options`, `switch_model`, `providers.rs` | `model.options`, `config.set {key: "model"}`, `session.mutate` | `switch.mjs` |
 | Settings ▸ Model ▸ Auxiliary | `aux_models.rs`, gw `turn_options` | `/api/model/auxiliary`, `/api/model/set {scope: auxiliary}`, `/api/model/auxiliary/local` (ours: "Use a local model for background jobs", patch 0023) | `aux-models-check.mjs`, `local-aux-check.mjs` |
@@ -206,19 +208,21 @@ Where to look first for each thing the user sees. (`gw` = a handler in `gateway/
 | Capabilities ▸ Tools | `toolsets.rs`, runtime `set_disabled_tools` | `/api/tools/*` | `toolsets-check.mjs` |
 | Command Center ▸ Maintenance, logs, insights | `maintenance.rs`, gw | `/api/curator*`, `/api/logs`, `insights.get` | — |
 | Import Hermes sessions | `hermes_import.rs` | `session.foreign.*`, `/import-hermes` | `import-check.mjs` |
-| Shell sandbox (`terminal.sandbox`, config only) | tools `sandbox.rs`, `sandbox_labels.rs`; gw `slash.rs` `sandbox_text` | `/sandbox`, `/sandbox remove-labels` (`slash.exec`) | — (unit tests; the `slash.exec` answer's shape is `/import-hermes`'s) |
+| Shell sandbox (`terminal.sandbox`, config only) | tools `sandbox.rs`, `sandbox_labels.rs`; `hermes_core` `commands.rs` `sandbox_text` | `/sandbox`, `/sandbox remove-labels` (`slash.exec`) | — (unit tests; the `slash.exec` answer's shape is `/import-hermes`'s) |
 | Profiles window, SOUL.md editor | `profiles.rs` | `/api/profiles/{name}/soul`, `/api/profiles` | `profiles-check.mjs` |
 | Window caption buttons, zoom, dialogs | `server.rs` `window_control`, `main.rs` | `/api/hermes-rs/window` | — |
 
 ## A turn, end to end
 
 1. Page: `prompt.submit {session_id, text, …}` (or `session.create` first).
-2. `Gateway::submit`: resolves the session's provider/model (`provider_for`, `route_session`),
-   attachments (`pending_images`, `attachments.rs`), builds the `TurnOptions` with
-   `Gateway::turn_options` (the model's known window, the session's effort, the side jobs'
-   models — use it for every runtime call that takes options), queues it if a turn is running
-   (`enqueue`/`run_queued`), then `runtime.start_turn(...)` (or `start_turn_with_images`,
-   `start_turn_with_call` for a scripted first tool call).
+2. `Gateway::prompt_submit` turns the params into a `SubmitTurn` and calls `Core::submit`
+   (`hermes_core::turns`) with its `PageTurn` hooks: the core queues it if a turn is running, else
+   cuts the conversation for an edit, sets a provisional title, resolves the provider (the hooks'
+   `settings`, from Settings), attachments (`hermes_core::attachments`), the `TurnOptions` (the
+   hooks' `options` = `Gateway::turn_options`: the model's known window, the session's effort, the
+   side jobs' models — use it for every runtime call that takes options), then
+   `runtime.start_turn(...)` (or `start_turn_with_images`, `start_turn_with_call` for `/review`'s
+   scripted first tool call).
 3. `Runtime::start_turn` (runtime `lib.rs`): loads the session from the store, builds the system
    prompt once per session (`hermes_prompts`, kept for caching), builds `SessionTools` minus
    disabled toolsets, wraps them in the per-turn ops (`ops.rs`: `GuardedTools` checks paths,
@@ -228,9 +232,10 @@ Where to look first for each thing the user sees. (`gw` = a handler in `gateway/
 4. The agent streams from `hermes_llm`'s OpenAI-compatible provider, runs tool calls
    (`hermes_tools`), queues each message for the store's writer (committed in ~5 ms batches, and
    flushed before `TurnFinished`), and emits `AgentEvent`s.
-5. Gateway forwards those as page events, records generation stats (`note_generation`), and on
-   `TurnFinished` sends `message.complete`, runs the next queued prompt, titles a new session
-   (`title_session`, aux "titles" model), and the background review may run. Just before
+5. The core's loop (`turns.rs` `TurnRun`) publishes those as `CoreEvent`s (the hub sends the
+   page's frames), calls the hooks for generation stats (`note_generation`) and `session.usage`,
+   and on `TurnFinished` publishes `TurnEnded` (the hooks send `message.complete`), runs the next
+   queued prompt, titles a new session (the aux "titles" model), and the background review may run. Just before
    `TurnFinished` the runtime scores the turn's learning signals (`signals.rs`: corrections,
    denials, workarounds, long turns, explicit requests; no request) and hands them to the signal
    store's writer thread; a rewind or `/undo` adds one too. The same step writes the outcome of

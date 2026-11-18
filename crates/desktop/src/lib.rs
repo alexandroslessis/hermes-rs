@@ -17,7 +17,6 @@ pub mod hermes_import;
 pub mod hub;
 pub mod learning;
 pub mod maintenance;
-pub mod open_file;
 pub mod paths;
 pub mod profiles;
 pub mod projects;
@@ -31,7 +30,7 @@ pub mod toolsets;
 pub mod transcript;
 
 // Moved to `hermes_core` (CP1.1); kept under their old paths for the modules that name them.
-pub use hermes_core::{archive, branch, workspace};
+pub use hermes_core::{archive, branch, open_file, workspace};
 
 /// Whether Settings' config record asks for Git Bash (`terminal.shell: "bash"`).
 pub fn wants_git_bash(data_dir: &std::path::Path) -> bool {

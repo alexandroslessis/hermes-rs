@@ -1581,11 +1581,31 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   `turnlock`). The ACP agent does not take it (it runs beside the desktop app); the native app
   must take it before it opens its window (when it starts using a `Core`, Phase 3). Tests and the
   perf instance use their own data folders, so they never meet the user's app.
-- **The gateway still runs the turn's loop and queue** (`gateway/turn.rs`) after CP1.1: it publishes
-  the core's stream events and builds `message.complete` / `session.info` itself. A new stream
-  event goes in `hermes_core::stream` and its frame in `hub.rs`. Until that loop moves (CP1.2), a
-  front end that builds a `Core` without a `Gateway` gets no stream events at all: nothing else
-  publishes them.
+- **The turn runs in the core** (`hermes_core::turns`, CP1.2): `Core::submit` with a front end's
+  `TurnHooks`. A new stream event goes in `hermes_core::stream` and its frame in `hub.rs`; a page
+  frame that needs the store (like `session.info`) goes in a hook, not in the hub listener (a
+  listener runs on the turn's task and must not block). The loop calls every hook on a blocking
+  thread and awaits it before the next event, so the frames keep the order they had when the loop
+  was the gateway's (`message.start`, then `session.info`; `TurnEnded`, then `message.complete`).
+  The hooks of the turn that ran are the ones its queued follow-up starts with (the page's socket
+  that sent the first prompt keeps following, as before).
+- **The queue is JSON in the session's actor** (`PageState::queue`): each item is a `SubmitTurn`
+  written with serde under the page's names (`submission_id`, `text`, `shown`, `images`,
+  `truncate`), because `dequeue` looks prompts up by `submission_id`. Read it with `Core::queue`,
+  never `handle.page().queue` directly; renaming a `SubmitTurn` field breaks the lookup.
+- **Queue changes reach a front end twice**: as `CoreEvent::QueueChanged` and through the
+  operation's hooks (`changed`: the page's `session.info`). The hub ignores the event.
+- **A queued prompt that can't start** (an attached image gone, no provider) publishes
+  `QueuedFailed` with its admission and the error, then `Idle`; no `TurnStarted`/`TurnEnded`
+  follows for it. The page hears it through the `queued_failed` hook (`message.complete` with the
+  error); the hub ignores the event.
+- **Queue races the old gateway had, kept as they were:** a steer whose turn ended between the
+  check and the steer, an edit (`replace_queued`) or a redirect landing just as the turn ends, put
+  the prompt back in the queue with no turn left to run it (it runs after the next prompt). Rare
+  (a window of one actor round trip); a fix is an `only_if_running` enqueue that then submits.
+- **A terminal's output is not a `CoreEvent`**: `Shell::attach` gives the snapshot and a per-shell
+  broadcast stream; a newer attachment supersedes the older (`is_current`). `Terminals::new`
+  takes the app's version (`TERM_PROGRAM_VERSION`), not the core's.
 - **A question's waiting future cleans up after itself.** If the turn drops it (its cancel token
   fires without `Core::stop`, an editor closes the thread), the open question is removed and
   `Settled` published, so `is_waiting` and `session.resume`'s `prompts` never show a dead card.

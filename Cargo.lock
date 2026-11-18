@@ -4798,7 +4798,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.23.1",
  "chrono",
+ "dirs 7.0.0",
  "hermes_agent",
  "hermes_llm",
  "hermes_prompts",
@@ -4806,12 +4808,14 @@ dependencies = [
  "hermes_store",
  "hermes_testdir",
  "hermes_tools",
+ "portable-pty",
  "rmcp",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

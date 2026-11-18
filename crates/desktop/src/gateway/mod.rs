@@ -36,7 +36,6 @@ use hermes_runtime::{Runtime, RuntimeEvent, TurnOptions, TurnStatus};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::commands;
 use crate::hub::{Hub, Outbox};
 use crate::providers::Settings;
 use crate::transcript;
