@@ -293,12 +293,17 @@ possible. They are the visual ground truth for Phase 2, and later phases reuse t
 
 - **Where:** `docs/native-ui/reference/t3code/`, committed. Names say what and which theme:
   `<screen-or-component>-<light|dark>[-<state>].png` (e.g. `sidebar-dark.png`,
-  `button-variants-light.png`, `titlebar-dark-maximised.png`). The user adds a line per file to
-  `reference/t3code/README.md` (what it shows, window size, scale) when they drop them in.
-- **Before CP2.1 starts**, the orchestrator checks that folder. If it is empty, it asks the user
-  for the screenshots Phase 2 needs rather than guessing: both themes of the app frame (title bar,
-  sidebar, empty main area), the buttons in every variant and size, a list row in its states, a
-  badge, kbd, tooltip, toast, and the command palette. Screens for later phases can come later.
+  `button-variants-light.png`, `titlebar-dark-maximised.png`; no theme suffix means dark). Whoever
+  adds a file adds a line to `reference/t3code/README.md` saying what it shows.
+- **The set is partial, by the user's choice** (2026-11-18: dark theme, frame, sidebar, thread,
+  panels, composer model picker; see the folder's `README.md` for the list and what is not
+  covered). The orchestrator does not ask the user for more. **A subagent that needs a screenshot
+  that is missing takes it itself** from t3code (installed; source in `C:\Users\alexandros\repos\t3code`; the user allows
+  using their instance and data, 2026-11-18, but nothing they'd notice may stay changed: put
+  settings back, don't create or delete threads/projects; close only what the agent started), crops to the element, saves it in `reference/t3code/` with the naming rule and adds a
+  row to the folder's `README.md`. This covers the light theme, button variants and sizes, title
+  bar, command palette, toast, tooltip, badge, kbd and empty states. Where t3code itself can't be
+  run, the implementer says so in the progress note and works from its source.
 - **CP2.1 (tokens):** the implementer reads the t3code CSS values first (`index.css`) and uses
   the screenshots to *check* them (sample a few pixel colours per token, background, border,
   muted text, accent, from the images), recording any token whose screenshot colour differs from

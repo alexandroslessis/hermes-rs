@@ -1,8 +1,51 @@
 # t3code reference screenshots
 
 Supplied by the user as the visual ground truth for the native UI (see Phase 2 in
-[../../PHASES.md](../../PHASES.md)). Name files `<screen-or-component>-<light|dark>[-<state>].png`.
+[../../PHASES.md](../../PHASES.md)). **Dark theme only so far.** Window size and scale were not
+recorded: measure from the image (pixel size) and don't assume 100% scale.
 
-| File | Shows | Window size / scale |
-|---|---|---|
-| _(none yet)_ | | |
+## The set is not complete, and that is fine
+
+The user took what was quick, not an exhaustive list. **If a screenshot you need is missing, take it
+yourself:** t3code is at `C:\Users\alexandros\repos\t3code` (MIT; `apps/web` is the UI). The user has t3code installed and
+allows you to use it (their instance and data included, user 2026-11-18; see its README). Change
+nothing in it that they would notice afterwards (settings, threads, projects): look, toggle the
+theme and put it back. Put it in the state you need and capture the one element or area you need
+(cropped, not the whole window unless the frame itself is the subject). Save it here with the naming
+below and add a row to the table. Light theme is only worth taking when a checkpoint needs it
+(t3code has a light theme: toggle it in its settings). Stop and close only the processes you started.
+
+## Naming
+
+`<screen-or-component>-<detail>[-<light|dark>][-<state>].png`. A file with no theme suffix is dark.
+
+## Files
+
+The "Shows" column is inferred from the file names; the first reader who looks at an image corrects
+its row if it is wrong.
+
+| File | Shows |
+|---|---|
+| `app-empty-dark.png` | Whole window, empty thread (frame, sidebar, empty main area) |
+| `app-thread-dark.png` | Whole window with a thread open |
+| `app-thread-options.png` | Thread menu / options |
+| `app-terminal-open.png` | Terminal drawer open |
+| `app-sidebar_closeup-dark.png` | Sidebar close-up |
+| `app-sidebar_collapsed.png` | Sidebar collapsed |
+| `app-codeblock_closeup-dark.png` | Code block close-up |
+| `app-hover_reply_closeup-dark.png` | Message hover actions (reply) close-up |
+| `sidebar.png` | Sidebar |
+| `sidebar-right.png` | Right sidebar / panel |
+| `sidebar-diff.png`, `sidebar-diff-content.png` | Diff panel and its content |
+| `sidebar-filetree.png` | File tree panel |
+| `sidebar-thread-details.png`, `sidebar-thread-details-hover.png` | Thread details row, normal and hover |
+| `button-session-variants-default.png`, `-hover.png`, `-selected.png` | Session/thread row button states |
+| `button-sidebar_toggle-hover.png` | Sidebar toggle button, hover |
+| `buttons-sidebar-down.png` | Sidebar buttons (bottom) |
+| `composer-model-picker.png`, `composer-model-picker-permission.png` | Composer model picker, and with the permission selector |
+
+## Not covered yet (take them when the checkpoint needs them)
+
+Light theme; the button variants and sizes in the design system's sense (default, outline, ghost,
+destructive); title bar and Windows caption buttons; command palette; toast; tooltip; badge and kbd;
+empty states. Phase 2 (CP2.1 tokens, CP2.2 components and frame) needs most of these.
