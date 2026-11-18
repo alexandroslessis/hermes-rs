@@ -171,20 +171,6 @@ impl Gateway {
         self.runtime.note_session_viewed(id);
     }
 
-    /// Settings ▸ Sessions' auto-archive (`archive.rs`): when it's on, sessions idle for
-    /// `sessions.auto_archive_days` go to the archive.
-    pub(super) fn auto_archive(&self) {
-        let sessions = self.rest.config_value("sessions");
-        if sessions["auto_archive"] != true {
-            return;
-        }
-        let days = sessions["auto_archive_days"]
-            .as_f64()
-            .filter(|d| *d >= 1.0)
-            .unwrap_or(crate::archive::DEFAULT_IDLE_DAYS);
-        self.core.auto_archive(days);
-    }
-
     pub(super) fn active_sessions(&self) -> Vec<Value> {
         self.core
             .live_sessions()
@@ -249,7 +235,7 @@ impl Gateway {
         };
         let (tool_definitions, mcp_tools) = (json_tokens(&builtin), json_tokens(&mcp));
         let estimated_total = system + tool_definitions + mcp_tools + conversation;
-        let context_max = self.context_length(&record.provider, &record.model).await;
+        let context_max = self.core.context_length(&record.provider, &record.model).await;
         let session = id.to_string();
         let measured = self
             .blocking(move |g| g.runtime.store().usage_totals(&session))
@@ -302,24 +288,10 @@ impl Gateway {
         }))
     }
 
-    /// The provider and model picked while the session's turn runs, if any.
-    pub(super) fn pending_route(&self, id: &str) -> Option<(String, String)> {
-        self.runtime
-            .existing_session_handle(id)?
-            .page()
-            .pending_route
-    }
-
     /// A model picked while the last turn ran, applied now that it has finished.
     pub(super) fn apply_pending_route(&self, id: &str) {
-        let pick = self
-            .runtime
-            .existing_session_handle(id)
-            .and_then(|handle| handle.take_pending_route().ok().flatten());
-        if let Some((provider, model)) = pick {
-            if let Err(error) = self.route_session(id, &provider, &model) {
-                tracing::warn!("applying the model picked during the turn in {id}: {error}");
-            }
+        if self.core.apply_pending_route(id) {
+            self.emit(id, "session.info", self.session_info(id));
         }
     }
 
@@ -353,7 +325,7 @@ impl Gateway {
                     .as_str()
                     .unwrap_or_default()
                     .to_lowercase();
-                self.pick_effort(&id, Some(effort.clone()));
+                self.core.pick_effort(&id, Some(effort.clone()));
                 self.emit(&id, "session.info", self.session_info(&id));
                 json!({"effort": effort, "status": "applied"})
             }
@@ -591,7 +563,7 @@ impl Gateway {
             .map(str::to_string);
         let mut turn = self
             .runtime
-            .compress(&id, &provider, self.turn_options(&id), focus)
+            .compress(&id, &provider, self.core.turn_options(&id), focus)
             .map_err(error)?;
         let mut failed = None;
         while let Some(event) = turn.events.recv().await {
@@ -693,33 +665,14 @@ impl Gateway {
             .unwrap_or(1)
     }
 
-    /// Picks the session's effort (`None`: Settings' again). A session may get one before it
-    /// was ever loaded (its actor starts here; nothing is read).
-    pub(super) fn pick_effort(&self, id: &str, effort: Option<String>) {
-        let picked = match &effort {
-            Some(_) => self
-                .runtime
-                .session_handle(id)
-                .map_err(|e| format!("{e:#}")),
-            None => match self.runtime.existing_session_handle(id) {
-                Some(handle) => Ok(handle),
-                None => return,
-            },
-        }
-        .and_then(|handle| handle.set_effort(effort).map_err(|e| e.to_string()));
-        if let Err(error) = picked {
-            tracing::warn!("picking the effort of {id}: {error}");
-        }
-    }
-
     pub(super) fn session_info(&self, id: &str) -> Value {
         let record = self.runtime.store().session(id).ok().flatten();
         let running = self.is_live(id);
         match record {
             Some(record) => json!({
                 // A pick made mid-reply shows at once; it takes effect from the next turn.
-                "model": self.pending_route(id).map_or(record.model, |(_, model)| model),
-                "provider": self.pending_route(id).map_or(record.provider, |(provider, _)| provider),
+                "model": self.core.pending_route(id).map_or(record.model, |(_, model)| model),
+                "provider": self.core.pending_route(id).map_or(record.provider, |(provider, _)| provider),
                 "cwd": record.cwd,
                 // The git identity a move recorded; the sidebar groups by the repo root.
                 "git_branch": self.core.workspaces().identity(id).and_then(|(branch, _)| branch),
@@ -731,7 +684,7 @@ impl Gateway {
                 // The protocol this backend speaks; the page warns "out of date" without it.
                 "desktop_protocol": "hermes-gateway-v1",
                 "profile_name": "default",
-                "reasoning_effort": self.effort(id),
+                "reasoning_effort": self.core.effort(id),
                 "revision": self.revision(id),
                 "execution_generation": EXECUTION_GENERATION,
                 // The queue panel's rows: prompts waiting for the running turn.

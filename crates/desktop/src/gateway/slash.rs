@@ -1,14 +1,14 @@
 //! Slash commands and completion: `commands.catalog`, `complete.slash`, `complete.path`,
 //! `slash.exec`, `command.dispatch`. What the commands do is `hermes_core::commands`
-//! (`Core::run_command`); the JSON is `crate::commands`; [`PageCommands`] gives the core what only
-//! the page's Settings know (the model's window, the session's provider, the importer).
+//! (`Core::run_command`, over `CoreCommands`: the core's own Settings); the JSON is
+//! `crate::commands`.
 //! Hermes: `tui_gateway/server.py` (`slash.exec`, `command.dispatch`, `complete.*`),
 //! `hermes_cli/commands.py`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use hermes_core::commands::{CommandEnv, CommandError, split_command};
+use hermes_core::commands::{CommandError, CoreCommands, split_command};
 use serde_json::json;
 
 use super::Gateway;
@@ -67,7 +67,7 @@ impl Gateway {
         }
         let (name, arg) = split_command(p.command.as_deref().unwrap_or_default());
         let session = session_id(&p.raw).ok();
-        let env = PageCommands::new(self, settings);
+        let env = CoreCommands::with_settings(&self.core, settings.clone());
         self.core
             .run_command(session.as_deref(), name, arg, &env)
             .await
@@ -90,7 +90,7 @@ impl Gateway {
 
     /// `/status` (`session.status`): the session, its model and folder, tokens, context.
     pub(super) async fn status_text(self: &Arc<Self>, id: &str) -> Result<String, RpcError> {
-        let env = PageCommands::new(self, &Settings::load(&self.data_dir));
+        let env = CoreCommands::with_settings(&self.core, Settings::load(&self.data_dir));
         self.core.status_text(id, &env).await.map_err(command_error)
     }
 }
@@ -101,82 +101,5 @@ fn command_error(error: CommandError) -> RpcError {
         CommandError::Invalid(text) => RpcError::invalid(text),
         CommandError::Failed(text) => RpcError::server(text),
         CommandError::NotACommand => RpcError::server("not a quick/plugin/bundle/skill command"),
-    }
-}
-
-/// What the commands need from the page's side: the Settings the request was answered with.
-struct PageCommands {
-    gateway: Arc<Gateway>,
-    settings: Settings,
-}
-
-impl PageCommands {
-    fn new(gateway: &Arc<Gateway>, settings: &Settings) -> Self {
-        Self {
-            gateway: gateway.clone(),
-            settings: settings.clone(),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl CommandEnv for PageCommands {
-    async fn context_length(&self, provider: &str, model: &str) -> usize {
-        self.gateway.context_length(provider, model).await
-    }
-
-    fn route(
-        &self,
-        session_id: &str,
-    ) -> Result<(hermes_runtime::ProviderConfig, TurnOptions), CommandError> {
-        let provider = self
-            .gateway
-            .provider_for(session_id, &self.settings)
-            .map_err(|e| CommandError::Failed(e.message()))?;
-        Ok((provider, self.gateway.turn_options(session_id)))
-    }
-
-    /// Every session of the original Hermes not imported yet (`hermes_import.rs`).
-    async fn import_hermes(&self) -> Result<String, CommandError> {
-        let (provider, model) = self
-            .gateway
-            .import_route(&self.settings)
-            .map_err(|e| CommandError::Failed(e.message()))?;
-        let runtime = self.gateway.runtime.clone();
-        let data_dir = self.gateway.data_dir.clone();
-        let found = tokio::task::spawn_blocking(move || {
-            let sources = crate::hermes_import::sources();
-            let target = crate::hermes_import::Target {
-                runtime: &runtime,
-                provider,
-                model,
-                data_dir: &data_dir,
-            };
-            (sources, crate::hermes_import::import_all(&target))
-        })
-        .await;
-        match found {
-            Ok((sources, _)) if sources.is_empty() => Ok(
-                "No Hermes data found here (looked in HERMES_HOME, %LOCALAPPDATA%\\hermes and ~\\.hermes)."
-                    .to_string(),
-            ),
-            Ok((sources, (imported, already, failed))) => {
-                let mut text = format!(
-                    "Imported {imported} session{} from Hermes ({} database{}); {already} already here.",
-                    if imported == 1 { "" } else { "s" },
-                    sources.len(),
-                    if sources.len() == 1 { "" } else { "s" },
-                );
-                if !failed.is_empty() {
-                    text.push_str(&format!(
-                        "\nNot imported ({}):\n{}",
-                        failed.len(),
-                        failed.join("\n")
-                    ));
-                }
-                Ok(text)
-            }
-            Err(e) => Err(CommandError::Failed(e.to_string())),
-        }
     }
 }

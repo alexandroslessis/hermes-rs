@@ -92,7 +92,7 @@ Read the existing tests near the area you change before writing a new one; the h
   fixture, a 240-entry archive that small talk and vague requests leave alone, two repositories'
   isolation incl. the filter-before-limit case, freshness across stores,
   skill boost, schema bump), `runtime/src/memory_hygiene.rs` and `review_once/tests.rs` (supersedes),
-  `desktop/src/learning.rs` (link edges, dangling links, no project memory). The curator turns test
+  `core/src/learning.rs` and `desktop/src/learning.rs` (the graph JSON; link edges, dangling links, no project memory). The curator turns test
   backdates `memory.db` rows with `rusqlite` (a dev-dependency of the runtime only for that).
 - `run_script` tests (Phase 10 CP10.1): the analysis is unit-tested in `crates/tools/src/script_guard.rs`
   (one list per smuggling construct and language, continuation joins, benign scripts that must pass);
@@ -138,7 +138,7 @@ Read the existing tests near the area you change before writing a new one; the h
   `scripts/perf/deferred-tools-check.mjs`. Under `HERMES_TEST_PROFILE=tokens` the suite keeps `tokens`' other knobs but **not** its deferred list
   (`test_budget(None)` sets `tool_schemas: All`: the other tests call deferred tools directly); the deferral is covered by the tests that name `Tokens`.
 - Provider fallback (Phase 12 CP12.1): classification and config validation are unit tests (`crates/llm/src/fallback.rs`: real OpenRouter /
-  OpenAI / Ollama bodies and Retry-After values; `crates/desktop/src/fallback.rs`; `crates/runtime/src/fallback.rs`: the gate, the cap, the fit
+  OpenAI / Ollama bodies and Retry-After values; `crates/core/src/fallback.rs`; `crates/runtime/src/fallback.rs`: the gate, the cap, the fit
   limit). `turns.rs` (after the `Phase 12` banner) runs two or three mock providers, `duo(a_handler, b_handler, http_retries)`, each recording
   (purpose, body) per request: the daily 429 -> b with the same messages and tools, the notice and the ledger on both; the next turn skips a known
   used-up primary; 5xx after the retries (counts 2 and 1), the next turn re-probes; a tool call after the switch stays on b and runs once; a

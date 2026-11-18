@@ -18,9 +18,13 @@ Read [AGENTS.md](../AGENTS.md) first.
 │     /api/{*rest}      → Gateway::rest  (None → 404 "No such API endpoint")  │      │
 │     /api/host-terminal, /api/fs/download, /api/files/*, file-upload, window │      │
 │                                                                            ▼      │
-│   gateway/    Gateway { runtime, hub, rest (settings), side stores … }            │
-│     │  per-feature modules: endpoints, attachments, files, git_review,           │
-│     │  terminal, branch, toolsets, learning, hermes_import, export, skills …     │
+│   gateway/    Gateway { core, hub, rest (the page's own state) }: Hermes's        │
+│     │  JSON-RPC and REST shapes over typed calls; hub = CoreEvent → frames        │
+│     ▼                                                                             │
+│   hermes_core::Core  ── the application layer, no JSON, no Hermes field names:    │
+│     │  sessions, turns and their queue, CoreEvents, questions, Settings,          │
+│     │  providers, skills, staging, usage, git, files, terminal, import …          │
+│     │  (the ACP agent goes through the gateway; the native UI will call it)       │
 │     ▼                                                                             │
 │   hermes_runtime::Runtime  ── sessions, turns, delegation, compression, MCP       │
 │     ├─ hermes_agent (Goose's agent loop)  ── hermes_llm (OpenAI-compatible HTTP) ─┼──► model endpoint
@@ -32,15 +36,17 @@ Read [AGENTS.md](../AGENTS.md) first.
 ```
 
 Python analogy: `server.rs` is a FastAPI app, `Gateway` is the one big service object every route
-handler holds (behind an `Arc`, i.e. a refcounted shared pointer), `Runtime` is the agent library
-it calls into. Everything runs in one process.
+handler holds (behind an `Arc`, i.e. a refcounted shared pointer) that turns Hermes's JSON into calls on
+`hermes_core::Core` (the service layer: typed functions and events, no JSON) which drives `Runtime`, the
+agent library. Everything runs in one process. The native UI (`crates/native`) will call `Core` the way
+the gateway does, with no page and no JSON in between.
 
 ## Crates
 
 | Crate | Package | Role | Notes |
 |---|---|---|---|
 | `crates/desktop` | `hermes-desktop` | The app: Tauri window, axum server, the protocol layer | The main app. Most feature work lands here. |
-| `crates/core` | `hermes_core` | The application layer (native UI Phase 1): `Core` over the runtime, typed `CoreEvent`s, the questions (`CoreBridge`, the runtime's `UserBridge`), sessions, the side files, the app lock | CP1.1 moved sessions, questions, events, the transcript reading, projects, branch/archive/workspace here; CP1.2 the turn (`turns.rs`: submit, the queue, the turn's loop, titles), the `/` menu (`commands.rs`), attachments, `@` paths, files, `open_file.rs`, git reads and the review pane (`git.rs`, `git_review.rs`), the terminal's shells (`terminal.rs`), export, processes and subagents (`delegation.rs`); `crates/desktop` keeps the protocol's shapes. Not yet: settings, providers, usage, skills and the rest of CP1.3 |
+| `crates/core` | `hermes_core` | The application layer (native UI Phase 1): `Core` over the runtime, typed `CoreEvent`s, the questions (`CoreBridge`, the runtime's `UserBridge`), sessions, the side files, the app lock | CP1.1 moved sessions, questions, events, the transcript reading, projects, branch/archive/workspace here; CP1.2 the turn (`turns.rs`: submit, the queue, the turn's loop, titles), the `/` menu (`commands.rs`), attachments, `@` paths, files, `open_file.rs`, git reads and the review pane (`git.rs`, `git_review.rs`), the terminal's shells (`terminal.rs`), export, processes and subagents (`delegation.rs`); `crates/desktop` keeps the protocol's shapes. CP1.3 the Hermes features and Settings: the config record (`config.rs`), providers and custom endpoints (`providers.rs`, `endpoints.rs`), auxiliary models and the fallback chain (`aux_models.rs`, `fallback.rs`), Settings put on the runtime, the model picker, a turn's options, a model's window (`settings.rs`), usage and the request ledger (`usage.rs`), toolsets, skills, staging, the Star map, maintenance and the curator (events `CuratorStarted` / `CuratorFinished`), the Hermes importer, profiles. `crates/desktop` keeps only Hermes's JSON, statuses and RPC errors for them |
 | `crates/runtime` | `hermes_runtime` | Sessions and turns over the agent: `Runtime` | `lib.rs` (API), `session.rs`, `session_actor.rs` (each session's actor: run slot, review slot, the page's state; Phase 13d), `agent_loop.rs` (the agent loop: passes over the checks, Stop, `Next`; Phase 13e), `ops.rs` (the loop's checks: retry and continuation rules, per-turn tool guards), `delegate.rs` + `subagents.rs`, `compress.rs`, `review.rs` (background review), `signals.rs` (learning signals: what each turn says is worth learning, scored locally into `signals/<id>.json`), `skill_outcomes.rs` (how the turns a skill was used in went, into `.usage.json`), `review_once.rs` (the evidence review: one request with a packet of signals, skills and memory; a JSON reply validated and applied or staged), `review_schedule.rs` (when it runs: per-session idle timers, switched-away/closed, one review at a time, back-off, hourly cap), `curator.rs` + `curator/` (the curator: the agent loop of `balanced`, and per-cluster proposals under `requests`), `mcp.rs`, `commands.rs` (`/diff`, `/usage`…), `guards.rs`, `changes.rs` |
 | `crates/agent` | `hermes_agent` | The agent's steps (from Goose): stream a reply (`inference.rs`, with the fallback chain), run tool calls (`tool.rs`); the loop that drives them is the runtime's `agent_loop.rs` since Phase 13e | `events.rs` has `AgentEvent` |
 | `crates/llm` | `hermes_llm` | Messages, the OpenAI-compatible provider, retries (from Goose) | `conversation::message::{Message, MessageContent}`; `observer.rs` is where every model POST is reported (purpose, session, provider) to the request ledger; `discovery.rs` lists an endpoint's `/models` and fills gaps from `canonical/` (a trimmed, compiled-in model catalog since Phase 14: see PITFALLS.md "The model catalog") |
@@ -184,11 +190,11 @@ Where to look first for each thing the user sees. (`gw` = a handler in `gateway/
 | Approvals, clarify | `hermes_core` `questions.rs` (`CoreBridge`), `hub.rs` (the cards' JSON), `hermes_tools::approval` | `approval.respond`, `clarify.respond` | `smoke.mjs` |
 | Sidebar: sessions, search, pin, rename, delete | gw `session_list`, `session_route` | `/api/profiles/sessions`, `/api/sessions/*` | — |
 | Artifacts (sidebar), `file:` links | page over `stored_messages`; `hermes_core` `open_file.rs` (patch 0013) | `/api/sessions/{id}/messages`, `/api/hermes-rs/open-file` | `artifacts-check.mjs` |
-| Archive, Settings ▸ Sessions | `hermes_core` `archive.rs`, `sessions.rs`, gw `set_archived`, `auto_archive` | PATCH `archived`, `session.mutate archive`, `?archived=` | `archive-check.mjs` |
+| Archive, Settings ▸ Sessions | `hermes_core` `archive.rs`, `sessions.rs`, `settings.rs` (`sweep_archive`), gw `set_archived` | PATCH `archived`, `session.mutate archive`, `?archived=` | `archive-check.mjs` |
 | Projects view | `hermes_core` `projects.rs` (grouping), `projects.rs` (JSON) | `projects.tree`, `projects.*` | — |
 | `/` menu, skills commands | `hermes_core` `commands.rs`, `commands.rs` (JSON), gw `slash.rs` | `commands.catalog`, `complete.slash`, `slash.exec`, `command.dispatch` | — |
 | Built-in commands (`/status`, `/compress`, `/diff`…) | `hermes_core` `commands.rs` (`Core::run_command`), runtime `commands.rs` | `slash.exec` | — |
-| `/plan`, `/init`, `/review`, `/learn`, `/import-hermes` | `hermes_core` `commands.rs` (`coding_command`, `review_task`), gw `slash.rs` (`import_hermes`) | `slash.exec` | `coding-commands-check.mjs` |
+| `/plan`, `/init`, `/review`, `/learn`, `/import-hermes` | `hermes_core` `commands.rs` (`coding_command`, `review_task`, `CoreCommands`), `hermes_import.rs` | `slash.exec` | `coding-commands-check.mjs` |
 | `/branch`, `/btw`, `/bg` | `hermes_core` `branch.rs`, `sessions.rs`, runtime `side_question`/`background` | `session.branch*`, `prompt.btw`, `prompt.background` | `side-and-branch-check.mjs` |
 | `/undo`, `/retry`, restore, `/rollback` | gw `rewind_turn`, `rollback`, `hermes_tools::checkpoints` | `session.rewind`, `session.mutate`, `rollback.*` | `rollback-check.mjs` |
 | `/save` | `hermes_core` `export.rs`, `export.rs` (JSON) | `session.export` | — |
@@ -198,18 +204,18 @@ Where to look first for each thing the user sees. (`gw` = a handler in `gateway/
 | Side panel: git review, coding rail | `hermes_core` `git_review.rs`, `git.rs`; `git_review.rs`, `git.rs` (routes, JSON) | `/api/git/*` | `git-check.mjs` |
 | Side panel: terminal | `hermes_core` `terminal.rs` (shells), `terminal.rs` (socket), `server.rs` | `/api/host-terminal` (PTY socket) | `terminal-check.mjs` |
 | Subagents | runtime `delegate.rs`, `subagents.rs`; gw `subagent.*` | `subagent.*`, `delegation.*` | `subagents-check.mjs` |
-| Model picker, effort | gw `model_options`, `switch_model`, `providers.rs` | `model.options`, `config.set {key: "model"}`, `session.mutate` | `switch.mjs` |
-| Settings ▸ Model ▸ Auxiliary | `aux_models.rs`, gw `turn_options` | `/api/model/auxiliary`, `/api/model/set {scope: auxiliary}`, `/api/model/auxiliary/local` (ours: "Use a local model for background jobs", patch 0023) | `aux-models-check.mjs`, `local-aux-check.mjs` |
-| Settings ▸ Providers ▸ Custom endpoints | `endpoints.rs`, `providers.rs` | `/api/providers/custom-endpoints*` | `endpoints-check.mjs` |
-| Settings (all other pages) | `rest.rs` (`config_defaults`, `config_schema`), gw `apply_settings` | `/api/config*` | — |
-| Settings ▸ Memory, the Star map | `learning.rs`, `hermes_memory` | `/api/learning/*`, `/api/memory*` | `memory-check.mjs` |
-| Capabilities ▸ Skills | `skills.rs` | `/api/skills*` | — |
-| Writes waiting for review (tainted sessions, or write approval on): "Waiting for your review" on Settings ▸ Memory and Capabilities ▸ Skills (patches 0024-0026) | `staging.rs`, `hermes_tools::staging` | `staging.list/apply/reject` (ours), `/api/staging*` | — |
-| Capabilities ▸ Tools | `toolsets.rs`, runtime `set_disabled_tools` | `/api/tools/*` | `toolsets-check.mjs` |
-| Command Center ▸ Maintenance, logs, insights | `maintenance.rs`, gw | `/api/curator*`, `/api/logs`, `insights.get` | — |
-| Import Hermes sessions | `hermes_import.rs` | `session.foreign.*`, `/import-hermes` | `import-check.mjs` |
+| Model picker, effort | `hermes_core` `settings.rs` (`model_options`, `switch_model`, `pick_effort`), `providers.rs`; gw `settings.rs` (JSON) | `model.options`, `config.set {key: "model"}`, `session.mutate` | `switch.mjs` |
+| Settings ▸ Model ▸ Auxiliary | `hermes_core` `aux_models.rs`, `settings.rs` (`turn_options`); `aux_models.rs` (JSON) | `/api/model/auxiliary`, `/api/model/set {scope: auxiliary}`, `/api/model/auxiliary/local` (ours: "Use a local model for background jobs", patch 0023) | `aux-models-check.mjs`, `local-aux-check.mjs` |
+| Settings ▸ Providers ▸ Custom endpoints | `hermes_core` `endpoints.rs`, `providers.rs`; `endpoints.rs` (JSON) | `/api/providers/custom-endpoints*` | `endpoints-check.mjs` |
+| Settings (all other pages) | `hermes_core` `config.rs` (the record, its defaults), `settings.rs` (`apply_settings`); `rest.rs` (`config_schema`, the routes) | `/api/config*` | — |
+| Settings ▸ Memory, the Star map | `hermes_core` `learning.rs`; `learning.rs` (JSON); `hermes_memory` | `/api/learning/*`, `/api/memory*` | `memory-check.mjs` |
+| Capabilities ▸ Skills | `hermes_core` `skills.rs`; `skills.rs` (routes, JSON) | `/api/skills*` | — |
+| Writes waiting for review (tainted sessions, or write approval on): "Waiting for your review" on Settings ▸ Memory and Capabilities ▸ Skills (patches 0024-0026) | `hermes_core` `staging.rs`, `staging.rs` (JSON), `hermes_tools::staging` | `staging.list/apply/reject` (ours), `/api/staging*` | — |
+| Capabilities ▸ Tools | `hermes_core` `toolsets.rs`, runtime `set_disabled_tools`; `toolsets.rs` (JSON) | `/api/tools/*` | `toolsets-check.mjs` |
+| Command Center ▸ Maintenance, logs, insights | `hermes_core` `maintenance.rs` (curator, memory files), `usage.rs` (`insights`); `maintenance.rs` (JSON), gw | `/api/curator*`, `/api/logs`, `insights.get` | — |
+| Import Hermes sessions | `hermes_core` `hermes_import.rs`; `hermes_import.rs` (JSON) | `session.foreign.*`, `/import-hermes` | `import-check.mjs` |
 | Shell sandbox (`terminal.sandbox`, config only) | tools `sandbox.rs`, `sandbox_labels.rs`; `hermes_core` `commands.rs` `sandbox_text` | `/sandbox`, `/sandbox remove-labels` (`slash.exec`) | — (unit tests; the `slash.exec` answer's shape is `/import-hermes`'s) |
-| Profiles window, SOUL.md editor | `profiles.rs` | `/api/profiles/{name}/soul`, `/api/profiles` | `profiles-check.mjs` |
+| Profiles window, SOUL.md editor | `hermes_core` `profiles.rs`; `profiles.rs` (JSON) | `/api/profiles/{name}/soul`, `/api/profiles` | `profiles-check.mjs` |
 | Window caption buttons, zoom, dialogs | `server.rs` `window_control`, `main.rs` | `/api/hermes-rs/window` | — |
 
 ## A turn, end to end
@@ -219,7 +225,7 @@ Where to look first for each thing the user sees. (`gw` = a handler in `gateway/
    (`hermes_core::turns`) with its `PageTurn` hooks: the core queues it if a turn is running, else
    cuts the conversation for an edit, sets a provisional title, resolves the provider (the hooks'
    `settings`, from Settings), attachments (`hermes_core::attachments`), the `TurnOptions` (the
-   hooks' `options` = `Gateway::turn_options`: the model's known window, the session's effort, the
+   hooks' `options` = `Core::turn_options`: the model's known window, the session's effort, the
    side jobs' models — use it for every runtime call that takes options), then
    `runtime.start_turn(...)` (or `start_turn_with_images`, `start_turn_with_call` for `/review`'s
    scripted first tool call).
@@ -378,13 +384,15 @@ Two settings files, with different owners — don't mix them up:
 | File | Read/written by | Holds |
 |---|---|---|
 | `config.json` | `providers::Settings::load/save`, `aux_models.rs` | providers (custom endpoints), the default model, the side jobs' models (`aux_models`), shared with GPUI |
-| `desktop-config.json` | `rest.rs` (`config_value("a.b")`, `set_config_value`) | everything on Hermes's Settings page (Hermes's `config.yaml` keys, dotted); `fallback_providers` is the fallback chain (read per turn by `fallback.rs`) |
+| `desktop-config.json` | `hermes_core` `config.rs` (`ConfigRecord::value("a.b")`, `set_value`; `rest.rs` and the gateway reach it as `config_value` / `set_config_value`) | everything on Hermes's Settings page (Hermes's `config.yaml` keys, dotted); `fallback_providers` is the fallback chain (read per turn by `fallback.rs`) |
 | `ui-preferences.json` | `rest.rs` | the page's interface preferences |
 
-`Gateway::apply_settings()` pushes `desktop-config.json` values into the runtime (approvals mode,
-checkpoints, memory limits, disabled toolsets, budget knobs). Call it after any settings write that affects the
-runtime; it runs at startup and after `PUT /api/config`. Defaults and descriptions for keys
-Hermes's page shows live in `rest.rs`.
+`Core::apply_settings()` (`hermes_core` `settings.rs`) pushes `desktop-config.json` values into the
+runtime (approvals mode, checkpoints, memory limits, disabled toolsets, budget knobs). Call it (from the
+gateway: `Gateway::apply_settings()`, which also refreshes the followed sessions' `session.info`) after any
+settings write that affects the runtime; it runs after `PUT /api/config`, and at startup inside
+`Core::start`, the one call every front end makes after `Core::new`. Defaults live in `hermes_core`
+`config.rs` (`defaults()`); descriptions for keys Hermes's page shows in `rest.rs` (`config_schema`).
 
 **Request accounting** (Phase 2 of `docs/backend/PHASES.md`): every model request is announced by
 `hermes_llm::observer` to the `Ledger` (`runtime/src/ledger.rs`, one thread owning `requests.json`),
@@ -458,13 +466,15 @@ Data folder (`%APPDATA%\hermes-rs`, or `HERMES_RS_HOME`):
 | Path | Owner |
 |---|---|
 | `sessions.db` | `hermes_store` (frozen schema) |
-| `config.json`, `desktop-config.json`, `ui-preferences.json` | above |
-| `generation-stats.json` | gateway (tokens/s per session) |
+| `config.json` | `hermes_core` `providers.rs`, `endpoints.rs`, `aux_models.rs` (providers, default model, side-job models; shared with the GPUI app) |
+| `desktop-config.json` | `hermes_core` `config.rs` (the config record Settings writes) |
+| `ui-preferences.json` | `rest.rs` (the page's own preferences) |
+| `generation-stats.json` | `hermes_core` `usage.rs` (tokens/s per session) |
 | `branches.json` | `hermes_core` `branch.rs` (child → parent session) |
 | `archived-sessions.json` | `hermes_core` `archive.rs` (archived sessions, last auto-archive sweep) |
 | `session-workspaces.json` | `hermes_core` `workspace.rs` (a moved session's git identity) |
 | `app.lock` | `hermes_core` `lock.rs`: held open by the running app (desktop or native, not ACP); a second app says "Hermes is already open" and exits |
-| `hermes-imports.json` | `hermes_import.rs` (imported Hermes session ids) |
+| `hermes-imports.json` | `hermes_core` `hermes_import.rs` (imported Hermes session ids) |
 | `requests.json` | `hermes_runtime::ledger` (model requests per provider, day and purpose; the provider's learned limit) |
 | `memory.db` (+ `-wal`, `-shm`) | `hermes_memory` (`db.rs`, `sync.rs`): the memory entries since Phase 9 (CP9.1), own schema version; a damaged one is moved aside to `memory.db.corrupt-<time>` |
 | `index.db` rows for memory (CP9.3) | `hermes_tools` (`index.rs`): `memory_doc` = the user's own entries (`memory` / `user`, scope `global`) plus the live `project` / `archive` rows of `memory.db` (`project:<n>` / `archive:<n>`, scope `project:<key>` or `global`); a cache, rebuilt from the files and `memory.db`; retrieved per turn under `requests` into the user message's `<context>` block (`preinject.rs`), never the system prompt |
@@ -617,7 +627,7 @@ listed (GAPS 3.8). Four small modules, one per layer; the switch itself is in on
 at most 3 (`MAX_FALLBACKS`). It is the key Hermes's own Settings ▸ Model ▸ Fallbacks sub-page edits (unhidden in
 `hide.css`; the schema entry is in `rest.rs`). It is global, not per profile or per session: this backend has
 no profile layering and a session stores only its own provider and model. Read at every turn
-(`Gateway::turn_options`), so a change applies from the next message. An entry names a provider that is
+(`Core::turn_options`), so a change applies from the next message. An entry names a provider that is
 configured under Settings ▸ Providers; its endpoint and key are that provider's, and nothing else in the entry
 is read (the page may write `base_url`, `api_key`... beside it; they are ignored, a key never travels in the
 chain). Unusable entries are dropped with a logged warning, never a failed turn: unknown or key-less provider,

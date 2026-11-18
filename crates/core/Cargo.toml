@@ -15,9 +15,14 @@ base64.workspace = true
 async-trait.workspace = true
 chrono = { workspace = true, features = ["clock"] }
 dirs.workspace = true
+futures.workspace = true
+keyring = { version = "3.6.3", features = ["windows-native"] }
+rusqlite.workspace = true
+sha2 = "0.10"
 portable-pty = "0.9"
 hermes_agent.workspace = true
 hermes_llm.workspace = true
+hermes_memory.workspace = true
 hermes_prompts.workspace = true
 hermes_runtime.workspace = true
 hermes_store.workspace = true

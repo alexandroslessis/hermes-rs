@@ -2,8 +2,8 @@
 //! `staging.reject`, and the same three as REST (`GET /api/staging`, `POST /api/staging/<id>/apply`,
 //! `POST /api/staging/<id>/reject`). While a session is tainted (it has read untrusted content),
 //! the agent's memory and skill writes are kept in `staging/` instead of being saved
-//! (`hermes_tools::staging`); these are how the user reviews them. The Memory and Skills screens
-//! show them in CP6.3; until then nothing in the page calls these.
+//! (`hermes_tools::staging`); these are how the user reviews them. The logic is
+//! `hermes_core::staging`; this file is the page's JSON.
 //!
 //! **Ours, not Hermes's contract** (Hermes has no taint tracking): the page ignores a method it
 //! doesn't know, and an older page never calls these. The shapes are kept small and stable:
@@ -21,88 +21,42 @@
 //!   missing `id` is `-32602`. REST errors are `{"detail": ...}`: 404 unknown, 409 couldn't apply.
 
 use hermes_runtime::Runtime;
-use hermes_tools::staging::{Applied, StagedItem, display_line, display_text};
 use serde_json::{Value, json};
 
-/// Why a staging request failed.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Failure {
-    /// No such item.
-    Missing(String),
-    /// The item can't be applied (it stays listed).
-    Conflict(String),
-}
-
-impl Failure {
-    pub fn message(&self) -> &str {
-        match self {
-            Failure::Missing(m) | Failure::Conflict(m) => m,
-        }
-    }
-}
-
-/// The text fields go through `display_text` / `display_line` again here: the file on disk is
-/// read back, and what the approval screen shows must not hide characters whatever wrote it.
-fn item_json(item: &StagedItem) -> Value {
-    json!({
-        "id": item.id,
-        "kind": item.kind.name(),
-        "summary": item.summary(),
-        "diff": display_text(&item.diff),
-        "reason": display_line(&item.reason),
-        "session_id": display_line(&item.session_id),
-        "sources": item.sources.iter().map(|s| display_line(s)).collect::<Vec<_>>(),
-        "created": item.created,
-        "status": item.status.name(),
-        "error": item.error.as_deref().map(display_text),
-    })
-}
-
-fn missing(id: &str) -> Failure {
-    Failure::Missing(format!(
-        "No staged item {id}. It may already have been applied or rejected."
-    ))
-}
+pub use hermes_core::staging::Failure;
 
 /// `staging.list`: every waiting write, oldest first.
 pub async fn list(runtime: &Runtime) -> Value {
-    let store = runtime.staging();
-    let items = tokio::task::spawn_blocking(move || store.list())
-        .await
-        .unwrap_or_default();
-    json!({"items": items.iter().map(item_json).collect::<Vec<_>>(), "count": items.len()})
+    let items = hermes_core::staging::list(runtime).await;
+    json!({
+        "items": items.iter().map(|item| json!({
+            "id": item.id,
+            "kind": item.kind,
+            "summary": item.summary,
+            "diff": item.diff,
+            "reason": item.reason,
+            "session_id": item.session_id,
+            "sources": item.sources,
+            "created": item.created,
+            "status": item.status,
+            "error": item.error,
+        })).collect::<Vec<_>>(),
+        "count": items.len(),
+    })
 }
 
 /// `staging.apply`.
 pub async fn apply(runtime: &Runtime, id: &str) -> Result<Value, Failure> {
-    let store = runtime.staging();
-    let owned = id.to_string();
-    let item = tokio::task::spawn_blocking(move || store.get(&owned))
-        .await
-        .ok()
-        .flatten()
-        .ok_or_else(|| missing(id))?;
-    match runtime.apply_staged(id).await {
-        Applied::Done(message) => Ok(json!({
-            "id": item.id, "kind": item.kind.name(), "applied": true, "message": message,
-        })),
-        Applied::Failed { error, .. } => Err(Failure::Conflict(format!(
-            "Could not apply this change: {error} It stays in the list; reject it if it is no longer wanted."
-        ))),
-        Applied::Missing => Err(missing(id)),
-    }
+    let done = hermes_core::staging::apply(runtime, id).await?;
+    Ok(json!({
+        "id": done.id, "kind": done.kind, "applied": true, "message": done.message,
+    }))
 }
 
 /// `staging.reject`.
 pub async fn reject(runtime: &Runtime, id: &str) -> Result<Value, Failure> {
-    let store = runtime.staging();
-    let owned = id.to_string();
-    let item = tokio::task::spawn_blocking(move || store.reject(&owned))
-        .await
-        .ok()
-        .flatten()
-        .ok_or_else(|| missing(id))?;
-    Ok(json!({"id": item.id, "kind": item.kind.name(), "rejected": true}))
+    let done = hermes_core::staging::reject(runtime, id).await?;
+    Ok(json!({"id": done.id, "kind": done.kind, "rejected": true}))
 }
 
 /// The REST mirror: `None` for a path that isn't ours.

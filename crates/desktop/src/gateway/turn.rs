@@ -38,7 +38,7 @@ impl Gateway {
                 .blocking(move |g| g.runtime.store().session(&id).ok().flatten())
                 .await?
         {
-            self.model_facts(&record.provider, &record.model).await;
+            self.core.model_facts(&record.provider, &record.model).await;
         }
         let id = session_id(&params)?;
         let turn = submit_turn(&params);
@@ -103,7 +103,7 @@ impl Gateway {
             return Err(RpcError::invalid("text required"));
         }
         let provider = self.session_provider(&id, settings)?;
-        let options = self.turn_options(&id);
+        let options = self.core.turn_options(&id);
         let mut task = self
             .runtime
             .background(&id, &provider, options, &text)
@@ -247,50 +247,6 @@ impl Gateway {
 }
 
 impl Gateway {
-    /// What every turn of a session runs with: its model's window (so compression starts in
-    /// time for a small local model) and the side jobs' models (Settings ▸ Model ▸ Auxiliary).
-    pub(super) fn turn_options(&self, session: &str) -> TurnOptions {
-        let settings = Settings::load(&self.data_dir);
-        let record = self.runtime.store().session(session).ok().flatten();
-        let context = |provider: &str, model: &str| self.known_context(provider, model);
-        // Only a picked effort is sent; unset leaves the provider's default (as Hermes).
-        let effort = self
-            .picked_effort(session)
-            // "ultra" is Hermes's own step above max: the wire has no more than max.
-            .map(|e| if e == "ultra" { "max".to_string() } else { e });
-        let mut aux = crate::aux_models::runtime_models(&settings, &context);
-        // "Inherit main model effort" (the Auxiliary page's default): compression and the
-        // background review think as hard as the chat. The approval judge and titles keep
-        // reasoning off unless picked, as Hermes runs them.
-        for job in [&mut aux.compression, &mut aux.review]
-            .into_iter()
-            .flatten()
-        {
-            if job.effort.is_none() {
-                job.effort = effort.clone();
-            }
-        }
-        TurnOptions {
-            context_length: record.as_ref().and_then(|r| context(&r.provider, &r.model)),
-            effort,
-            supports_vision: record
-                .as_ref()
-                .is_some_and(|r| self.sends_images(&r.provider, &r.model)),
-            aux,
-            // Settings ▸ Model ▸ Fallbacks (`fallback.rs`): the providers a request moves to when
-            // the main one cannot serve it.
-            fallback: crate::fallback::resolve(
-                &self.rest.config_value("fallback_providers"),
-                &settings,
-                record
-                    .as_ref()
-                    .map(|r| (r.provider.as_str(), r.model.as_str())),
-                &context,
-                &|provider, model| self.sends_images(provider, model),
-            ),
-        }
-    }
-
     /// Whether the session has a turn in flight as the page sees it: the runtime's turn, or the
     /// gap between a turn and its queued follow-up (the page must not see the turn end there).
     pub(super) fn is_live(&self, id: &str) -> bool {
@@ -437,7 +393,7 @@ impl TurnHooks for PageTurn {
     }
 
     fn options(&self, session_id: &str) -> TurnOptions {
-        self.gateway.turn_options(session_id)
+        self.gateway.core.turn_options(session_id)
     }
 
     fn follow(&self, session_id: &str) {
@@ -466,7 +422,7 @@ impl TurnHooks for PageTurn {
             provider.to_string(),
             model.to_string(),
         );
-        tokio::spawn(async move { this.context_length(&provider, &model).await });
+        tokio::spawn(async move { this.core.context_length(&provider, &model).await });
     }
 
     fn changed(&self, session_id: &str) {
@@ -493,6 +449,7 @@ impl TurnHooks for PageTurn {
         last_input: Option<usize>,
     ) {
         self.gateway
+            .core
             .note_generation(session_id, output_tokens, seconds);
         let snapshot = self.gateway.usage_snapshot(session_id, last_input);
         self.gateway

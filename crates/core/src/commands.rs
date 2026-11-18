@@ -9,8 +9,8 @@
 //! prompt), and `/review`'s reviewer briefing.
 //!
 //! What the commands need from the front end (the model's context window, the provider a session
-//! talks to, the importer of the original Hermes's sessions: Settings, until CP1.3 moves them) is
-//! a [`CommandEnv`].
+//! talks to, the importer of the original Hermes's sessions) is a [`CommandEnv`]; [`CoreCommands`]
+//! is the one over the core's own Settings, which every front end can use.
 //!
 //! Hermes: `tui_gateway/methods_complete.py` (`complete.slash`), `tui_gateway/command_discovery.py`,
 //! `tui_gateway/server.py` (`slash.exec`, `command.dispatch`), `hermes_cli/commands.py` (the
@@ -202,6 +202,87 @@ pub trait CommandEnv: Send + Sync {
 
 /// The context window assumed when a provider lists none (Hermes's `DEFAULT_FALLBACK_CONTEXT`).
 pub const FALLBACK_CONTEXT: usize = 256_000;
+
+/// The [`CommandEnv`] over the core's own Settings: what every front end that has no Settings of
+/// its own to give uses (a model's window, a session's provider and options, the importer).
+pub struct CoreCommands {
+    core: Arc<Core>,
+    settings: crate::providers::Settings,
+}
+
+impl CoreCommands {
+    /// With the Settings as they are now.
+    pub fn new(core: &Arc<Core>) -> Self {
+        Self::with_settings(core, crate::providers::Settings::load(core.data_dir()))
+    }
+
+    /// With the Settings a request was answered with.
+    pub fn with_settings(core: &Arc<Core>, settings: crate::providers::Settings) -> Self {
+        Self {
+            core: core.clone(),
+            settings,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandEnv for CoreCommands {
+    async fn context_length(&self, provider: &str, model: &str) -> usize {
+        self.core.context_length(provider, model).await
+    }
+
+    fn route(&self, session_id: &str) -> Result<(ProviderConfig, TurnOptions), CommandError> {
+        let provider = self
+            .core
+            .provider_for(session_id, &self.settings)
+            .map_err(|e| CommandError::Failed(e.to_string()))?;
+        Ok((provider, self.core.turn_options(session_id)))
+    }
+
+    /// Every session of the original Hermes not imported yet (`hermes_import.rs`).
+    async fn import_hermes(&self) -> Result<String, CommandError> {
+        let (provider, model) = self
+            .core
+            .import_route(&self.settings)
+            .map_err(|e| CommandError::Failed(e.to_string()))?;
+        let runtime = self.core.runtime().clone();
+        let data_dir = self.core.data_dir().to_path_buf();
+        let found = tokio::task::spawn_blocking(move || {
+            let sources = crate::hermes_import::sources();
+            let target = crate::hermes_import::Target {
+                runtime: &runtime,
+                provider,
+                model,
+                data_dir: &data_dir,
+            };
+            (sources, crate::hermes_import::import_all(&target))
+        })
+        .await;
+        match found {
+            Ok((sources, _)) if sources.is_empty() => Ok(
+                "No Hermes data found here (looked in HERMES_HOME, %LOCALAPPDATA%\\hermes and ~\\.hermes)."
+                    .to_string(),
+            ),
+            Ok((sources, (imported, already, failed))) => {
+                let mut text = format!(
+                    "Imported {imported} session{} from Hermes ({} database{}); {already} already here.",
+                    if imported == 1 { "" } else { "s" },
+                    sources.len(),
+                    if sources.len() == 1 { "" } else { "s" },
+                );
+                if !failed.is_empty() {
+                    text.push_str(&format!(
+                        "\nNot imported ({}):\n{}",
+                        failed.len(),
+                        failed.join("\n")
+                    ));
+                }
+                Ok(text)
+            }
+            Err(e) => Err(CommandError::Failed(e.to_string())),
+        }
+    }
+}
 
 /// `/plan`, `/init`, `/learn`: Hermes's `send` dispatch, a prompt sent as a normal turn (the agent
 /// does the work with its own tools), shown as the command typed. `/review` sends itself

@@ -54,7 +54,6 @@ mod usage;
 #[cfg(test)]
 use rpc::{INVALID_PARAMS, SERVER_ERROR};
 use rpc::{P, Raw, Reply, Request, RpcError};
-use settings::{FALLBACK_CONTEXT, ModelFacts};
 
 /// What `Gateway::call` answers a client in this process (the ACP server): the code and the
 /// message of an `RpcError`.
@@ -64,18 +63,12 @@ type RpcResult = Result<Value, (i64, String)>;
 /// one agent per session in-process, so a single generation serves every turn.
 pub const EXECUTION_GENERATION: u64 = 0;
 
-/// Each session's generated tokens and generation seconds (the status bar's tokens per second),
-/// in the data folder.
-const GENERATION_FILE: &str = "generation-stats.json";
-
 pub struct Gateway {
     /// The application layer (`hermes_core`): sessions, questions, events, the side files.
     pub core: Arc<hermes_core::Core>,
     /// `core`'s runtime.
     pub runtime: Arc<Runtime>,
     pub rest: crate::rest::Rest,
-    /// Background actions the page follows by name (the curator's run).
-    actions: Arc<crate::maintenance::Actions>,
     data_dir: PathBuf,
     /// Changes when the process restarts, so reconnecting clients reset their replay state.
     replay_epoch: String,
@@ -83,11 +76,6 @@ pub struct Gateway {
     hub: Arc<Hub>,
     /// Admission id → the started turn waiting for its `prompt.submit` reply to go out first.
     starts: std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
-    /// `provider\nmodel` → its context window, as the provider lists it (asked once).
-    context_lengths: std::sync::Mutex<std::collections::HashMap<String, ModelFacts>>,
-    /// Session id → output tokens generated and the seconds the model calls took (kept in
-    /// `GENERATION_FILE`; the status bar's tokens per second).
-    generation: std::sync::Mutex<std::collections::HashMap<String, (u64, f64)>>,
     /// File ticket → the file it opens (download links and media elements).
     file_tickets: std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
     /// Each page socket and the session it shows now (its last `session.resume` or
@@ -109,7 +97,7 @@ impl Gateway {
 
     fn build(core: Arc<hermes_core::Core>, background: bool) -> Self {
         let data_dir = core.data_dir().to_path_buf();
-        let data_dir_for_stats = data_dir.clone();
+        let config = core.config().clone();
         // Every event the core publishes reaches the page through the hub, in order with the
         // gateway's own frames.
         let hub = Arc::new(Hub::default());
@@ -117,33 +105,18 @@ impl Gateway {
         let gateway = Self {
             runtime: core.runtime().clone(),
             core,
-            rest: crate::rest::Rest::new(data_dir.clone()),
-            actions: Default::default(),
+            rest: crate::rest::Rest::with_config(data_dir.clone(), config),
             data_dir,
             replay_epoch: uuid::Uuid::new_v4().to_string(),
             hub,
             starts: Default::default(),
-            context_lengths: Default::default(),
             file_tickets: Default::default(),
             viewing: Default::default(),
-            generation: std::sync::Mutex::new(
-                std::fs::read(data_dir_for_stats.join(GENERATION_FILE))
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                    .unwrap_or_default(),
-            ),
         };
-        // The runtime keeps the approval policy in memory: Settings' choice applies from the start.
-        gateway.apply_settings();
-        if background {
-            crate::maintenance::schedule_curator(
-                gateway.runtime.clone(),
-                gateway.actions.clone(),
-                gateway.data_dir.clone(),
-            );
-        }
-        // So are the skills switched off in Capabilities ▸ Skills.
-        crate::skills::apply_config(&gateway.runtime.skills(), &gateway.rest);
+        // The runtime keeps Settings in memory (the approval policy, the switched-off skills...):
+        // they apply from the start. No page follows a session yet, so the `session.info` frames
+        // `Gateway::apply_settings` adds on a change have no one to go to here.
+        gateway.core.start(background);
         gateway
     }
 
@@ -160,7 +133,7 @@ impl Gateway {
             loop {
                 hourly.tick().await;
                 let Some(this) = weak.upgrade() else { break };
-                let _ = tokio::task::spawn_blocking(move || this.auto_archive()).await;
+                let _ = tokio::task::spawn_blocking(move || this.core.sweep_archive()).await;
             }
         });
     }
@@ -176,7 +149,7 @@ impl Gateway {
                 let gateway = weak.upgrade()?;
                 let settings = Settings::load(&gateway.data_dir);
                 let provider = gateway.provider_for(id, &settings).ok()?;
-                Some((provider, gateway.turn_options(id)))
+                Some((provider, gateway.core.turn_options(id)))
             })));
     }
 
@@ -417,23 +390,6 @@ impl Gateway {
         }
     }
 
-    /// The effort picked for this session, if any (not Settings' default). Kept by the
-    /// session's actor (`PageState::effort`).
-    pub(crate) fn picked_effort(&self, id: &str) -> Option<String> {
-        self.runtime.existing_session_handle(id)?.page().effort
-    }
-
-    /// The session's reasoning effort: picked in the composer, else Settings' default.
-    pub(crate) fn effort(&self, id: &str) -> String {
-        self.picked_effort(id)
-            .or_else(|| {
-                self.rest
-                    .config_value("agent.reasoning_effort")
-                    .as_str()
-                    .map(str::to_string)
-            })
-            .unwrap_or_default()
-    }
 }
 
 /// The page's id for a `prompt.submit` (its admission id).

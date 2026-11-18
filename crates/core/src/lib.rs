@@ -21,6 +21,15 @@
 //! | `commands.rs` | the `/` menu: catalog, completion, running a command; what a message was |
 //! | `attachments.rs` | images and files attached in the composer |
 //! | `lock.rs` | "Hermes is already open": one app per data folder |
+//! | `config.rs` | Hermes's config record (`desktop-config.json`), read over the defaults by dotted key |
+//! | `providers.rs`, `endpoints.rs` | the providers in `config.json`, their keys, custom endpoints (add, test, default, remove) |
+//! | `aux_models.rs`, `fallback.rs` | the side jobs' models (and "use a local model"), the fallback chain |
+//! | `settings.rs` | Settings put on the runtime, the model picker and switching, a model's window, a session's provider, a turn's options |
+//! | `usage.rs` | the status bar's usage, generation speed, the request ledger's numbers, activity |
+//! | `toolsets.rs`, `skills.rs`, `profiles.rs` | Capabilities ▸ Tools and Skills, the SOUL.md editor |
+//! | `maintenance.rs` | the skills curator (run, schedule, pause), the built-in memory files, background actions |
+//! | `staging.rs`, `learning.rs` | the writes waiting for review, the Star map |
+//! | `hermes_import.rs` | sessions from the original Hermes |
 //! | `git.rs` | running `git` quietly |
 //!
 //! Threads (README "Architecture"): `Core` holds the tokio runtime's `Handle`; a front end on
@@ -30,24 +39,40 @@
 
 pub mod archive;
 pub mod attachments;
+pub mod aux_models;
 pub mod branch;
 pub mod commands;
+pub mod config;
 pub mod delegation;
+pub mod endpoints;
 pub mod events;
 pub mod export;
+pub mod fallback;
 pub mod files;
 pub mod git;
 pub mod git_review;
+pub mod hermes_import;
+pub mod learning;
 pub mod lock;
+pub mod maintenance;
 pub mod open_file;
 pub mod paths;
+pub mod profiles;
 pub mod projects;
+pub mod providers;
 pub mod questions;
 pub mod sessions;
+pub mod settings;
+#[cfg(test)]
+mod settings_tests;
+pub mod skills;
+pub mod staging;
 pub mod stream;
 pub mod terminal;
+pub mod toolsets;
 pub mod transcript;
 pub mod turns;
+pub mod usage;
 pub mod workspace;
 
 use std::collections::HashMap;
@@ -75,6 +100,14 @@ pub struct Core {
     data_dir: PathBuf,
     events: Arc<EventBus>,
     questions: Arc<questions::Questions>,
+    /// Hermes's config record, as Settings writes it (`config.rs`).
+    config: Arc<config::ConfigRecord>,
+    /// What the providers said about their models (windows, vision), asked once (`settings.rs`).
+    models: settings::ModelCache,
+    /// Each session's generation speed (`usage.rs`).
+    generation: usage::Generation,
+    /// Background actions followed by name: the curator's run (`maintenance.rs`).
+    actions: Arc<maintenance::Actions>,
     /// Branch → the session it was branched from (`branch.rs`).
     branches: branch::Links,
     /// Session id → the git identity of its workspace (`workspace.rs`), kept beside the store.
@@ -104,11 +137,31 @@ impl Core {
             branches: branch::Links::load(&data_dir),
             workspaces: Arc::new(workspace::Workspaces::load(&data_dir)),
             archive: archive::Archive::load(&data_dir),
+            config: Arc::new(config::ConfigRecord::load(&data_dir)),
+            actions: Arc::default(),
+            models: Default::default(),
+            generation: usage::Generation::load(&data_dir),
             data_dir,
             events,
             questions,
             branch_keys: Mutex::default(),
         }))
+    }
+
+    /// Puts the stored Settings on the runtime, once, right after [`Core::new`]: every front end
+    /// calls it before it serves anything (`Core::new` applies nothing). In order: the config
+    /// record's keys (`apply_settings`: approvals, sandbox, ledger limits, budget, checkpoints,
+    /// memory, switched-off tools), the auto-archive sweep when it is on, the scheduled curator
+    /// when `background` (the desktop app and the native UI; not the ACP agent, which may run
+    /// beside the desktop app on the same folder), and the skills switched off in Capabilities ▸
+    /// Skills. Blocking (files and the store): call it off the async workers.
+    pub fn start(&self, background: bool) {
+        self.apply_settings();
+        self.sweep_archive();
+        if background {
+            self.schedule_curator();
+        }
+        skills::apply_config(&self.runtime.skills(), &self.config);
     }
 
     /// The runtime underneath (sessions, turns, tools, the store).
@@ -119,6 +172,41 @@ impl Core {
     /// The data folder (`%APPDATA%\hermes-rs`, or `HERMES_RS_HOME`).
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Hermes's config record (`desktop-config.json`): Settings' keys, read and written one dotted
+    /// key at a time.
+    pub fn config(&self) -> &Arc<config::ConfigRecord> {
+        &self.config
+    }
+
+    /// The background actions the page follows by name (the curator's run).
+    pub fn actions(&self) -> &Arc<maintenance::Actions> {
+        &self.actions
+    }
+
+    /// Runs the skills curator in the background (`CuratorStarted`, then `CuratorFinished`);
+    /// `false` when a run is already going.
+    pub fn run_curator(&self) -> bool {
+        maintenance::run_curator(
+            &self.handle,
+            self.runtime.clone(),
+            self.actions.clone(),
+            self.events.clone(),
+            self.data_dir.clone(),
+        )
+    }
+
+    /// Starts the scheduled curator (checked every ten minutes; see `maintenance.rs`). The desktop
+    /// app owns it; the ACP agent, which may run beside it on the same folder, does not.
+    pub fn schedule_curator(&self) {
+        maintenance::schedule_curator(
+            &self.handle,
+            self.runtime.clone(),
+            self.actions.clone(),
+            self.events.clone(),
+            self.data_dir.clone(),
+        );
     }
 
     /// The tokio runtime the core's work runs on.

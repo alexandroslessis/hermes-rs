@@ -77,9 +77,7 @@ impl Gateway {
             };
             if method != "GET" {
                 // A changed endpoint may have a new window or models.
-                if let Ok(mut lengths) = self.context_lengths.lock() {
-                    lengths.clear();
-                }
+                self.core.forget_model_facts();
                 // ...or a new daily request limit.
                 self.apply_settings();
             }
@@ -335,11 +333,7 @@ impl Gateway {
                 ));
             }
             ("POST", "/api/curator/run") => {
-                let started = crate::maintenance::run_curator(
-                    self.runtime.clone(),
-                    self.actions.clone(),
-                    self.data_dir.clone(),
-                );
+                let started = self.core.run_curator();
                 return Some((
                     200,
                     json!({"ok": true, "pid": 0, "name": crate::maintenance::CURATOR_RUN,
@@ -377,7 +371,10 @@ impl Gateway {
             let limit = crate::rest::query_param(query, "lines")
                 .and_then(|l| l.parse().ok())
                 .unwrap_or(200);
-            return Some((200, self.actions.status(&name, limit)));
+            return Some((
+                200,
+                crate::maintenance::action_status(&self.core.actions().status(&name, limit)),
+            ));
         }
         if path == "/api/staging" || path.starts_with("/api/staging/") {
             return crate::staging::route(&self.runtime, method, path).await;
@@ -399,9 +396,7 @@ impl Gateway {
             }
             let body: Value = serde_json::from_slice(body).unwrap_or_default();
             let answer = crate::aux_models::use_local(&self.data_dir, &body, well_known).await;
-            if let Ok(mut lengths) = self.context_lengths.lock() {
-                lengths.clear();
-            }
+            self.core.forget_model_facts();
             return Some(answer);
         }
         if (method, path) == ("POST", "/api/model/set") {

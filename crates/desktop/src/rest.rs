@@ -11,23 +11,7 @@ use serde_json::{Value, json};
 pub const HERMES_COMMIT: &str = include_str!("../../../HERMES_COMMIT");
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The model new sessions use, from the hermes-rs settings (`config.json`).
-#[derive(Clone, Debug, Default)]
-pub struct DefaultModel {
-    pub provider: String,
-    pub model: String,
-}
-
-pub fn default_model(data_dir: &Path) -> DefaultModel {
-    let config: Value = std::fs::read(data_dir.join("config.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-    DefaultModel {
-        provider: config["provider"].as_str().unwrap_or_default().to_string(),
-        model: config["model"].as_str().unwrap_or_default().to_string(),
-    }
-}
+pub use hermes_core::config::{DefaultModel, default_model};
 
 /// A query parameter, percent-decoded (`+` is a space).
 pub fn query_param(query: Option<&str>, name: &str) -> Option<String> {
@@ -51,71 +35,6 @@ pub fn desktop_plugins_dir(data_dir: &Path) -> PathBuf {
         let _ = std::fs::write(ours.join("plugin.js"), BUILTIN_PLUGIN);
     }
     dir
-}
-
-/// Hermes's config defaults for the keys this backend honours (`hermes_cli/config.py`'s
-/// `DEFAULT_CONFIG`): what `/api/config/defaults` reports and `/api/config` starts from.
-fn config_defaults() -> Value {
-    json!({
-        "agent": {"reasoning_effort": ""},
-        "display": {
-            "show_reasoning": true,
-            "busy_input_mode": "steer",
-            "interim_assistant_messages": true,
-            "timestamps": false,
-            "tool_progress": "all",
-        },
-        "approvals": {"mode": "manual"},
-        // The providers a request moves to when the main one cannot serve it (daily quota used
-        // up, server down, unknown model): `[{provider, model}, ...]`, in order, at most three
-        // (`fallback.rs`). Empty: no fallback.
-        "fallback_providers": [],
-        // How the agent spends model requests and tokens (`hermes_runtime::budget`): `requests`
-        // (the default, also for a config without the key), `balanced` (how it worked before
-        // profiles) or `tokens`. Per-knob overrides sit beside it (`budget.max_iterations`...).
-        // `review_mode` "" is the profile's own background review (Phase 7: `idle_once` under
-        // `requests`, `nudges` otherwise); a Settings select can pick another.
-        "budget": {"profile": "requests", "review_mode": ""},
-        // On by default (Hermes's is opt-in): a coding harness keeps a way back from the agent's
-        // edits, as Claude Code does. Settings ▸ Safety ▸ Checkpoints switches it.
-        // The skills curator (backend v2 Phase 8): `auto_apply` applies its merge and repair
-        // proposals at once, through the same checks as an approval; off, they wait in Capabilities
-        // ▸ Skills ▸ Pending.
-        "curator": {"auto_apply": false},
-        "checkpoints": {"enabled": true},
-        "stt": {"enabled": false},
-        // Settings ▸ Sessions: hide sessions idle this many days (`archive.rs`); off by default.
-        "sessions": {"auto_archive": false, "auto_archive_days": 3},
-        // The built-in memory (MEMORY.md, USER.md), applied to new sessions (Hermes's
-        // `memory.*`; `write_approval` is ours: stage the agent's writes for review).
-        "memory": {
-            "memory_enabled": true,
-            "user_profile_enabled": true,
-            "memory_char_limit": 2200,
-            "user_char_limit": 1375,
-            "project_char_limit": 1500,
-            "write_approval": false,
-        },
-    })
-}
-
-/// `PUT /api/config` deep-merges onto what's stored, as Hermes's does.
-fn deep_merge(target: &mut Value, changes: &Value) {
-    match (target.as_object_mut(), changes.as_object()) {
-        (Some(target), Some(changes)) => {
-            for (key, value) in changes {
-                match target.get_mut(key) {
-                    Some(existing) if existing.is_object() && value.is_object() => {
-                        deep_merge(existing, value)
-                    }
-                    _ => {
-                        target.insert(key.clone(), value.clone());
-                    }
-                }
-            }
-        }
-        _ => *target = changes.clone(),
-    }
 }
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -330,7 +249,7 @@ fn config_schema() -> serde_json::Map<String, Value> {
         out.insert(prefix.to_string(), field);
     }
     let mut out = serde_json::Map::new();
-    walk("", &config_defaults(), &mut out);
+    walk("", &hermes_core::config::defaults(), &mut out);
     out
 }
 
@@ -339,13 +258,24 @@ pub struct Rest {
     plugins_dir: PathBuf,
     /// The Desktop's interface preferences (theme, layout), in Hermes's store format.
     ui_preferences: std::sync::Mutex<UiPreferences>,
-    /// Hermes's config record as the Settings pages write it (`desktop-config.json`); the
-    /// model and provider come from the hermes-rs settings instead.
-    config: std::sync::Mutex<Value>,
+    /// Hermes's config record as the Settings pages write it (`desktop-config.json`; the core
+    /// owns it, `hermes_core::config`); the model and provider come from the hermes-rs settings
+    /// instead.
+    config: std::sync::Arc<hermes_core::config::ConfigRecord>,
 }
 
 impl Rest {
+    /// A page backend with a config record of its own (tests).
     pub fn new(data_dir: PathBuf) -> Self {
+        let config = std::sync::Arc::new(hermes_core::config::ConfigRecord::load(&data_dir));
+        Self::with_config(data_dir, config)
+    }
+
+    /// A page backend over the core's config record (`Core::config`).
+    pub fn with_config(
+        data_dir: PathBuf,
+        config: std::sync::Arc<hermes_core::config::ConfigRecord>,
+    ) -> Self {
         let mut ui_preferences = UiPreferences::read(&data_dir.join(UI_PREFERENCES_FILE));
         // The sidebar opens on the Projects view (a seed: a choice made in its menu stays).
         if let Ok(true) = ui_preferences.write(&json!({
@@ -357,77 +287,40 @@ impl Rest {
                 ui_preferences.document(),
             );
         }
-        let config = read_json(&data_dir.join("desktop-config.json")).unwrap_or_else(|| json!({}));
         Self {
             plugins_dir: desktop_plugins_dir(&data_dir),
             data_dir,
             ui_preferences: std::sync::Mutex::new(ui_preferences),
-            config: std::sync::Mutex::new(config),
+            config,
         }
+    }
+
+    /// The config record (the core's), for the calls that take it whole.
+    pub fn config_record(&self) -> &hermes_core::config::ConfigRecord {
+        &self.config
     }
 
     /// `GET /api/config`: the stored record over the defaults (unless `include_defaults=false`),
     /// with the model from the hermes-rs settings.
     fn config(&self, query: Option<&str>) -> Option<Value> {
-        let stored = self.config.lock().ok()?.clone();
-        let mut record = if query_param(query, "include_defaults").as_deref() == Some("false") {
-            json!({})
-        } else {
-            config_defaults()
-        };
-        deep_merge(&mut record, &stored);
-        let model = default_model(&self.data_dir);
-        if !model.model.is_empty() {
-            record["model"] = json!({"default": model.model, "provider": model.provider});
-        }
-        Some(record)
+        let with_defaults = query_param(query, "include_defaults").as_deref() != Some("false");
+        self.config.merged(with_defaults)
     }
 
     fn save_config(&self, body: &[u8]) -> Option<Value> {
         let body: Value = serde_json::from_slice(body).ok()?;
-        let mut changes = body.get("config").cloned().unwrap_or(body);
-        // The model is the hermes-rs settings' (the model picker changes it).
-        if let Some(changes) = changes.as_object_mut() {
-            changes.remove("model");
-        }
-        // Budget settings the runtime would refuse (an unknown profile, a 0 cap) are dropped
-        // here, as `config.set` refuses them.
-        // A `budget` that isn't an object would replace the stored one whole: dropped too.
-        if let Some(changes) = changes.as_object_mut() {
-            match changes.get_mut("budget") {
-                Some(Value::Object(budget)) => budget.retain(|key, value| {
-                    hermes_runtime::budget::check_config_value(key, value).is_ok()
-                }),
-                Some(_) => {
-                    changes.remove("budget");
-                }
-                None => {}
-            }
-        }
-        let mut config = self.config.lock().ok()?;
-        deep_merge(&mut config, &changes);
-        let _ = std::fs::write(
-            self.data_dir.join("desktop-config.json"),
-            config.to_string(),
-        );
-        Some(json!({"ok": true}))
+        let changes = body.get("config").cloned().unwrap_or(body);
+        self.config.save(changes).then(|| json!({"ok": true}))
     }
 
     /// One dotted key of the config record (`display.in_app_tips`), as `config.set` writes it.
     pub fn set_config_value(&self, key: &str, value: Value) {
-        let changes = key
-            .rsplit('.')
-            .fold(value, |inner, part| json!({ part: inner }));
-        let _ = self.save_config(json!({ "config": changes }).to_string().as_bytes());
+        self.config.set_value(key, value);
     }
 
     /// A string setting from the config record (`display.busy_input_mode`), defaults included.
     pub fn config_value(&self, key: &str) -> Value {
-        let record = self.config(None).unwrap_or_default();
-        key.split('.')
-            .try_fold(&record, |value, part| value.get(part))
-            .cloned()
-            .unwrap_or(Value::Null)
+        self.config.value(key)
     }
 
     /// `/api/desktop-plugins/*` (`hermes_cli/web_routers/desktop_plugins.py`): the folder, its
@@ -555,7 +448,7 @@ impl Rest {
             }
             ("GET", "/api/config") => ok(self.config(query)?),
             ("PUT", "/api/config") => ok(self.save_config(body)?),
-            ("GET", "/api/config/defaults") => ok(config_defaults()),
+            ("GET", "/api/config/defaults") => ok(hermes_core::config::defaults()),
             ("GET", "/api/config/schema") => ok(json!({
                 "fields": config_schema(),
                 "category_order": CATEGORY_ORDER,
@@ -580,9 +473,9 @@ mod tests {
 
     #[test]
     fn saved_config_merges_over_the_defaults_and_keeps_the_model_out() {
-        let dir =
-            std::env::temp_dir().join(format!("hermes-desktop-rest-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Removed when the test ends, even when it fails (docs/PITFALLS.md).
+        let tmp = hermes_testdir::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         std::fs::write(
             dir.join("config.json"),
             r#"{"provider":"ollama","model":"qwen"}"#,
@@ -608,14 +501,13 @@ mod tests {
         // It survives a restart.
         let again = Rest::new(dir.clone());
         assert_eq!(again.config_value("display.show_reasoning"), false);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn ui_preferences_merge_seed_and_survive_a_restart() {
-        let dir =
-            std::env::temp_dir().join(format!("hermes-desktop-prefs-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Removed when the test ends, even when it fails (docs/PITFALLS.md).
+        let tmp = hermes_testdir::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let rest = Rest::new(dir.clone());
         let (_, empty) = rest
             .handle("GET", "/api/ui-preferences", None, b"")
@@ -654,14 +546,13 @@ mod tests {
             json!({"hermes.desktop.theme": "dark", "hermes.desktop.agentsGroupedByWorkspace": "false"})
         );
         assert_eq!(again["generation"], written["generation"]);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn the_budget_profile_defaults_to_requests_and_is_a_select() {
-        let dir =
-            std::env::temp_dir().join(format!("hermes-desktop-rest-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Removed when the test ends, even when it fails (docs/PITFALLS.md).
+        let tmp = hermes_testdir::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let rest = Rest::new(dir);
         // Nothing saved: the default.
         assert_eq!(rest.config_value("budget.profile"), "requests");

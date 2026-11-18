@@ -153,10 +153,16 @@ pub enum CoreEvent {
         actions: Vec<String>,
         requested: bool,
     },
+    /// The skills curator started a run (the schedule's or the user's "run now"). It belongs to
+    /// no session.
+    CuratorStarted,
+    /// The curator's run ended: whether it worked, and its summary lines (a failure's one line
+    /// is the error). It belongs to no session.
+    CuratorFinished { ok: bool, lines: Vec<String> },
 }
 
 impl CoreEvent {
-    /// The session the event belongs to.
+    /// The session the event belongs to; empty for the curator's, which belong to none.
     pub fn session_id(&self) -> &str {
         match self {
             CoreEvent::TextDelta { session_id, .. }
@@ -178,6 +184,7 @@ impl CoreEvent {
             | CoreEvent::Settled { session_id, .. }
             | CoreEvent::ProcessFinished { session_id, .. }
             | CoreEvent::ReviewFinished { session_id, .. } => session_id,
+            CoreEvent::CuratorStarted | CoreEvent::CuratorFinished { .. } => "",
         }
     }
 }

@@ -598,3 +598,289 @@ each, `mock_llm.py` where a check has no provider; temp folders in `%TEMP%`): `q
 `subagents`: all exit 0. Only this build's processes and the mock were stopped; none left.
 `clean-test-temp.ps1`: 216 folders / 88.7 MB, all removed, a second dry run finds 0; the checks'
 own temp folders removed too.
+
+## CP1.3 — Settings and Hermes features
+Worktree: C:\Users\alexandros\repos\hermes-rs-n1   Branch: native/p1-core   Model: Sonnet 5.5 (subagent)
+On top of CP1.2 (cc0666d). Not committed. This is Phase 1's last checkpoint.
+
+### Verdict
+
+The logic of every module on the list is in `hermes_core`, typed, with Rust errors; `crates/desktop`
+keeps Hermes's JSON, the `{detail}` / RPC error shapes, the route tables and the page-only frames.
+A pure refactor for the page and ACP: the RPC-table fixture passes **unchanged** (not re-blessed),
+the ACP suite and the live checks pass (below). Nothing on the list was left behind: the modules
+that were "mostly typed already" (`providers.rs`, `fallback.rs`, `hermes_import.rs`) moved whole
+with `git mv`; the others were split.
+
+### Done
+
+| core module | typed API | stays in desktop |
+|---|---|---|
+| `providers.rs` (`git mv`, whole) | `Settings`, `ProviderSettings`, `ModelChoice`, `AuxModels`, `save_default`, keys, `model_ids` | re-export (`lib.rs`) |
+| `config.rs` (new, from `rest.rs`) | `ConfigRecord` (`desktop-config.json`: `merged`, `save`, `set_value`, `value`), `defaults()`, `deep_merge`, `default_model` | `rest.rs`: the schema, `/api/config*` routes, UI preferences, plugins; `Rest` holds the core's `Arc<ConfigRecord>` |
+| `endpoints.rs` | `list -> EndpointList`, `save(EndpointInput) -> id`, `delete`, `activate`, `validate -> Validation`, `EndpointError::{Invalid, NotFound, Failed}` | JSON, 400 / 404 / 500 `{detail}` |
+| `aux_models.rs` | `list -> AuxList`, `assign(Assignment { task, provider, model, EffortChange }) -> Assigned`, `local_servers`, `use_local -> UsedLocal`, `runtime_model(s)`, `AuxError` | JSON, `effort_of` (the page's null / absent / string) |
+| `fallback.rs` (`git mv`, whole) | `validate`, `resolve` over the config record's list (a file format, not a page shape) | re-export |
+| `profiles.rs` | `soul -> Soul`, `save_soul`, `ProfileError::{NoSuchProfile, Io}` | JSON, 404 `Profile '<name>' does not exist.` / 500 |
+| `toolsets.rs` | `TOOLSETS`, `list -> Vec<Toolset>`, `switch`, `disabled_tools` | JSON, the config and terminal-backend stubs |
+| `skills.rs` | `list -> Vec<SkillInfo>`, `toggle`, `content`, `create`, `edit`, `apply_config`, `SkillError` | routes, JSON, the skill hub's "nothing here" answers |
+| `maintenance.rs` | `Actions` (typed `ActionStatus`), `curator_status`, `set_curator_paused`, `curator_model`, `run_curator` / `schedule_curator` (publish `CuratorStarted` / `CuratorFinished`), `memory_status`, `reset_memory(ResetTarget)` | JSON, `/api/actions/*` status shape |
+| `staging.rs` | `list -> Vec<Item>`, `apply`, `reject -> Done`, `Failure` | `staging.*` and REST JSON, 404 / 409 |
+| `learning.rs` | `graph -> Graph` (typed nodes, edges, cards, links, stats), `detail`, `delete`, `edit`, `LearningError` | `StarmapGraph` JSON (field order kept), `{ok, message, detail}` answers |
+| `usage.rs` (from `gateway/usage.rs`) | `Core::usage_snapshot -> UsageSnapshot`, `note_generation`, `requests_status`, `insights`; `generation-stats.json` | JSON (`session.usage`, `requests.status`, `insights.get`) |
+| `hermes_import.rs` (`git mv`, then typed) | `list -> ForeignPage`, `preview -> Preview`, `import -> Imported`, `import_all`, `ImportError` | `session.foreign.*` JSON |
+| `settings.rs` (from `gateway/settings.rs`) | `Core::apply_settings`, `sweep_archive`, `turn_options`, `picked_effort` / `pick_effort` / `effort`, `pending_route` / `apply_pending_route`, `model_options -> ModelOptions`, `switch_model(ModelSwitch, ..., changed) -> ModelSwitched`, `route_session`, `known_context` / `context_length` / `model_facts` / `sends_images` / `forget_model_facts`, `provider_for` / `session_provider` / `import_route` (`RouteError`, `ImportRouteError`), `setup_status`, `provider_limits`, `sandbox_grants` | `config.get` / `config.set` shapes, `setup.*` and `profiles.list` JSON, the picker's JSON, the `session.info` frames |
+| `commands.rs` (CP1.2's hook) | `CoreCommands` (`CommandEnv` over the core's own Settings: window, route, `/import-hermes`) | `Core::run_command(.., &CoreCommands::new(&core))` needs no gateway; the gateway passes the request's Settings (`with_settings`) |
+| `events.rs` | `CoreEvent::CuratorStarted`, `CuratorFinished { ok, lines }` (no session: `session_id()` is empty) | the hub ignores them |
+
+`Core` gained `config()`, `actions()`, `run_curator()`, `schedule_curator()`; it owns the models
+cache (`provider\nmodel` → window / vision) and the generation stats the gateway held. The gateway
+lost `actions`, `context_lengths`, `generation`, `GENERATION_FILE`, `ModelFacts`, `turn_options`,
+`pending_route`, `pick_effort`, `picked_effort`, `effort`, `auto_archive`, `PageCommands` and the
+settings logic; what it keeps in `gateway/settings.rs` and `usage.rs` is JSON and error mapping.
+Docs: `PORTING.md` (core rows for the moved modules with their Hermes citations and the diverged
+notes, desktop rows say what shape they keep), `docs/ARCHITECTURE.md` (the picture now shows
+`hermes_core::Core` between the gateway and the runtime; crate row; the feature map; data folder
+rows), `docs/PITFALLS.md` (CP1.3 bullets), `core/src/lib.rs` module table, PHASES.md (CP1.3 status),
+and small path fixes in GAPS.md, GAPS-PLAYBOOK.md, TESTING.md, `docs/acp/PROTOCOL.md`.
+No new patch and no new perf check (a pure refactor): `scripts/perf/README.md` and
+`crates/desktop/patches/README.md` unchanged.
+
+### Files
+
+New in core: `src/{config,endpoints,aux_models,profiles,toolsets,skills,maintenance,staging,
+learning,settings,usage}.rs`, `src/settings_tests.rs`. Moved with `git mv`: `crates/desktop/src/
+{providers,fallback,hermes_import}.rs` to `crates/core/src/`. Changed in core: `Cargo.toml`
+(`hermes_memory`, `futures`, `keyring`, `rusqlite`, `sha2`: all already in `Cargo.lock`),
+`lib.rs`, `commands.rs`, `events.rs`. Changed in desktop: `src/{endpoints,aux_models,profiles,
+toolsets,skills,maintenance,staging,learning,hermes_import,rest,hub,lib}.rs`, `src/acp/server.rs`,
+`src/gateway/{mod,settings,usage,sessions,turn,slash,rest,tests}.rs`. `Cargo.lock`. The docs above
+and this note.
+
+`crates/desktop/src` line counts (whole tree 18,101 → 14,586): `providers.rs` 218 → 0, `fallback.rs`
+288 → 0, `hermes_import.rs` 774 → 77, `endpoints.rs` 484 → 248, `aux_models.rs` 757 → 281, `profiles.rs`
+157 → 65, `toolsets.rs` 183 → 62, `skills.rs` 330 → 251, `maintenance.rs` 289 → 129, `staging.rs`
+125 → 79, `learning.rs` 769 → 453 (its JSON tests stayed), `rest.rs` 708 → 601, `gateway/settings.rs`
+643 → 249, `gateway/usage.rs` 156 → 97, `gateway/slash.rs` 182 → 105, `gateway/sessions.rs` 932 → 885,
+`gateway/turn.rs` 548 → 505, `gateway/mod.rs` 461 → 420. `crates/core/src`: 9,919 → 16,254 lines.
+
+### Tests
+
+All with `CARGO_TARGET_DIR=target/claude` (the worktree's).
+
+- `cargo test -p hermes_core`: 137 passed (was 81). New or moved typed tests per module (endpoints
+  incl. the daily limit, aux models incl. the local-server probes and the hung-server timeout,
+  profiles, toolsets, skills, maintenance `Actions` / memory reset / curator pause, learning,
+  settings `provider_limits` / `sandbox_grants` / `setup_status`, config record, usage) and
+  `settings_tests.rs` over a real runtime with **no gateway**: the config record reaches the
+  runtime (`apply_settings`), a model pick moves the session and the default (the `changed`
+  callback, an unknown provider refused), a session's provider and a turn's options (window,
+  "ultra" effort sent as "max"), usage / generation speed / quota gauge, a curator run reporting
+  `CuratorStarted` then `CuratorFinished` and one run at a time, staging with nothing waiting.
+- `cargo test -p hermes-desktop`: lib 130 passed (was 155: typed tests moved to core), including
+  `gateway::rpc_table_tests::every_method_answers_as_the_table_says` against the **unchanged**
+  `tests/fixtures/rpc_table.txt`; shape tests for every split module (the routes' JSON and
+  statuses); `tests/acp.rs` 68 passed.
+- `cargo test -p hermes_runtime --test turns`: 258 passed, 7 ignored.
+- `cargo build --workspace`: passes.
+- `cargo clippy -p hermes_core --all-targets --no-deps`: clean (two moved `sort_by` and one
+  redundant clone in a moved test fixed). `cargo fmt -p hermes_core`: done; desktop files written
+  here formatted with `rustfmt` one by one (`rest.rs`, `gateway/{mod,sessions}.rs` and `lib.rs`
+  were not clean before and are left alone: `rustfmt` on a `mod.rs` would reformat their whole
+  tree).
+- Live checks, each on a **fresh instance** (debug exe of this worktree, port 47810, `target/perf/home`
+  deleted before each start, started with perf.ps1's environment; temp folders in `%TEMP%`,
+  outside any git repository; `mock_llm.py` only for `endpoints` and `stop`, every other check is
+  its own provider): `budget`, `requests`, `endpoints`, `aux-models`, `local-aux`, `fallback`,
+  `profiles`, `toolsets`, `staging`, `memory` (the Star map, node edits, the curator's pass,
+  memory files), `import` (a home built by `make-hermes-db.py`), `rpc-dispatch` (all methods),
+  `queue`, `stop`, `coding-commands`, `archive`, `provider-error`, `side-and-branch`,
+  `subagents`, `review`, `workspace`: **all exit 0**, every line `ok`. (`import` first failed two
+  lines because my runner named the project folder `import`, not `import-folder`, which the
+  check greps for; rerun with the right folder: all ok.) The instance and the mock were stopped
+  after each check (only processes under `target\claude` and the mock this run started); none
+  left running.
+- `scripts/clean-test-temp.ps1`: dry run 235 folders / 93 MB (the `turns` suite's known leftovers
+  and the ACP tests'), `-Delete` removed 235, could not remove 0; a second dry run finds 0. The
+  checks' own temp folders were removed too.
+
+### User's checklist for Phase 1 (desktop app built from this branch)
+
+A short pass over the main screens; everything should look and behave as before. The first two
+are the lock and the CP1.2 items, then CP1.3's.
+
+1. **"Hermes is already open".** Start `hermes-desktop.exe`, then start the same exe a second
+   time (same data folder, i.e. without `HERMES_RS_HOME`): a dialog says "Hermes is already
+   open. Switch to its window, or close it before starting Hermes again." and no second window
+   opens. Close the first app and start it again: it opens (a crash never leaves the folder
+   locked). Zed's `hermes-acp.exe` still works beside the running app.
+2. **Chat** (CP1.1 / CP1.2): send a message: the reply streams, a tool call shows its card and
+   result, the title appears, the status bar's tokens/s and context percentage update.
+3. **Queue and stop** (CP1.2): while a reply runs, send two more: they show as queue cards; steer
+   one into the turn, edit the other, delete it; Stop, then type and use "redirect".
+4. **Approvals**: ask for something that needs approval ("delete the build folder"): the card
+   shows; "Allow once" runs it. Stop a turn while a card is open: the card closes.
+5. **`/` menu and `@`** (CP1.2): `/status`, `/context`, `/tools`, `/plan something`, a skill;
+   `@file:` lists files. `/import-hermes` (CP1.3, needs a Hermes install) imports your Hermes
+   sessions or says none were found.
+6. **Sidebar and Projects**: rename, archive (it leaves the list; Settings ▸ Sessions lists it),
+   restore, delete; `/branch` from a message; drag a session onto a project.
+7. **Side panel** (CP1.2): open a file, edit and save; Review tab: diff, stage, commit; Terminal:
+   `echo hi`, reload the page, the output is replayed; attach an image; `/save` as Markdown.
+8. **Model picker** (CP1.3): open the picker in the composer: your providers and their models
+   are listed; pick another model for this chat (session only); pick one as the default: a new
+   chat uses it. Change the effort (the brain icon): it shows in the status bar.
+9. **Settings ▸ Providers ▸ Custom endpoints** (CP1.3): add an endpoint (Test connection lists
+   its models), make it the default, edit it (name, daily request limit), delete it: the default
+   moves to another endpoint.
+10. **Settings ▸ Model** (CP1.3): Auxiliary: pick a model and an effort for "Title generation",
+    reset all; "Use a local model for background jobs" if Ollama / LM Studio runs; Fallbacks:
+    add and remove an entry. Settings ▸ Safety: switch the approval mode and Checkpoints; the
+    status bar's mode follows at once. Settings ▸ Memory: change a size; Settings ▸ Sessions:
+    auto-archive on.
+11. **Capabilities** (CP1.3): Tools: switch Terminal off, send a message that needs it: the agent
+    has no terminal; switch it on. Skills: toggle a skill, create one, edit it; "Waiting for your
+    review" shows items when a tainted session left writes (apply / reject).
+12. **Memory and Star map** (CP1.3): the map shows learned skills and memories; open a memory
+    node, edit it, delete it. **Command Center ▸ Maintenance**: "Run curator now" finishes and
+    shows its lines; pause / resume; memory file sizes; **profile rail ▸ Edit SOUL.md**: save,
+    reopen. **Usage**: the status bar's allowance gauge shows when the endpoint has a daily limit.
+
+### What stayed in `crates/desktop`, and why
+
+- **Hermes's JSON, statuses and RPC errors** (by design): every `list` / `save` shape, the
+  `{detail}` errors, `StarmapGraph`, the toolsets' and skills' fields, the skill hub's empty answers,
+  `config.get` / `config.set`'s params and answers, `setup.*`, `profiles.list`, the picker's JSON.
+- **`rest.rs`**: the config schema (`config_schema`, the descriptions), the REST routes over the
+  record, UI preferences, desktop plugins. The record itself (defaults, merge, save) moved.
+- **`POST /api/model/set`** (`gateway/rest.rs`): a three-line check (known provider) and
+  `save_default`; page-only validation, left.
+- **`/btw`, `/bg`, `file_tickets`** (from CP1.2's list): page frames over typed runtime calls; they
+  can move when the native composer wants them (Phase 5).
+- **`session_info`, `status_text`'s page shape, `context_breakdown`**: page shapes over the
+  runtime and the typed `usage` / `settings` calls.
+- **`viewing`** and the review route (`install_review_route`): keyed by the page's socket.
+
+### Deviations from the plan
+
+- None in scope. `CommandEnv` stays a trait (a front end may still supply its own); `CoreCommands`
+  is the default one, so "Core::run_command no longer needs the gateway" holds for every part
+  (window, route, import).
+- `Core::new` does not call `apply_settings` (as before, the gateway does at start); a front end
+  with no gateway must call `core.apply_settings()` and `hermes_core::skills::apply_config(
+  &runtime.skills(), core.config())` once at start (see "For the reviewer" 2).
+
+### For the reviewer
+
+1. **`apply_settings` order.** The gateway's wrapper now runs `Core::apply_settings` (everything
+   on the runtime), then sends `session.info` to the followed sessions, then `sweep_archive`.
+   Before, the `session.info` frames were sent right after the approval mode was set and before
+   the environment, sandbox, ledger, budget, curator, checkpoints, memory and tool settings. The
+   frame reads the record, so it can only be more current now; there was no frame between.
+2. **Two start-up calls for a front end with no gateway**: `Core::apply_settings()` and
+   `skills::apply_config(...)`. Folding the second into the first would be harmless (it is
+   idempotent) but would change what a settings change touches, so it is not done; the native UI
+   (Phase 3) must call both.
+3. **One record, two owners' worth of code.** `Rest::new(data_dir)` still builds a record of its
+   own (the `rest.rs` and `skills.rs` tests use it); the gateway uses `Rest::with_config(.., core
+   .config().clone())`. Two records over one file would overwrite each other: PITFALLS says so.
+4. **`switch_model`'s `changed` callback** is called at the same points the gateway emitted
+   `session.info` (a deferred pick, a routed session), before `save_default`; `apply_pending_route`
+   now returns whether it moved the session and the gateway emits. The error texts are the
+   same strings (`RpcError::server` of the same text; the busy text still maps to `Busy`).
+5. **`provider_for` / `session_provider`**: kept as two core functions because their errors differ
+   (a store error vs "no session", "Session x not found" vs "No session x."); the gateway maps
+   `RouteError::NoSession` for the second to `RpcError::invalid` as before.
+6. **`Graph.archive` is `hermes_memory::ArchiveRow`** (not a copy), so the Star map's typed graph
+   depends on that type; the JSON is built from it unchanged.
+7. **Curator events carry no session**: `CoreEvent::session_id()` returns "" for them. Fine for the
+   hub (it ignores them); a subscriber that indexes by session id must skip them.
+8. **`schedule_curator` spawns on the core's handle** (it used `Handle::try_current()` and did
+   nothing when there was no runtime); `Gateway::new` is always built inside the tokio runtime
+   in the app and the tests, so nothing changes there.
+9. **Duplicated tests are intended**: the learning tests that read JSON stayed in desktop and
+   the typed versions are in core (the two files each test their own layer). Desktop's lib count
+   went 155 → 130 because the typed halves moved; core 81 → 137.
+10. **`staging.rs` has no unit tests of its own** beyond the core test (nothing staged, unknown
+    id): staging an item needs a tainted session; the gateway's staging tests (`gateway/tests.rs`)
+    and `staging-check.mjs` cover apply / reject / shapes. Adding a core test with a seeded
+    `staging/` folder is easy if wanted.
+11. **Formatting**: `cargo fmt -p hermes-desktop -- --check` still lists files untouched here and
+    `rest.rs`, `gateway/mod.rs`, `gateway/sessions.rs`, `lib.rs` (not clean before).
+
+### Review (Opus 5.5)
+
+Main had not moved since 83e7e87: no merge. `/code-review` was not run (no Skill pass in this
+subagent); the pass below is by hand.
+
+**Verdict: accepted; Phase 1 done.** Compared against HEAD (cc0666d) function by function:
+`apply_settings` (same keys, same order, same defaults and bounds), `sweep_archive` (= the old
+`auto_archive`), `switch_model` / `route_session` / `apply_pending_route` (same checks, same error
+texts, `session.info` at the same points through the callback or the return value),
+`known_context` / `context_length` / `model_facts` / `sends_images` (one cache, same key, same
+"asked again only when the provider did not answer"), `provider_for` / `session_provider` /
+`import_route` (same texts; `NoSession` still `-32602` for the second), `usage_snapshot` (same
+arithmetic: the cap of `used` at the window, the `used > 0` condition, `used_bp` saturating and
+capped at 10,000, `resets_at * 1000`; the JSON built from it has the same keys), `CoreCommands`
+(= the old `PageCommands`, the import text verbatim), the config record (`defaults`, `deep_merge`,
+the `model` / `budget` filtering, `set_value`'s fold and `value`'s dotted read; the old
+`{"config": ...}` wrapping round trip is equivalent), endpoints (same validation order and texts,
+`daily_request_limit` absent vs null kept apart, keys only to the key store, previews masked as
+before), `staging`, `maintenance`, `hermes_import` (no new `unwrap`/indexing on user data; the
+two indexings outside tests are guarded as before), `profiles` (only "default", atomic write
+kept). Secrets: no key is logged or returned anywhere it was not before. RPC-table fixture:
+`git diff` shows `crates/desktop/tests/` untouched since 2a99eb9, and the test passes. Store
+schema untouched; prompt caching untouched (Settings still apply on the next turn / session);
+blocking calls are reached through `blocking` / `spawn_blocking` as before; Hermes citations
+moved with the logic; PORTING rows point at `crates/core/src`; tests use `hermes_testdir` with the
+`TestDir` last.
+
+**The `session.info` order in `Gateway::apply_settings`** (implementer's point 1): not visible.
+The frames are built and sent inside the same synchronous call either way, after the approval
+mode is set; the only difference is that the frame now also sees the later settings, and no page
+frame can come between. Left as is.
+
+**Found and fixed**
+- *Start-up was two calls a front end could forget.* New `Core::start(background)`: Settings on
+  the runtime, the auto-archive sweep, the scheduled curator when `background`, the switched-off
+  skills: exactly what `Gateway::build` did, in its order. The gateway now calls it (the
+  `session.info` loop it skips has no followed session at build time), so the native app (Phase 3)
+  starts the same way. Test: `start_puts_the_stored_settings_on_the_runtime` (`Core::new` applies
+  nothing, `start` applies a stored record).
+- *A curator run that panicked never finished.* `CuratorStarted` would have no `CuratorFinished`
+  and the `curator-run` action stayed "running", refusing every later run until a restart (the old
+  code had the same gap). The run is now its own task; a panic ends the action as failed and
+  publishes `CuratorFinished { ok: false }`. A runtime shut down mid-run still ends without one
+  (the app is closing).
+- *Staging had no apply / reject test in core.* `a_staged_write_is_applied_or_rejected` stages two
+  memory writes, applies one (it reaches MEMORY.md), rejects the other, and checks neither id can
+  be decided again.
+- *`rest.rs`'s three tests leaked their folders* (`%TEMP%\hermes-desktop-rest-*` / `-prefs-*`,
+  made with `std::env::temp_dir()`, which `clean-test-temp.ps1` does not sweep; there before this
+  checkpoint): now `hermes_testdir::tempdir()` (ground rule 9).
+- Docs: `ARCHITECTURE.md` (`desktop-config.json`'s owner, `Core::apply_settings` / `Core::start`),
+  `PITFALLS.md` (`Core::start`; curator events always paired),
+  `CONVENTIONS.md` and `GAPS-PLAYBOOK.md` (where a Settings key's default and its runtime push go
+  now), `GAPS.md` 3.8's path to `fallback.rs`; PHASES.md (Phase 1 ✅, the review line).
+
+**Checked and left**
+- `desktop-config.json` and `generation-stats.json` are still written with `std::fs::write` (not
+  temp + rename): as before the move; a crash mid-write loses the record. Follow-up, not CP1.3.
+- `curator_model` reads `config.json` on an async worker (as before).
+- The implementer's open points 3–11: agreed (two `ConfigRecord`s over one file only in tests;
+  curator events with an empty session id; `schedule_curator` on the core's handle).
+- The 12-step checklist above was spot-checked against the code (the lock's dialog text, the
+  local-models button, the curator / SOUL.md routes, the allowance gauge): accurate.
+
+**Re-run by the reviewer** (`CARGO_TARGET_DIR=target/claude`): `cargo test -p hermes_core` 139
+passed (137 + the two new tests); `-p hermes-desktop` lib 130 (RPC table unchanged) and
+`tests/acp.rs` 68; `cargo test -p hermes_runtime --test turns` 258 passed, 7 ignored; `cargo build
+--workspace` passes; clippy on `hermes_core` clean, `cargo fmt -p hermes_core` clean. Live, each on
+a fresh instance (debug exe of this branch, port 47810, `target/perf/home` deleted before each,
+`mock_llm.py` for `rpc-dispatch`, `endpoints`, `stop`; temp folders in `%TEMP%`, outside any git
+repository; `import` against a home from `make-hermes-db.py` with the project in `import-folder`):
+`rpc-dispatch` (87 ok), `budget`, `endpoints`, `aux-models`, `fallback`, `profiles`, `toolsets`,
+`staging`, `memory`, `import`, `review`, `queue`, `stop`: all exit 0, no `FAIL` line. Only this
+build's processes and the mocks it started were stopped; none left. `clean-test-temp.ps1`: 220
+folders / 80.8 MB removed, a second dry run finds 0; the runs' own folders removed.
+

@@ -19,9 +19,10 @@ in `gateway/rpc.rs`, so a method answered only through another one, like `sessio
 3. New module `crates/desktop/src/<feature>.rs` with a header (`Hermes:` line) and unit tests; thin
    handlers in `gateway/` (a `Request` variant in `rpc.rs`, a handler in the area's file and an arm in
    `dispatch` for RPC; a prefix block in `rest` for REST).
-4. Settings keys: add Hermes's default under `config_defaults()` in `rest.rs` (and a description
-   or select override in `config_schema()` if the generated label is poor), read with
-   `self.rest.config_value("a.b")`, push into the runtime in `Gateway::apply_settings()`.
+4. Settings keys: add Hermes's default under `defaults()` in `crates/core/src/config.rs` (and a
+   description or select override in `rest.rs`'s `config_schema()` if the generated label is poor),
+   read with `self.rest.config_value("a.b")` (core: `self.config.value("a.b")`), push into the
+   runtime in `Core::apply_settings()` (`crates/core/src/settings.rs`).
 5. Unhide the UI: delete the selector in `crates/desktop/plugins/hermes-rs/hide.css`, or the name
    in `plugin.js`'s `hide` list, or extend patch 0005's `SHOWN_MODES` (Capabilities tabs).
 6. Live check `scripts/perf/<feature>-check.mjs`; user checklist; GAPS/PORTING/READMEs; commit.
@@ -129,9 +130,9 @@ empty output, because the page polls each session's goal. Replace that stub.
 
 ## 2.9 Auxiliary model routing in Settings — ✅ done 2026-11-05
 
-Built as `crates/desktop/src/aux_models.rs` (see its header and `scripts/perf/aux-models-check.mjs`):
+Built as `crates/core/src/aux_models.rs` (JSON in `crates/desktop/src/aux_models.rs`; see their headers and `scripts/perf/aux-models-check.mjs`):
 `GET /api/model/auxiliary` and `POST /api/model/set {scope: "auxiliary"}`, choices in `config.json`
-`aux_models` (the GPUI app's names), each with an optional effort; `Gateway::turn_options` hands
+`aux_models` (the GPUI app's names), each with an optional effort; `Core::turn_options` hands
 them to every turn; unrun slots' rows hidden in `hide.css` (`#aux-task-<slot>`).
 
 **Lesson for the other recipes here:** this recipe's first draft guessed the page edited
@@ -228,7 +229,7 @@ config key is `fallback_model` (single dict or list; `hermes_cli/config.py`) rea
 - **`/api/profiles/sessions/sidebar`** (`api/sessions.ts:337`): a sidebar-sized session list;
   answer it from `session_rows()` with the query's limit. (The `/api/sessions/:id/messages` half
   of the GAPS line is done: `stored_messages`.)
-- **Context window fallback 256k** (`FALLBACK_CONTEXT` in `gateway/settings.rs`): when the provider's model
+- **Context window fallback 256k** (`FALLBACK_CONTEXT` in `crates/core/src/commands.rs`, re-exported by `settings.rs`): when the provider's model
   list has no context length, ask the endpoint (Ollama `/api/show`, llama.cpp `/props`,
   LM Studio `/api/v0/models`) in `model_facts`, cache it, else keep 256k.
 - **Other unanswered session RPCs** worth a look: `session.undo` (alias of rewind),

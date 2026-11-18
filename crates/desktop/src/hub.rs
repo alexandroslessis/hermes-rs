@@ -246,7 +246,9 @@ impl Listener for Hub {
             | CoreEvent::QueuedFailed { .. }
             | CoreEvent::Idle { .. }
             | CoreEvent::ProcessFinished { .. }
-            | CoreEvent::ReviewFinished { .. } => false,
+            | CoreEvent::ReviewFinished { .. }
+            | CoreEvent::CuratorStarted
+            | CoreEvent::CuratorFinished { .. } => false,
         }
     }
 }

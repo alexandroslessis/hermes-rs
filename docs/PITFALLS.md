@@ -277,7 +277,7 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   database must make the same split.
 - **Pass the model's window.** Until 2026-11-05 no desktop turn set `TurnOptions.context_length`,
   so compression assumed the runtime's 128k default (threshold 96k) whatever the model held: a
-  32k local model overflowed first. Build options with `Gateway::turn_options`, never
+  32k local model overflowed first. Build options with `Core::turn_options`, never
   `TurnOptions::default()`.
 - **Compression must be visible.** A turn that compresses first emits `status.update`
   `compacting` / `compacted` (the page's "Summarizing thread" indicator); without it a long
@@ -1609,6 +1609,34 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **A question's waiting future cleans up after itself.** If the turn drops it (its cancel token
   fires without `Core::stop`, an editor closes the thread), the open question is removed and
   `Settled` published, so `is_waiting` and `session.resume`'s `prompts` never show a dead card.
+- **One config record, shared** (CP1.3): `Core` owns the `ConfigRecord` (`desktop-config.json`);
+  the page's `Rest` holds the same `Arc` (`Rest::with_config`), so a `config.set`, a Settings page
+  and `Core::apply_settings` see one copy. `Rest::new(data_dir)` (a record of its own) is for
+  tests only: two records over one file overwrite each other.
+- **`apply_settings` does not talk to the page.** `Core::apply_settings` puts the record on the
+  runtime and nothing else; the gateway's wrapper then sends `session.info` for the followed
+  sessions (the approval mode shows in the status bar) and calls `Core::sweep_archive`. A native
+  front end that shows the approval mode refreshes after calling it. Call it after every change
+  to the record (`ConfigRecord::set_value` / `save` do not apply anything themselves).
+- **`Core::new` applies no Settings; `Core::start(background)` does** (CP1.3 review): the record
+  on the runtime, the auto-archive sweep, the scheduled curator (`background`: not for ACP) and
+  the switched-off skills. Every front end calls it once after `Core::new`, off the async workers;
+  without it a native app would run with manual approvals and every skill on, whatever Settings
+  say.
+- **Settings are read when needed, not cached**: `known_context`, `turn_options`, `provider_for`
+  and the others load `config.json` each call (a small file; the gateway did the same), so a
+  change made through the endpoints or by hand applies on the next call. Only a provider's answer
+  about a model (its window, vision) is cached (`Core::forget_model_facts` after an endpoint
+  changes).
+- **The curator reports as events**: `CuratorStarted` / `CuratorFinished { ok, lines }` carry no
+  session (`CoreEvent::session_id()` is empty for them); the hub ignores them and the page still
+  polls `/api/actions/curator-run` (`Core::actions`). A front end that listens for sessions'
+  events must not index by that id. Every `CuratorStarted` gets its `CuratorFinished`, also when
+  the run panics (`ok: false`); only a runtime shutting down mid-run ends without one.
+- **A deferred model pick calls back**: `Core::switch_model` takes a `changed` callback it calls
+  at the point the session's model changes (or the pick is deferred), so the gateway's
+  `session.info` keeps its place before the default is saved. `Core::apply_pending_route` returns
+  whether it moved the session; the caller announces it.
 
 ## The model catalog (Phase 14, `crates/llm/src/canonical/`)
 

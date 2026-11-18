@@ -36,7 +36,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | # | Phase | Size | Depends on |
 |---|---|---|---|
 | 0 | Spike and dev loop: GPUI Kit on Windows, layout dump, snapshots, gallery — ✅ 2026-11-18 | M | — |
-| 1 | `hermes_core`: the backend's application layer, extracted from `crates/desktop` | L | — |
+| 1 | `hermes_core`: the backend's application layer, extracted from `crates/desktop` — ✅ 2026-11-18 | L | — |
 | 2 | Design system and app frame: themes, tokens, design layer, window, palette, keymap | M–L | 0 |
 | 3 | Sidebar: projects and threads | M | 1 (CP1.1), 2 |
 | 4 | Thread view: timeline, markdown, tool calls, streaming | L | 3 |
@@ -266,6 +266,17 @@ Providers and endpoints (`providers.rs`, `endpoints.rs`), auxiliary models, fall
 skills, maintenance and curator (`toolsets.rs`, `skills.rs`, `maintenance.rs`), staging
 (`staging.rs`), learning (`learning.rs`), usage and the request ledger (`gateway/usage.rs`), import
 from Hermes (`hermes_import.rs`).
+
+**Status (CP1.3 implementer, 2026-11-18):** done. The logic of every module listed is in
+`hermes_core` (`config`, `providers`, `endpoints`, `aux_models`, `fallback`, `profiles`,
+`settings`, `usage`, `toolsets`, `skills`, `maintenance` with the curator's `CuratorStarted` /
+`CuratorFinished` events, `staging`, `learning`, `hermes_import`); `crates/desktop` keeps Hermes's
+JSON, statuses and RPC errors. `CoreCommands` is the `CommandEnv` over the core's own Settings, so
+`Core::run_command` needs no gateway. Details and doubts: `progress/phase-1.md`, CP1.3.
+
+**Reviewed 2026-11-18 (Opus):** accepted. `Core::start(background)` added: the one call a front end
+makes after `Core::new` (Settings on the runtime, the auto-archive sweep, the scheduled curator,
+the switched-off skills); the gateway uses it, so the native app (Phase 3) calls it the same way.
 
 **Done for Phase 1:** `docs/ARCHITECTURE.md` shows `hermes_core` between the front ends and the
 runtime; `PORTING.md` paths updated; no behaviour change visible in the Tauri app (the user's

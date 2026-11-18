@@ -288,17 +288,3 @@ async fn the_sandbox_command_reports_and_removes_labels() {
         "{unknown:?}"
     );
 }
-
-#[test]
-fn sandbox_grants_are_read_from_the_config_list() {
-    use super::settings::sandbox_grants;
-    assert_eq!(
-        sandbox_grants(&json!([" D:\\data ", "", 3, "E:\\x"])),
-        [
-            std::path::PathBuf::from("D:\\data"),
-            std::path::PathBuf::from("E:\\x")
-        ]
-    );
-    assert!(sandbox_grants(&json!("D:\\data")).is_empty());
-    assert!(sandbox_grants(&Value::Null).is_empty());
-}
