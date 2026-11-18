@@ -83,7 +83,7 @@ mod tests {
     use super::*;
     use crate::gallery::open_story as open;
     use crate::testing::{Checks, headless_app, layout};
-    use crate::themes::ThemeChoice;
+    use crate::theme::ThemeChoice;
 
     /// The checks every state of a button story must pass.
     fn common_checks(check: &mut Checks) {
@@ -101,7 +101,7 @@ mod tests {
         let mut cx = headless_app();
         for theme in [ThemeChoice::DefaultLight, ThemeChoice::DefaultDark] {
             // The colour checks below only mean something if the states differ in colour.
-            cx.update(|cx| crate::themes::apply_theme(theme, cx));
+            cx.update(|cx| crate::theme::apply_theme(theme, cx));
             let colors = cx.update(|cx| cx.theme().colors);
             let distinct: std::collections::HashSet<_> =
                 [colors.button, colors.button_hover, colors.button_active]

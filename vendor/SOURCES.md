@@ -44,6 +44,17 @@ snapshot tests use on Windows (`gpui-pre-platform` wires it on Linux only; docs/
 *Native UI*). Its `wgpu-hal` needs `gpu-allocator` built against `windows` 0.62; that entry in
 `Cargo.lock` was set by hand (CP0.2).
 
+## Themes and fonts bundled in `crates/native/assets/` (CP2.1)
+
+- `assets/themes/one/one.json` and `assets/themes/ayu/ayu.json`: Zed's One (its port of Atom's
+  One; MIT, copyright 2014 GitHub Inc., per `LICENSE` beside it) and Ayu (MIT, copyright 2016
+  Ike Ku) theme families, theme data rather than code, copied unchanged from the repo's
+  `assets/themes/` (which `scripts/vendor_zed.py` fills from the vendored Zed). Gruvbox is not
+  bundled: its licence file in Zed's tree still has the `<YEAR> <COPYRIGHT HOLDER>` placeholders.
+- `assets/fonts/inter/`: Inter 4.001, static Regular, Bold, Italic and Bold Italic (SIL OFL 1.1,
+  `OFL.txt`; copyright The Inter Project Authors), unmodified, taken from t3code's client bundle.
+  Decision record: `crates/native/src/theme/fonts.rs`.
+
 ## Hermes Agent
 
 Commit `c419cf7c864ac0ee511dbd9f7091a8bba0b567ee` from https://github.com/NousResearch/hermes-agent

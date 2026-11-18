@@ -24,7 +24,7 @@ use image::{Rgba, RgbaImage};
 
 use super::{Story, all, button, open_story};
 use crate::testing::{Layout, text_system};
-use crate::themes::ThemeChoice;
+use crate::theme::ThemeChoice;
 
 /// A pixel counts as changed when any channel moved by more than this (GPU rasterisation of
 /// anti-aliased edges and glyphs may differ by a step or two between drivers).

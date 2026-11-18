@@ -2,7 +2,7 @@
 //! data, in both themes (`crates/native/src/gallery/`). Polishing happens here, not in the app.
 //!
 //! Flags:
-//! - `--theme <dark|light|one-dark|one-light>`: the theme to start with (default `light`).
+//! - `--theme <dark|light|one-dark|one-light|t3-dark|t3-light>`: the theme to start with (default `light`).
 //! - `--quit-after <seconds>`: quit on its own after that long.
 //! - `--dump <file>` (with `--features dev`): write the element dump once the window has drawn.
 //!   With `--features dev`, F12 writes it to `layout-dump.txt` in `HERMES_RS_HOME`.
@@ -12,10 +12,11 @@ use std::time::Duration;
 use gpui_kit::*;
 use hermes_native::{
     gallery::GalleryView,
-    themes::{ThemeChoice, apply_theme},
+    theme::{ThemeChoice, apply_theme},
 };
 
 fn main() {
+    hermes_native::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
     let flag = |name: &str| {
         args.iter()
@@ -26,6 +27,8 @@ fn main() {
     let theme = match flag("--theme").as_deref() {
         Some("dark") => ThemeChoice::DefaultDark,
         Some("one-dark") => ThemeChoice::OneDark,
+        Some("t3-dark") => ThemeChoice::T3Dark,
+        Some("t3-light") => ThemeChoice::T3Light,
         Some("one-light") => ThemeChoice::OneLight,
         _ => ThemeChoice::DefaultLight,
     };

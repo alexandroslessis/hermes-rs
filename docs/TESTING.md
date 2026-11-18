@@ -397,8 +397,8 @@ ring missing", "dark: label clipped on the right"). The reviewer reads verdicts,
 only for an "unexpected" one. Full-window captures of our own instance are for the end of a phase.
 
 **The gallery** (`hermes-native-gallery.exe`, `cargo run -p hermes-native --bin
-hermes-native-gallery`): every story in every state, with GPUI Kit / Zed One and light / dark
-switches, for a person to judge hover, press and focus by hand (the user's checklist).
+hermes-native-gallery`): every story in every state, with t3code's default / GPUI Kit / Zed One and
+light / dark switches, for a person to judge hover, press and focus by hand (the user's checklist).
 
 ## Before you commit
 

@@ -5,7 +5,7 @@
 //! Flags (for measuring, CP0.1 step 4):
 //! - `--no-stream`: don't start the timer that streams text into the last message (idle memory).
 //! - `--quit-after <seconds>`: quit on its own after that long.
-//! - `--theme <dark|light|one-dark|one-light>`: the theme to start with (default `dark`).
+//! - `--theme <dark|light|one-dark|one-light|t3-dark|t3-light>`: the theme to start with (default `dark`).
 //! - `--dump <file>` (with `--features dev`): write the element dump once the window has drawn
 //!   (`docs/TESTING.md`, *Native UI*). With `--features dev`, F12 writes it to `layout-dump.txt`
 //!   in `HERMES_RS_HOME`.
@@ -18,11 +18,12 @@ use std::time::{Duration, Instant};
 use gpui_kit::*;
 use hermes_native::{
     spike,
-    themes::{ThemeChoice, apply_theme},
+    theme::{ThemeChoice, apply_theme},
 };
 
 fn main() {
     let started = Instant::now();
+    hermes_native::log_to_stderr();
     let args: Vec<String> = std::env::args().collect();
     let stream = !args.iter().any(|a| a == "--no-stream");
     let quit_after = args
@@ -40,6 +41,8 @@ fn main() {
     {
         Some("light") => ThemeChoice::DefaultLight,
         Some("one-dark") => ThemeChoice::OneDark,
+        Some("t3-dark") => ThemeChoice::T3Dark,
+        Some("t3-light") => ThemeChoice::T3Light,
         Some("one-light") => ThemeChoice::OneLight,
         _ => ThemeChoice::DefaultDark,
     };

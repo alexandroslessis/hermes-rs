@@ -20,7 +20,7 @@ use gpui_kit::{prelude::FluentBuilder as _, *};
 use crate::{
     dev::ProbeExt as _,
     fake::{self, Message, Role},
-    themes::{ThemeChoice, apply_theme},
+    theme::{ThemeChoice, apply_theme},
 };
 
 /// Messages in the fake conversation.

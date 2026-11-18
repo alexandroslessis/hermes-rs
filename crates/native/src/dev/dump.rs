@@ -310,7 +310,7 @@ mod tests {
     use super::*;
     use crate::gallery::{all, open_story};
     use crate::testing::headless_app;
-    use crate::themes::ThemeChoice;
+    use crate::theme::ThemeChoice;
 
     #[core::prelude::v1::test]
     fn the_dump_names_each_element_with_bounds_colours_and_state() {

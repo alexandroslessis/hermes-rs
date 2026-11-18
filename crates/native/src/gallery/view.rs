@@ -1,6 +1,6 @@
 //! The gallery window (`hermes-native-gallery`): the stories on the left, the selected story in
-//! each of its states on the right, and switches for the theme (GPUI Kit's default or Zed's One)
-//! and for light or dark. Hover, press and focus are the person's to do with the mouse and Tab;
+//! each of its states on the right, and switches for the theme (t3code's default, GPUI Kit's own
+//! or Zed's One) and for light or dark. Hover, press and focus are the person's to do with the mouse and Tab;
 //! the snapshot harness reaches them on its own.
 
 use gpui_kit::{
@@ -15,7 +15,7 @@ use gpui_kit::{
 
 use super::{Interaction, all, story_cell};
 use crate::dev::ProbeExt as _;
-use crate::themes::{ThemeChoice, apply_theme};
+use crate::theme::{ThemeChoice, apply_theme};
 
 /// The gallery's root view.
 pub struct GalleryView {
@@ -60,9 +60,15 @@ impl GalleryView {
                     .child("Hermes native gallery"),
             )
             .child(switch(
+                "theme-t3",
+                "Default",
+                theme.is_t3(),
+                ThemeChoice::T3Light.with_dark(theme.is_dark()),
+            ))
+            .child(switch(
                 "theme-kit",
                 "GPUI Kit",
-                !theme.is_zed(),
+                !theme.is_zed() && !theme.is_t3(),
                 ThemeChoice::DefaultLight.with_dark(theme.is_dark()),
             ))
             .child(switch(

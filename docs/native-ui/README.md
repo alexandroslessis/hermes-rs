@@ -174,8 +174,12 @@ sandbox, import from the original Hermes, `/` commands from our catalog.
 - Monospace for code, paths and commands; text selection works inside every message and code block;
   every message and code block has a copy button.
 - Panels resize with exact handles and remember their size; nothing jumps when a panel opens.
-- Themes: Zed theme JSON files load as-is (bundled set + a user folder), light and dark follow the
-  system unless set.
+- Themes: Zed theme JSON files load as-is (bundled One and Ayu + the user folder
+  `<data>/themes/`, re-read when a file changes; `theme/`), mapped onto t3code's tokens
+  (`design/tokens.rs`); t3code's own light and dark are the defaults. Light and dark follow the
+  system unless set (the setting is CP2.2's). The folder reading and watching are built and
+  tested (CP2.1); CP2.2's workspace is the first window that calls them, and the spike still
+  starts in GPUI Kit's dark. Fonts: Inter bundled, Consolas for code (`theme/fonts.rs`).
 
 ## The dev loop
 

@@ -6,11 +6,21 @@
 //! element dump), `testing` (layout checks, in tests and with `--features dev`), and the gallery's
 //! snapshot tests (`cargo test -p hermes-native --features snapshots`).
 
+pub mod design;
 pub mod dev;
 pub mod fake;
 pub mod gallery;
 pub mod spike;
 #[cfg(any(test, feature = "dev"))]
 pub mod testing;
-pub mod themes;
-pub mod zed_theme;
+pub mod theme;
+
+/// Sends `tracing` warnings and errors (a theme file skipped, fonts that failed to load) to
+/// stderr. Both binaries call it first; without a subscriber those messages are lost.
+pub fn log_to_stderr() {
+    // Fails only when a subscriber is already set, which is fine.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+}

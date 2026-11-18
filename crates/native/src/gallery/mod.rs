@@ -11,6 +11,7 @@
 mod button;
 #[cfg(all(test, feature = "snapshots"))]
 mod snapshots;
+mod tokens;
 mod view;
 
 pub use view::GalleryView;
@@ -71,7 +72,7 @@ macro_rules! register_stories {
     };
 }
 
-register_stories![button::STATES_STORY];
+register_stories![button::STATES_STORY, tokens::SWATCHES_STORY];
 
 /// One story in one state, on the theme's background: the root view of a snapshot window, and
 /// what the gallery shows in each column. Its element is `story`, the crop of a snapshot.
@@ -123,12 +124,12 @@ pub(crate) fn open_story(
     cx: &mut gpui_kit::HeadlessAppContext,
     story: &'static Story,
     state: usize,
-    theme: crate::themes::ThemeChoice,
+    theme: crate::theme::ThemeChoice,
 ) -> gpui_kit::AnyWindowHandle {
     use crate::testing::{draw, open_window};
     use gpui_kit::{AppContext as _, px, size};
 
-    cx.update(|cx| crate::themes::apply_theme(theme, cx));
+    cx.update(|cx| crate::theme::apply_theme(theme, cx));
     let (w, h) = story.size;
     let window = open_window(cx, size(px(w), px(h)), |_, cx| {
         cx.new(|_| StoryCell::new(story, state))

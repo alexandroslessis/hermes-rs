@@ -28,6 +28,7 @@ snapshots = ["dev", "dep:gpui-pre-wgpu", "dep:image"]
 
 [dependencies]
 anyhow.workspace = true
+dirs.workspace = true
 # Pinned exactly (AGENTS.md ground rule 3, the GPUI Kit exception); vendor/SOURCES.md records it.
 # `syntect` highlights fenced code: GPUI Kit's `tree-sitter` features pull tree-sitter 0.26,
 # which Cargo refuses next to crates/highlight's 0.27 (both declare `links = "tree-sitter"`).
@@ -36,9 +37,13 @@ gpui-kit = { version = "=0.10.0", features = ["syntect"] }
 # renderer; only with `snapshots`.
 gpui-pre-wgpu = { version = "=0.3.12", features = ["test-support"], optional = true }
 image = { version = "0.25.1", default-features = false, features = ["png"], optional = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
+hermes_testdir.workspace = true
 gpui-kit = { version = "=0.10.0", features = ["syntect", "test-support"] }
 
 [lints]

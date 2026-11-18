@@ -4727,10 +4727,15 @@ name = "hermes-native"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "dirs 7.0.0",
  "gpui-kit",
  "gpui-pre-wgpu",
+ "hermes_testdir",
  "image",
+ "serde",
  "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

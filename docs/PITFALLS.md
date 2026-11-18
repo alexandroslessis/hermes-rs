@@ -208,6 +208,16 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   space to another border's drag) plus a `size_range` minimum on the middle pane fixes it
   (`spike.rs`, test `dragging_a_border_past_its_limit_leaves_the_other_side_pane_alone`). Phase 2's
   frame does the same, or uses `resize_handle` on its own sidebar.
+- **GPUI Kit's theme deserializer is silent and strict in different places.** An unknown colour
+  key is dropped without a word (`theme::kit` tests that every key we write comes back); a
+  `highlight` section without `syntax` makes the whole config fail ("missing field `syntax`"),
+  so `kit::config` adds an empty one; and a theme without a `highlight` keeps the *previous*
+  theme's code colours unless `theme::apply` copies Kit's default for the mode in.
+- **Fonts: name only installed families.** `Fonts::install` adds the bundled Inter and picks the
+  first installed family of each stack (`theme/fonts.rs`); Windows draws weight 500 of a family
+  that has no Medium as the next heavier face (Segoe: SemiBold), Inter's static files draw 500
+  as Regular and 600 as Bold. Headless test apps (`#[gpui_kit::test]`) have no fonts, so
+  `resolve` falls back to `.SystemUIFont`.
 - **Kit's `ElementSnapshot::focused()` panics** when an element can take focus but no focus
   binding was observed (its way of flagging `.test_support()` placed after `.track_focus()`). The
   dump reads focus without panicking; a disabled Kit `Button` tracks no focus at all (`None`).
