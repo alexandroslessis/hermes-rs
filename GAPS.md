@@ -104,7 +104,7 @@ backend code · **L** = a port of a Hermes subsystem.
   `Runtime::set_background_review` (`crates/app/src/state.rs`, `settings.rs`), so the runtime's
   default (on) holds and background reviews run after turns (and after `/undo` / `/retry`, a
   learning signal) whatever the config says. Fix where Settings reach the runtime
-  (`gateway/settings.rs` `apply_settings`), with a turn test; then the ACP tests' review filter
+  (`hermes_core::settings` `Core::apply_settings`), with a turn test; then the ACP tests' review filter
   (`turn_requests` in `crates/desktop/tests/acp.rs`) can be revisited.
 
 ## 5. Later, if wanted

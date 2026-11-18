@@ -100,7 +100,7 @@ fn file_path(link: &str) -> Option<PathBuf> {
     };
     let rest = rest.trim_start_matches('/');
     let rest = rest.strip_prefix("localhost/").unwrap_or(rest);
-    let decoded = crate::rest::percent_decode(rest);
+    let decoded = crate::files::percent_decode(rest);
     let path = PathBuf::from(decoded.replace('/', "\\"));
     path.is_absolute().then_some(path)
 }

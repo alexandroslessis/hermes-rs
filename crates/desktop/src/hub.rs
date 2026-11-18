@@ -1,40 +1,30 @@
-//! What the runtime and the page share: which socket each session's events go to, and the
-//! questions waiting for the user (a flagged command's approval, the agent's clarify questions).
-//! The runtime asks through [`DesktopBridge`]; the page sees Hermes's canonical prompt events
-//! (`approval.request` / `clarify.request`, then `*.settled`) and answers with
-//! `approval.respond` / `clarify.respond` (`apps/desktop/src/api/canonical-protocol.ts`).
+//! Which socket each session's events go to, and the page's JSON for the core's events. Every
+//! event the page sees goes out here: the gateway's own (`emit`) and the core's (`CoreEvent`s,
+//! translated by the [`Listener`] impl into Hermes's frames: `message.delta`, `tool.start`, the
+//! canonical prompt events `approval.request` / `clarify.request` and their `*.settled`, ...). The
+//! questions themselves (waiting for an answer, `approval.respond` / `clarify.respond`) are the
+//! core's (`hermes_core::questions`).
+//!
+//! Hermes: `tui_gateway/server.py` (`_emit`), `apps/desktop/src/api/canonical-protocol.ts` (what the
+//! page reads from the prompt events).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
-use async_trait::async_trait;
-use hermes_runtime::{ClarifyOutcome, ClarifyRequest, ProcessNotice};
-use hermes_tools::UserBridge;
-use hermes_tools::approval::{ApprovalChoice, CommandApproval};
-use hermes_tools::{ClarifyAnswer, ClarifyResponse};
+use hermes_core::{Ask, CoreEvent, Listener, OpenQuestion, QuestionKind};
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 /// Where a connection's outgoing frames go.
 pub type Outbox = mpsc::UnboundedSender<String>;
 
 /// Hermes's approval choices, in its order.
-pub const APPROVAL_CHOICES: [&str; 4] = ["once", "session", "always", "deny"];
-
-struct Pending {
-    session_id: String,
-    kind: &'static str,
-    /// The event payload, kept so a resumed session shows the card again.
-    payload: Value,
-    reply: oneshot::Sender<String>,
-}
+pub use hermes_core::APPROVAL_CHOICES;
 
 #[derive(Default)]
 pub struct Hub {
     /// Session id → the socket that last created, resumed or prompted it.
     subscribers: Mutex<HashMap<String, Outbox>>,
-    /// Open questions by prompt id.
-    prompts: Mutex<HashMap<String, Pending>>,
 }
 
 impl Hub {
@@ -90,171 +80,182 @@ impl Hub {
         });
         outbox.send(frame.to_string()).is_ok()
     }
-
-    /// Shows a question and waits for the answer; `None` when no page follows the session or
-    /// the question was dropped.
-    async fn ask(
-        &self,
-        session_id: &str,
-        kind: &'static str,
-        mut payload: Value,
-    ) -> Option<String> {
-        let prompt_id = uuid::Uuid::new_v4().to_string();
-        payload["prompt_id"] = Value::String(prompt_id.clone());
-        payload["kind"] = Value::String(kind.to_string());
-        // The page answers a card only while its generation is the session's.
-        payload["execution_generation"] = json!(crate::gateway::EXECUTION_GENERATION);
-        let (reply, answer) = oneshot::channel();
-        self.prompts.lock().ok()?.insert(
-            prompt_id.clone(),
-            Pending {
-                session_id: session_id.to_string(),
-                kind,
-                payload: payload.clone(),
-                reply,
-            },
-        );
-        if !self.emit(session_id, &format!("{kind}.request"), payload) {
-            self.prompts.lock().ok()?.remove(&prompt_id);
-            return None;
-        }
-        answer.await.ok()
-    }
-
-    /// The page's answer to a question. `false` when it's no longer open.
-    pub fn answer(&self, prompt_id: &str, answer: String) -> bool {
-        let Some(pending) = self
-            .prompts
-            .lock()
-            .ok()
-            .and_then(|mut prompts| prompts.remove(prompt_id))
-        else {
-            return false;
-        };
-        self.emit(
-            &pending.session_id,
-            &format!("{}.settled", pending.kind),
-            json!({"prompt_id": prompt_id, "kind": pending.kind}),
-        );
-        let _ = pending.reply.send(answer);
-        true
-    }
-
-    /// Drops a session's open questions (its turn was stopped): their cards close and the
-    /// runtime hears "no answer" (an approval is denied).
-    pub fn cancel_session(&self, session_id: &str) {
-        let dropped: Vec<(String, &'static str)> = match self.prompts.lock() {
-            Ok(mut prompts) => {
-                let ids: Vec<String> = prompts
-                    .iter()
-                    .filter(|(_, p)| p.session_id == session_id)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                ids.into_iter()
-                    .filter_map(|id| prompts.remove(&id).map(|p| (id, p.kind)))
-                    .collect()
-            }
-            Err(_) => return,
-        };
-        for (prompt_id, kind) in dropped {
-            self.emit(
-                session_id,
-                &format!("{kind}.settled"),
-                json!({"prompt_id": prompt_id, "kind": kind}),
-            );
-        }
-    }
-
-    /// A session's open questions, for `session.resume` (its `prompts`).
-    pub fn open_prompts(&self, session_id: &str) -> Vec<Value> {
-        self.prompts
-            .lock()
-            .map(|prompts| {
-                prompts
-                    .values()
-                    .filter(|p| p.session_id == session_id)
-                    .map(|p| p.payload.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
 }
 
-/// The runtime's way to the user: through the page following the session.
-pub struct DesktopBridge {
-    pub hub: Arc<Hub>,
-}
-
-#[async_trait]
-impl UserBridge for DesktopBridge {
-    async fn clarify(&self, session_id: &str, request: ClarifyRequest) -> ClarifyOutcome {
-        // The page answers one question at a time.
-        let mut responses = Vec::new();
-        for question in request.questions {
-            let payload = json!({
-                "question": question.question,
-                "choices": question.choices,
-                "multi_select": question.multi_select,
-            });
-            let Some(answer) = self.hub.ask(session_id, "clarify", payload).await else {
-                return if responses.is_empty() {
-                    ClarifyOutcome::Undelivered
-                } else {
-                    ClarifyOutcome::Cancelled
-                };
-            };
-            let answer = answer.trim().to_string();
-            responses.push(if answer.is_empty() {
-                ClarifyResponse::Skipped
-            } else if question.multi_select {
-                ClarifyResponse::Answered(ClarifyAnswer::Choices(
-                    answer
-                        .split([',', '\n'])
-                        .map(|choice| choice.trim().to_string())
-                        .filter(|choice| !choice.is_empty())
-                        .collect(),
-                ))
-            } else {
-                ClarifyResponse::Answered(ClarifyAnswer::Text(answer))
-            });
-        }
-        ClarifyOutcome::Submitted(responses)
-    }
-
-    fn process_finished(&self, session_id: &str, notice: ProcessNotice) {
-        tracing::info!("background process finished in {session_id}: {notice:?}");
-    }
-
-    async fn approve_command(&self, session_id: &str, request: CommandApproval) -> ApprovalChoice {
-        let choices: &[&str] = if request.once_only {
-            &["once", "deny"]
-        } else {
-            &APPROVAL_CHOICES
-        };
-        let payload = json!({
-            "command": request.command,
-            "description": request.description,
+/// A question as the page's card payload (`approval.request` / `clarify.request`, and
+/// `session.resume`'s `prompts`).
+pub fn question_payload(prompt_id: &str, ask: &Ask) -> Value {
+    let mut payload = match ask {
+        Ask::Approval {
+            command,
+            description,
+            choices,
+        } => json!({
+            "command": command,
+            "description": description,
             "choices": choices,
-        });
-        // No page to ask (or the card was dropped): deny, as Hermes does when nobody answers.
-        match self
-            .hub
-            .ask(session_id, "approval", payload)
-            .await
-            .as_deref()
-        {
-            Some("once") => ApprovalChoice::Once,
-            Some("session") => ApprovalChoice::Session,
-            Some("always") => ApprovalChoice::Always,
-            _ => ApprovalChoice::Deny,
-        }
-    }
+        }),
+        Ask::Clarify {
+            question,
+            choices,
+            multi_select,
+        } => json!({
+            "question": question,
+            "choices": choices,
+            "multi_select": multi_select,
+        }),
+    };
+    payload["prompt_id"] = Value::String(prompt_id.to_string());
+    payload["kind"] = Value::String(ask.kind().as_str().to_string());
+    // The page answers a card only while its generation is the session's.
+    payload["execution_generation"] = json!(crate::gateway::EXECUTION_GENERATION);
+    payload
+}
 
-    fn review_finished(&self, session_id: &str, actions: Vec<String>, requested: bool) {
-        if !actions.is_empty() || requested {
-            tracing::info!("background review of {session_id}: {actions:?}");
+/// A session's open questions as the page's card payloads.
+pub fn open_payloads(open: &[OpenQuestion]) -> Vec<Value> {
+    open.iter()
+        .map(|q| question_payload(&q.prompt_id, &q.ask))
+        .collect()
+}
+
+impl Listener for Hub {
+    /// The core's events as Hermes's frames. Usage and the end of a turn are the gateway's own
+    /// frames (`session.usage`, `message.complete`), built from more than the event; background
+    /// processes and the review's result have no page event (they are logged).
+    fn deliver(&self, event: &CoreEvent) -> bool {
+        let id = event.session_id();
+        match event {
+            CoreEvent::TextDelta { text, .. } => {
+                self.emit(id, "message.delta", json!({"text": text}))
+            }
+            CoreEvent::ReasoningDelta { text, .. } => {
+                self.emit(id, "reasoning.delta", json!({"text": text}))
+            }
+            CoreEvent::ToolStarted {
+                tool_id,
+                name,
+                args,
+                ..
+            } => self.emit(
+                id,
+                "tool.start",
+                json!({"tool_id": tool_id, "name": name, "args": args}),
+            ),
+            // The running row shows the message beside its timer, and the clicked-open row
+            // renders it as its output while the call works (patches/0017). The payload is the
+            // contract's ToolProgressPayload.
+            CoreEvent::ToolProgress {
+                tool_id,
+                name,
+                progress,
+                message,
+                ..
+            } => self.emit(
+                id,
+                "tool.progress",
+                json!({
+                    "tool_id": tool_id,
+                    "name": name,
+                    "progress": progress,
+                    "total": Value::Null,
+                    "percent": Value::Null,
+                    "message": message,
+                }),
+            ),
+            CoreEvent::ToolCompleted {
+                tool_id,
+                name,
+                text,
+                ..
+            } => {
+                // Hermes's tools return JSON; the card reads `result` as the value.
+                let result = serde_json::from_str::<Value>(text)
+                    .unwrap_or_else(|_| Value::String(text.clone()));
+                self.emit(
+                    id,
+                    "tool.complete",
+                    json!({
+                        "tool_id": tool_id,
+                        "name": name,
+                        "result": result,
+                        "result_text": text,
+                    }),
+                )
+            }
+            // The page keeps `fallback` ones as a system line; `compacting` / `compacted` drive
+            // its "summarizing" indicator.
+            CoreEvent::Status { kind, text, .. } => {
+                self.emit(id, "status.update", json!({"kind": kind, "text": text}))
+            }
+            CoreEvent::TitleChanged { title, .. } => self.emit(
+                id,
+                "session.title",
+                json!({"session_id": id, "title": title}),
+            ),
+            CoreEvent::ApprovalRequested {
+                prompt_id,
+                command,
+                description,
+                choices,
+                ..
+            } => {
+                let ask = Ask::Approval {
+                    command: command.clone(),
+                    description: description.clone(),
+                    choices: choices.clone(),
+                };
+                self.emit(id, "approval.request", question_payload(prompt_id, &ask))
+            }
+            CoreEvent::ClarifyRequested {
+                prompt_id,
+                question,
+                choices,
+                multi_select,
+                ..
+            } => {
+                let ask = Ask::Clarify {
+                    question: question.clone(),
+                    choices: choices.clone(),
+                    multi_select: *multi_select,
+                };
+                self.emit(id, "clarify.request", question_payload(prompt_id, &ask))
+            }
+            CoreEvent::Settled {
+                prompt_id, kind, ..
+            } => self.emit(
+                id,
+                &format!("{}.settled", kind.as_str()),
+                json!({"prompt_id": prompt_id, "kind": kind.as_str()}),
+            ),
+            // The page turns a queued prompt's card into the user's bubble on the admission it
+            // names (patches/0001), before `session.info` retires the card.
+            CoreEvent::TurnStarted { admission_id, .. } => self.emit(
+                id,
+                "message.start",
+                json!({"turn_id": admission_id, "admission_id": admission_id}),
+            ),
+            // A subagent's activity: the page's live subagent rows (the runtime builds Hermes's
+            // payload).
+            CoreEvent::Subagent { kind, payload, .. } => self.emit(id, kind, payload.clone()),
+            // The gateway's own frames (`session.usage`, `message.complete`, `session.info`),
+            // built from more than the event by its turn hooks (`gateway/turn.rs`).
+            CoreEvent::Usage { .. }
+            | CoreEvent::TurnEnded { .. }
+            | CoreEvent::QueueChanged { .. }
+            | CoreEvent::QueuedFailed { .. }
+            | CoreEvent::Idle { .. }
+            | CoreEvent::ProcessFinished { .. }
+            | CoreEvent::ReviewFinished { .. }
+            | CoreEvent::CuratorStarted
+            | CoreEvent::CuratorFinished { .. } => false,
         }
     }
+}
+
+/// `true` for an approval card.
+pub fn is_approval(question: &OpenQuestion) -> bool {
+    question.ask.kind() == QuestionKind::Approval
 }
 
 #[cfg(test)]
@@ -269,71 +270,73 @@ mod tests {
         out
     }
 
-    #[tokio::test]
-    async fn an_approval_is_asked_on_the_page_and_answered_from_it() {
-        let hub = Arc::new(Hub::default());
+    /// The card goes out as Hermes's canonical event, in the payload's field order, and only to
+    /// the socket following its session.
+    #[test]
+    fn an_approval_is_the_canonical_card_on_the_following_socket() {
+        let hub = Hub::default();
         let (outbox, mut page) = mpsc::unbounded_channel();
         hub.subscribe("s1", &outbox);
-        let bridge = DesktopBridge { hub: hub.clone() };
-        let asking = tokio::spawn(async move {
-            bridge
-                .approve_command(
-                    "s1",
-                    CommandApproval {
-                        command: "rm -rf build".into(),
-                        description: "recursive delete".into(),
-                        once_only: false,
-                    },
-                )
-                .await
-        });
-        // The card goes out as Hermes's canonical event, and stays open for a resume.
-        let prompt_id = loop {
-            if let Some(frame) = frames(&mut page).into_iter().next() {
-                assert_eq!(frame["params"]["type"], "approval.request");
-                assert_eq!(frame["params"]["payload"]["command"], "rm -rf build");
-                break frame["params"]["payload"]["prompt_id"]
-                    .as_str()
-                    .unwrap()
-                    .to_string();
-            }
-            tokio::task::yield_now().await;
+        let request = CoreEvent::ApprovalRequested {
+            session_id: "s1".into(),
+            prompt_id: "p1".into(),
+            command: "rm -rf build".into(),
+            description: "recursive delete".into(),
+            choices: APPROVAL_CHOICES.to_vec(),
         };
-        assert_eq!(hub.open_prompts("s1").len(), 1);
-        assert!(hub.answer(&prompt_id, "session".into()));
-        assert!(matches!(asking.await.unwrap(), ApprovalChoice::Session));
+        assert!(hub.deliver(&request));
+        let frame = &frames(&mut page)[0];
+        assert_eq!(frame["params"]["type"], "approval.request");
+        assert_eq!(frame["params"]["session_id"], "s1");
+        let payload = &frame["params"]["payload"];
+        let keys: Vec<&str> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "command",
+                "description",
+                "choices",
+                "prompt_id",
+                "kind",
+                "execution_generation"
+            ]
+        );
+        assert_eq!(payload["kind"], "approval");
+        assert!(hub.deliver(&CoreEvent::Settled {
+            session_id: "s1".into(),
+            prompt_id: "p1".into(),
+            kind: QuestionKind::Approval,
+        }));
         assert_eq!(frames(&mut page)[0]["params"]["type"], "approval.settled");
-        assert!(hub.open_prompts("s1").is_empty());
-        // A second answer to the same card finds nothing.
-        assert!(!hub.answer(&prompt_id, "once".into()));
+        // Nobody follows s2: not shown, so the core denies it.
+        let elsewhere = CoreEvent::ClarifyRequested {
+            session_id: "s2".into(),
+            prompt_id: "p2".into(),
+            question: "Which?".into(),
+            choices: vec![],
+            multi_select: false,
+        };
+        assert!(!hub.deliver(&elsewhere));
     }
 
-    #[tokio::test]
-    async fn nobody_to_ask_denies_and_skips() {
-        let bridge = DesktopBridge {
-            hub: Arc::new(Hub::default()),
-        };
-        let request = CommandApproval {
-            command: "x".into(),
-            description: "y".into(),
-            once_only: false,
-        };
-        assert!(matches!(
-            bridge.approve_command("none", request).await,
-            ApprovalChoice::Deny
-        ));
-        let outcome = bridge
-            .clarify(
-                "none",
-                ClarifyRequest {
-                    questions: vec![hermes_tools::ClarifyQuestion {
-                        question: "Which?".into(),
-                        choices: vec![],
-                        multi_select: false,
-                    }],
-                },
-            )
-            .await;
-        assert!(matches!(outcome, ClarifyOutcome::Undelivered));
+    #[test]
+    fn a_tool_result_in_json_is_read_as_its_value() {
+        let hub = Hub::default();
+        let (outbox, mut page) = mpsc::unbounded_channel();
+        hub.subscribe("s1", &outbox);
+        hub.deliver(&CoreEvent::ToolCompleted {
+            session_id: "s1".into(),
+            tool_id: "c1".into(),
+            name: "terminal".into(),
+            text: r#"{"exit_code": 0}"#.into(),
+        });
+        let payload = &frames(&mut page)[0]["params"]["payload"];
+        assert_eq!(payload["result"]["exit_code"], 0);
+        assert_eq!(payload["result_text"], r#"{"exit_code": 0}"#);
     }
 }

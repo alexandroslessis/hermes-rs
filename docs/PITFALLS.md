@@ -159,7 +159,9 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **Zoom:** CSS zoom misplaces Radix popovers (they open at the wrong place, clipped). Zoom is
   WebView2's native zoom through the window bridge (patch 0010).
 - **localStorage is per origin**: the port must be stable (`DEFAULT_PORT` 47731) or the page loses
-  its local settings. A second instance gets a random port and empty local settings, by design.
+  its local settings. A second instance on another data folder (`HERMES_RS_HOME`, the perf
+  instance) gets a random port and empty local settings, by design; a second one on the same data
+  folder says "Hermes is already open" and exits (`hermes_core::lock`, native UI CP1.1).
 - **The page uses a HashRouter.** Navigate with `location.hash = '#/settings'`; `pushState` does
   nothing.
 - **The page sees this backend as a remote gateway** (`isRemoteGateway()` is true in the
@@ -275,7 +277,7 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   database must make the same split.
 - **Pass the model's window.** Until 2026-11-05 no desktop turn set `TurnOptions.context_length`,
   so compression assumed the runtime's 128k default (threshold 96k) whatever the model held: a
-  32k local model overflowed first. Build options with `Gateway::turn_options`, never
+  32k local model overflowed first. Build options with `Core::turn_options`, never
   `TurnOptions::default()`.
 - **Compression must be visible.** A turn that compresses first emits `status.update`
   `compacting` / `compacted` (the page's "Summarizing thread" indicator); without it a long
@@ -1562,6 +1564,79 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   `pub(super)`. The moved code starts with `use super::*;` (it reads as it did in one file). `Gateway::blocking` and
   `rest_blocking` (CP13c) are in `mod.rs` / `rest.rs`; the off-worker rules did not change.
 - **`scripts/contract.mjs` reads `gateway/rpc.rs`** (`rename = "<method>"`) to say which contract methods are served.
+
+## `hermes_core` (native UI Phase 1, `crates/core`)
+
+- **Two kinds of event delivery.** `Core::subscribe()` is a channel (the native UI); a `Listener`
+  (`Core::listen`) is called in the publisher's thread, in order (the gateway's `Hub`). The page's
+  frames must keep their order with the ones the gateway sends itself (`message.start` before the
+  first `message.delta`, `approval.settled` before the next `tool.complete`), so the hub is a
+  listener, not a subscriber. A listener never blocks and never publishes from `deliver`.
+- **A question counts as asked only if a listener showed it** (`publish` returns `true`). The hub
+  shows a session's events only when a socket follows it, so an approval in a session nobody has
+  open is denied at once, as before. A `subscribe()` channel shows everything while its receiver
+  lives: a front end that subscribes and never answers holds approvals open until the turn is
+  stopped.
+- **The app lock is per data folder** (`<data>/app.lock`, held open with no sharing like
+  `turnlock`). The ACP agent does not take it (it runs beside the desktop app); the native app
+  must take it before it opens its window (when it starts using a `Core`, Phase 3). Tests and the
+  perf instance use their own data folders, so they never meet the user's app.
+- **The turn runs in the core** (`hermes_core::turns`, CP1.2): `Core::submit` with a front end's
+  `TurnHooks`. A new stream event goes in `hermes_core::stream` and its frame in `hub.rs`; a page
+  frame that needs the store (like `session.info`) goes in a hook, not in the hub listener (a
+  listener runs on the turn's task and must not block). The loop calls every hook on a blocking
+  thread and awaits it before the next event, so the frames keep the order they had when the loop
+  was the gateway's (`message.start`, then `session.info`; `TurnEnded`, then `message.complete`).
+  The hooks of the turn that ran are the ones its queued follow-up starts with (the page's socket
+  that sent the first prompt keeps following, as before).
+- **The queue is JSON in the session's actor** (`PageState::queue`): each item is a `SubmitTurn`
+  written with serde under the page's names (`submission_id`, `text`, `shown`, `images`,
+  `truncate`), because `dequeue` looks prompts up by `submission_id`. Read it with `Core::queue`,
+  never `handle.page().queue` directly; renaming a `SubmitTurn` field breaks the lookup.
+- **Queue changes reach a front end twice**: as `CoreEvent::QueueChanged` and through the
+  operation's hooks (`changed`: the page's `session.info`). The hub ignores the event.
+- **A queued prompt that can't start** (an attached image gone, no provider) publishes
+  `QueuedFailed` with its admission and the error, then `Idle`; no `TurnStarted`/`TurnEnded`
+  follows for it. The page hears it through the `queued_failed` hook (`message.complete` with the
+  error); the hub ignores the event.
+- **Queue races the old gateway had, kept as they were:** a steer whose turn ended between the
+  check and the steer, an edit (`replace_queued`) or a redirect landing just as the turn ends, put
+  the prompt back in the queue with no turn left to run it (it runs after the next prompt). Rare
+  (a window of one actor round trip); a fix is an `only_if_running` enqueue that then submits.
+- **A terminal's output is not a `CoreEvent`**: `Shell::attach` gives the snapshot and a per-shell
+  broadcast stream; a newer attachment supersedes the older (`is_current`). `Terminals::new`
+  takes the app's version (`TERM_PROGRAM_VERSION`), not the core's.
+- **A question's waiting future cleans up after itself.** If the turn drops it (its cancel token
+  fires without `Core::stop`, an editor closes the thread), the open question is removed and
+  `Settled` published, so `is_waiting` and `session.resume`'s `prompts` never show a dead card.
+- **One config record, shared** (CP1.3): `Core` owns the `ConfigRecord` (`desktop-config.json`);
+  the page's `Rest` holds the same `Arc` (`Rest::with_config`), so a `config.set`, a Settings page
+  and `Core::apply_settings` see one copy. `Rest::new(data_dir)` (a record of its own) is for
+  tests only: two records over one file overwrite each other.
+- **`apply_settings` does not talk to the page.** `Core::apply_settings` puts the record on the
+  runtime and nothing else; the gateway's wrapper then sends `session.info` for the followed
+  sessions (the approval mode shows in the status bar) and calls `Core::sweep_archive`. A native
+  front end that shows the approval mode refreshes after calling it. Call it after every change
+  to the record (`ConfigRecord::set_value` / `save` do not apply anything themselves).
+- **`Core::new` applies no Settings; `Core::start(background)` does** (CP1.3 review): the record
+  on the runtime, the auto-archive sweep, the scheduled curator (`background`: not for ACP) and
+  the switched-off skills. Every front end calls it once after `Core::new`, off the async workers;
+  without it a native app would run with manual approvals and every skill on, whatever Settings
+  say.
+- **Settings are read when needed, not cached**: `known_context`, `turn_options`, `provider_for`
+  and the others load `config.json` each call (a small file; the gateway did the same), so a
+  change made through the endpoints or by hand applies on the next call. Only a provider's answer
+  about a model (its window, vision) is cached (`Core::forget_model_facts` after an endpoint
+  changes).
+- **The curator reports as events**: `CuratorStarted` / `CuratorFinished { ok, lines }` carry no
+  session (`CoreEvent::session_id()` is empty for them); the hub ignores them and the page still
+  polls `/api/actions/curator-run` (`Core::actions`). A front end that listens for sessions'
+  events must not index by that id. Every `CuratorStarted` gets its `CuratorFinished`, also when
+  the run panics (`ok: false`); only a runtime shutting down mid-run ends without one.
+- **A deferred model pick calls back**: `Core::switch_model` takes a `changed` callback it calls
+  at the point the session's model changes (or the pick is deferred), so the gateway's
+  `session.info` keeps its place before the default is saved. `Core::apply_pending_route` returns
+  whether it moved the session; the caller announces it.
 
 ## The model catalog (Phase 14, `crates/llm/src/canonical/`)
 

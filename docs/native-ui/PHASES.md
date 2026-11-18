@@ -36,7 +36,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | # | Phase | Size | Depends on |
 |---|---|---|---|
 | 0 | Spike and dev loop: GPUI Kit on Windows, layout dump, snapshots, gallery — ✅ 2026-11-18 | M | — |
-| 1 | `hermes_core`: the backend's application layer, extracted from `crates/desktop` | L | — |
+| 1 | `hermes_core`: the backend's application layer, extracted from `crates/desktop` — ✅ 2026-11-18 | L | — |
 | 2 | Design system and app frame: themes, tokens, design layer, window, palette, keymap | M–L | 0 |
 | 3 | Sidebar: projects and threads | M | 1 (CP1.1), 2 |
 | 4 | Thread view: timeline, markdown, tool calls, streaming | L | 3 |
@@ -231,6 +231,34 @@ Git review and git reads (`git_review.rs`, `git.rs`), files (`files.rs`, `open_f
 `gateway/slash.rs` minus the shapes), export (`export.rs`), background processes and subagents
 (`gateway/delegation.rs`).
 
+**Carried over from CP1.1 (reviewed 2026-11-18; do these first, and implement them with Opus:
+it is CP1.1's concurrency work).** CP1.1 left the turn in the gateway (progress note, "What stayed
+and why"). Phases 4 and 5 cannot start without:
+
+1. **Turns in core:** `Core::submit(session, SubmitTurn { text, images, ... }) -> Started | Queued`
+   with a typed queue (list, remove, steer, redirect), the turn's event loop (`gateway/turn.rs`
+   `submit` / `run_queued`, the title, the heartbeat) running in core and publishing the stream
+   events itself, plus `TurnStarted` and a `TurnEnded` carrying the persisted rows and the error
+   text. Today only the gateway's loop publishes the stream: a front end with a `Core` and no
+   `Gateway` sees no `TextDelta` at all. The gateway keeps the admission gate, `message.start`,
+   `session.info` and `message.complete` as frames built from those events (the queue items keep
+   the page's params beside the typed fields, or `PageState::queue` becomes typed).
+2. **`/` command dispatch from Rust:** `Core::run_command(session, command, args) -> outcome`
+   (what `gateway/slash.rs` does minus its JSON), with the catalog above.
+
+Done for these: the RPC-table fixture unchanged, `queue-check`, `stop-check`, `coding-commands-check`
+green, and a core test that submits, queues behind a running turn and cancels against the mock
+provider with no `Gateway`.
+
+**Status (CP1.2 implementer, 2026-11-18):** both done. `hermes_core::turns` (`Core::submit`,
+`SubmitTurn`, the typed queue: `queue`, `remove_queued`, `steer_queued`, `replace_queued`,
+`redirect`; the loop with title and heartbeat; `TurnStarted`, `TurnEnded { end: TurnEnd }`,
+`QueueChanged`, `Idle`, `Subagent` events). The page's frames that need the store come from the
+gateway's `TurnHooks` (`gateway/turn.rs` `PageTurn`), not from the events (a listener must not
+block). `Core::run_command` / `dispatch_command` with the catalog in `hermes_core::commands`; what
+needs Settings (context windows, a session's provider, `/import-hermes`) is a `CommandEnv` until
+CP1.3. Tests: `crates/core/src/turns/tests.rs`. Details and doubts: `progress/phase-1.md`, CP1.2.
+
 ### CP1.3 — Settings and Hermes features (M)
 
 Providers and endpoints (`providers.rs`, `endpoints.rs`), auxiliary models, fallbacks, profiles
@@ -238,6 +266,17 @@ Providers and endpoints (`providers.rs`, `endpoints.rs`), auxiliary models, fall
 skills, maintenance and curator (`toolsets.rs`, `skills.rs`, `maintenance.rs`), staging
 (`staging.rs`), learning (`learning.rs`), usage and the request ledger (`gateway/usage.rs`), import
 from Hermes (`hermes_import.rs`).
+
+**Status (CP1.3 implementer, 2026-11-18):** done. The logic of every module listed is in
+`hermes_core` (`config`, `providers`, `endpoints`, `aux_models`, `fallback`, `profiles`,
+`settings`, `usage`, `toolsets`, `skills`, `maintenance` with the curator's `CuratorStarted` /
+`CuratorFinished` events, `staging`, `learning`, `hermes_import`); `crates/desktop` keeps Hermes's
+JSON, statuses and RPC errors. `CoreCommands` is the `CommandEnv` over the core's own Settings, so
+`Core::run_command` needs no gateway. Details and doubts: `progress/phase-1.md`, CP1.3.
+
+**Reviewed 2026-11-18 (Opus):** accepted. `Core::start(background)` added: the one call a front end
+makes after `Core::new` (Settings on the runtime, the auto-archive sweep, the scheduled curator,
+the switched-off skills); the gateway uses it, so the native app (Phase 3) calls it the same way.
 
 **Done for Phase 1:** `docs/ARCHITECTURE.md` shows `hermes_core` between the front ends and the
 runtime; `PORTING.md` paths updated; no behaviour change visible in the Tauri app (the user's

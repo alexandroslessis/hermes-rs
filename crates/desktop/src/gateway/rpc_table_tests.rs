@@ -374,19 +374,8 @@ async fn record() -> String {
         data_dir: data.path().to_path_buf(),
         ..hermes_runtime::RuntimeConfig::for_current_user().unwrap()
     };
-    let hub = Arc::new(Hub::default());
-    let runtime = Arc::new(
-        Runtime::new(
-            config,
-            Arc::new(crate::hub::DesktopBridge { hub: hub.clone() }),
-        )
-        .unwrap(),
-    );
-    let gateway = Arc::new(Gateway::new_for_acp(
-        runtime,
-        hub,
-        data.path().to_path_buf(),
-    ));
+    let core = hermes_core::Core::new(config, tokio::runtime::Handle::current()).unwrap();
+    let gateway = Arc::new(Gateway::new_for_acp(core));
     let mut out = String::new();
     // Last: these two end what the others still read.
     let mut methods: Vec<&str> = SERVED.to_vec();
@@ -445,19 +434,8 @@ async fn names_that_are_not_served_are_method_not_found() {
         data_dir: data.path().to_path_buf(),
         ..hermes_runtime::RuntimeConfig::for_current_user().unwrap()
     };
-    let hub = Arc::new(Hub::default());
-    let runtime = Arc::new(
-        Runtime::new(
-            config,
-            Arc::new(crate::hub::DesktopBridge { hub: hub.clone() }),
-        )
-        .unwrap(),
-    );
-    let gateway = Arc::new(Gateway::new_for_acp(
-        runtime,
-        hub,
-        data.path().to_path_buf(),
-    ));
+    let core = hermes_core::Core::new(config, tokio::runtime::Handle::current()).unwrap();
+    let gateway = Arc::new(Gateway::new_for_acp(core));
     for name in UNSERVED {
         let (outbox, _events) = tokio::sync::mpsc::unbounded_channel();
         for params in [Value::Null, json!({"session_id": "s"}), json!([1])] {

@@ -430,10 +430,10 @@ impl AcpServer {
     /// What the effort picker shows must be what a turn sends: a thread with nothing picked gets
     /// Settings' effort, else Hermes's default (medium), picked for it.
     async fn settle_effort(&self, id: &str) {
-        if self.gateway.picked_effort(id).is_some() {
+        if self.gateway.core.picked_effort(id).is_some() {
             return;
         }
-        let effective = self.gateway.effort(id);
+        let effective = self.gateway.core.effort(id);
         let effort = if effective.is_empty() {
             controls::DEFAULT_EFFORT.to_string()
         } else {
@@ -536,7 +536,7 @@ impl AcpServer {
         if options["model"].is_string() {
             config.push(controls::model_option(&options));
         }
-        config.push(controls::effort_option(&self.gateway.effort(session)));
+        config.push(controls::effort_option(&self.gateway.core.effort(session)));
         config.push(controls::mode_option(
             self.gateway.runtime.approval_mode(session),
         ));

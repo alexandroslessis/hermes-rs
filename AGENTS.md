@@ -139,7 +139,8 @@ powershell -File scripts/perf/perf.ps1 -Do stop
 Tools on this machine: Node 26 in `tools/node` (not on PATH: call `tools/node/node.exe`); Python
 via `~/.local/bin/uv.exe run --no-project ...` (`python` on PATH is the Microsoft Store stub);
 `git`; no `gh`. Package names: `hermes-desktop`, `hermes_runtime`, `hermes_tools`,
-`hermes_memory`, `hermes_store`, `hermes_prompts`, `hermes_llm`, `hermes_agent`, `hermes-native`.
+`hermes_memory`, `hermes_store`, `hermes_prompts`, `hermes_llm`, `hermes_agent`, `hermes-native`,
+`hermes_core`.
 
 ## Where things are
 
@@ -148,6 +149,7 @@ via `~/.local/bin/uv.exe run --no-project ...` (`python` on PATH is the Microsof
 | `crates/desktop/src/` | The backend the page talks to: one module per feature (see ARCHITECTURE) |
 | `crates/desktop/patches/` | Our patches to Hermes's frontend, applied in name order by the webapp build |
 | `crates/desktop/plugins/hermes-rs/` | `hide.css` + `plugin.js`: hides features we don't serve |
+| `crates/core/` | `hermes_core`: the application layer every front end calls (native UI Phase 1, being extracted from `crates/desktop`): `Core`, typed events, questions (the runtime's `UserBridge`), sessions, the side files, the app lock |
 | `crates/runtime/` | Sessions, turns, delegation/subagents, compression, review, curator, MCP |
 | `crates/native/` | The native UI on GPUI Kit (`hermes-native.exe`, [docs/native-ui/](docs/native-ui/README.md)); for now CP0.1's spike window on fake data, plus `hermes-native-gallery.exe` (stories), the element dump and layout checks (`src/dev/`, `src/testing.rs`) and snapshot baselines (`snapshots/`) |
 | `crates/tools/` | The agent's tools (terminal, files, search, skills, web, vision, checkpoints…) |

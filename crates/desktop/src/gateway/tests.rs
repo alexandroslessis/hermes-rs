@@ -8,15 +8,8 @@ fn gateway(dir: &std::path::Path) -> Arc<Gateway> {
         data_dir: dir.to_path_buf(),
         ..hermes_runtime::RuntimeConfig::for_current_user().unwrap()
     };
-    let hub = Arc::new(Hub::default());
-    let runtime = Arc::new(
-        Runtime::new(
-            config,
-            Arc::new(crate::hub::DesktopBridge { hub: hub.clone() }),
-        )
-        .unwrap(),
-    );
-    Arc::new(Gateway::new_for_acp(runtime, hub, dir.to_path_buf()))
+    let core = hermes_core::Core::new(config, tokio::runtime::Handle::current()).unwrap();
+    Arc::new(Gateway::new_for_acp(core))
 }
 
 async fn call(gateway: &Arc<Gateway>, method: &str, params: Value) -> RpcResult {
@@ -288,21 +281,10 @@ async fn the_sandbox_command_reports_and_removes_labels() {
         .await
         .unwrap();
     assert!(
-        unknown["output"].as_str().unwrap().contains("remove-labels"),
+        unknown["output"]
+            .as_str()
+            .unwrap()
+            .contains("remove-labels"),
         "{unknown:?}"
     );
-}
-
-#[test]
-fn sandbox_grants_are_read_from_the_config_list() {
-    use super::settings::sandbox_grants;
-    assert_eq!(
-        sandbox_grants(&json!([" D:\\data ", "", 3, "E:\\x"])),
-        [
-            std::path::PathBuf::from("D:\\data"),
-            std::path::PathBuf::from("E:\\x")
-        ]
-    );
-    assert!(sandbox_grants(&json!("D:\\data")).is_empty());
-    assert!(sandbox_grants(&Value::Null).is_empty());
 }

@@ -3,14 +3,11 @@
 //! for editors, `src/bin/hermes-acp.rs`).
 
 pub mod acp;
-pub mod archive;
 pub mod attachments;
 pub mod aux_models;
-pub mod branch;
 pub mod commands;
 pub mod endpoints;
 pub mod export;
-pub mod fallback;
 pub mod files;
 pub mod gateway;
 pub mod git;
@@ -19,11 +16,9 @@ pub mod hermes_import;
 pub mod hub;
 pub mod learning;
 pub mod maintenance;
-pub mod open_file;
 pub mod paths;
 pub mod profiles;
 pub mod projects;
-pub mod providers;
 pub mod rest;
 pub mod server;
 pub mod skills;
@@ -31,7 +26,9 @@ pub mod staging;
 pub mod terminal;
 pub mod toolsets;
 pub mod transcript;
-pub mod workspace;
+
+// Moved to `hermes_core` (CP1.1); kept under their old paths for the modules that name them.
+pub use hermes_core::{archive, branch, fallback, open_file, providers, workspace};
 
 /// Whether Settings' config record asks for Git Bash (`terminal.shell: "bash"`).
 pub fn wants_git_bash(data_dir: &std::path::Path) -> bool {

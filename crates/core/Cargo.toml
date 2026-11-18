@@ -1,0 +1,39 @@
+[package]
+name = "hermes_core"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "The backend's application layer: sessions, turns, events and questions as typed Rust calls, for every front end (the Tauri page's gateway, the ACP agent, the native UI)."
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+async-trait.workspace = true
+chrono = { workspace = true, features = ["clock"] }
+dirs.workspace = true
+futures.workspace = true
+keyring = { version = "3.6.3", features = ["windows-native"] }
+rusqlite.workspace = true
+sha2 = "0.10"
+portable-pty = "0.9"
+hermes_agent.workspace = true
+hermes_llm.workspace = true
+hermes_memory.workspace = true
+hermes_prompts.workspace = true
+hermes_runtime.workspace = true
+hermes_store.workspace = true
+hermes_tools.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+hermes_testdir.workspace = true
+wiremock = "0.6"

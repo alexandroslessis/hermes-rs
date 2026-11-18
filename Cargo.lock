@@ -4692,6 +4692,7 @@ dependencies = [
  "dirs 7.0.0",
  "futures",
  "hermes_agent",
+ "hermes_core",
  "hermes_llm",
  "hermes_memory",
  "hermes_prompts",
@@ -4789,6 +4790,37 @@ dependencies = [
  "tracing",
  "tracing-futures",
  "uuid",
+]
+
+[[package]]
+name = "hermes_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "dirs 7.0.0",
+ "futures",
+ "hermes_agent",
+ "hermes_llm",
+ "hermes_memory",
+ "hermes_prompts",
+ "hermes_runtime",
+ "hermes_store",
+ "hermes_testdir",
+ "hermes_tools",
+ "keyring",
+ "portable-pty",
+ "rmcp",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]

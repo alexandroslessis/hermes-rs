@@ -77,9 +77,7 @@ impl Gateway {
             };
             if method != "GET" {
                 // A changed endpoint may have a new window or models.
-                if let Ok(mut lengths) = self.context_lengths.lock() {
-                    lengths.clear();
-                }
+                self.core.forget_model_facts();
                 // ...or a new daily request limit.
                 self.apply_settings();
             }
@@ -335,11 +333,7 @@ impl Gateway {
                 ));
             }
             ("POST", "/api/curator/run") => {
-                let started = crate::maintenance::run_curator(
-                    self.runtime.clone(),
-                    self.actions.clone(),
-                    self.data_dir.clone(),
-                );
+                let started = self.core.run_curator();
                 return Some((
                     200,
                     json!({"ok": true, "pid": 0, "name": crate::maintenance::CURATOR_RUN,
@@ -377,7 +371,10 @@ impl Gateway {
             let limit = crate::rest::query_param(query, "lines")
                 .and_then(|l| l.parse().ok())
                 .unwrap_or(200);
-            return Some((200, self.actions.status(&name, limit)));
+            return Some((
+                200,
+                crate::maintenance::action_status(&self.core.actions().status(&name, limit)),
+            ));
         }
         if path == "/api/staging" || path.starts_with("/api/staging/") {
             return crate::staging::route(&self.runtime, method, path).await;
@@ -399,9 +396,7 @@ impl Gateway {
             }
             let body: Value = serde_json::from_slice(body).unwrap_or_default();
             let answer = crate::aux_models::use_local(&self.data_dir, &body, well_known).await;
-            if let Ok(mut lengths) = self.context_lengths.lock() {
-                lengths.clear();
-            }
+            self.core.forget_model_facts();
             return Some(answer);
         }
         if (method, path) == ("POST", "/api/model/set") {
@@ -636,7 +631,9 @@ impl Gateway {
             }
             return match self.runtime.delete_session(id).await {
                 Ok(()) => {
-                    let _ = self.blocking(move |g| g.archive.forget(&session)).await;
+                    let _ = self
+                        .blocking(move |g| g.core.archive().forget(&session))
+                        .await;
                     Some((200, json!({"ok": true})))
                 }
                 Err(error) => Some((500, json!({"detail": format!("{error:#}")}))),
@@ -651,7 +648,7 @@ impl Gateway {
             match method.as_str() {
                 "GET" => {
                     let count = store.message_count(id).unwrap_or(0);
-                    Some((200, g.session_row(&record, count)))
+                    Some((200, g.session_row(&g.core.summary(record, count))))
                 }
                 "PATCH" => {
                     let changes: Value = serde_json::from_slice(&body).unwrap_or_default();
@@ -730,44 +727,40 @@ impl Gateway {
 
     /// One session as the sidebar lists it (`SessionInfo`). `message_count` must be true: the page
     /// treats a resume that returns no messages for a row it counted as a lost transcript.
-    pub(super) fn session_row(
-        &self,
-        s: &hermes_store::SessionRecord,
-        message_count: usize,
-    ) -> Value {
+    pub(super) fn session_row(&self, s: &hermes_core::SessionSummary) -> Value {
+        let record = &s.record;
         json!({
-            "id": s.id,
-            "title": s.title,
-            "cwd": s.cwd,
-            "model": s.model,
+            "id": record.id,
+            "title": record.title,
+            "cwd": record.cwd,
+            "model": record.model,
             "source": "desktop",
-            "preview": s.title,
-            "started_at": s.created_at as f64 / 1000.,
-            "last_active": s.updated_at as f64 / 1000.,
+            "preview": record.title,
+            "started_at": record.created_at as f64 / 1000.,
+            "last_active": record.updated_at as f64 / 1000.,
             "ended_at": null,
-            "message_count": message_count,
+            "message_count": s.message_count,
             "input_tokens": 0,
             "output_tokens": 0,
-            "is_active": self.runtime.is_running(&s.id),
-            "pinned": s.pinned,
-            "archived": self.archive.is_archived(&s.id),
+            "is_active": s.running,
+            "pinned": record.pinned,
+            "archived": s.archived,
             "profile": "default",
             // The git identity a move recorded (the sidebar groups by the repo root); a session
             // that never moved carries none and groups by its cwd.
-            "git_branch": self.workspaces.identity(&s.id).and_then(|(branch, _)| branch),
-            "git_repo_root": self.workspaces.identity(&s.id).and_then(|(_, root)| root),
+            "git_branch": s.git_branch,
+            "git_repo_root": s.git_repo_root,
             // A branch is listed under the session it came from.
-            "parent_session_id": self.branches.parent(&s.id),
+            "parent_session_id": s.parent,
         })
     }
 
     /// Every session the sidebar's project tree shows (archived ones aren't), newest first.
     pub(super) fn session_rows(&self) -> Vec<Value> {
-        let all = self.runtime.store().list_sessions(1000).unwrap_or_default();
-        let counts = self.runtime.store().message_counts().unwrap_or_default();
-        all.iter()
-            .filter(|s| !self.archive.is_archived(&s.id))
-            .map(|s| self.session_row(s, counts.get(&s.id).copied().unwrap_or(0)))
+        self.core
+            .sessions(crate::archive::Filter::Exclude)
+            .iter()
+            .map(|s| self.session_row(s))
             .collect()
     }
 
@@ -781,20 +774,12 @@ impl Gateway {
         // `archived=exclude` (the sidebar, default), `only` (Settings ▸ Sessions), `include`.
         let filter =
             crate::archive::Filter::parse(crate::rest::query_param(query, "archived").as_deref());
-        let all: Vec<_> = self
-            .runtime
-            .store()
-            .list_sessions(1000)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|s| filter.keeps(self.archive.is_archived(&s.id)))
-            .collect();
-        let counts = self.runtime.store().message_counts().unwrap_or_default();
+        let all = self.core.sessions(filter);
         let sessions: Vec<Value> = all
             .iter()
             .skip(offset)
             .take(limit)
-            .map(|s| self.session_row(s, counts.get(&s.id).copied().unwrap_or(0)))
+            .map(|s| self.session_row(s))
             .collect();
         json!({
             "sessions": sessions,

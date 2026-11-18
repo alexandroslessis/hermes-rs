@@ -47,8 +47,10 @@ impl Gateway {
             .delete_session(&id)
             .await
             .map_err(RpcError::failed)?;
-        let session = id.clone();
-        self.blocking(move |g| g.archive.forget(&session)).await?;
+        self.core
+            .forget_archived(&id)
+            .await
+            .map_err(|e| RpcError::server(format!("The request stopped: {e:#}")))?;
         Ok(json!({"deleted": id}))
     }
 
@@ -169,57 +171,18 @@ impl Gateway {
         self.runtime.note_session_viewed(id);
     }
 
-    /// Settings ▸ Sessions' auto-archive (`archive.rs`): when it's on, sessions idle for
-    /// `sessions.auto_archive_days` go to the archive.
-    pub(super) fn auto_archive(&self) {
-        let sessions = self.rest.config_value("sessions");
-        if sessions["auto_archive"] != true {
-            return;
-        }
-        let days = sessions["auto_archive_days"]
-            .as_f64()
-            .filter(|d| *d >= 1.0)
-            .unwrap_or(crate::archive::DEFAULT_IDLE_DAYS);
-        let all = self
-            .runtime
-            .store()
-            .list_sessions(100_000)
-            .unwrap_or_default();
-        let candidates: Vec<crate::archive::Candidate<'_>> = all
-            .iter()
-            .map(|s| crate::archive::Candidate {
-                id: &s.id,
-                last_active: s.updated_at,
-                pinned: s.pinned,
-                running: self.runtime.is_running(&s.id),
-            })
-            .collect();
-        let swept = self
-            .archive
-            .sweep(&candidates, days, chrono::Utc::now().timestamp_millis());
-        if !swept.is_empty() {
-            tracing::info!(
-                "auto-archive: archived {} session(s) idle for {days} days or more",
-                swept.len()
-            );
-        }
-    }
-
     pub(super) fn active_sessions(&self) -> Vec<Value> {
-        let Ok(sessions) = self.runtime.store().list_sessions(200) else {
-            return Vec::new();
-        };
-        sessions
+        self.core
+            .live_sessions()
             .into_iter()
-            .filter(|s| self.is_live(&s.id))
             .map(|s| {
                 // The page holds a session busy only while it's listed as `working` (or
                 // `waiting`, on the user: a card is open); any other status idles it on the next
                 // poll, which blinked Stop and Steer every 1.5 s mid-turn.
-                let status = if self.hub.open_prompts(&s.id).is_empty() {
-                    "working"
-                } else {
+                let status = if self.core.is_waiting(&s.id) {
                     "waiting"
+                } else {
+                    "working"
                 };
                 json!({
                     "id": s.id,
@@ -272,7 +235,7 @@ impl Gateway {
         };
         let (tool_definitions, mcp_tools) = (json_tokens(&builtin), json_tokens(&mcp));
         let estimated_total = system + tool_definitions + mcp_tools + conversation;
-        let context_max = self.context_length(&record.provider, &record.model).await;
+        let context_max = self.core.context_length(&record.provider, &record.model).await;
         let session = id.to_string();
         let measured = self
             .blocking(move |g| g.runtime.store().usage_totals(&session))
@@ -325,24 +288,10 @@ impl Gateway {
         }))
     }
 
-    /// The provider and model picked while the session's turn runs, if any.
-    pub(super) fn pending_route(&self, id: &str) -> Option<(String, String)> {
-        self.runtime
-            .existing_session_handle(id)?
-            .page()
-            .pending_route
-    }
-
     /// A model picked while the last turn ran, applied now that it has finished.
     pub(super) fn apply_pending_route(&self, id: &str) {
-        let pick = self
-            .runtime
-            .existing_session_handle(id)
-            .and_then(|handle| handle.take_pending_route().ok().flatten());
-        if let Some((provider, model)) = pick {
-            if let Err(error) = self.route_session(id, &provider, &model) {
-                tracing::warn!("applying the model picked during the turn in {id}: {error}");
-            }
+        if self.core.apply_pending_route(id) {
+            self.emit(id, "session.info", self.session_info(id));
         }
     }
 
@@ -376,7 +325,7 @@ impl Gateway {
                     .as_str()
                     .unwrap_or_default()
                     .to_lowercase();
-                self.pick_effort(&id, Some(effort.clone()));
+                self.core.pick_effort(&id, Some(effort.clone()));
                 self.emit(&id, "session.info", self.session_info(&id));
                 json!({"effort": effort, "status": "applied"})
             }
@@ -409,27 +358,24 @@ impl Gateway {
                     .map(str::trim)
                     .filter(|c| !c.is_empty())
                     .ok_or(RpcError::invalid("cwd is required"))?;
-                if self.runtime.is_running(&id) {
-                    return Err(RpcError::Busy);
-                }
-                let runtime = self.runtime.clone();
-                let workspaces = self.workspaces.clone();
-                let moved = id.clone();
-                let requested = requested.to_string();
-                let (cwd, branch, root) = tokio::task::spawn_blocking(move || {
-                    crate::workspace::move_session(runtime.store(), &workspaces, &moved, &requested)
-                })
-                .await
-                .map_err(|e| RpcError::server(format!("the move failed: {e}")))?
-                .map_err(|e| match e {
-                    crate::workspace::MoveError::InvalidFolder(folder) => {
-                        RpcError::invalid(format!("No such folder: {folder}"))
-                    }
-                    crate::workspace::MoveError::Store(message) => RpcError::server(message),
-                })?;
-                if let Err(e) = self.runtime.evict(&id).await {
-                    tracing::warn!("dropping the moved session's live state: {e:#}");
-                }
+                // `~` and `file:` links are the page's spellings.
+                let folder = crate::files::resolve(requested, None);
+                let (cwd, branch, root) =
+                    self.core
+                        .move_session(&id, folder)
+                        .await
+                        .map_err(|e| match e {
+                            crate::workspace::MoveError::InvalidFolder(folder) => {
+                                RpcError::invalid(format!("No such folder: {folder}"))
+                            }
+                            crate::workspace::MoveError::Store(message) => {
+                                RpcError::server(message)
+                            }
+                            crate::workspace::MoveError::Busy => RpcError::Busy,
+                            crate::workspace::MoveError::Stopped(e) => {
+                                RpcError::server(format!("the move failed: {e}"))
+                            }
+                        })?;
                 self.emit(&id, "session.info", self.session_info(&id));
                 json!({"cwd": cwd, "branch": branch, "git_repo_root": root})
             }
@@ -466,23 +412,21 @@ impl Gateway {
         let Some(row) = params["target_message_id"].as_u64() else {
             return Ok(nothing());
         };
-        if self.runtime.is_running(&id) {
-            return Err(RpcError::server("session busy"));
-        }
-        let error = |e: anyhow::Error| RpcError::server(format!("{e:#}"));
-        let before = self.runtime.messages(&id).map_err(error)?;
-        let keep = transcript::kept_before_row(row as usize);
-        let Some(target) = before.get(keep) else {
-            return Ok(nothing());
+        let rewound = match self.core.rewind_to_row(&id, row as usize) {
+            Ok(Some(rewound)) => rewound,
+            Ok(None) => return Ok(nothing()),
+            Err(hermes_core::sessions::RewindError::Busy) => {
+                return Err(RpcError::server("session busy"));
+            }
+            Err(hermes_core::sessions::RewindError::Failed(e)) => {
+                return Err(RpcError::server(format!("{e:#}")));
+            }
         };
-        // What the user typed: without the skills and memory the index attached to it.
-        let content = hermes_runtime::preinject::user_text(target);
-        let kept = self.runtime.rewind(&id, keep).map_err(error)?;
         Ok(json!({
             "session_id": id,
             "status": "applied",
-            "rewound_count": before.len() - kept.len(),
-            "target_message": {"id": row, "content": content},
+            "rewound_count": rewound.removed,
+            "target_message": {"id": row, "content": rewound.typed},
             "revision": self.bump_revision(&id),
             "execution_generation": EXECUTION_GENERATION,
         }))
@@ -573,90 +517,6 @@ impl Gateway {
         }
     }
 
-    /// The session model's context window, as the gauge shows it.
-    pub(super) async fn window_for(self: &Arc<Self>, id: &str) -> Option<usize> {
-        let session = id.to_string();
-        let record = self
-            .blocking(move |g| g.runtime.store().session(&session).ok().flatten())
-            .await
-            .ok()
-            .flatten()?;
-        Some(self.context_length(&record.provider, &record.model).await)
-    }
-
-    /// `/status`: the session, its model and folder, tokens so far, the context in use.
-    pub(super) async fn status_text(self: &Arc<Self>, id: &str) -> Result<String, RpcError> {
-        // The session's rows and the size of its request: store reads, off the async workers.
-        let session = id.to_string();
-        let (record, totals, messages, used) = self
-            .blocking(move |g| {
-                let store = g.runtime.store();
-                let record = store
-                    .session(&session)
-                    .map_err(|e| RpcError::server(format!("{e:#}")))?
-                    .ok_or(RpcError::server(format!("Session {session} not found")))?;
-                let totals = store.usage_totals(&session).unwrap_or_default();
-                let messages = store.message_count(&session).unwrap_or(0);
-                let used = g
-                    .runtime
-                    .context_breakdown(&session)
-                    .map(|b| b.total())
-                    .unwrap_or(0);
-                Ok::<_, RpcError>((record, totals, messages, used))
-            })
-            .await??;
-        let window = self.context_length(&record.provider, &record.model).await;
-        Ok([
-            format!(
-                "Session: {} ({})",
-                record.title.as_deref().unwrap_or("Untitled"),
-                record.id
-            ),
-            format!("Model: {} via {}", record.model, record.provider),
-            format!("Folder: {}", record.cwd),
-            format!("Messages: {messages}"),
-            format!(
-                "Tokens: {} in, {} out over {} calls",
-                totals.input_tokens, totals.output_tokens, totals.calls
-            ),
-            format!(
-                "Context: ~{used} of {window} ({}%)",
-                (used * 100).checked_div(window).unwrap_or(0)
-            ),
-        ]
-        .join("\n"))
-    }
-
-    /// `/context`: what the next request is made of, by part, against the model's window.
-    pub(super) async fn context_text(self: &Arc<Self>, id: &str) -> Result<String, RpcError> {
-        let session = id.to_string();
-        let b = self
-            .blocking(move |g| g.runtime.context_breakdown(&session))
-            .await?
-            .map_err(|e| RpcError::server(format!("{e:#}")))?;
-        let window = self.window_for(id).await.unwrap_or(FALLBACK_CONTEXT);
-        let total = b.total();
-        let row = |name: &str, n: usize| {
-            format!(
-                "  {name:<18}~{n:>8}  {:>3}%",
-                (n * 100).checked_div(total).unwrap_or(0)
-            )
-        };
-        Ok([
-            format!(
-                "Context: ~{total} of {window} tokens ({}% of the window)",
-                (total * 100).checked_div(window).unwrap_or(0)
-            ),
-            row("System prompt", b.system_prompt),
-            row("Tool definitions", b.tool_definitions),
-            row("Skills", b.skills),
-            row("Memory", b.memory),
-            row("Conversation", b.conversation),
-            "Estimates (characters / 4); /compress summarizes the conversation now.".into(),
-        ]
-        .join("\n"))
-    }
-
     /// `/compress [focus]` (`session.compress`): summarizes the conversation now, as Hermes's
     /// context compression does when the window fills, and answers with the shorter transcript
     /// the page shows from then on.
@@ -703,7 +563,7 @@ impl Gateway {
             .map(str::to_string);
         let mut turn = self
             .runtime
-            .compress(&id, &provider, self.turn_options(&id), focus)
+            .compress(&id, &provider, self.core.turn_options(&id), focus)
             .map_err(error)?;
         let mut failed = None;
         while let Some(event) = turn.events.recv().await {
@@ -757,21 +617,18 @@ impl Gateway {
     /// the page saves it through a Save As dialog.
     pub(super) fn export_session(&self, params: &Value) -> Reply {
         let id = session_id(params)?;
-        let format = crate::export::Format::parse(params["format"].as_str().unwrap_or("json"))
-            .ok_or(RpcError::invalid("format is json, md or html"))?;
+        let format =
+            hermes_core::export::Format::parse(params["format"].as_str().unwrap_or("json"))
+                .ok_or(RpcError::invalid("format is json, md or html"))?;
         let store = self.runtime.store();
         let error = |e: anyhow::Error| RpcError::server(format!("{e:#}"));
         let record = store
             .session(&id)
             .map_err(error)?
             .ok_or(RpcError::server(format!("Session {id} not found")))?;
-        let rows = transcript::messages(
-            &store.load_messages(&id).map_err(error)?,
-            &record.provider,
-            &record.model,
-        );
+        let messages = store.load_messages(&id).map_err(error)?;
         let (content, filename) =
-            crate::export::export(&record, &rows, format, params["redact"] == true);
+            crate::export::export(&record, &messages, format, params["redact"] == true);
         Ok(json!({"content": content, "filename": filename, "format": format.extension()}))
     }
 
@@ -779,34 +636,17 @@ impl Gateway {
     /// Archives or restores a session (the sidebar, the shortcut, Settings ▸ Sessions). An
     /// archived session leaves the pins, as Hermes's does.
     pub(super) fn set_archived(&self, id: &str, archived: bool) -> Result<(), RpcError> {
-        let store = self.runtime.store();
-        let record = store
-            .session(id)
-            .ok()
-            .flatten()
-            .ok_or(RpcError::invalid(format!("No session {id}.")))?;
-        if archived && record.pinned {
-            store
-                .set_pinned(id, false)
-                .map_err(|e| RpcError::server(format!("{e:#}")))?;
+        match self.core.set_archived(id, archived) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(RpcError::invalid(format!("No session {id}."))),
+            Err(e) => Err(RpcError::server(format!("{e:#}"))),
         }
-        self.archive
-            .set(id, archived, chrono::Utc::now().timestamp_millis());
-        Ok(())
     }
 
     pub(super) fn rename(&self, id: &str, title: &str) -> Result<(), RpcError> {
-        let title = title.trim();
-        self.runtime
-            .store()
-            .set_title(id, title)
-            .map_err(|e| RpcError::server(format!("{e:#}")))?;
-        self.emit(
-            id,
-            "session.title",
-            json!({"session_id": id, "title": title}),
-        );
-        Ok(())
+        self.core
+            .rename(id, title)
+            .map_err(|e| RpcError::server(format!("{e:#}")))
     }
 
     /// The session's edit counter (Hermes's CAS revision), which the page presents with each edit.
@@ -825,37 +665,18 @@ impl Gateway {
             .unwrap_or(1)
     }
 
-    /// Picks the session's effort (`None`: Settings' again). A session may get one before it
-    /// was ever loaded (its actor starts here; nothing is read).
-    pub(super) fn pick_effort(&self, id: &str, effort: Option<String>) {
-        let picked = match &effort {
-            Some(_) => self
-                .runtime
-                .session_handle(id)
-                .map_err(|e| format!("{e:#}")),
-            None => match self.runtime.existing_session_handle(id) {
-                Some(handle) => Ok(handle),
-                None => return,
-            },
-        }
-        .and_then(|handle| handle.set_effort(effort).map_err(|e| e.to_string()));
-        if let Err(error) = picked {
-            tracing::warn!("picking the effort of {id}: {error}");
-        }
-    }
-
     pub(super) fn session_info(&self, id: &str) -> Value {
         let record = self.runtime.store().session(id).ok().flatten();
         let running = self.is_live(id);
         match record {
             Some(record) => json!({
                 // A pick made mid-reply shows at once; it takes effect from the next turn.
-                "model": self.pending_route(id).map_or(record.model, |(_, model)| model),
-                "provider": self.pending_route(id).map_or(record.provider, |(provider, _)| provider),
+                "model": self.core.pending_route(id).map_or(record.model, |(_, model)| model),
+                "provider": self.core.pending_route(id).map_or(record.provider, |(provider, _)| provider),
                 "cwd": record.cwd,
                 // The git identity a move recorded; the sidebar groups by the repo root.
-                "git_branch": self.workspaces.identity(id).and_then(|(branch, _)| branch),
-                "git_repo_root": self.workspaces.identity(id).and_then(|(_, root)| root),
+                "git_branch": self.core.workspaces().identity(id).and_then(|(branch, _)| branch),
+                "git_repo_root": self.core.workspaces().identity(id).and_then(|(_, root)| root),
                 "title": record.title.unwrap_or_default(),
                 "stored_session_id": record.id,
                 "running": running,
@@ -863,7 +684,7 @@ impl Gateway {
                 // The protocol this backend speaks; the page warns "out of date" without it.
                 "desktop_protocol": "hermes-gateway-v1",
                 "profile_name": "default",
-                "reasoning_effort": self.effort(id),
+                "reasoning_effort": self.core.effort(id),
                 "revision": self.revision(id),
                 "execution_generation": EXECUTION_GENERATION,
                 // The queue panel's rows: prompts waiting for the running turn.
@@ -894,88 +715,37 @@ impl Gateway {
             .filter(|id| !id.is_empty())
             .ok_or(RpcError::invalid("session_id is required"))?
             .to_string();
-        let record = self
-            .runtime
-            .store()
-            .session(&parent)
-            .ok()
-            .flatten()
-            .ok_or(RpcError::invalid(format!("No session {parent}.")))?;
-        let key = params["idempotency_key"].as_str().filter(|k| !k.is_empty());
-        let existing = key.and_then(|key| {
-            self.branch_keys
-                .lock()
-                .ok()
-                .and_then(|keys| keys.get(key).cloned())
-        });
-        let (child, kept) = match existing {
-            // A retried request: the branch it already made.
-            Some(child) => {
-                let kept = self.runtime.messages(&child).unwrap_or_default();
-                (child, kept)
-            }
-            None => {
-                let messages = self
-                    .runtime
-                    .messages(&parent)
-                    .map_err(|e| RpcError::server(format!("{e:#}")))?;
-                let keep = if whole {
-                    messages.len()
-                } else if let Some(row) = params["through_message_id"].as_u64() {
-                    row as usize
-                } else if let Some(count) = params["count"].as_u64().filter(|c| *c > 0) {
-                    // The page's rows: through the count-th one.
-                    transcript::messages(&messages, &record.provider, &record.model)
-                        .get(count as usize - 1)
-                        .and_then(|row| row["row_id"].as_u64())
-                        .map_or(messages.len(), |row| row as usize)
-                } else {
-                    messages.len()
-                };
-                let kept = crate::branch::cut(&messages, keep);
-                if kept.is_empty() {
-                    return Err(RpcError::invalid(
-                        "nothing to branch — send a message first",
-                    ));
-                }
-                let provider = self.session_provider(&parent, settings)?;
-                let cwd = params["cwd"]
-                    .as_str()
-                    .filter(|c| !c.is_empty())
-                    .unwrap_or(&record.cwd)
-                    .to_string();
-                let made = self
-                    .runtime
-                    .create_session(&provider, &record.model, None, std::path::Path::new(&cwd))
-                    .map_err(|e| RpcError::server(format!("{e:#}")))?;
-                self.runtime
-                    .store()
-                    .replace_messages(&made.id, &kept)
-                    .map_err(|e| RpcError::server(format!("{e:#}")))?;
-                // The branch carries the parent's untrusted text, so its taint too (Phase 6).
-                self.runtime.copy_taint(&parent, &made.id);
-                let taken: Vec<String> = self
-                    .runtime
-                    .store()
-                    .list_sessions(1000)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|s| s.title)
-                    .collect();
-                let title = params["name"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|n| !n.is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| crate::branch::title(record.title.as_deref(), &taken));
-                let _ = self.runtime.store().set_title(&made.id, &title);
-                self.branches.link(&made.id, &parent);
-                if let (Some(key), Ok(mut keys)) = (key, self.branch_keys.lock()) {
-                    keys.insert(key.to_string(), made.id.clone());
-                }
-                (made.id, kept)
-            }
+        let point = if whole {
+            hermes_core::BranchPoint::Whole
+        } else if let Some(row) = params["through_message_id"].as_u64() {
+            hermes_core::BranchPoint::ThroughRow(row as usize)
+        } else if let Some(count) = params["count"].as_u64().filter(|c| *c > 0) {
+            // The page's rows: through the count-th one.
+            hermes_core::BranchPoint::ThroughEntry(count as usize)
+        } else {
+            hermes_core::BranchPoint::Whole
         };
+        let request = hermes_core::BranchRequest {
+            parent: parent.clone(),
+            point,
+            cwd: params["cwd"].as_str().map(str::to_string),
+            name: params["name"].as_str().map(str::to_string),
+            idempotency_key: params["idempotency_key"].as_str().map(str::to_string),
+        };
+        let made = self
+            .core
+            .branch(request, || self.session_provider(&parent, settings))
+            .map_err(|e| match e {
+                hermes_core::BranchError::UnknownSession(id) => {
+                    RpcError::invalid(format!("No session {id}."))
+                }
+                hermes_core::BranchError::Empty => {
+                    RpcError::invalid("nothing to branch — send a message first")
+                }
+                hermes_core::BranchError::Provider(error) => error,
+                hermes_core::BranchError::Failed(e) => RpcError::server(format!("{e:#}")),
+            })?;
+        let (child, kept, record) = (made.child, made.kept, made.parent);
         self.subscribe(&child, outbox);
         let title = self
             .runtime
@@ -1029,13 +799,6 @@ impl Gateway {
             .map(PathBuf::from)
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("C:/"));
-        let record = self
-            .runtime
-            .create_session(&provider.runtime(), &model, None, &cwd)
-            .map_err(|e| RpcError::server(format!("{e:#}")))?;
-        if let Some(title) = params["title"].as_str().filter(|t| !t.is_empty()) {
-            let _ = self.runtime.store().set_title(&record.id, title);
-        }
         // A branch the page builds itself: the messages it starts with, and its parent.
         let seeded: Vec<hermes_llm::conversation::message::Message> = params["messages"]
             .as_array()
@@ -1055,22 +818,17 @@ impl Gateway {
                     .collect()
             })
             .unwrap_or_default();
-        if !seeded.is_empty() {
-            self.runtime
-                .store()
-                .replace_messages(&record.id, &seeded)
-                .map_err(|e| RpcError::server(format!("{e:#}")))?;
-        }
-        if let Some(parent) = params["parent_session_id"]
-            .as_str()
-            .filter(|p| !p.is_empty())
-        {
-            self.branches.link(&record.id, parent);
-            // Seeded from the parent's rows: as careful as the parent (Phase 6).
-            if !seeded.is_empty() {
-                self.runtime.copy_taint(parent, &record.id);
-            }
-        }
+        let (record, seeded) = self
+            .core
+            .create_session(hermes_core::NewSession {
+                provider: provider.runtime(),
+                model,
+                cwd,
+                title: params["title"].as_str().map(str::to_string),
+                seeded,
+                parent: params["parent_session_id"].as_str().map(str::to_string),
+            })
+            .map_err(|e| RpcError::server(format!("{e:#}")))?;
         self.viewing(&record.id, outbox);
         self.subscribe(&record.id, outbox);
         Ok(json!({
@@ -1109,7 +867,7 @@ impl Gateway {
             "info": self.session_info(&id),
             "running": self.runtime.is_running(&id),
             // Questions still waiting: the page shows their cards again.
-            "prompts": self.hub.open_prompts(&id),
+            "prompts": crate::hub::open_payloads(&self.core.open_questions(&id)),
             // The page's edit and turn-control fences.
             "revision": self.revision(&id),
             "execution_generation": EXECUTION_GENERATION,

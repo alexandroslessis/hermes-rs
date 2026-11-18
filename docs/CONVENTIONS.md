@@ -24,8 +24,9 @@ code and mention it.
   `branch.rs` `Links`, `hermes_import.rs`). Not a store schema change.
 - **Settings**: Hermes's Settings page reads/writes `desktop-config.json` keys named exactly like
   Hermes's `config.yaml` keys (`memory.memory_char_limit`, `approvals.mode`). Read them with
-  `self.rest.config_value("a.b")`; if the runtime needs them, apply them in `apply_settings()`.
-  Defaults and descriptions go in `rest.rs`'s tables, copied from Hermes's `hermes_cli/config.py`
+  `self.rest.config_value("a.b")` (in `hermes_core`: `self.config.value("a.b")`); if the runtime
+  needs them, apply them in `Core::apply_settings()` (`hermes_core` `settings.rs`).
+  Defaults go in `hermes_core` `config.rs` (`defaults()`), descriptions in `rest.rs`'s tables, copied from Hermes's `hermes_cli/config.py`
   `DEFAULT_CONFIG`.
 
 ## Module header

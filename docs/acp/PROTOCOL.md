@@ -383,7 +383,7 @@ Config options (Zed renders `category: "model"` as its model picker, `thought_le
   `<provider id>/<model id>` can be ambiguous when a model id contains `/` (OpenRouter): split at
   the **first** `/` only, and provider ids never contain `/` (check `providers.rs`).
 - `session/set_config_option {sessionId, configId:"model", value}` → the same call the page makes
-  to switch a session's model (read `gateway/settings.rs` `switch_model` / `gateway/sessions.rs` `mutate`); answer with the
+  to switch a session's model (read `hermes_core::settings` `Core::switch_model`, `gateway/settings.rs` and `gateway/sessions.rs` `mutate`); answer with the
   full `configOptions` again. Effort → the page's effort call (`efforts` in the gateway).
 - Switching model rebuilds the frozen system prompt (`Runtime::set_session_route`): applies from
   the next turn (ground rule 8). Refuse with -32603 while a turn is running.
