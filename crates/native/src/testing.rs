@@ -333,7 +333,7 @@ pub fn text_system() -> Arc<dyn PlatformTextSystem> {
 /// initialised, with no renderer: for layout checks.
 pub fn headless_app() -> HeadlessAppContext {
     let mut cx =
-        HeadlessAppContext::with_asset_source(text_system(), Arc::new(gpui_kit::assets::Assets));
+        HeadlessAppContext::with_asset_source(text_system(), Arc::new(crate::design::AppAssets));
     cx.update(gpui_kit::init);
     cx
 }

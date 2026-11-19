@@ -190,3 +190,47 @@ mod tests {
         }
     }
 }
+
+/// Fake threads for the command palette and the app frame (names from t3code's screenshots):
+/// `(id, title, project, branch)`.
+pub fn palette_threads() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+    vec![
+        ("t1", "halo", "structure", "master"),
+        ("t2", "ayo", "engine", "main"),
+        ("t3", "hi", "hermes-rs", "main"),
+        (
+            "t4",
+            "Fix the sidebar width",
+            "hermes-rs",
+            "native/p2-design",
+        ),
+        (
+            "t5",
+            "Port the command palette",
+            "hermes-rs",
+            "native/p2-design",
+        ),
+    ]
+}
+
+/// Fake projects: `(path, name)`.
+pub fn palette_projects() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (r"C:\work\structure", "structure"),
+        (r"C:\work\engine", "engine"),
+        (r"C:\Users\me\repos\hermes-rs", "hermes-rs"),
+    ]
+}
+
+/// A stream of fake notices for the toast stack, as the core's events with no other place will
+/// be in Phase 3 (a review finished, a queued prompt that could not start, a failed turn).
+pub fn notices() -> Vec<crate::design::ToastSpec> {
+    use crate::design::toast::{Kind, ToastSpec};
+    vec![
+        ToastSpec::new(Kind::Success, "Review finished").description("2 memory notes were saved."),
+        ToastSpec::new(Kind::Warning, "A queued prompt could not start")
+            .description("Another turn is running.")
+            .action("Open thread"),
+        ToastSpec::new(Kind::Error, "The turn failed").description("Connection refused."),
+    ]
+}

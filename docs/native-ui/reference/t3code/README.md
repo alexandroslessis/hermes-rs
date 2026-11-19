@@ -38,11 +38,18 @@ its row if it is wrong.
 | `sidebar-right.png` | Right sidebar / panel |
 | `sidebar-diff.png`, `sidebar-diff-content.png` | Diff panel and its content |
 | `sidebar-filetree.png` | File tree panel |
-| `sidebar-thread-details.png`, `sidebar-thread-details-hover.png` | Thread details row, normal and hover |
-| `button-session-variants-default.png`, `-hover.png`, `-selected.png` | Session/thread row button states |
-| `button-sidebar_toggle-hover.png` | Sidebar toggle button, hover |
-| `buttons-sidebar-down.png` | Sidebar buttons (bottom) |
+| `sidebar-thread-details.png`, `sidebar-thread-details-hover.png` | Corrected by CP2.2: the thread details card (Open in Zed, branch, Commit, Changes, Context), a glass panel |
+| `button-session-variants-default.png` | Corrected by CP2.2: the three ghost icon buttons of the sidebar's search row (filter, add folder, new thread) |
+| `button-session-variants-hover.png` | Not looked at |
+| `button-session-variants-selected.png` | Corrected by CP2.2: three thread rows (project monogram and name, time; bold title; branch), the middle one selected |
+| `button-sidebar_toggle-hover.png` | Corrected by CP2.2: the topbar's three panel toggles (the middle one hovered, with its "Toggle terminal drawer (Ctrl+J)" tooltip) and the Windows caption buttons |
+| `buttons-sidebar-down.png` | Sidebar footer: settings, source control and usage icons, refresh at the right |
 | `composer-model-picker.png`, `composer-model-picker-permission.png` | Composer model picker, and with the permission selector |
+
+CP2.2 took no new screenshot: t3code was not running and nothing available to the implementer can
+drive its window (no input automation), so the light theme, tooltip, toast, badge, kbd, palette
+and empty-state were built from `index.css` and the source named in each module header; the visual
+check should say what differs.
 
 ## Not covered yet (take them when the checkpoint needs them)
 

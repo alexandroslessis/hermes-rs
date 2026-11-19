@@ -226,6 +226,46 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   quad of the element's bounds *with a visible fill*. Kit's hover and active fills are
   semi-transparent (`#e5e5e580` in the light theme): compare colours as painted, not as opaque.
 
+- **A drag zone swallows the buttons inside it.** `window_control_area(Drag)` makes Windows answer
+  `HTCAPTION` over the whole element, and GPUI's hit test returns the first control area under
+  the pointer whatever is drawn on top, so a button *inside* the zone never gets its click. The
+  title bar (`titlebar.rs`) keeps buttons as siblings of the drag zone. The caption buttons are
+  `window_control_area(Min/Max/Close)` with no click handler: Windows does the click (and shows
+  the Windows 11 snap flyout over `HTMAXBUTTON`).
+  The same goes for anything drawn *over* a drag zone (a resize handle, an overlay): a control area
+  under it still wins, because elements without `.occlude()` do not hide it from the hit test. That
+  is why the sidebar's resize handle starts below the 40 px top row (the sidebar header is a drag
+  zone), and why a click on the palette's backdrop over the title bar moves the window.
+- **Focus rings are `focus-visible`.** A clicked button takes the focus too; drawing the ring on
+  `is_focused` alone leaves a blue ring on every title-bar toggle after a click. `design::Button`
+  draws it only when `window.last_input_was_keyboard()`. A test or story that wants the ring must
+  send a key first (the gallery's `Interaction::Focus` sends a bare `shift`), `window.focus_next`
+  alone does not count as keyboard input.
+- **Kit's tooltips and dialogs need `Root`.** `TooltipOverlay` is per window "via `Root`", so the
+  app window's root view is `Root::new(workspace, ..)`; our design `Tooltip` uses GPUI's own
+  `.tooltip(..)` and does not need it, but Kit's `Button::tooltip` would.
+- **Resize handles of our own.** The frame does not use Kit's `h_resizable`: a handle is an
+  absolutely positioned 6 px `div` with `on_drag` and one `on_drag_move` on the root that sets
+  *one* size (`Workspace::drag_border`), so no other pane can move. Sizes are decided by the pure
+  `frame_layout` (the right panel hides when the window is too narrow, the sidebar gives way first).
+- **`.probe()` before you assert.** A plain `div().id("x")` is not in the layout dump; only probed
+  elements and Kit controls are. A "no element named" failure usually means a missing `.probe()`
+  (or an indexed id: `div().id(("toast", 3usize))` is named `toast:3`).
+- **Extra Lucide icons** are compiled in by name (`design/icons.rs`, `icon_assets!`); Kit's default
+  bundle has 101. Every window, the gallery and the test apps register `AppAssets`, not Kit's
+  `Assets`, or an icon outside the default set fails to load. Kit's `Icon::with_size` needs
+  `component::Sizable` in scope.
+- **Text needs a line height.** GPUI's default line height is about 1.6x the font size, so a 12 px
+  label in a 16 px row overflows it by 3 px in the dump: set `.line_height(text::XS.line_height)`
+  together with `.text_size(..)`.
+- **Hover holds toasts.** While the pointer is over the toast stack none expires (t3code's
+  behaviour); a test that ticks the clock must move the pointer away first. Dismissing the last
+  toast under the pointer removes the stack, so no "pointer left" arrives: `Toasts::dismiss` ends
+  the hold itself when the stack empties.
+- **`HeadlessAppContext` has a fake clock.** Timers (the 500 ms `native-ui.json` debounce, toast
+  expiry) fire only after `cx.advance_clock(..)` and `cx.run_until_parked()`; sleeping the thread
+  does nothing.
+
 ## Protocol and page behaviour
 
 - **-32601 / 404 hide features.** If you answer a method with something half-right, the page shows

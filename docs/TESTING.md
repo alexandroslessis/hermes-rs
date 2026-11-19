@@ -378,8 +378,10 @@ the_dump -- --nocapture` prints this one.
 
 **2. Snapshots (images, no tokens unless something changed).** Each story registered in
 `crates/native/src/gallery/mod.rs` (`register_stories!`) is rendered off-screen in each of its
-states, in Kit's light and dark theme, cropped to the story's element, states side by side, and
-compared with `crates/native/snapshots/<story>-<light|dark>.png` (a pixel counts as changed when a
+states, in two themes (`Story::themes`: the CP0.2 and CP2.1 stories keep GPUI Kit's light and dark,
+`-light.png` / `-dark.png`; every design-layer and frame story is rendered under t3code's own
+themes, `-t3-light.png` / `-t3-dark.png`), cropped to the story's element, states side by side, and
+compared with `crates/native/snapshots/<story>-<theme>.png` (a pixel counts as changed when a
 channel moves by more than 8). On a difference the test writes `<name>.actual.png` and
 `<name>.diff.png` (changed pixels red over the faded baseline) to `target/claude/snapshots/` and
 fails; a story with no baseline writes only `.actual.png`. Images are at scale 2 (the test
@@ -395,6 +397,18 @@ To accept: look at (or have a subagent look at) the `.actual.png`, then `check.p
 "expected: <what changed and why>" or "unexpected: <what is wrong, where>" (e.g. "state 3: focus
 ring missing", "dark: label clipped on the right"). The reviewer reads verdicts, and opens an image
 only for an "unexpected" one. Full-window captures of our own instance are for the end of a phase.
+
+**The frame and the design layer (CP2.2).** `workspace_tests.rs` opens the whole `Workspace` in a
+headless window at three sizes (640x480, 1100x700, 1920x1080) and presses real shortcuts
+(`window.press("ctrl-b", cx)`, `window.input("tog", cx)` after `keymap::bind` and `palette::bind`),
+drags the borders (`window.drag(from, to, cx)` on the `*-handle` elements) and reads sizes back from
+the dump; the sizing rules (`workspace::frame_layout`), `restore_window`, `ui_state` (`native-ui.json`
+round trip, malformed files), the palette matcher, the keymap table and the toast model are plain
+unit tests. Each design component's states are asserted in `gallery/design.rs` and `gallery/frame.rs`
+through `each_state(story, ...)`. An element a test names needs `.probe()` (a bare `div().id(..)`
+is not in the dump). What cannot be tested headlessly: the Windows non-client hit test (snap
+layouts flyout, caption drag, double-click to maximise), DPI changes, real window position
+restore: they are on the user's checklist (`progress/phase-2.md`).
 
 **The gallery** (`hermes-native-gallery.exe`, `cargo run -p hermes-native --bin
 hermes-native-gallery`): every story in every state, with t3code's default / GPUI Kit / Zed One and

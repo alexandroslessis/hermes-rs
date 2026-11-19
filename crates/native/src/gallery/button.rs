@@ -45,6 +45,7 @@ pub static STATES_STORY: Story = Story {
     name: "button-states",
     title: "Button: five states",
     size: (160., 60.),
+    themes: super::Themes::Kit,
     states: &STATES,
     render,
 };
@@ -72,6 +73,7 @@ pub(super) static SQUEEZED_STORY: Story = Story {
     name: "button-states",
     title: "Button: squeezed (broken on purpose)",
     size: (160., 60.),
+    themes: super::Themes::Kit,
     states: &STATES,
     render: |state, _, _| button(state.name == "disabled", Some(gpui_kit::px(64.))),
 };

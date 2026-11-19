@@ -18,7 +18,7 @@ use crate::dev::ProbeExt as _;
 use crate::theme::Fonts;
 
 /// Tokens in a column (four columns hold all of them).
-const ROWS: usize = 15;
+const ROWS: usize = 16;
 
 /// Width of a name label.
 const LABEL_WIDTH: f32 = 160.;
@@ -28,6 +28,7 @@ pub static SWATCHES_STORY: Story = Story {
     name: "tokens-swatches",
     title: "Tokens: colours, sizes, type",
     size: (920., 660.),
+    themes: super::Themes::Kit,
     states: &[
         State {
             name: "light",

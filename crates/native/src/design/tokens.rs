@@ -23,7 +23,9 @@
 //! paints a 3.5% fractal-noise grain over the body (`--surface-grain`), so the sidebar's #000
 //! shows as noise around #030303; and floating surfaces are "glass", a token at
 //! [`GLASS_OPACITY`] over what is behind (the dark composer is `surface_raised` #111 at 80% over
-//! black: #0e0e0e). Neither changes a token.
+//! black: #0e0e0e). Neither changes a token. The right panel's #0f0f0f and its #252525 edge are
+//! `dropdown-glass` (CP2.2): the tokens `panel_surface` (the popover at [`PANEL_ALPHA`]) and
+//! `panel_edge` (the foreground at 10%).
 //!
 //! t3code: `apps/web/src/index.css` (`:root` and `@variant dark` blocks, `[data-app-sidebar]`,
 //! `@theme inline` radii and text sizes), `apps/web/src/components/ui/button.tsx` (control
@@ -210,6 +212,13 @@ palette! {
     surface_raised,
     /// Menus, popovers and the palette (`--popover`).
     popover,
+    /// The glass panel behind the right panel, toasts and floating cards: `dropdown-glass`'s
+    /// fill, `--popover` at [`PANEL_ALPHA`] (18% of it over 80% of it). Dark: #0e0e0e over the
+    /// canvas, which the screenshots show as #0f0f0f (CP2.1's "right panel" difference).
+    panel_surface,
+    /// The edge of a glass panel: `dropdown-glass`'s 1 px border, the foreground at 10%
+    /// (#252525 over the dark panel: CP2.1's "panel edge" difference).
+    panel_edge,
     /// Text on a popover.
     popover_foreground,
     /// The brand colour: primary buttons, links, focus (`--primary`).
@@ -339,6 +348,8 @@ impl Palette {
             // card at 20%.
             surface_raised: Color::rgba(0xffffff33),
             popover: Color::rgb(0xffffff),
+            panel_surface: Color::rgba(0xffffffd5),
+            panel_edge: Color::rgba(0x18181b19),
             popover_foreground: foreground,
             primary,
             primary_foreground: Color::rgb(0xffffff),
@@ -422,6 +433,8 @@ impl Palette {
             card_foreground: foreground,
             surface_raised: card,
             popover: card,
+            panel_surface: Color::rgba(0x111111d5),
+            panel_edge: Color::rgba(0xf5f5f519),
             popover_foreground: foreground,
             primary,
             primary_foreground: Color::rgb(0xffffff),
@@ -517,6 +530,10 @@ impl Appearance {
 /// How opaque a glass surface is over what lies behind it (t3code's `--glass-opacity`, used by
 /// the `surface-glass` utility and the composer; the blur behind it is not reproduced).
 pub const GLASS_OPACITY: f32 = 0.8;
+
+/// The alpha of `panel_surface` (t3code's `dropdown-glass`: `--popover` at 18%, then at
+/// `--glass-opacity` over what is left: 0.18 + 0.82 * 0.8 = 0.836).
+pub const PANEL_ALPHA: f32 = 0.18 + (1. - 0.18) * GLASS_OPACITY;
 
 /// The spacing unit (t3code's Tailwind `--spacing`): every gap and padding is a multiple.
 pub const SPACING_UNIT: f32 = 4.;
@@ -699,6 +716,12 @@ mod tests {
             dark.surface_raised.with_alpha(alpha).over(black),
             Color::rgb(0x0e0e0e)
         );
+        // The right panel is `dropdown-glass`: #0f0f0f in `sidebar-right.png` (our #0e0e0e plus
+        // the 1-2 levels of grain), its edge #252525 (the foreground at 10% over it).
+        let panel = dark.panel_surface.over(black);
+        assert_eq!(panel, Color::rgb(0x0e0e0e));
+        assert_eq!(dark.panel_edge.over(panel), Color::rgb(0x25_25_25));
+        assert_eq!(dark.panel_surface.a, (PANEL_ALPHA * 255.).round() as u8);
         // The open thread's row (`sidebar.png`, ~#1e1e1e over the ~#030303 grain).
         let row = dark.sidebar_row_active.over(Color::rgb(0x030303));
         assert!((0x1d..=0x20).contains(&row.r), "{}", row.hex());

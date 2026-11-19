@@ -29,8 +29,6 @@ use crate::theme::ThemeChoice;
 /// A pixel counts as changed when any channel moved by more than this (GPU rasterisation of
 /// anti-aliased edges and glyphs may differ by a step or two between drivers).
 const CHANNEL_TOLERANCE: u8 = 8;
-/// The themes every story is snapshotted in.
-const THEMES: [ThemeChoice; 2] = [ThemeChoice::DefaultLight, ThemeChoice::DefaultDark];
 /// Space between two states in a story's image, filled with [`GAP_COLOR`].
 const GAP: u32 = 4;
 const GAP_COLOR: Rgba<u8> = Rgba([255, 0, 255, 255]);
@@ -39,7 +37,7 @@ const GAP_COLOR: Rgba<u8> = Rgba([255, 0, 255, 255]);
 fn rendering_app() -> HeadlessAppContext {
     let mut cx = HeadlessAppContext::with_platform(
         text_system(),
-        Arc::new(gpui_kit::assets::Assets),
+        Arc::new(crate::design::AppAssets),
         || {
             gpui_wgpu::WgpuHeadlessRenderer::new()
                 .map(|renderer| Some(Box::new(renderer) as Box<dyn PlatformHeadlessRenderer>))
@@ -154,7 +152,7 @@ fn every_story_matches_its_snapshot() {
     let mut cx = rendering_app();
     let mut failures = Vec::new();
     for story in all() {
-        for theme in THEMES {
+        for theme in story.themes.pair() {
             let name = format!("{}-{}", story.name, theme.slug());
             let actual = render_story(&mut cx, story, theme);
             let baseline_path = baseline_dir().join(format!("{name}.png"));

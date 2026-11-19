@@ -19,7 +19,7 @@ use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
-use crate::design::tokens::{Appearance, Color, Palette};
+use crate::design::tokens::{Appearance, Color, PANEL_ALPHA, Palette};
 
 /// A colour field: the string if the value is one, nothing for `null` or anything else (a theme
 /// with one broken key keeps the rest of its colours).
@@ -244,6 +244,11 @@ pub fn map_style(appearance: Appearance, style: &Style) -> Palette {
         .message_action
         .with_alpha(230)
         .over(palette.background);
+    // t3code's glass panel: the popover at 83.6%, edged by the foreground at 10%.
+    palette.panel_surface = palette
+        .popover
+        .with_alpha((PANEL_ALPHA * 255.).round() as u8);
+    palette.panel_edge = palette.foreground.with_alpha(25);
     palette
 }
 

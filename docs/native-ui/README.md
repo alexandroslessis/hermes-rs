@@ -178,8 +178,9 @@ sandbox, import from the original Hermes, `/` commands from our catalog.
   `<data>/themes/`, re-read when a file changes; `theme/`), mapped onto t3code's tokens
   (`design/tokens.rs`); t3code's own light and dark are the defaults. Light and dark follow the
   system unless set (the setting is CP2.2's). The folder reading and watching are built and
-  tested (CP2.1); CP2.2's workspace is the first window that calls them, and the spike still
-  starts in GPUI Kit's dark. Fonts: Inter bundled, Consolas for code (`theme/fonts.rs`).
+  tested (CP2.1) and, since CP2.2, called by the app (`app.rs`): the user's themes folder is read at
+  start and watched while it runs; the theme follows the system's light or dark until one is
+  picked (it is then remembered in `native-ui.json`). Fonts: Inter bundled, Consolas for code (`theme/fonts.rs`).
 
 ## The dev loop
 

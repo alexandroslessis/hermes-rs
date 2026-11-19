@@ -9,6 +9,8 @@
 //! Like Zed's storybook and GPUI Kit's `story` crate (structure only; no code from either).
 
 mod button;
+mod design;
+mod frame;
 #[cfg(all(test, feature = "snapshots"))]
 mod snapshots;
 mod tokens;
@@ -31,10 +33,35 @@ pub struct Story {
     pub title: &'static str,
     /// The window each state is rendered in for snapshots, in logical pixels.
     pub size: (f32, f32),
+    /// The themes the snapshot harness renders it under.
+    pub themes: Themes,
     /// The states, left to right.
     pub states: &'static [State],
     /// Renders the story in one state.
     pub render: fn(&State, &mut Window, &mut App) -> AnyElement,
+}
+
+/// Which light and dark theme a story's snapshots are taken in. The CP0.2 and CP2.1 stories
+/// (the Kit button, the token swatches) keep GPUI Kit's own themes, which their baselines were
+/// made under; every story of the design layer is checked under t3code's two themes, the ones the
+/// app wears (`-t3-light.png`, `-t3-dark.png`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Themes {
+    /// GPUI Kit's default light and dark (`-light.png`, `-dark.png`).
+    Kit,
+    /// t3code's default light and dark (`-t3-light.png`, `-t3-dark.png`).
+    T3,
+}
+
+impl Themes {
+    /// The light and the dark theme.
+    pub fn pair(self) -> [crate::theme::ThemeChoice; 2] {
+        use crate::theme::ThemeChoice;
+        match self {
+            Themes::Kit => [ThemeChoice::DefaultLight, ThemeChoice::DefaultDark],
+            Themes::T3 => [ThemeChoice::T3Light, ThemeChoice::T3Dark],
+        }
+    }
 }
 
 /// One state of a story: a name, and what the harness does to the rendered story to reach it
@@ -72,7 +99,31 @@ macro_rules! register_stories {
     };
 }
 
-register_stories![button::STATES_STORY, tokens::SWATCHES_STORY];
+register_stories![
+    button::STATES_STORY,
+    tokens::SWATCHES_STORY,
+    design::BUTTON_DEFAULT,
+    design::BUTTON_OUTLINE,
+    design::BUTTON_GHOST,
+    design::BUTTON_GHOST_MUTED,
+    design::BUTTON_DESTRUCTIVE,
+    design::BUTTON_SIZES,
+    design::ICON_BUTTON,
+    design::LIST_ROW,
+    design::THREAD_ROW,
+    design::THREAD_STATUS,
+    design::SECTION_HEADER,
+    design::PANEL,
+    design::BADGE,
+    design::KBD,
+    design::TOOLTIP,
+    design::TOAST,
+    design::EMPTY_STATE,
+    design::MIDDLE_TRUNCATE,
+    frame::TITLE_BAR,
+    frame::PALETTE,
+    frame::APP_FRAME,
+];
 
 /// One story in one state, on the theme's background: the root view of a snapshot window, and
 /// what the gallery shows in each column. Its element is `story`, the crop of a snapshot.
@@ -160,7 +211,12 @@ pub fn interact(interaction: Interaction, window: &mut Window, cx: &mut App) {
             window.pointer_down(center, MouseButton::Left, cx);
         }
         Interaction::Focus(id) => {
-            // Tab order, as a keyboard user gets there; a story has few tab stops.
+            // Tab order, as a keyboard user gets there; a story has few tab stops. A key press
+            // first, so the window counts the input as keyboard and draws the `focus-visible`
+            // ring (a bare modifier: no binding, no text).
+            if let Ok(key) = gpui_kit::Keystroke::parse("shift") {
+                window.dispatch_keystroke(key, cx);
+            }
             for _ in 0..16 {
                 window.focus_next(cx);
                 window.render_frame(cx);

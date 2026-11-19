@@ -6,14 +6,20 @@
 //! element dump), `testing` (layout checks, in tests and with `--features dev`), and the gallery's
 //! snapshot tests (`cargo test -p hermes-native --features snapshots`).
 
+pub mod app;
 pub mod design;
 pub mod dev;
 pub mod fake;
 pub mod gallery;
+pub mod keymap;
+pub mod palette;
 pub mod spike;
 #[cfg(any(test, feature = "dev"))]
 pub mod testing;
 pub mod theme;
+pub mod titlebar;
+pub mod ui_state;
+pub mod workspace;
 
 /// Sends `tracing` warnings and errors (a theme file skipped, fonts that failed to load) to
 /// stderr. Both binaries call it first; without a subscriber those messages are lost.

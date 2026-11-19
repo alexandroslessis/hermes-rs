@@ -1,8 +1,14 @@
-//! `hermes-native`: the native Windows UI for Hermes on GPUI Kit (`docs/native-ui/`). For now it
-//! is CP0.1's throwaway spike window on fake data ([`spike`]); the real app replaces it from
-//! Phase 2 on.
+//! `hermes-native`: the native Windows UI for Hermes on GPUI Kit (`docs/native-ui/`). From CP2.2 it
+//! opens the app frame ([`hermes_native::app`]): title bar, sidebar, main area, a right panel and a
+//! drawer that open on demand, the command palette (`Ctrl+K`), toasts and the themes. The
+//! throwaway window of CP0.1 is still there with `--spike`.
 //!
-//! Flags (for measuring, CP0.1 step 4):
+//! Flags of the app:
+//! - `--theme <name>`: wear that theme (`"Default Dark"`, `"One Light"`, a user file's) instead of
+//!   the remembered one.
+//! - `--quit-after <seconds>`, `--dump <file>` (with `--features dev`): as below.
+//!
+//! Flags of `--spike` (for measuring, CP0.1 step 4):
 //! - `--no-stream`: don't start the timer that streams text into the last message (idle memory).
 //! - `--quit-after <seconds>`: quit on its own after that long.
 //! - `--theme <dark|light|one-dark|one-light|t3-dark|t3-light>`: the theme to start with (default `dark`).
@@ -47,6 +53,20 @@ fn main() {
         _ => ThemeChoice::DefaultDark,
     };
     let dump = hermes_native::dev::dump_flag(&args);
+
+    if !args.iter().any(|a| a == "--spike") {
+        let theme = args
+            .iter()
+            .position(|a| a == "--theme")
+            .and_then(|ix| args.get(ix + 1))
+            .cloned();
+        hermes_native::app::run(hermes_native::app::Options {
+            quit_after,
+            theme,
+            dump,
+        });
+        return;
+    }
 
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
