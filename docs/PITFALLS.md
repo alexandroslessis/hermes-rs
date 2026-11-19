@@ -266,6 +266,33 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   expiry) fire only after `cx.advance_clock(..)` and `cx.run_until_parked()`; sleeping the thread
   does nothing.
 
+- **A Kit context menu wraps the element** (`ContextMenuExt::context_menu` returns a `ContextMenu<E>`,
+  not an element you can `.probe()`), and its id lands in every descendant's dump path
+  (`context-menu-Name("row")/row/title`). The sidebar probes an outer element and gives each part an
+  id with the thread's or project's id in it.
+- **Keys bound in a parent context eat typing.** A `space` binding in the `Sidebar` context would
+  swallow the space typed into the filter box; only keys the text fields do not need are bound there
+  (`sidebar/keys.rs`), and each handler returns early while a field has the keyboard.
+- **A re-read must not undo a running turn's marks.** The core's `live` flag can lag the
+  `TurnStarted` event; `AppModel` keeps the working and waiting sets from the events and ORs them into
+  every snapshot until the end event.
+- **`canonicalize` adds a verbatim prefix (`\\?\`).** A project's folder and a moved thread's
+  folder must share a spelling (`project_for_path` compares text); the folder picker's paths are
+  plain, so a test that uses a temp folder must strip the prefix.
+- **Dropping a tokio runtime waits for its blocking tasks without end.** `hermes-native` owns the
+  core's runtime; after the event loop returns it calls `shutdown_timeout(2 s)` so a curator or
+  review call in flight cannot leave a windowless process holding `app.lock`.
+- **`Core::sessions` reads an unreadable store as "no sessions"** (`unwrap_or_default`). A front end
+  that shows a first-run screen for an empty list must ask the store once itself (`CoreBackend`
+  does) or it greets a damaged database with "What should we work on?".
+- **Optimistic edits must reach the backend in order.** Two quick edits of one thread spawned
+  side by side land in either order; `AppModel` queues them and runs one at a time.
+- **GPUI's text ellipsis in a flex row truncates early and leaves a gap** (`MiddleTruncate`'s
+  head is cut even when the whole string would fit). Thread titles are end-truncated in one text
+  box, as t3code's are; `MiddleTruncate` stays for paths and branches.
+- **`Handle::block_on` for core calls** (`delete_session`, `move_session`) is fine from GPUI's
+  background threads and panics inside a tokio worker; `CoreBackend` is only called from the former.
+
 ## Protocol and page behaviour
 
 - **-32601 / 404 hide features.** If you answer a method with something half-right, the page shows

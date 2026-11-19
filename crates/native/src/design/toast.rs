@@ -404,7 +404,11 @@ impl RenderOnce for Toast {
 
 /// The toasts of `stack` as elements, oldest first (the workspace puts them in a column at the
 /// bottom right, so the newest sits lowest).
-pub fn stack_elements(toasts: &Toasts, on_dismiss: impl Fn(ToastId) -> Handler) -> Vec<AnyElement> {
+pub fn stack_elements(
+    toasts: &Toasts,
+    on_dismiss: impl Fn(ToastId) -> Handler,
+    on_action: impl Fn(ToastId) -> Handler,
+) -> Vec<AnyElement> {
     toasts
         .visible()
         .iter()
@@ -412,6 +416,10 @@ pub fn stack_elements(toasts: &Toasts, on_dismiss: impl Fn(ToastId) -> Handler) 
             Toast::new(("toast", live.id as usize), &live.spec)
                 .on_dismiss({
                     let handler = on_dismiss(live.id);
+                    move |e, w, cx| handler(e, w, cx)
+                })
+                .on_action({
+                    let handler = on_action(live.id);
                     move |e, w, cx| handler(e, w, cx)
                 })
                 .into_any_element()

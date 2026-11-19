@@ -410,6 +410,22 @@ is not in the dump). What cannot be tested headlessly: the Windows non-client hi
 layouts flyout, caption drag, double-click to maximise), DPI changes, real window position
 restore: they are on the user's checklist (`progress/phase-2.md`).
 
+**The sidebar (CP3.1).** `sidebar/tests.rs` opens a `Sidebar` over a `FixtureBackend` (fake data that
+records every `Op` and can be told to fail or to emit `CoreEvent`s) in a headless window: layout (row
+and header heights, titles under the folder's name, status icons and times on one right edge, the
+tile of a pinned row, nothing overflowing), then real key presses and clicks (arrows, Enter, F2, Delete
+and its question, Ctrl+F, drag onto a header) and the `Op` that reaches the backend. `CoreBackend` is
+tested against a real `Core` on a `hermes_testdir` folder (a tokio runtime of the test's own, calls from
+the test thread). Run the app on fake data with `hermes-native.exe --fixture` (no lock, no core). Names in
+the dump of a row's parts carry the thread id (`title-t1`, `status-icon-t1`), because a context menu wraps
+the row and puts its own id in the path; `no_overflow` ignores the rows inside a scrolling `threads` list.
+`edits_through_the_model_survive_a_restart` drives `AppModel` over a real core, then opens a second
+core on the same folder and checks the store. To run the app on many threads without the user's
+data, seed a synthetic folder (empty, under `target\native-test`):
+`$env:HERMES_NATIVE_SEED = "$PWD\target\native-test\seed"; cargo test -p hermes-native
+seed_synthetic -- --ignored --nocapture` (three projects, 50 threads with emoji / newline / long / untitled titles, pins,
+archives, no-project ones), then `$env:HERMES_RS_HOME` to that folder.
+
 **The gallery** (`hermes-native-gallery.exe`, `cargo run -p hermes-native --bin
 hermes-native-gallery`): every story in every state, with t3code's default / GPUI Kit / Zed One and
 light / dark switches, for a person to judge hover, press and focus by hand (the user's checklist).

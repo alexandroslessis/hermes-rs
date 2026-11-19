@@ -6,6 +6,7 @@
 //! Flags of the app:
 //! - `--theme <name>`: wear that theme (`"Default Dark"`, `"One Light"`, a user file's) instead of
 //!   the remembered one.
+//! - `--fixture`: fake projects and threads, no core and no app lock (for looking and testing).
 //! - `--quit-after <seconds>`, `--dump <file>` (with `--features dev`): as below.
 //!
 //! Flags of `--spike` (for measuring, CP0.1 step 4):
@@ -64,6 +65,7 @@ fn main() {
             quit_after,
             theme,
             dump,
+            fixture: args.iter().any(|a| a == "--fixture"),
         });
         return;
     }

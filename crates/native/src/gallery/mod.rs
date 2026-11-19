@@ -11,6 +11,7 @@
 mod button;
 mod design;
 mod frame;
+mod sidebar;
 #[cfg(all(test, feature = "snapshots"))]
 mod snapshots;
 mod tokens;
@@ -123,6 +124,9 @@ register_stories![
     frame::TITLE_BAR,
     frame::PALETTE,
     frame::APP_FRAME,
+    sidebar::SIDEBAR,
+    sidebar::SIDEBAR_MORE,
+    sidebar::EMPTY_STATES,
 ];
 
 /// One story in one state, on the theme's background: the root view of a snapshot window, and

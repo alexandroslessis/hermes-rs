@@ -14,8 +14,10 @@
 //! (`docs/PITFALLS.md`, Native UI), and `dragging_a_border_past_its_limit_*` below is the CP0.1
 //! test again for this frame.
 //!
-//! The content of the regions is placeholder (fake threads in the sidebar, an empty-state in the
-//! main area): the sidebar is Phase 3, the thread view Phase 4, the panel Phase 6.
+//! The sidebar is the real one since Phase 3 ([`crate::sidebar`], over the app model
+//! [`crate::model::AppModel`]); the main area shows the empty states of the sidebar's world (no
+//! project yet, no open thread) or a placeholder for the open thread (the thread view is Phase 4),
+//! the panel and the drawer are placeholders for Phase 6.
 //!
 //! t3code: `apps/web/src/components/AppSidebarLayout.tsx` (the frame, the sidebar width limits:
 //! `threadSidebarWidth.ts`), `components/ui/sidebar.tsx` (`Sidebar`, `SidebarRail`: the drag
@@ -26,6 +28,7 @@
 //! topbar), `app-terminal-open.png` (the drawer), `sidebar-right.png` (the right panel).
 
 use std::{
+    collections::HashMap,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -39,17 +42,17 @@ use gpui_kit::{
 
 use crate::{
     design::{
-        Button, EmptyState, ListRow, Panel, SectionHeader, ThreadRow, Toasts,
+        EmptyState, Panel, Toasts,
         button::{self, Variant, icon_button},
-        list_row::Status,
         panel::Edge,
         toast::{self, ToastId, ToastSpec},
-        tokens::text,
+        tokens::{Appearance, text},
     },
     dev::ProbeExt as _,
-    fake,
     keymap::{self, *},
+    model::{AppModel, ModelEvent, Selection, fixture},
     palette::{self, Item, Kind, Mode, Palette, PaletteEvent},
+    sidebar::{Sidebar, SidebarEvent, data::Snapshot, empty},
     theme::{self, DesignTheme as _, Themes},
     titlebar::{self, TitleBar},
     ui_state::{self, MIN_WINDOW, UiState},
@@ -213,16 +216,33 @@ pub struct Workspace {
     palette_subscription: Option<Subscription>,
     focus: FocusHandle,
     save_task: Option<Task<()>>,
-    selected_thread: usize,
-    notice: usize,
+    model: Entity<AppModel>,
+    sidebar: Entity<Sidebar>,
+    /// The thread a toast's action opens.
+    toast_threads: HashMap<ToastId, String>,
     _bounds: Subscription,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Workspace {
-    /// The frame with `state`; `data_dir` is where `native-ui.json` is written (`None`: not saved).
+    /// The frame over fake projects and threads ([`fixture`]): the gallery, the snapshots and the
+    /// tests. `state` is what was remembered; `data_dir` is where `native-ui.json` is written
+    /// (`None`: not saved).
     pub fn new(
         state: UiState,
         data_dir: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let model = cx.new(AppModel::fixture);
+        Self::with_model(state, data_dir, model, window, cx)
+    }
+
+    /// The frame over `model` (the real core's, from the app).
+    pub fn with_model(
+        state: UiState,
+        data_dir: Option<PathBuf>,
+        model: Entity<AppModel>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -230,6 +250,13 @@ impl Workspace {
         let bounds = cx.observe_window_bounds(window, |this, window, cx| {
             this.window_moved(window, cx);
         });
+        let sidebar = cx.new(|cx| Sidebar::new(model.clone(), state.sidebar_list.clone(), cx));
+        let subscriptions = vec![
+            cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
+            cx.subscribe(&model, Self::on_model_event),
+            // The palette's list and the title follow the model.
+            cx.observe(&model, |_, _, cx| cx.notify()),
+        ];
         Self {
             state,
             data_dir,
@@ -241,9 +268,58 @@ impl Workspace {
             palette_subscription: None,
             focus,
             save_task: None,
-            selected_thread: 0,
-            notice: 0,
+            model,
+            sidebar,
+            toast_threads: HashMap::new(),
             _bounds: bounds,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// The app model (projects, threads, the open one).
+    pub fn model(&self) -> &Entity<AppModel> {
+        &self.model
+    }
+
+    /// The sidebar view.
+    pub fn sidebar_view(&self) -> &Entity<Sidebar> {
+        &self.sidebar
+    }
+
+    fn on_sidebar_event(
+        &mut self,
+        _: &Entity<Sidebar>,
+        event: &SidebarEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SidebarEvent::ToggleSidebar => self.toggle_sidebar(cx),
+            SidebarEvent::OpenPalette => self.open_palette(Mode::All, window, cx),
+            SidebarEvent::OpenSettings => self.run_command("settings.open", window, cx),
+            SidebarEvent::OpenUsage => {
+                self.push_toast(
+                    ToastSpec::new(toast::Kind::Info, "Usage")
+                        .description("The usage screen arrives in Phase 7."),
+                    cx,
+                );
+            }
+            SidebarEvent::ToggleTheme => self.toggle_theme(cx),
+            SidebarEvent::PrefsChanged(prefs) => {
+                self.state.sidebar_list = prefs.clone();
+                self.changed(cx);
+            }
+        }
+    }
+
+    fn on_model_event(&mut self, _: Entity<AppModel>, event: &ModelEvent, cx: &mut Context<Self>) {
+        match event {
+            ModelEvent::Toast { spec, open } => {
+                let id = self.push_toast(spec.clone(), cx);
+                if let Some(thread) = open {
+                    self.toast_threads.insert(id, thread.clone());
+                }
+            }
         }
     }
 
@@ -406,7 +482,38 @@ impl Workspace {
         id
     }
 
+    /// A toast's action button: opens the thread the notice is about, and the notice goes.
+    fn run_toast_action(&mut self, id: ToastId, cx: &mut Context<Self>) {
+        if let Some(thread) = self.toast_threads.remove(&id) {
+            self.model.update(cx, |m, cx| m.open(&thread, cx));
+        }
+        self.dismiss_toast(id, cx);
+    }
+
+    /// The title bar's text: the open thread's project and name (t3code's breadcrumb), the new
+    /// thread's project, or "No active thread".
+    fn topbar_title(&self, cx: &App) -> String {
+        let model = self.model.read(cx);
+        let snapshot = model.snapshot();
+        match model.selected() {
+            Selection::Thread(id) => match snapshot.thread(id) {
+                Some(t) => format!(
+                    "{}  /  {}",
+                    snapshot.project(&t.project).map_or("", |p| p.name.as_str()),
+                    t.display_title()
+                ),
+                None => "No active thread".to_string(),
+            },
+            Selection::Draft(project) => format!(
+                "{}  /  New thread",
+                snapshot.project(project).map_or("", |p| p.name.as_str())
+            ),
+            Selection::None => "No active thread".to_string(),
+        }
+    }
+
     fn dismiss_toast(&mut self, id: ToastId, cx: &mut Context<Self>) {
+        self.toast_threads.remove(&id);
         self.toasts.dismiss(id);
         self.arm_toast_timer(cx);
         cx.notify();
@@ -438,23 +545,43 @@ impl Workspace {
 
     // --- palette --------------------------------------------------------------------------
 
+    /// The palette's entries for fake data (the gallery's story): every action, the fixture's
+    /// threads and projects.
     pub fn palette_items() -> Vec<Item> {
+        Self::palette_items_for(&fixture::snapshot())
+    }
+
+    /// The palette's entries: every action, then the threads (newest first) and the projects of
+    /// `snapshot`.
+    pub fn palette_items_for(snapshot: &Snapshot) -> Vec<Item> {
         let mut items = palette::action_items();
-        for (id, title, project, branch) in fake::palette_threads() {
+        let mut threads: Vec<_> = snapshot.threads.iter().collect();
+        threads.sort_by_key(|t| std::cmp::Reverse(t.updated_ms));
+        for thread in threads {
+            let project = snapshot
+                .project(&thread.project)
+                .map_or("", |p| p.name.as_str());
             items.push(Item {
                 kind: Kind::Thread,
-                id: id.to_string(),
-                title: title.to_string(),
-                subtitle: Some(format!("{project} · {branch}")),
+                id: thread.id.clone(),
+                title: thread.display_title().to_string(),
+                subtitle: Some(match &thread.branch {
+                    Some(branch) => format!("{project} · {branch}"),
+                    None => project.to_string(),
+                }),
                 shortcut: None,
             });
         }
-        for (path, name) in fake::palette_projects() {
+        for project in snapshot
+            .projects
+            .iter()
+            .filter(|p| p.kind != crate::sidebar::data::ProjectKind::None)
+        {
             items.push(Item {
                 kind: Kind::Project,
-                id: path.to_string(),
-                title: name.to_string(),
-                subtitle: Some(path.to_string()),
+                id: project.id.clone(),
+                title: project.name.clone(),
+                subtitle: project.path.clone(),
                 shortcut: None,
             });
         }
@@ -467,7 +594,8 @@ impl Workspace {
             self.close_palette(window, cx);
             return;
         }
-        let palette = cx.new(|cx| Palette::new(mode, Self::palette_items(), window, cx));
+        let items = Self::palette_items_for(self.model.read(cx).snapshot());
+        let palette = cx.new(|cx| Palette::new(mode, items, window, cx));
         self.palette_subscription = Some(cx.subscribe_in(
             &palette,
             window,
@@ -498,21 +626,11 @@ impl Workspace {
         match item.kind {
             Kind::Action => self.run_command(&item.id, window, cx),
             Kind::Thread => {
-                if let Some(ix) = fake::palette_threads().iter().position(|t| t.0 == item.id) {
-                    self.selected_thread = ix;
-                }
-                self.push_toast(
-                    ToastSpec::new(toast::Kind::Info, format!("Opened “{}”", item.title))
-                        .description("The thread view arrives in Phase 4."),
-                    cx,
-                );
+                self.model.update(cx, |m, cx| m.open(&item.id, cx));
             }
+            // A project: a new thread in it (what t3code's palette does).
             Kind::Project => {
-                self.push_toast(
-                    ToastSpec::new(toast::Kind::Info, format!("Project {}", item.title))
-                        .description("Projects arrive with the sidebar, Phase 3."),
-                    cx,
-                );
+                self.model.update(cx, |m, cx| m.new_thread(&item.id, cx));
             }
         }
     }
@@ -528,13 +646,7 @@ impl Workspace {
             "appearance.cycle" => self.cycle_theme(cx),
             "workspace.focusNext" => window.focus_next(cx),
             "workspace.focusPrevious" => window.focus_prev(cx),
-            "chat.new" => {
-                self.push_toast(
-                    ToastSpec::new(toast::Kind::Info, "New thread")
-                        .description("Threads arrive with the sidebar, Phase 3."),
-                    cx,
-                );
-            }
+            "chat.new" => self.sidebar.update(cx, |s, cx| s.new_thread_here(cx)),
             "settings.open" => {
                 self.push_toast(
                     ToastSpec::new(toast::Kind::Info, "Settings")
@@ -544,6 +656,21 @@ impl Workspace {
             }
             other => tracing::warn!("no handler for command {other}"),
         }
+    }
+
+    /// The sidebar's theme button: t3code's light theme when the dark one is worn, and back (the
+    /// choice is remembered; `Ctrl+Alt+Shift+A` still cycles through every theme).
+    pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+        let themes = Themes::global(cx);
+        let to = if cx.design_theme().appearance.is_dark() {
+            Appearance::Light
+        } else {
+            Appearance::Dark
+        };
+        let def = themes.default_for(to).clone();
+        theme::apply(&def, cx);
+        self.state.theme = Some(def.name);
+        self.changed(cx);
     }
 
     /// Switches to the next theme of the list (built in, bundled, the user's folder).
@@ -610,144 +737,71 @@ impl Workspace {
         .into_any_element()
     }
 
-    fn sidebar(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
-        let palette = cx.design_theme().palette;
-        let threads = fake::palette_threads();
-        let statuses = [None, Some(Status::Done), None, Some(Status::Working), None];
-        let times = ["now", "", "20h", "3m", "1d"];
+    fn sidebar(&self, width: f32) -> AnyElement {
         div()
-            .id("sidebar")
-            .flex()
-            .flex_col()
+            .id("sidebar-slot")
             .flex_shrink_0()
             .w(px(width))
             .h_full()
-            .bg(palette.sidebar.hsla())
-            .text_color(palette.sidebar_foreground.hsla())
-            .border_r_1()
-            .border_color(palette.sidebar_border.hsla())
-            .child(
-                div()
-                    .id("sidebar-header")
-                    .flex()
-                    .items_center()
-                    .flex_shrink_0()
-                    .gap(px(8.))
-                    .h(px(titlebar::HEIGHT))
-                    .px(px(10.))
-                    .child(self.sidebar_toggle(cx))
-                    .child(
-                        div()
-                            .id("brand")
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .child("Hermes"),
-                    )
-                    .child(
-                        div()
-                            .id("sidebar-drag")
-                            .flex_1()
-                            .h_full()
-                            .window_control_area(gpui_kit::WindowControlArea::Drag),
-                    )
-                    .probe(),
-            )
-            .child(
-                div()
-                    .id("sidebar-search")
-                    .flex()
-                    .items_center()
-                    .flex_shrink_0()
-                    .gap(px(4.))
-                    .px(px(8.))
-                    .pb(px(8.))
-                    .child(div().flex_1().min_w_0().child({
-                        let this = cx.entity();
-                        ListRow::new("search", "Search")
-                            .icon(IconName::Search)
-                            .meta("Ctrl+K")
-                            .on_click(move |window, cx| {
-                                this.update(cx, |t, cx| t.open_palette(Mode::All, window, cx));
-                            })
-                    }))
-                    .child(
-                        icon_button("new-thread", IconName::SquarePen, "New thread (Ctrl+N)")
-                            .variant(Variant::GhostMuted)
-                            .size(button::Size::Sm)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.run_command("chat.new", window, cx)
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .id("threads")
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .gap(px(4.))
-                    .px(px(8.))
-                    .overflow_y_scroll()
-                    .child(
-                        SectionHeader::new("threads-header", "Threads")
-                            .meta(threads.len().to_string()),
-                    )
-                    .children(threads.iter().enumerate().map(
-                        |(ix, (_, title, project, branch))| {
-                            let mut row = ThreadRow::new(("thread", ix), *project, *title)
-                                .branch(*branch)
-                                .selected(ix == self.selected_thread);
-                            match statuses[ix % statuses.len()] {
-                                Some(status) => row = row.status(status),
-                                None if !times[ix % times.len()].is_empty() => {
-                                    row = row.time(times[ix % times.len()])
-                                }
-                                None => {}
-                            }
-                            div()
-                                .id(("thread-click", ix))
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.selected_thread = ix;
-                                    cx.notify();
-                                }))
-                                .child(row)
-                        },
-                    ))
-                    .probe(),
-            )
-            .child(
-                div()
-                    .id("sidebar-footer")
-                    .flex()
-                    .items_center()
-                    .flex_shrink_0()
-                    .gap(px(4.))
-                    .h(px(titlebar::HEIGHT))
-                    .px(px(10.))
-                    .child(
-                        icon_button("settings", IconName::Settings, "Settings (Ctrl+,)")
-                            .variant(Variant::GhostMuted)
-                            .size(button::Size::Sm)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.run_command("settings.open", window, cx)
-                            })),
-                    )
-                    .child(
-                        icon_button("theme", IconName::Palette, "Cycle theme (Ctrl+Alt+Shift+A)")
-                            .variant(Variant::GhostMuted)
-                            .size(button::Size::Sm)
-                            .on_click(cx.listener(|this, _, _, cx| this.cycle_theme(cx))),
-                    )
-                    .probe(),
-            )
-            .probe()
+            .child(self.sidebar.clone())
             .into_any_element()
     }
 
+    /// What the main area is about: the sidebar's empty states, or (until Phase 4) a placeholder
+    /// for the thread that is open.
     fn main_area(&self, cx: &mut Context<Self>) -> AnyElement {
         let palette = cx.design_theme().palette;
-        let thread = fake::palette_threads()[self.selected_thread];
+        let model = self.model.read(cx);
+        let snapshot = model.snapshot();
+        let starting = matches!(model.phase(), crate::model::Phase::Starting);
+        let body: AnyElement = match model.selected() {
+            Selection::Thread(id) => {
+                let thread = snapshot.thread(id);
+                EmptyState::new(
+                    "empty",
+                    thread.map_or("Thread".to_string(), |t| t.display_title().to_string()),
+                )
+                .icon(IconName::MessageSquare)
+                .description("The thread view arrives in Phase 4.")
+                .size(crate::design::empty_state::Size::Hero)
+                .into_any_element()
+            }
+            Selection::Draft(project) => {
+                let name = snapshot
+                    .project(project)
+                    .map_or("this project".to_string(), |p| p.name.clone());
+                EmptyState::new("empty", format!("What should we build in {name}?"))
+                    .icon(IconName::MessageSquare)
+                    .description("The composer arrives in Phase 5.")
+                    .size(crate::design::empty_state::Size::Hero)
+                    .into_any_element()
+            }
+            Selection::None if starting => div().into_any_element(),
+            Selection::None if matches!(model.phase(), crate::model::Phase::Failed(_)) => {
+                let why = match model.phase() {
+                    crate::model::Phase::Failed(why) => why.clone(),
+                    _ => String::new(),
+                };
+                EmptyState::new("open-failed", "Hermes could not open its data")
+                    .icon(IconName::CircleAlert)
+                    .description(why)
+                    .into_any_element()
+            }
+            Selection::None if snapshot.is_empty() => {
+                let add = self.sidebar.clone();
+                let scratch = self.sidebar.clone();
+                empty::no_projects_hero(
+                    move |_, cx| add.update(cx, |s, cx| s.add_project_dialog(cx)),
+                    move |_, cx| {
+                        scratch.update(cx, |s, cx| {
+                            s.new_thread(crate::sidebar::data::NO_PROJECT, cx)
+                        })
+                    },
+                )
+                .into_any_element()
+            }
+            Selection::None => empty::no_active_thread().into_any_element(),
+        };
         div()
             .id("main")
             .flex()
@@ -756,31 +810,7 @@ impl Workspace {
             .min_h_0()
             .overflow_hidden()
             .bg(palette.background.hsla())
-            .child(
-                EmptyState::new("empty", format!("What should we build in {}?", thread.2))
-                    .icon(IconName::MessageSquare)
-                    .description(
-                        "The thread view arrives in Phase 4. Press Ctrl+K for the palette.",
-                    )
-                    .size(crate::design::empty_state::Size::Hero)
-                    .child(
-                        Button::new("open-palette", "Command palette")
-                            .variant(Variant::Outline)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_palette(Mode::All, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("show-notice", "Show a notice")
-                            .variant(Variant::Ghost)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let notices = fake::notices();
-                                let spec = notices[this.notice % notices.len()].clone();
-                                this.notice += 1;
-                                this.push_toast(spec, cx);
-                            })),
-                    ),
-            )
+            .child(body)
             .probe()
             .into_any_element()
     }
@@ -825,7 +855,7 @@ impl Render for Workspace {
         let maximized = window.is_maximized();
         self.maximized = maximized;
         let (w, h) = (viewport.width.as_f32(), viewport.height.as_f32());
-        let thread = fake::palette_threads()[self.selected_thread];
+        let title = self.topbar_title(cx);
 
         let sidebar_toggle = (frame.sidebar == 0.).then(|| {
             div()
@@ -844,7 +874,7 @@ impl Render for Workspace {
         });
         let topbar = TitleBar::new()
             .maximized(maximized)
-            .title(format!("{}  /  {}", thread.2, thread.1))
+            .title(title)
             .right(self.panel_toggles(cx))
             .when_some(sidebar_toggle, |bar, left| bar.left(left));
 
@@ -909,12 +939,24 @@ impl Render for Workspace {
                     }
                     this.arm_toast_timer(cx);
                 }))
-                .children(toast::stack_elements(&self.toasts, move |id| {
-                    let this = this.clone();
-                    std::rc::Rc::new(move |_, _, cx| {
-                        this.update(cx, |this, cx| this.dismiss_toast(id, cx));
-                    })
-                }))
+                .children(toast::stack_elements(
+                    &self.toasts,
+                    {
+                        let this = this.clone();
+                        move |id| {
+                            let this = this.clone();
+                            std::rc::Rc::new(move |_, _, cx| {
+                                this.update(cx, |this, cx| this.dismiss_toast(id, cx));
+                            })
+                        }
+                    },
+                    move |id| {
+                        let this = this.clone();
+                        std::rc::Rc::new(move |_, _, cx| {
+                            this.update(cx, |this, cx| this.run_toast_action(id, cx));
+                        })
+                    },
+                ))
                 .probe()
         });
 
@@ -986,9 +1028,7 @@ impl Render for Workspace {
                     this.drag_border(pane, event.event.position, window.viewport_size(), cx);
                 }),
             )
-            .when(frame.sidebar > 0., |d| {
-                d.child(self.sidebar(frame.sidebar, cx))
-            })
+            .when(frame.sidebar > 0., |d| d.child(self.sidebar(frame.sidebar)))
             .child(
                 div()
                     .id("content")

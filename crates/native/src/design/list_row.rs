@@ -175,6 +175,10 @@ pub enum Status {
     Unread,
     /// Finished.
     Done,
+    /// A command waits for the user's approval (t3code's "Approval": a shield with a question
+    /// mark, in the warning colour). The sidebar shows it; it is not in [`Status::ALL`], which is
+    /// the CP2.2 gallery's five (adding a state there would change its approved snapshot).
+    Approval,
 }
 
 impl Status {
@@ -195,6 +199,7 @@ impl Status {
             Status::Failed => "Failed",
             Status::Unread => "New",
             Status::Done => "Done",
+            Status::Approval => "Approval",
         }
     }
 
@@ -206,6 +211,7 @@ impl Status {
             Status::Failed => palette.error_foreground,
             Status::Unread => palette.primary,
             Status::Done => palette.success_foreground,
+            Status::Approval => palette.warning_foreground,
         }
     }
 
@@ -218,6 +224,7 @@ impl Status {
             Status::Failed => IconName::CircleAlert,
             Status::Unread => IconName::CircleDot,
             Status::Done => IconName::CircleCheck,
+            Status::Approval => IconName::ShieldQuestionMark,
         }
     }
 }

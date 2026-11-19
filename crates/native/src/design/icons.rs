@@ -17,7 +17,9 @@ use gpui_kit::{
 icon_assets!(
     ExtraIcons,
     [
+        Archive,
         ArrowUp,
+        ChartColumn,
         CircleDashed,
         CircleDot,
         CircleDotDashed,
@@ -29,7 +31,12 @@ icon_assets!(
         ListFilter,
         MessageSquare,
         Paperclip,
+        Pencil,
+        Pin,
+        PinOff,
+        ShieldQuestionMark,
         SquarePen,
+        Trash,
     ]
 );
 

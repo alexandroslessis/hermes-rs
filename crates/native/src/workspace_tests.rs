@@ -641,22 +641,20 @@ fn typing_filters_arrows_move_and_enter_runs_the_command() {
 }
 
 #[core::prelude::v1::test]
-fn a_thread_result_selects_the_thread_and_shows_a_notice() {
+fn a_thread_result_opens_the_thread_and_the_title_bar_names_it() {
     let mut cx = headless_app();
     let handle = open(&mut cx, MEDIUM, UiState::default());
     press(&mut cx, handle, "ctrl-k");
     type_text(&mut cx, handle, "port the");
     press(&mut cx, handle, "enter");
-    with(&mut cx, handle, |ws, _, _| {
+    with(&mut cx, handle, |ws, _, cx| {
         assert!(!ws.palette_open());
-        assert_eq!(ws.toasts().visible().len(), 1);
-        assert!(
-            ws.toasts().visible()[0]
-                .spec
-                .title
-                .contains("Port the command palette")
+        assert_eq!(
+            ws.model().read(cx).selected(),
+            &crate::model::Selection::Thread("t5".into())
         );
     });
+    assert!(layout(&mut cx, handle).get("titlebar").is_ok());
 }
 
 // --- toasts ----------------------------------------------------------------------------------
@@ -739,7 +737,7 @@ fn toasts_stack_bottom_right_newest_lowest_and_expire() {
 fn the_fake_notices_become_toasts_of_every_kind() {
     let mut cx = headless_app();
     let handle = open(&mut cx, MEDIUM, UiState::default());
-    for spec in fake::notices() {
+    for spec in crate::fake::notices() {
         with(&mut cx, handle, |ws, _, cx| ws.push_toast(spec, cx));
     }
     draw(&mut cx, handle);

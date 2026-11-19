@@ -12,6 +12,7 @@
 //! logical pixels. The theme follows the system's light or dark until the user picks one
 //! (`Ctrl+Alt+Shift+A`, the sidebar's palette button, the palette).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::{
@@ -21,7 +22,9 @@ use gpui_kit::{
 
 use crate::{
     design::{AppAssets, Appearance},
-    keymap, palette,
+    keymap,
+    model::{AppModel, CoreBackend},
+    palette, sidebar,
     theme::{self, DesignTheme as _, Themes},
     ui_state::{MIN_WINDOW, UiState},
     workspace::{Workspace, restore_window},
@@ -36,6 +39,8 @@ pub struct Options {
     pub theme: Option<String>,
     /// Where `--dump` writes the element dump (needs `--features dev`).
     pub dump: Option<std::path::PathBuf>,
+    /// `--fixture`: fake projects and threads, no core, no lock (tests, screenshots, a look).
+    pub fixture: bool,
 }
 
 fn appearance_of(window: WindowAppearance) -> Appearance {
@@ -45,8 +50,50 @@ fn appearance_of(window: WindowAppearance) -> Appearance {
     }
 }
 
+/// Says why the app does not start, in a message box, and exits (nothing was opened yet).
+fn stop(level: rfd::MessageLevel, message: &str) -> ! {
+    tracing::warn!("not starting: {message}");
+    rfd::MessageDialog::new()
+        .set_level(level)
+        .set_title("Hermes")
+        .set_description(message)
+        .show();
+    std::process::exit(1)
+}
+
 /// Opens the app and runs until the window closes.
+///
+/// With the real core (the default): takes `<data>/app.lock` first (a second app on the folder
+/// says "Hermes is already open" and exits, as the desktop app does; the folder is the same
+/// `HERMES_RS_HOME` / `%APPDATA%\hermes-rs`), starts a tokio runtime for the core, opens the
+/// window at once and builds the core on a background thread (`Core::new` seeds the bundled
+/// skills on a first run), then `Core::start(true)`: Settings on the runtime, the auto-archive
+/// sweep and the scheduled curator. `background = true` because this app is the one app on the
+/// folder (the lock), exactly as the desktop app owns the curator's schedule; only the ACP agent,
+/// which runs beside another app, passes `false`.
 pub fn run(options: Options) {
+    let data_dir = theme::folder::data_dir();
+    let _lock = if options.fixture {
+        None
+    } else {
+        let Some(dir) = &data_dir else {
+            stop(
+                rfd::MessageLevel::Error,
+                "Hermes could not find its data folder.",
+            );
+        };
+        match hermes_core::AppLock::acquire(dir) {
+            Ok(lock) => Some(lock),
+            Err(error) => stop(rfd::MessageLevel::Info, &error.to_string()),
+        }
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_name("hermes-runtime")
+        .enable_all()
+        .build()
+        .expect("a tokio runtime");
+    let handle = runtime.handle().clone();
     gpui_kit::application()
         .with_assets(AppAssets)
         .run(move |cx| {
@@ -55,8 +102,8 @@ pub fn run(options: Options) {
             crate::dev::install(cx);
             keymap::bind(cx);
             palette::bind(cx);
+            sidebar::keys::bind(cx);
 
-            let data_dir = theme::folder::data_dir();
             let state = data_dir.as_deref().map(UiState::load).unwrap_or_default();
 
             // The user's themes folder: read now, watched while we run.
@@ -104,7 +151,15 @@ pub fn run(options: Options) {
                         .clone();
                     theme::apply(&def, cx);
 
-                    let workspace = cx.new(|cx| Workspace::new(state, data_dir, window, cx));
+                    let model = if options.fixture {
+                        cx.new(AppModel::fixture)
+                    } else {
+                        let model = cx.new(|_| AppModel::starting());
+                        start_core(model.clone(), handle.clone(), cx);
+                        model
+                    };
+                    let workspace =
+                        cx.new(|cx| Workspace::with_model(state, data_dir, model, window, cx));
                     workspace.update(cx, |w, cx| w.focus(window, cx));
                     // Follow the system's light and dark while no theme was picked.
                     let follow = workspace.clone();
@@ -147,4 +202,27 @@ pub fn run(options: Options) {
                 .detach();
             }
         });
+    // When the event loop returns (the window closed): dropping a tokio runtime waits without end
+    // for its blocking tasks (a curator or review call in flight), which would leave a windowless
+    // process holding the app lock. Give them a moment, then go; the lock is released after.
+    runtime.shutdown_timeout(Duration::from_secs(2));
+}
+
+/// Builds the core off the main thread and gives it to the model.
+fn start_core(model: gpui_kit::Entity<AppModel>, handle: tokio::runtime::Handle, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        let built = cx
+            .background_spawn(async move {
+                let config = hermes_runtime::RuntimeConfig::for_current_user()?;
+                let core = hermes_core::Core::new(config, handle)?;
+                core.start(true);
+                Ok::<_, anyhow::Error>(core)
+            })
+            .await;
+        let _ = model.update(cx, |model, cx| match built {
+            Ok(core) => model.connect(Arc::new(CoreBackend::new(core)), cx),
+            Err(error) => model.fail(format!("{error:#}"), cx),
+        });
+    })
+    .detach();
 }

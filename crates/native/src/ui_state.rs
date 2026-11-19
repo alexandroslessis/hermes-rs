@@ -1,7 +1,8 @@
 //! `native-ui.json`: the native app's remembered layout, in the data folder beside `sessions.db`
 //! (AGENTS.md ground rule 6: a side file, never the store's schema). Window position and size,
 //! whether it was maximised, the sidebar, right panel and bottom drawer (open or not, and their
-//! sizes) and the theme. Later phases add per-thread drafts and collapsed projects here.
+//! sizes), the theme, and (Phase 3) the sidebar list's closed folders and project colours. Later
+//! phases add per-thread drafts here.
 //!
 //! Reading never fails: a missing file, a file that is not JSON, or a value out of range gives the
 //! defaults for what is wrong (a bad width does not reset the window position). Writing is atomic
@@ -118,6 +119,8 @@ pub struct UiState {
     pub drawer: PaneState,
     /// The theme's name (`None`: follow the system's light or dark).
     pub theme: Option<String>,
+    /// The sidebar's list: the folders the user closed and the projects' colours (Phase 3).
+    pub sidebar_list: crate::sidebar::data::Prefs,
 }
 
 impl Default for UiState {
@@ -137,6 +140,7 @@ impl Default for UiState {
                 size: drawer::DEFAULT,
             },
             theme: None,
+            sidebar_list: Default::default(),
         }
     }
 }
@@ -243,6 +247,9 @@ impl UiState {
             right_panel: read("right_panel", &defaults.right_panel),
             drawer: read("drawer", &defaults.drawer),
             theme: part("theme").and_then(|v| v.as_str().map(str::to_string)),
+            sidebar_list: part("sidebar_list")
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
         }
         .sanitized()
     }

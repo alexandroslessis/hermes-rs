@@ -12,7 +12,9 @@ pub mod dev;
 pub mod fake;
 pub mod gallery;
 pub mod keymap;
+pub mod model;
 pub mod palette;
+pub mod sidebar;
 pub mod spike;
 #[cfg(any(test, feature = "dev"))]
 pub mod testing;
