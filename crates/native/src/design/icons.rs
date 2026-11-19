@@ -19,6 +19,7 @@ icon_assets!(
     [
         Archive,
         ArrowUp,
+        Brain,
         ChartColumn,
         CircleDashed,
         CircleDot,
@@ -28,8 +29,11 @@ icon_assets!(
         CornerDownLeft,
         FolderPlus,
         GitBranch,
+        Lightbulb,
         ListFilter,
         MessageSquare,
+        MessageSquareWarning,
+        OctagonAlert,
         Paperclip,
         Pencil,
         Pin,
@@ -37,6 +41,7 @@ icon_assets!(
         ShieldQuestionMark,
         SquarePen,
         Trash,
+        Wrench,
     ]
 );
 

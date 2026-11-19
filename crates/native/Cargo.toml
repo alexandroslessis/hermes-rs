@@ -28,10 +28,14 @@ snapshots = ["dev", "dep:gpui-pre-wgpu", "dep:image"]
 
 [dependencies]
 anyhow.workspace = true
+# Attached images are stored base64 in the messages; the thread view decodes them for thumbnails.
+base64.workspace = true
 chrono = { workspace = true, features = ["clock"] }
 dirs.workspace = true
 # The application layer (docs/native-ui/README.md, "Architecture"): the app's models call it, views never.
 hermes_core.workspace = true
+# The stored messages' types (a user message's attached images), read by the model's backend only.
+hermes_llm.workspace = true
 hermes_runtime.workspace = true
 hermes_store.workspace = true
 # Pinned exactly (AGENTS.md ground rule 3, the GPUI Kit exception); vendor/SOURCES.md records it.
@@ -52,6 +56,8 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 hermes_testdir.workspace = true
 gpui-kit = { version = "=0.10.0", features = ["syntect", "test-support"] }
+# The mock provider of the recorded thread fixture (`thread/recording.rs`), as hermes_core's tests.
+wiremock = "0.6"
 
 [lints]
 workspace = true

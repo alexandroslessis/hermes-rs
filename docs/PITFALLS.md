@@ -290,6 +290,29 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **GPUI's text ellipsis in a flex row truncates early and leaves a gap** (`MiddleTruncate`'s
   head is cut even when the whole string would fit). Thread titles are end-truncated in one text
   box, as t3code's are; `MiddleTruncate` stays for paths and branches.
+- **Mouse selection does not work under `headless_app()`.** With the real DirectWrite text system in a
+  `HeadlessAppContext`, a pointer drag over a Kit `TextView` selects nothing (focus moves, `Copy` finds
+  no text); the same drag under `#[gpui_kit::test]` (`TestAppContext`, fake text) selects. Selection
+  tests use the latter (`thread/tests.rs`).
+- **GPUI's `list` caches the height of rows it is not drawing.** Visible rows are laid out every frame,
+  rows above and below keep their last measured height: a row whose content changes (a streamed reply)
+  needs `remeasure_items(ix..ix + 1)` or the scroll anchor drifts. `ThreadModel` does it on every delta.
+- **`Runtime::messages` opens the session.** It starts the session's actor, and an open session counts
+  as live: the sidebar would show every thread looked at as working. The thread view reads history from
+  the store (`store().load_messages`).
+- **Kit's text view keeps its own copy of the source.** A streamed row holds only its `TextViewState`;
+  "copy message" reads the source back through Kit's doc-hidden `base::text::Text::get_text`.
+- **A Kit code block's actions sit in its top-right corner** (`code_block_actions`, absolutely placed):
+  the code is pushed down by the `code_block` style's top padding to make a header row; a language label
+  at the left would need a custom block renderer (losing Kit's selection in code).
+- **A link in a message is the model's text.** `cx.open_url` hands the URL to the Windows shell, which
+  runs whatever a scheme (`ms-msdt:`, `search-ms:`, `file:`) or a path names. `thread::markdown::link_action`
+  opens only `http(s):`/`mailto:` (and `www.`) in the browser, sends file paths to the right panel and
+  ignores the rest. Phase 6's file view must *show* a linked file, never run it.
+- **Win32 messages did not drive a GPUI window.** `SendMessage`/`PostMessage` of `WM_LBUTTONDOWN` or
+  `WM_KEYDOWN` (F12) to our own instance's `Zed::Window` showed no effect (CP4.1 review: no change in a
+  `PrintWindow` capture, no F12 dump written; why was not found). Real input (`SendInput`) moves the
+  user's own pointer and keyboard focus, so mouse checks (selection by drag) stay the user's.
 - **`Handle::block_on` for core calls** (`delete_session`, `move_session`) is fine from GPUI's
   background threads and panics inside a tokio worker; `CoreBackend` is only called from the former.
 

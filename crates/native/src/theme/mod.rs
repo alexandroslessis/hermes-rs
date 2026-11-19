@@ -175,8 +175,8 @@ fn bundled() -> &'static [ThemeDef] {
     })
 }
 
-/// The theme in use, as a global.
-struct Active(ThemeDef);
+/// The theme in use, as a global (set on every theme change: views that cache sizes observe it).
+pub(crate) struct Active(ThemeDef);
 
 impl Global for Active {}
 

@@ -23,9 +23,10 @@ use gpui_kit::{
 use crate::{
     design::{AppAssets, Appearance},
     keymap,
-    model::{AppModel, CoreBackend},
+    model::{AppModel, CoreBackend, FixtureBackend, fixture},
     palette, sidebar,
     theme::{self, DesignTheme as _, Themes},
+    thread::recording::Recording,
     ui_state::{MIN_WINDOW, UiState},
     workspace::{Workspace, restore_window},
 };
@@ -41,6 +42,14 @@ pub struct Options {
     pub dump: Option<std::path::PathBuf>,
     /// `--fixture`: fake projects and threads, no core, no lock (tests, screenshots, a look).
     pub fixture: bool,
+    /// `--dev`: a dev-only strip under the open thread sends a prompt (until Phase 5's composer).
+    /// With `--fixture` a sent prompt replays the recorded turn
+    /// (`crates/native/fixtures/thread-session.json`).
+    pub dev: bool,
+    /// `--dev-provider <url>`: the dev strip's prompts go to this OpenAI-compatible endpoint (a
+    /// mock provider such as `scripts/perf/mock_llm.py`'s `http://127.0.0.1:47900/v1`) instead of
+    /// the thread's own provider.
+    pub dev_provider: Option<String>,
 }
 
 fn appearance_of(window: WindowAppearance) -> Appearance {
@@ -152,14 +161,29 @@ pub fn run(options: Options) {
                     theme::apply(&def, cx);
 
                     let model = if options.fixture {
-                        cx.new(AppModel::fixture)
+                        let snapshot = fixture::snapshot();
+                        let backend = FixtureBackend::new(snapshot.clone());
+                        if options.dev {
+                            backend.replay_on_submit(Recording::fixture());
+                        }
+                        cx.new(|cx| {
+                            AppModel::with_snapshot(backend, snapshot, cx)
+                                .with_clock(|| fixture::NOW_MS)
+                        })
                     } else {
                         let model = cx.new(|_| AppModel::starting());
-                        start_core(model.clone(), handle.clone(), cx);
+                        start_core(
+                            model.clone(),
+                            handle.clone(),
+                            options.dev_provider.clone(),
+                            cx,
+                        );
                         model
                     };
-                    let workspace =
-                        cx.new(|cx| Workspace::with_model(state, data_dir, model, window, cx));
+                    let dev = options.dev;
+                    let workspace = cx.new(|cx| {
+                        Workspace::with_model(state, data_dir, model, window, cx).with_dev(dev)
+                    });
                     workspace.update(cx, |w, cx| w.focus(window, cx));
                     // Follow the system's light and dark while no theme was picked.
                     let follow = workspace.clone();
@@ -209,7 +233,12 @@ pub fn run(options: Options) {
 }
 
 /// Builds the core off the main thread and gives it to the model.
-fn start_core(model: gpui_kit::Entity<AppModel>, handle: tokio::runtime::Handle, cx: &mut App) {
+fn start_core(
+    model: gpui_kit::Entity<AppModel>,
+    handle: tokio::runtime::Handle,
+    dev_provider: Option<String>,
+    cx: &mut App,
+) {
     cx.spawn(async move |cx| {
         let built = cx
             .background_spawn(async move {
@@ -220,7 +249,10 @@ fn start_core(model: gpui_kit::Entity<AppModel>, handle: tokio::runtime::Handle,
             })
             .await;
         let _ = model.update(cx, |model, cx| match built {
-            Ok(core) => model.connect(Arc::new(CoreBackend::new(core)), cx),
+            Ok(core) => model.connect(
+                Arc::new(CoreBackend::new(core).with_dev_provider(dev_provider)),
+                cx,
+            ),
             Err(error) => model.fail(format!("{error:#}"), cx),
         });
     })

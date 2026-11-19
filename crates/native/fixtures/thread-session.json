@@ -1,0 +1,87 @@
+{
+  "prompt": "Read notes.md and sketch the fix, with a table of the timings.",
+  "events": [
+    {
+      "kind": "turn_started"
+    },
+    {
+      "kind": "reasoning",
+      "text": "The user wants "
+    },
+    {
+      "kind": "reasoning",
+      "text": "the notes first, "
+    },
+    {
+      "kind": "reasoning",
+      "text": "then a fix."
+    },
+    {
+      "kind": "text",
+      "text": "Let me read "
+    },
+    {
+      "kind": "text",
+      "text": "the notes."
+    },
+    {
+      "kind": "tool_started",
+      "tool": "t0",
+      "name": "read_file",
+      "args": {
+        "path": "notes.md"
+      }
+    },
+    {
+      "kind": "tool_completed",
+      "tool": "t0",
+      "name": "read_file",
+      "text": "{\"content\":\"1|# Notes\\n2|\\n3|Streaming re-parses the whole message on every delta.\",\"total_lines\":3,\"file_size\":63}"
+    },
+    {
+      "kind": "text",
+      "text": "Here is what **notes.md** says, "
+    },
+    {
+      "kind": "text",
+      "text": "with a sketch of the fix.\n\n"
+    },
+    {
+      "kind": "text",
+      "text": "> [!NOTE]\n> The parser keeps the last block open while text streams in.\n\n"
+    },
+    {
+      "kind": "text",
+      "text": "```python\ndef primes_up_to(n: int) -> list[int]:\n    sieve = bytearray([1]) * (n + 1)\n"
+    },
+    {
+      "kind": "text",
+      "text": "    sieve[0:2] = b\"\\x00\\x00\"\n    for i in range(2, int(n**0.5) + 1):\n        if sieve[i]:\n            sieve[i * i :: i] = b\"\\x00\" * len(sieve[i * i :: i])\n    return [i for i, p in enumerate(sieve) if p]\n```\n\n"
+    },
+    {
+      "kind": "text",
+      "text": "| Step | Before | After |\n|---|---|---|\n| parse | 41 ms | 3 ms |\n"
+    },
+    {
+      "kind": "text",
+      "text": "| layout | 12 ms | 11 ms |\n\n"
+    },
+    {
+      "kind": "text",
+      "text": "See [src/stream.rs](src/stream.rs#L42) for where deltas land, and [the plan](https://example.com/plan).\n\n"
+    },
+    {
+      "kind": "text",
+      "text": "- keep the tail open\n- reparse only the last block\n"
+    },
+    {
+      "kind": "turn_ended",
+      "outcome": "complete",
+      "error": null,
+      "text": "Let me read the notes.Here is what **notes.md** says, with a sketch of the fix.\n\n> [!NOTE]\n> The parser keeps the last block open while text streams in.\n\n```python\ndef primes_up_to(n: int) -> list[int]:\n    sieve = bytearray([1]) * (n + 1)\n    sieve[0:2] = b\"\\x00\\x00\"\n    for i in range(2, int(n**0.5) + 1):\n        if sieve[i]:\n            sieve[i * i :: i] = b\"\\x00\" * len(sieve[i * i :: i])\n    return [i for i, p in enumerate(sieve) if p]\n```\n\n| Step | Before | After |\n|---|---|---|\n| parse | 41 ms | 3 ms |\n| layout | 12 ms | 11 ms |\n\nSee [src/stream.rs](src/stream.rs#L42) for where deltas land, and [the plan](https://example.com/plan).\n\n- keep the tail open\n- reparse only the last block\n"
+    },
+    {
+      "kind": "idle"
+    }
+  ]
+}

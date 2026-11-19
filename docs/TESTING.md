@@ -426,6 +426,21 @@ data, seed a synthetic folder (empty, under `target\native-test`):
 seed_synthetic -- --ignored --nocapture` (three projects, 50 threads with emoji / newline / long / untitled titles, pins,
 archives, no-project ones), then `$env:HERMES_RS_HOME` to that folder.
 
+**The thread view (CP4.1).** `thread/tests.rs` opens a `ThreadView` over a `FixtureBackend` (histories
+from `model/fixture.rs`, any length with `fixture::long_history(n)`) in a headless window and feeds the
+model `CoreEvent`s directly (`ThreadModel::on_event`, or `on_event_at` with a time): layout (bubble and
+reply against the content lane, the code block's header), the virtual list (painted `row:<key>` elements
+of a 2,000-row thread), older pages through real wheel events (`ScrollEvent` on `timeline`), pinning and
+the `jump-to-latest` button, the parse counter (`markdown::probe`: paragraphs containing `PARSEPROBE`),
+copy buttons, the dev prompt, the workspace wiring, a timing printed as `stream-20: ... stream-2000: ...`
+(`cargo test -p hermes-native --lib two_thousand -- --nocapture`). Mouse selection is tested under
+`#[gpui_kit::test]` (`TestAppContext`): under `headless_app()` a drag selects nothing (PITFALLS). A real
+turn is kept in `crates/native/fixtures/thread-session.json`: `the_recorded_session_is_what_the_real_core_sends`
+runs a real `Core` against a `wiremock` provider and fails when the core's events change;
+`UPDATE_FIXTURES=1` rewrites the file. The gallery's `thread` and `thread-live` stories replay it. To try a
+turn by hand: `hermes-native --fixture --dev` (the strip under the thread replays the recording), or the real
+core on a synthetic folder with `--dev --dev-provider http://127.0.0.1:47900/v1` and `scripts/perf/mock_llm.py`.
+
 **The gallery** (`hermes-native-gallery.exe`, `cargo run -p hermes-native --bin
 hermes-native-gallery`): every story in every state, with t3code's default / GPUI Kit / Zed One and
 light / dark switches, for a person to judge hover, press and focus by hand (the user's checklist).

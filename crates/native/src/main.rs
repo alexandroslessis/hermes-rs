@@ -7,6 +7,9 @@
 //! - `--theme <name>`: wear that theme (`"Default Dark"`, `"One Light"`, a user file's) instead of
 //!   the remembered one.
 //! - `--fixture`: fake projects and threads, no core and no app lock (for looking and testing).
+//! - `--dev` (DEV ONLY, until Phase 5's composer): a strip under the open thread sends a prompt;
+//!   with `--fixture` it replays the recorded turn. `--dev-provider <url>` sends the prompts to a
+//!   mock OpenAI-compatible endpoint (`scripts/perf/mock_llm.py`: `http://127.0.0.1:47900/v1`).
 //! - `--quit-after <seconds>`, `--dump <file>` (with `--features dev`): as below.
 //!
 //! Flags of `--spike` (for measuring, CP0.1 step 4):
@@ -66,6 +69,12 @@ fn main() {
             theme,
             dump,
             fixture: args.iter().any(|a| a == "--fixture"),
+            dev: args.iter().any(|a| a == "--dev"),
+            dev_provider: args
+                .iter()
+                .position(|a| a == "--dev-provider")
+                .and_then(|ix| args.get(ix + 1))
+                .cloned(),
         });
         return;
     }

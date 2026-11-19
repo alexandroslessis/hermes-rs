@@ -32,8 +32,8 @@ its row if it is wrong.
 | `app-terminal-open.png` | Terminal drawer open |
 | `app-sidebar_closeup-dark.png` | Sidebar close-up |
 | `app-sidebar_collapsed.png` | Sidebar collapsed |
-| `app-codeblock_closeup-dark.png` | Code block close-up |
-| `app-hover_reply_closeup-dark.png` | Message hover actions (reply) close-up |
+| `app-codeblock_closeup-dark.png` | Corrected by CP4.1: "Worked for 1.9s", two Python code blocks (language icon left, wrap and copy right), inline code between them |
+| `app-hover_reply_closeup-dark.png` | Corrected by CP4.1: the hover footer under a reply: copy, branch and reply icons, then the time (`6:25 PM`) |
 | `sidebar.png` | Sidebar |
 | `sidebar-right.png` | Right sidebar / panel |
 | `sidebar-diff.png`, `sidebar-diff-content.png` | Diff panel and its content |
@@ -50,6 +50,10 @@ CP2.2 took no new screenshot: t3code was not running and nothing available to th
 drive its window (no input automation), so the light theme, tooltip, toast, badge, kbd, palette
 and empty-state were built from `index.css` and the source named in each module header; the visual
 check should say what differs.
+
+CP4.1 took no new screenshot either (same reason: no input automation for t3code's window was
+available to the implementer): the light thread, alerts, tables, a user message with attachments and the
+reasoning row follow `ChatMarkdown.tsx`, `TimelineUserMessageRow.tsx` and `TimelineWorkEntryRow.tsx`.
 
 ## Not covered yet (take them when the checkpoint needs them)
 

@@ -16,8 +16,10 @@
 //!
 //! The sidebar is the real one since Phase 3 ([`crate::sidebar`], over the app model
 //! [`crate::model::AppModel`]); the main area shows the empty states of the sidebar's world (no
-//! project yet, no open thread) or a placeholder for the open thread (the thread view is Phase 4),
-//! the panel and the drawer are placeholders for Phase 6.
+//! project yet, no open thread) or the open thread ([`crate::thread::ThreadView`], Phase 4); the
+//! panel and the drawer are placeholders for Phase 6. A file link in a message
+//! ([`crate::thread::OpenFileInPanel`]) opens the right panel, which says which file it will show
+//! once Phase 6 builds its file view.
 //!
 //! t3code: `apps/web/src/components/AppSidebarLayout.tsx` (the frame, the sidebar width limits:
 //! `threadSidebarWidth.ts`), `components/ui/sidebar.tsx` (`Sidebar`, `SidebarRail`: the drag
@@ -54,6 +56,7 @@ use crate::{
     palette::{self, Item, Kind, Mode, Palette, PaletteEvent},
     sidebar::{Sidebar, SidebarEvent, data::Snapshot, empty},
     theme::{self, DesignTheme as _, Themes},
+    thread::{OpenFileInPanel, ThreadView},
     titlebar::{self, TitleBar},
     ui_state::{self, MIN_WINDOW, UiState},
 };
@@ -220,6 +223,12 @@ pub struct Workspace {
     sidebar: Entity<Sidebar>,
     /// The thread a toast's action opens.
     toast_threads: HashMap<ToastId, String>,
+    /// The open thread's view (made when the model opens a thread).
+    thread_view: Option<Entity<ThreadView>>,
+    /// `--dev`: the thread view gets the dev-only prompt strip.
+    dev: bool,
+    /// The file a link asked the right panel to open (its view is Phase 6).
+    panel_file: Option<OpenFileInPanel>,
     _bounds: Subscription,
     _subscriptions: Vec<Subscription>,
 }
@@ -254,8 +263,11 @@ impl Workspace {
         let subscriptions = vec![
             cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
             cx.subscribe(&model, Self::on_model_event),
-            // The palette's list and the title follow the model.
-            cx.observe(&model, |_, _, cx| cx.notify()),
+            // The palette's list, the title and the open thread follow the model.
+            cx.observe_in(&model, window, |this, _, window, cx| {
+                this.sync_thread_view(window, cx);
+                cx.notify();
+            }),
         ];
         Self {
             state,
@@ -271,9 +283,60 @@ impl Workspace {
             model,
             sidebar,
             toast_threads: HashMap::new(),
+            thread_view: None,
+            dev: false,
+            panel_file: None,
             _bounds: bounds,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// With the dev-only prompt strip under an open thread (`hermes-native --dev`).
+    pub fn with_dev(mut self, dev: bool) -> Self {
+        self.dev = dev;
+        self
+    }
+
+    /// The open thread's view.
+    pub fn thread_view(&self) -> Option<&Entity<ThreadView>> {
+        self.thread_view.as_ref()
+    }
+
+    /// The file the right panel was asked to open.
+    pub fn panel_file(&self) -> Option<&OpenFileInPanel> {
+        self.panel_file.as_ref()
+    }
+
+    /// Makes the view of the model's open thread, or drops it when none is open.
+    fn sync_thread_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let thread = self.model.read(cx).thread().cloned();
+        let current = self
+            .thread_view
+            .as_ref()
+            .map(|v| v.read(cx).model().clone());
+        if thread == current {
+            return;
+        }
+        let dev = self.dev;
+        self.thread_view =
+            thread.map(|thread| cx.new(|cx| ThreadView::new(thread, dev, window, cx)));
+    }
+
+    /// A file link was clicked: the right panel opens and will show it (Phase 6).
+    pub fn open_file_in_panel(&mut self, file: &OpenFileInPanel, cx: &mut Context<Self>) {
+        self.panel_file = Some(file.clone());
+        if !self.state.right_panel.open {
+            self.state.right_panel.open = true;
+            self.changed(cx);
+        }
+        self.push_toast(
+            ToastSpec::new(toast::Kind::Info, "Open file").description(format!(
+                "{}: the file view arrives in Phase 6.",
+                file.label()
+            )),
+            cx,
+        );
+        cx.notify();
     }
 
     /// The app model (projects, threads, the open one).
@@ -747,25 +810,25 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// What the main area is about: the sidebar's empty states, or (until Phase 4) a placeholder
-    /// for the thread that is open.
+    /// What the main area is about: the sidebar's empty states, or the open thread.
     fn main_area(&self, cx: &mut Context<Self>) -> AnyElement {
         let palette = cx.design_theme().palette;
         let model = self.model.read(cx);
         let snapshot = model.snapshot();
         let starting = matches!(model.phase(), crate::model::Phase::Starting);
         let body: AnyElement = match model.selected() {
-            Selection::Thread(id) => {
-                let thread = snapshot.thread(id);
-                EmptyState::new(
-                    "empty",
-                    thread.map_or("Thread".to_string(), |t| t.display_title().to_string()),
-                )
-                .icon(IconName::MessageSquare)
-                .description("The thread view arrives in Phase 4.")
-                .size(crate::design::empty_state::Size::Hero)
-                .into_any_element()
-            }
+            Selection::Thread(_) => match &self.thread_view {
+                Some(view) => div()
+                    .id("thread-slot")
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(view.clone())
+                    .into_any_element(),
+                // The model opens it; the view follows on the next notification.
+                None => div().into_any_element(),
+            },
             Selection::Draft(project) => {
                 let name = snapshot
                     .project(project)
@@ -891,10 +954,20 @@ impl Render for Workspace {
                         .child(
                             div()
                                 .id("right-body")
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.))
                                 .p(px(12.))
                                 .text_size(text::SM.size)
                                 .text_color(palette.muted_foreground.hsla())
-                                .child("Diff, files and terminal tabs arrive in Phase 6."),
+                                .child("Diff, files and terminal tabs arrive in Phase 6.")
+                                .children(self.panel_file.as_ref().map(|file| {
+                                    div()
+                                        .id("panel-file")
+                                        .text_color(palette.foreground.hsla())
+                                        .child(format!("File to open: {}", file.label()))
+                                        .probe()
+                                })),
                         ),
                 )
         });
@@ -1020,6 +1093,11 @@ impl Render for Workspace {
                 this.run_command("settings.open", window, cx)
             }))
             .on_action(cx.listener(|this, _: &CycleTheme, _, cx| this.cycle_theme(cx)))
+            .on_action(
+                cx.listener(|this, file: &OpenFileInPanel, _, cx| {
+                    this.open_file_in_panel(file, cx)
+                }),
+            )
             .on_action(cx.listener(|_, _: &FocusNextRegion, window, cx| window.focus_next(cx)))
             .on_action(cx.listener(|_, _: &FocusPreviousRegion, window, cx| window.focus_prev(cx)))
             .on_drag_move(

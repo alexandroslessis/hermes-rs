@@ -19,6 +19,7 @@ pub mod spike;
 #[cfg(any(test, feature = "dev"))]
 pub mod testing;
 pub mod theme;
+pub mod thread;
 pub mod titlebar;
 pub mod ui_state;
 pub mod workspace;

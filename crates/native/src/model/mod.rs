@@ -26,16 +26,22 @@
 //! Start-up: [`AppModel::starting`] is an empty model that shows nothing yet;
 //! [`AppModel::connect`] gives it its backend (the app builds the `Core` on a background thread
 //! and calls it when ready, so the window opens at once).
+//!
+//! The open thread (Phase 4): opening a thread makes its [`ThreadModel`] (its history is read a
+//! page at a time from the backend), and the core's events for that thread are handed to it
+//! before the model looks at them itself. One thread model at a time: a thread that is not open
+//! keeps streaming in the core and shows what it stored when it is opened.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-use gpui_kit::{AppContext as _, Context, EventEmitter, Task};
+use gpui_kit::{AppContext as _, Context, Entity, EventEmitter, Task};
 use hermes_core::CoreEvent;
 use hermes_runtime::TurnStatus;
 
 use crate::design::toast::{Kind, ToastSpec};
 use crate::sidebar::data::{Marks, Op, Snapshot};
+use crate::thread::ThreadModel;
 
 pub mod backend;
 pub mod fixture;
@@ -95,6 +101,10 @@ pub struct AppModel {
     /// A list was read (or given) at least once.
     loaded: bool,
     events_task: Option<Task<()>>,
+    /// The open thread's model.
+    thread: Option<Entity<ThreadModel>>,
+    /// The clock the open thread's durations use.
+    thread_clock: Option<fn() -> i64>,
 }
 
 impl EventEmitter<ModelEvent> for AppModel {}
@@ -122,6 +132,8 @@ impl AppModel {
             queue: VecDeque::new(),
             loaded: false,
             events_task: None,
+            thread: None,
+            thread_clock: None,
         }
     }
 
@@ -274,6 +286,43 @@ impl AppModel {
         }
     }
 
+    /// The open thread's model (once [`Self::open`] made it).
+    pub fn thread(&self) -> Option<&Entity<ThreadModel>> {
+        self.thread.as_ref()
+    }
+
+    /// The clock the open thread's durations use (fixtures: a fixed one).
+    pub fn with_thread_clock(mut self, clock: fn() -> i64) -> Self {
+        self.thread_clock = Some(clock);
+        self
+    }
+
+    /// Makes the open thread's model if it is not the selection's yet, or drops it when nothing
+    /// is open.
+    fn sync_thread(&mut self, cx: &mut Context<Self>) {
+        let wanted = self.open_thread().map(str::to_string);
+        let current = self
+            .thread
+            .as_ref()
+            .map(|t| t.read(cx).session().to_string());
+        if wanted == current {
+            return;
+        }
+        self.thread = match (wanted, self.backend.clone()) {
+            (Some(id), Some(backend)) => {
+                let clock = self.thread_clock;
+                Some(cx.new(|cx| {
+                    let model = ThreadModel::new(&id, backend, cx);
+                    match clock {
+                        Some(clock) => model.with_clock(clock),
+                        None => model,
+                    }
+                }))
+            }
+            _ => None,
+        };
+    }
+
     /// The project the main area is about: the open thread's, or the draft's.
     pub fn current_project(&self) -> Option<&str> {
         match &self.selected {
@@ -292,18 +341,21 @@ impl AppModel {
         }
         self.unread.remove(id);
         self.selected = Selection::Thread(id.to_string());
+        self.sync_thread(cx);
         cx.notify();
     }
 
     /// Starts a new thread in a project (a draft: nothing is stored until it is sent).
     pub fn new_thread(&mut self, project: &str, cx: &mut Context<Self>) {
         self.selected = Selection::Draft(project.to_string());
+        self.sync_thread(cx);
         cx.notify();
     }
 
     /// Closes whatever is open.
     pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.selected = Selection::None;
+        self.sync_thread(cx);
         cx.notify();
     }
 
@@ -366,6 +418,7 @@ impl AppModel {
             && snapshot.thread(id).is_none()
         {
             self.selected = Selection::None;
+            self.sync_thread(cx);
         }
         let ids: HashSet<&str> = snapshot.threads.iter().map(|t| t.id.as_str()).collect();
         self.unread.retain(|id| ids.contains(id.as_str()));
@@ -393,6 +446,7 @@ impl AppModel {
             && self.selected == Selection::Thread(id.clone())
         {
             self.selected = Selection::None;
+            self.sync_thread(cx);
         }
         cx.notify();
         if self.backend.is_none() {
@@ -473,8 +527,14 @@ impl AppModel {
         }
     }
 
-    /// Takes in one core event (the channel's task calls it; tests call it directly).
+    /// Takes in one core event (the channel's task calls it; tests call it directly). The open
+    /// thread sees its own events first.
     pub fn on_event(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
+        if let Some(thread) = &self.thread
+            && thread.read(cx).session() == event.session_id()
+        {
+            thread.update(cx, |thread, cx| thread.on_event(&event, cx));
+        }
         match event {
             CoreEvent::TurnStarted { session_id, .. } => {
                 self.failed.remove(&session_id);

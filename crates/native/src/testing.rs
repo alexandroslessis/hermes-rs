@@ -182,12 +182,12 @@ impl Checks<'_> {
             .entries
             .iter()
             .filter(|e| e.path.len() > entry.path.len() && e.path.starts_with(&entry.path))
-            // The rows of a scrolling list (an element called `threads`) are clipped by it, not
-            // overflowing: only the list itself has to fit.
+            // The rows of a scrolling list (the sidebar's `threads`, the thread view's
+            // `timeline-list`) are clipped by it, not overflowing: only the list has to fit.
             .filter(|e| {
                 !e.path[entry.path.len()..e.path.len() - 1]
                     .iter()
-                    .any(|s| s == "threads")
+                    .any(|s| s == "threads" || s == "timeline-list")
             })
             .cloned()
             .collect();

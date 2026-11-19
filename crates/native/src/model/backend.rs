@@ -14,24 +14,34 @@
 //! core's own tokio handle with `block_on`, which is allowed from a thread that is not a tokio
 //! worker, as the background executor's threads are not.
 //!
+//! The thread view (CP4.1) reads a thread's history a page at a time ([`Backend::history`]: the
+//! stored messages through `hermes_core::transcript::entries`, read from the store, so opening a
+//! thread does not wake its session in the runtime) and, in a `--dev` build of the app only, sends
+//! a prompt ([`Backend::submit`]: `Core::submit`; the composer is Phase 5).
+//!
 //! Hermes: none (the sidebar's data is the page's `projects.tree` and `session.list` in
-//! `crates/desktop`, built from the same core calls).
+//! `crates/desktop`, built from the same core calls; the history is what `session.resume` reads).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use hermes_core::{
-    Core, CoreEvent,
+    Core, CoreEvent, NoHooks, SubmitTurn,
     archive::Filter,
     projects::{self, NodeKind, ProjectEdit, TreeRow},
     workspace::MoveError,
 };
+use hermes_llm::conversation::message::{Message, MessageContent};
+use hermes_runtime::ProviderConfig;
 use hermes_store::Project;
 use tokio::sync::mpsc;
 
 use crate::sidebar::data::{
     NO_PROJECT, NO_PROJECT_LABEL, Op, ProjectItem, ProjectKind, Snapshot, ThreadItem,
 };
+use crate::thread::data::{Attachment, HistoryItem, HistoryPage, items_from_entries, page};
+use crate::thread::recording::Recording;
 
 /// The sidebar's view of the backend. Methods block; see the module docs.
 pub trait Backend: Send + Sync + 'static {
@@ -43,6 +53,65 @@ pub trait Backend: Send + Sync + 'static {
     fn events(&self) -> Option<mpsc::UnboundedReceiver<CoreEvent>> {
         None
     }
+    /// A page of a thread's history: at most `limit` items ending before item `before` (the
+    /// newest when `None`).
+    fn history(
+        &self,
+        _session: &str,
+        _before: Option<usize>,
+        _limit: usize,
+    ) -> Result<HistoryPage, String> {
+        Ok(HistoryPage::default())
+    }
+    /// Sends a prompt in a thread (the dev-only input until Phase 5's composer). The turn's
+    /// events arrive through [`Backend::events`].
+    fn submit(&self, _session: &str, _text: &str) -> Result<(), String> {
+        Err("Sending a prompt is not available here.".to_string())
+    }
+}
+
+/// The images attached to a stored message, decoded (an image whose data does not decode is
+/// left out: a thumbnail of nothing helps no one).
+pub fn images_of(message: Option<&Message>) -> Vec<Attachment> {
+    use base64::Engine as _;
+    let Some(message) = message else {
+        return Vec::new();
+    };
+    message
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            MessageContent::Image(image) => base64::engine::general_purpose::STANDARD
+                .decode(image.data.as_bytes())
+                .ok()
+                .map(|bytes| (image.mime_type.clone(), bytes)),
+            _ => None,
+        })
+        .enumerate()
+        .map(|(ix, (mime, bytes))| Attachment {
+            name: format!("image {}", ix + 1),
+            mime,
+            bytes: Arc::new(bytes),
+        })
+        .collect()
+}
+
+/// A page of a thread's history (as [`page`]) from its stored messages. Every message is turned
+/// into an item (the page's place depends on all of them: the store has no ranged read), but
+/// only the page's images are decoded.
+pub fn history_page(messages: &[Message], before: Option<usize>, limit: usize) -> HistoryPage {
+    let entries = hermes_core::transcript::entries(messages);
+    let total = items_from_entries(&entries, |_, _| Vec::new()).len();
+    let end = before.unwrap_or(total).min(total);
+    let wanted = end.saturating_sub(limit)..end;
+    let items = items_from_entries(&entries, |row, item| {
+        if wanted.contains(&item) {
+            images_of(row.checked_sub(1).and_then(|ix| messages.get(ix)))
+        } else {
+            Vec::new()
+        }
+    });
+    page(&items, before, limit)
 }
 
 /// One stored session as the project tree groups it.
@@ -106,11 +175,28 @@ pub fn build_snapshot(
 /// The real backend: a [`Core`].
 pub struct CoreBackend {
     core: Arc<Core>,
+    /// `--dev-provider <url>`: the dev-only input's prompts go to this OpenAI-compatible endpoint
+    /// (a mock provider) instead of the thread's configured one.
+    dev_provider: Option<ProviderConfig>,
 }
 
 impl CoreBackend {
     pub fn new(core: Arc<Core>) -> Self {
-        Self { core }
+        Self {
+            core,
+            dev_provider: None,
+        }
+    }
+
+    /// Sends the dev-only input's prompts to `base_url` (e.g. `scripts/perf/mock_llm.py`'s
+    /// `http://127.0.0.1:47900/v1`).
+    pub fn with_dev_provider(mut self, base_url: Option<String>) -> Self {
+        self.dev_provider = base_url.map(|base_url| ProviderConfig {
+            id: "dev-mock".into(),
+            base_url,
+            api_key: Some("mock".into()),
+        });
+        self
     }
 
     /// The folder a thread moves into when dropped on `project`: a user project's primary folder,
@@ -202,15 +288,63 @@ impl Backend for CoreBackend {
     fn events(&self) -> Option<mpsc::UnboundedReceiver<CoreEvent>> {
         Some(self.core.subscribe())
     }
+
+    fn history(
+        &self,
+        session: &str,
+        before: Option<usize>,
+        limit: usize,
+    ) -> Result<HistoryPage, String> {
+        // From the store, not `Runtime::messages`: that opens the session in the runtime, and an
+        // open session counts as live (the sidebar would show every thread looked at as working).
+        let messages = self
+            .core
+            .runtime()
+            .store()
+            .load_messages(session)
+            .map_err(|e| format!("{e:#}"))?;
+        Ok(history_page(&messages, before, limit))
+    }
+
+    fn submit(&self, session: &str, text: &str) -> Result<(), String> {
+        let core = &self.core;
+        let provider = match &self.dev_provider {
+            Some(provider) => Some(provider.clone()),
+            None => core
+                .session_provider(
+                    session,
+                    &hermes_core::providers::Settings::load(core.data_dir()),
+                )
+                .ok(),
+        };
+        let hooks = Arc::new(NoHooks {
+            provider,
+            options: core.turn_options(session),
+        });
+        let turn = SubmitTurn {
+            text: text.to_string(),
+            ..SubmitTurn::default()
+        };
+        core.submit(session, turn, hooks)
+            .map(|_| ())
+            .map_err(|e| e.message().to_string())
+    }
 }
 
 /// Fake data in memory. Edits change the list as the core's would and are recorded; a failure can
-/// be scripted; events are sent by hand.
+/// be scripted; events are sent by hand. Threads have the fixture's histories
+/// ([`super::fixture::history`]) unless given others; a prompt sent in one replays the recorded
+/// session (`--fixture --dev`) when a recording is set, else it is only recorded.
 pub struct FixtureBackend {
     state: Mutex<Snapshot>,
     log: Mutex<Vec<Op>>,
     failure: Mutex<Option<String>>,
     sender: Mutex<Option<mpsc::UnboundedSender<CoreEvent>>>,
+    histories: Mutex<HashMap<String, Arc<Vec<HistoryItem>>>>,
+    /// Pages asked for, as `(session, before)`.
+    pages: Mutex<Vec<(String, Option<usize>)>>,
+    sent: Mutex<Vec<(String, String)>>,
+    replay: Mutex<Option<Recording>>,
 }
 
 impl FixtureBackend {
@@ -220,7 +354,35 @@ impl FixtureBackend {
             log: Mutex::default(),
             failure: Mutex::default(),
             sender: Mutex::default(),
+            histories: Mutex::default(),
+            pages: Mutex::default(),
+            sent: Mutex::default(),
+            replay: Mutex::default(),
         })
+    }
+
+    /// Gives a thread this history.
+    pub fn set_history(&self, session: &str, items: Vec<HistoryItem>) {
+        self.histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session.to_string(), Arc::new(items));
+    }
+
+    /// The pages asked for so far, as `(session, before)`.
+    pub fn pages(&self) -> Vec<(String, Option<usize>)> {
+        self.pages.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The prompts sent so far, as `(session, text)`.
+    pub fn sent(&self) -> Vec<(String, String)> {
+        self.sent.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Makes a sent prompt replay `recording`'s events (one every `step`), as a mock provider's
+    /// turn would arrive.
+    pub fn replay_on_submit(&self, recording: Recording) {
+        *self.replay.lock().unwrap_or_else(|e| e.into_inner()) = Some(recording);
     }
 
     /// The edits received so far, in order.
@@ -275,5 +437,59 @@ impl Backend for FixtureBackend {
         let (sender, receiver) = mpsc::unbounded_channel();
         *self.sender.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
         Some(receiver)
+    }
+
+    fn history(
+        &self,
+        session: &str,
+        before: Option<usize>,
+        limit: usize,
+    ) -> Result<HistoryPage, String> {
+        self.pages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((session.to_string(), before));
+        let items = self
+            .histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(super::fixture::history(session)));
+        Ok(page(&items, before, limit))
+    }
+
+    fn submit(&self, session: &str, text: &str) -> Result<(), String> {
+        self.sent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((session.to_string(), text.to_string()));
+        if let Some(message) = &*self.failure.lock().unwrap_or_else(|e| e.into_inner()) {
+            return Err(message.clone());
+        }
+        let replay = self
+            .replay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let (Some(recording), Some(sender)) = (replay, sender) {
+            let session = session.to_string();
+            // A plain thread, as a provider's stream would arrive: the model drains the channel
+            // on its own task. Only `--fixture --dev` sets a replay.
+            std::thread::spawn(move || {
+                for event in recording.events_for(&session) {
+                    std::thread::sleep(crate::thread::recording::REPLAY_STEP);
+                    if sender.send(event).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        Ok(())
     }
 }

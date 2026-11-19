@@ -39,7 +39,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 1 | `hermes_core`: the backend's application layer, extracted from `crates/desktop` — ✅ 2026-11-18 | L | — |
 | 2 | Design system and app frame: themes, tokens, design layer, window, palette, keymap — ✅ 2026-11-19 | M–L | 0 |
 | 3 | Sidebar: projects and threads — ✅ 2026-11-19 | M | 1 (CP1.1), 2 |
-| 4 | Thread view: timeline, markdown, tool calls, streaming | L | 3 |
+| 4 | Thread view: timeline, markdown, tool calls, streaming — CP4.1 built | L | 3 |
 | 5 | Composer: input, mentions, commands, attachments, model, approvals, questions | L | 4 |
 | 6 | Right panel: diff, files, terminal | L | 1, 4 |
 | 7 | Hermes screens: settings, memory, skills, staging, usage, import | L | 1, 2 |
@@ -393,6 +393,8 @@ row state.
    bottom pinning with a "jump to latest" button when the user scrolled up.
 4. Reasoning blocks collapsed by default with their duration.
 5. Selection inside messages and code; copy message (as markdown); copy code.
+
+**Status (CP4.1, 2026-11-19):** built and reviewed (Opus); mouse selection in a real window awaits the user's check. `crates/native/src/thread/`; details, measurements and doubts in `progress/phase-4.md`.
 
 ### CP4.2 — Tool calls and the work log (M)
 
