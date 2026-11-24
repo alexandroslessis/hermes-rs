@@ -11,6 +11,7 @@
 mod button;
 mod design;
 mod frame;
+mod header;
 mod sidebar;
 #[cfg(all(test, feature = "snapshots"))]
 mod snapshots;
@@ -136,6 +137,7 @@ register_stories![
     thread::TOOLS_AGENT,
     thread::TOOLS_GROUP,
     thread::TOOLS_FOOTER,
+    header::THREAD_HEADER,
 ];
 
 /// One story in one state, on the theme's background: the root view of a snapshot window, and

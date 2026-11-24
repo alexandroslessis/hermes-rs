@@ -50,6 +50,9 @@ pub struct Options {
     /// mock provider such as `scripts/perf/mock_llm.py`'s `http://127.0.0.1:47900/v1`) instead of
     /// the thread's own provider.
     pub dev_provider: Option<String>,
+    /// `--dev-send <prompt>` (with `--dev`): open the first thread, send the prompt, print the
+    /// streamed and the stored reply, quit ([`crate::dev_send`]: the Phase 4 live check).
+    pub dev_send: Option<String>,
 }
 
 fn appearance_of(window: WindowAppearance) -> Appearance {
@@ -112,6 +115,7 @@ pub fn run(options: Options) {
             keymap::bind(cx);
             palette::bind(cx);
             sidebar::keys::bind(cx);
+            crate::thread::header::bind(cx);
 
             let state = data_dir.as_deref().map(UiState::load).unwrap_or_default();
 
@@ -138,6 +142,8 @@ pub fn run(options: Options) {
             let displays: Vec<Bounds<Pixels>> = cx.displays().iter().map(|d| d.bounds()).collect();
             let bounds = restore_window(&state.window, &displays);
             let wanted_theme = options.theme.clone().or_else(|| state.theme.clone());
+            let (dev_send, send_dump) = (options.dev_send.clone(), options.dump.clone());
+            let driven = options.dev && options.dev_send.is_some();
             let opened = gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(bounds),
@@ -181,6 +187,15 @@ pub fn run(options: Options) {
                         model
                     };
                     let dev = options.dev;
+                    if let Some(prompt) = dev_send.clone().filter(|_| dev) {
+                        crate::dev_send::start(
+                            model.clone(),
+                            window.window_handle(),
+                            prompt,
+                            send_dump.clone(),
+                            cx,
+                        );
+                    }
                     let workspace = cx.new(|cx| {
                         Workspace::with_model(state, data_dir, model, window, cx).with_dev(dev)
                     });
@@ -211,7 +226,11 @@ pub fn run(options: Options) {
                 },
             );
             match opened {
-                Ok((window, _)) => crate::dev::start_dump(options.dump.clone(), window, cx),
+                // With `--dev-send` the dump is written when its turn has ended.
+                Ok((window, _)) if !driven => {
+                    crate::dev::start_dump(options.dump.clone(), window, cx)
+                }
+                Ok(_) => {}
                 Err(error) => {
                     eprintln!("could not open the window: {error:#}");
                     cx.quit();

@@ -56,7 +56,7 @@ use crate::{
     palette::{self, Item, Kind, Mode, Palette, PaletteEvent},
     sidebar::{Sidebar, SidebarEvent, data::Snapshot, empty},
     theme::{self, DesignTheme as _, Themes},
-    thread::{OpenDiffTab, OpenFileInPanel, OpenScreen, ThreadView},
+    thread::{HeaderEvent, OpenDiffTab, OpenFileInPanel, OpenScreen, ThreadHeader, ThreadView},
     titlebar::{self, TitleBar},
     ui_state::{self, MIN_WINDOW, UiState},
 };
@@ -67,6 +67,10 @@ pub const MAIN_MIN_WIDTH: f32 = 320.;
 pub const MAIN_MIN_HEIGHT: f32 = 160.;
 /// How wide the invisible band that grabs a border is.
 pub const HANDLE: f32 = 6.;
+/// The title bar's right-hand toggles: two 28 px buttons, a 4 px gap and 8 px of padding.
+const TOGGLES_WIDTH: f32 = 68.;
+/// The title bar's left block while the sidebar is collapsed: padding, toggle, gap, "Hermes".
+const BRAND_BLOCK: f32 = 100.;
 
 /// The sizes of the regions for one window size.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -225,6 +229,9 @@ pub struct Workspace {
     toast_threads: HashMap<ToastId, String>,
     /// The open thread's view (made when the model opens a thread).
     thread_view: Option<Entity<ThreadView>>,
+    /// The open thread's header, in the title bar (made and dropped with the view).
+    thread_header: Option<Entity<ThreadHeader>>,
+    header_subscription: Option<Subscription>,
     /// `--dev`: the thread view gets the dev-only prompt strip.
     dev: bool,
     /// The file a link asked the right panel to open (its view is Phase 6).
@@ -284,6 +291,8 @@ impl Workspace {
             sidebar,
             toast_threads: HashMap::new(),
             thread_view: None,
+            thread_header: None,
+            header_subscription: None,
             dev: false,
             panel_file: None,
             _bounds: bounds,
@@ -318,8 +327,30 @@ impl Workspace {
             return;
         }
         let dev = self.dev;
-        self.thread_view =
-            thread.map(|thread| cx.new(|cx| ThreadView::new(thread, dev, window, cx)));
+        self.thread_view = thread
+            .clone()
+            .map(|thread| cx.new(|cx| ThreadView::new(thread, dev, window, cx)));
+        // The header is the title bar's middle while a thread is open.
+        let app = self.model.clone();
+        self.thread_header =
+            thread.map(|thread| cx.new(|cx| ThreadHeader::new(app, thread, window, cx)));
+        self.header_subscription = self.thread_header.as_ref().map(|header| {
+            cx.subscribe_in(
+                header,
+                window,
+                |this, _, event: &HeaderEvent, window, cx| match event {
+                    HeaderEvent::Notice(spec) => {
+                        this.push_toast(spec.clone(), cx);
+                    }
+                    HeaderEvent::RenameEnded => this.focus(window, cx),
+                },
+            )
+        });
+    }
+
+    /// The open thread's header.
+    pub fn thread_header(&self) -> Option<&Entity<ThreadHeader>> {
+        self.thread_header.as_ref()
     }
 
     /// A file link was clicked: the right panel opens and will show it (Phase 6).
@@ -796,7 +827,7 @@ impl Workspace {
                 icon_button(
                     "toggle-drawer",
                     IconName::PanelBottom,
-                    "Toggle terminal drawer (Ctrl+J)",
+                    keymap::tooltip("terminal.toggle", "Toggle terminal drawer"),
                 )
                 .variant(Variant::Ghost)
                 .size(button::Size::Sm)
@@ -807,7 +838,7 @@ impl Workspace {
                 icon_button(
                     "toggle-right",
                     IconName::PanelRight,
-                    "Toggle right panel (Ctrl+Alt+B)",
+                    keymap::tooltip("rightPanel.toggle", "Toggle right panel"),
                 )
                 .variant(Variant::Ghost)
                 .size(button::Size::Sm)
@@ -822,7 +853,7 @@ impl Workspace {
         icon_button(
             "toggle-sidebar",
             IconName::PanelLeft,
-            "Toggle sidebar (Ctrl+B)",
+            keymap::tooltip("sidebar.toggle", "Toggle sidebar"),
         )
         .variant(Variant::Ghost)
         .size(button::Size::Sm)
@@ -965,11 +996,32 @@ impl Render for Workspace {
                         .child("Hermes"),
                 )
         });
+        // With a thread open the bar's middle is its header (interactive: the title edits, a
+        // menu opens), told how much room it has; otherwise the text title in the drag zone.
+        let room = (w - frame.sidebar)
+            - if frame.sidebar == 0. { BRAND_BLOCK } else { 0. }
+            - TOGGLES_WIDTH
+            - 3. * titlebar::CAPTION_WIDTH
+            - titlebar::DRAG_MIN;
+        let header = self
+            .thread_header
+            .clone()
+            .filter(|_| matches!(self.model.read(cx).selected(), Selection::Thread(_)));
+        if let Some(header) = &header {
+            let colors = &self.state.sidebar_list.colors;
+            header.update(cx, |header, _| {
+                header.set_room(room);
+                header.set_colors(colors);
+            });
+        }
         let topbar = TitleBar::new()
             .maximized(maximized)
-            .title(title)
             .right(self.panel_toggles(cx))
-            .when_some(sidebar_toggle, |bar, left| bar.left(left));
+            .when_some(sidebar_toggle, |bar, left| bar.left(left))
+            .map(|bar| match header {
+                Some(header) => bar.header(header),
+                None => bar.title(title),
+            });
 
         let right = (frame.right > 0.).then(|| {
             div()

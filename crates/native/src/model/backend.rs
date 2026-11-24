@@ -23,6 +23,10 @@
 //! thread does not wake its session in the runtime) and, in a `--dev` build of the app only, sends
 //! a prompt ([`Backend::submit`]: `Core::submit`; the composer is Phase 5).
 //!
+//! The thread header (CP4.3) asks for what it shows ([`Backend::header_info`]: the thread's folder,
+//! model and the git state of the folder) and for the file a save dialog writes
+//! ([`Backend::export`]: `hermes_core::export::document` over the stored messages).
+//!
 //! Hermes: none (the sidebar's data is the page's `projects.tree` and `session.list` in
 //! `crates/desktop`, built from the same core calls; the history is what `session.resume` reads).
 
@@ -46,6 +50,7 @@ use crate::sidebar::data::{
     NO_PROJECT, NO_PROJECT_LABEL, Op, ProjectItem, ProjectKind, Snapshot, ThreadItem,
 };
 use crate::thread::data::{Attachment, HistoryItem, HistoryPage, items_from_entries, page};
+use crate::thread::header_data::{Exported, GitState, GitSummary, HeaderInfo};
 use crate::thread::recording::Recording;
 
 /// The sidebar's view of the backend. Methods block; see the module docs.
@@ -82,6 +87,32 @@ pub trait Backend: Send + Sync + 'static {
     /// the new thread's id.
     fn branch(&self, _session: &str, _through_row: usize) -> Result<String, String> {
         Err("Branching is not available here.".to_string())
+    }
+    /// What the thread header shows about a thread: its folder, model and the git state of the
+    /// folder. Runs `git`, so it blocks.
+    fn header_info(&self, _session: &str) -> Result<HeaderInfo, String> {
+        Err("Thread details are not available here.".to_string())
+    }
+    /// The thread as a file's content (Markdown or HTML), for the save dialog.
+    fn export(
+        &self,
+        _session: &str,
+        _format: hermes_core::export::Format,
+    ) -> Result<Exported, String> {
+        Err("Exporting is not available here.".to_string())
+    }
+}
+
+/// The git state of a folder, for the header: not on disk, not in a repository, or the repository's
+/// branch and changes. Runs `git status` (blocking).
+pub fn git_state(cwd: &str) -> GitState {
+    let folder = std::path::Path::new(cwd.trim());
+    if cwd.trim().is_empty() || !folder.is_dir() {
+        return GitState::NoFolder;
+    }
+    match hermes_core::git::repo_status(folder) {
+        Some(status) => GitState::Repo(GitSummary::from_status(&status)),
+        None => GitState::NoRepo,
     }
 }
 
@@ -395,6 +426,45 @@ impl Backend for CoreBackend {
         }
     }
 
+    fn header_info(&self, session: &str) -> Result<HeaderInfo, String> {
+        let record = self
+            .core
+            .runtime()
+            .store()
+            .session(session)
+            .map_err(|e| format!("{e:#}"))?
+            .ok_or_else(|| "That thread no longer exists.".to_string())?;
+        Ok(HeaderInfo {
+            git: git_state(&record.cwd),
+            archived: self.core.archive().is_archived(session),
+            cwd: record.cwd,
+            model: record.model,
+            provider: record.provider,
+        })
+    }
+
+    /// Masked (`redact`), as a file that may be shared should be; the page's `/save` masks only
+    /// when asked.
+    fn export(
+        &self,
+        session: &str,
+        format: hermes_core::export::Format,
+    ) -> Result<Exported, String> {
+        let store = self.core.runtime().store();
+        let record = store
+            .session(session)
+            .map_err(|e| format!("{e:#}"))?
+            .ok_or_else(|| "That thread no longer exists.".to_string())?;
+        let messages = store.load_messages(session).map_err(|e| format!("{e:#}"))?;
+        let entries = hermes_core::transcript::entries(&messages);
+        let content = hermes_core::export::document(&record, &entries, format, true)
+            .ok_or_else(|| "That format cannot be saved here.".to_string())?;
+        Ok(Exported {
+            content,
+            file_name: hermes_core::export::file_name(&record, format),
+        })
+    }
+
     fn submit(&self, session: &str, text: &str) -> Result<(), String> {
         let core = &self.core;
         let provider = match &self.dev_provider {
@@ -437,6 +507,11 @@ pub struct FixtureBackend {
     sent: Mutex<Vec<(String, String)>>,
     replay: Mutex<Option<Recording>>,
     thread_ops: Mutex<Vec<ThreadOp>>,
+    /// The header's answers set by a test or a story (a thread without one gets
+    /// [`FixtureBackend::default_header`]).
+    headers: Mutex<HashMap<String, HeaderInfo>>,
+    header_reads: Mutex<usize>,
+    exports: Mutex<Vec<(String, hermes_core::export::Format)>>,
 }
 
 /// A turn footer's action that reached a [`FixtureBackend`].
@@ -458,6 +533,49 @@ impl FixtureBackend {
             sent: Mutex::default(),
             replay: Mutex::default(),
             thread_ops: Mutex::default(),
+            headers: Mutex::default(),
+            header_reads: Mutex::default(),
+            exports: Mutex::default(),
+        })
+    }
+
+    /// Gives a thread this header (folder, model, git state).
+    pub fn set_header(&self, session: &str, info: HeaderInfo) {
+        self.headers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session.to_string(), info);
+    }
+
+    /// How many times the header was read (the "not per frame" tests count it).
+    pub fn header_reads(&self) -> usize {
+        *self.header_reads.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The exports asked for so far, as `(session, format)`.
+    pub fn exports(&self) -> Vec<(String, hermes_core::export::Format)> {
+        self.exports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// What a thread without a set header answers: its listed folder and branch, a model.
+    pub fn default_header(&self, session: &str) -> Option<HeaderInfo> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let thread = state.threads.iter().find(|t| t.id == session)?;
+        Some(HeaderInfo {
+            cwd: thread.cwd.clone(),
+            model: "fixture-model".to_string(),
+            provider: "fixture".to_string(),
+            archived: false,
+            git: match &thread.branch {
+                Some(branch) => GitState::Repo(GitSummary {
+                    branch: Some(branch.clone()),
+                    ..GitSummary::default()
+                }),
+                None => GitState::NoRepo,
+            },
         })
     }
 
@@ -605,6 +723,45 @@ impl Backend for FixtureBackend {
             state.threads.push(thread);
         }
         Ok(child)
+    }
+
+    fn header_info(&self, session: &str) -> Result<HeaderInfo, String> {
+        *self.header_reads.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        if let Some(info) = self
+            .headers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session)
+        {
+            return Ok(info.clone());
+        }
+        self.default_header(session)
+            .ok_or_else(|| "That thread no longer exists.".to_string())
+    }
+
+    fn export(
+        &self,
+        session: &str,
+        format: hermes_core::export::Format,
+    ) -> Result<Exported, String> {
+        self.exports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((session.to_string(), format));
+        if let Some(message) = &*self.failure.lock().unwrap_or_else(|e| e.into_inner()) {
+            return Err(message.clone());
+        }
+        let title = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .thread(session)
+            .map(|t| t.display_title().to_string())
+            .ok_or_else(|| "That thread no longer exists.".to_string())?;
+        Ok(Exported {
+            content: format!("# {title}\n"),
+            file_name: format!("hermes-{session}.{}", format.extension()),
+        })
     }
 
     fn submit(&self, session: &str, text: &str) -> Result<(), String> {

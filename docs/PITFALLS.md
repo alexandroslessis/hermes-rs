@@ -265,6 +265,20 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **`HeadlessAppContext` has a fake clock.** Timers (the 500 ms `native-ui.json` debounce, toast
   expiry) fire only after `cx.advance_clock(..)` and `cx.run_until_parked()`; sleeping the thread
   does nothing.
+- **Interactive content cannot sit inside the title bar's drag zone** (CP4.3): Windows' hit test answers
+  "caption" for the whole zone, so a button or field inside would never get its click. The thread header is a
+  *sibling* of the drag zone (`TitleBar::header`), which keeps at least 24 px; only plain text goes inside.
+- **`gpui_kit::test`'s `pointer_down` always sends `click_count: 1`**: a double click is two
+  `MouseDownEvent`/`MouseUpEvent` pairs dispatched by hand with `click_count` 1 then 2 (`header_tests.rs`).
+- **A Kit `dropdown_menu` needs Kit's own `Button`** (`DropdownMenu` is implemented for it only), so the header's
+  chevron is Kit-styled, not our design `Button`. A click-opened menu on our `Button` would need a `Popover`
+  trigger adapter (`Selectable`).
+- **`HeaderInfo`'s git probe is a process**: it runs from `ThreadModel::refresh_header` on a background thread
+  (at open, at a turn's end, when the window comes forward and the last read is over 2 s old), never from
+  `render`. `core::git::repo_status` is `None` for "not a repository", "no `git`" and "folder gone" alike; the
+  header tells the last apart (`GitState::NoFolder`) by checking the folder first.
+- **`no_overflow` on text that ellipsizes fails by design** (`probe_text` records the width the text needs):
+  check `inside(..)` instead and compare `text_width` with the bounds to prove the ellipsis.
 
 - **A tool result's text is not always JSON, even from our own tools, and plain text is not an
   error.** `tool_result_text` joins a result's text blocks with newlines, so the guardrails' notes

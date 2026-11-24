@@ -39,7 +39,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 1 | `hermes_core`: the backend's application layer, extracted from `crates/desktop` — ✅ 2026-11-18 | L | — |
 | 2 | Design system and app frame: themes, tokens, design layer, window, palette, keymap — ✅ 2026-11-19 | M–L | 0 |
 | 3 | Sidebar: projects and threads — ✅ 2026-11-19 | M | 1 (CP1.1), 2 |
-| 4 | Thread view: timeline, markdown, tool calls, streaming — CP4.1 built | L | 3 |
+| 4 | Thread view: timeline, markdown, tool calls, streaming — ✅ 2026-11-24 | L | 3 |
 | 5 | Composer: input, mentions, commands, attachments, model, approvals, questions | L | 4 |
 | 6 | Right panel: diff, files, terminal | L | 1, 4 |
 | 7 | Hermes screens: settings, memory, skills, staging, usage, import | L | 1, 2 |
@@ -413,6 +413,11 @@ row state.
 
 Thread title (editable), project and folder, git branch and status (from core git reads), model
 in use, right panel toggles, the thread's actions menu (export, branch, archive).
+
+**Status (CP4.3, 2026-11-24):** ✅ built and reviewed; Phase 4 is done. The header is the title bar's middle
+(`thread/header.rs`, `header_data.rs`); see `progress/phase-4.md` for what covers each Done item. The live
+turn is `scripts/perf/native-thread-check.ps1` (our `hermes-native --dev --dev-send` on a seeded synthetic
+folder against `mock_llm.py`: the streamed reply and the same reply read back from the store).
 
 **Done:** a recorded fixture session (every event kind, from a mock provider run) replays in the
 gallery; timeline layout tests; snapshots of every card kind; a live turn against the mock

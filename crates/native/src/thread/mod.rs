@@ -6,7 +6,8 @@
 //!
 //! t3code: `apps/web/src/components/ChatView.tsx`, `chat/ChatCanvas.tsx`, `ChatMarkdown.tsx`,
 //! `chat/MessagesTimeline.tsx`. References: `app-thread-dark.png`,
-//! `app-codeblock_closeup-dark.png`, `app-hover_reply_closeup-dark.png`.
+//! `app-codeblock_closeup-dark.png`, `app-hover_reply_closeup-dark.png`. The header
+//! ([`header`], CP4.3: title, project, git, model, the actions menu) is the title bar's middle.
 
 use gpui_kit::Action;
 use serde::Deserialize;
@@ -15,6 +16,10 @@ pub mod ansi;
 pub mod cards;
 pub mod data;
 pub mod diff;
+pub mod header;
+pub mod header_data;
+#[cfg(test)]
+mod header_tests;
 pub mod markdown;
 pub mod model;
 pub mod recording;
@@ -24,6 +29,7 @@ pub mod tools;
 pub mod view;
 pub mod work;
 
+pub use header::{HeaderEvent, ThreadHeader};
 pub use model::{ThreadEvent, ThreadModel};
 pub use view::ThreadView;
 

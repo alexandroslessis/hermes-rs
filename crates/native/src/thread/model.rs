@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EventEmitter, ImageFormat, SharedString,
@@ -39,6 +40,7 @@ use hermes_core::{CoreEvent, Outcome};
 use serde_json::Value;
 
 use super::data::{Attachment, HistoryItem, HistoryPage, PAGE};
+use super::header_data::{Exported, HeaderInfo};
 use super::tools::{Detail, Status, SubTool, ToolCard, ToolKind, changed_files};
 use super::work::{Footer, ToolEntry, Usage, WorkGroup};
 use crate::model::Backend;
@@ -202,6 +204,38 @@ pub struct ThreadModel {
     generation: u64,
     /// A replayed turn (the gallery) is in no store: its end reconciles nothing.
     replaying: bool,
+    /// What the header shows about the thread (folder, model, git), read in the background.
+    header: HeaderRead,
+    /// A save is being prepared (the menu's export entries wait).
+    exporting: bool,
+}
+
+/// How long after one header read the window coming back to the front does not read again.
+const HEADER_STALE: Duration = Duration::from_secs(2);
+
+/// The header's data and the bookkeeping of reading it: one read at a time, a request made
+/// meanwhile runs once more after it.
+struct HeaderRead {
+    stale_after: Duration,
+    info: Option<HeaderInfo>,
+    /// Why the last read failed (the header then shows no chips).
+    error: Option<String>,
+    reading: bool,
+    again: bool,
+    last: Option<Instant>,
+}
+
+impl Default for HeaderRead {
+    fn default() -> Self {
+        Self {
+            stale_after: HEADER_STALE,
+            info: None,
+            error: None,
+            reading: false,
+            again: false,
+            last: None,
+        }
+    }
 }
 
 /// What the model tells its view besides "something changed".
@@ -211,6 +245,10 @@ pub enum ThreadEvent {
     SendFailed(String),
     /// "Branch from here" made this thread (the app model lists it and opens it).
     Branched(String),
+    /// The thread's export is ready for the save dialog (the header asks for the file's place).
+    ExportReady(Exported),
+    /// The export could not be made (why).
+    ExportFailed(String),
 }
 
 impl EventEmitter<ThreadEvent> for ThreadModel {}
@@ -244,9 +282,150 @@ impl ThreadModel {
             open_reasoning: false,
             generation: 0,
             replaying: false,
+            header: HeaderRead::default(),
+            exporting: false,
         };
         model.load_page(None, Load::First, cx);
+        model.refresh_header(cx);
         model
+    }
+
+    // --- the header's data --------------------------------------------------------------------
+
+    /// What the header shows: `None` until the first read lands (or when it failed: see
+    /// [`Self::header_error`]).
+    pub fn header(&self) -> Option<&HeaderInfo> {
+        self.header.info.as_ref()
+    }
+
+    /// Why the header's data could not be read.
+    pub fn header_error(&self) -> Option<&str> {
+        self.header.error.as_deref()
+    }
+
+    /// Reads the thread's folder, model and git state again, in the background (a git probe is a
+    /// process: never from a handler or `render`). Reads do not pile up: one runs at a time and a
+    /// request made meanwhile runs once more after it. Called when the thread opens and when a
+    /// turn ends; the header calls [`Self::refresh_header_if_stale`] when the window comes forward.
+    pub fn refresh_header(&mut self, cx: &mut Context<Self>) {
+        if self.header.reading {
+            self.header.again = true;
+            return;
+        }
+        self.header.reading = true;
+        self.header.last = Some(Instant::now());
+        let (backend, session) = (self.backend.clone(), self.session.clone());
+        cx.spawn(async move |this, cx| {
+            loop {
+                let (reader, id) = (backend.clone(), session.clone());
+                let read = cx
+                    .background_spawn(async move { reader.header_info(&id) })
+                    .await;
+                let again = this.update(cx, |this, cx| {
+                    match read {
+                        Ok(info) => {
+                            this.header.info = Some(info);
+                            this.header.error = None;
+                        }
+                        Err(why) => this.header.error = Some(why),
+                    }
+                    let again = std::mem::take(&mut this.header.again);
+                    if !again {
+                        this.header.reading = false;
+                    }
+                    cx.notify();
+                    again
+                });
+                match again {
+                    Ok(true) => continue,
+                    _ => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// [`Self::refresh_header`] unless a read is running or one finished just now (the window
+    /// coming forward in quick succession reads once).
+    pub fn refresh_header_if_stale(&mut self, cx: &mut Context<Self>) {
+        let fresh = self
+            .header
+            .last
+            .is_some_and(|last| last.elapsed() < self.header.stale_after);
+        if !self.header.reading && !fresh {
+            self.refresh_header(cx);
+        }
+    }
+
+    /// How old the last header read must be for [`Self::refresh_header_if_stale`] to read again
+    /// (tests lower it).
+    pub fn set_header_stale(&mut self, after: Duration) {
+        self.header.stale_after = after;
+    }
+
+    /// Whether the thread has a message of the user's or a reply (what "export" saves).
+    pub fn has_messages(&self) -> bool {
+        self.phase == ThreadPhase::Ready
+            && self
+                .rows
+                .iter()
+                .any(|r| matches!(r.kind, RowKind::User { .. } | RowKind::Assistant { .. }))
+    }
+
+    /// The footer "branch from latest reply" uses: the newest turn's, when it is stored and
+    /// nothing is running or being branched.
+    fn branch_target(&self) -> Option<u64> {
+        if self.live.is_some() {
+            return None;
+        }
+        self.rows.iter().rev().find_map(|r| match &r.kind {
+            RowKind::Footer(f) if f.last_row.is_some() && !f.busy => Some(r.key),
+            _ => None,
+        })
+    }
+
+    /// Whether the thread has a finished reply to branch from now.
+    pub fn can_branch(&self) -> bool {
+        self.branch_target().is_some()
+    }
+
+    /// Branch from the latest reply (the header's menu): the same operation as the turn footer's
+    /// button on the newest turn.
+    pub fn branch_latest(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.branch_target() {
+            self.branch(key, cx);
+        }
+    }
+
+    /// Whether a save is being prepared.
+    pub fn exporting(&self) -> bool {
+        self.exporting
+    }
+
+    /// Makes the thread's file in the background (`Backend::export`: the core's export over the
+    /// stored messages) and tells the header ([`ThreadEvent::ExportReady`]), which asks where to
+    /// save it.
+    pub fn export(&mut self, format: hermes_core::export::Format, cx: &mut Context<Self>) {
+        if self.exporting {
+            return;
+        }
+        self.exporting = true;
+        let (backend, session) = (self.backend.clone(), self.session.clone());
+        cx.spawn(async move |this, cx| {
+            let made = cx
+                .background_spawn(async move { backend.export(&session, format) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.exporting = false;
+                cx.emit(match made {
+                    Ok(file) => ThreadEvent::ExportReady(file),
+                    Err(why) => ThreadEvent::ExportFailed(why),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     /// The clock the durations use.
@@ -784,8 +963,9 @@ impl ThreadModel {
         self.scroll_to_end(cx);
     }
 
-    /// Reads the thread from the store again, from its newest page: after a retry dropped rows.
-    fn restart(&mut self, cx: &mut Context<Self>) {
+    /// Reads the thread from the store again, from its newest page: after a retry dropped rows (and
+    /// `--dev-send`, to read a finished turn back).
+    pub fn restart(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         self.rows.clear();
         self.live = None;
@@ -1017,6 +1197,11 @@ impl ThreadModel {
                 self.live = None;
                 if partial && !self.replaying {
                     self.reload(keep_from, cx);
+                }
+                // The turn may have changed files and commits: the header's git state is read
+                // again (a replay is in no folder).
+                if !self.replaying {
+                    self.refresh_header(cx);
                 }
                 cx.notify();
             }

@@ -41,6 +41,8 @@ use crate::theme::DesignTheme as _;
 pub const HEIGHT: f32 = 40.;
 /// One caption button's width (the Windows standard).
 pub const CAPTION_WIDTH: f32 = 46.;
+/// The least the drag zone keeps beside a header, so the window can always be grabbed.
+pub const DRAG_MIN: f32 = 24.;
 
 /// Windows' own red for the close button's hover and its darker pressed shade.
 const CLOSE_HOVER: Color = Color::rgb(0xe81123);
@@ -147,6 +149,7 @@ impl RenderOnce for CaptionButtons {
 #[derive(IntoElement)]
 pub struct TitleBar {
     left: Option<AnyElement>,
+    header: Option<AnyElement>,
     title: Option<SharedString>,
     right: Option<AnyElement>,
     maximized: bool,
@@ -158,6 +161,7 @@ impl TitleBar {
     pub fn new() -> Self {
         Self {
             left: None,
+            header: None,
             title: None,
             right: None,
             maximized: false,
@@ -168,6 +172,14 @@ impl TitleBar {
     /// Controls at the left (outside the drag zone).
     pub fn left(mut self, element: impl IntoElement) -> Self {
         self.left = Some(element.into_any_element());
+        self
+    }
+
+    /// The thread header (CP4.3): interactive content (a title that edits, a menu, chips) that
+    /// cannot sit inside the drag zone, so it is its sibling: it takes the room it needs (and
+    /// shrinks when there is not enough) and the drag zone keeps the rest, at least 24 px.
+    pub fn header(mut self, element: impl IntoElement) -> Self {
+        self.header = Some(element.into_any_element());
         self
     }
 
@@ -216,13 +228,14 @@ impl RenderOnce for TitleBar {
             .text_size(text::SM.size)
             .line_height(text::SM.line_height)
             .when_some(self.left, |d, left| d.child(left))
+            .when_some(self.header, |d, header| d.child(header))
             .child(
                 div()
                     .id("drag")
                     .flex()
                     .items_center()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(px(DRAG_MIN))
                     .h_full()
                     .px(px(12.))
                     .window_control_area(WindowControlArea::Drag)

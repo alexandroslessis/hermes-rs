@@ -10,6 +10,9 @@
 //! - `--dev` (DEV ONLY, until Phase 5's composer): a strip under the open thread sends a prompt;
 //!   with `--fixture` it replays the recorded turn. `--dev-provider <url>` sends the prompts to a
 //!   mock OpenAI-compatible endpoint (`scripts/perf/mock_llm.py`: `http://127.0.0.1:47900/v1`).
+//! - `--dev-send <prompt>` (with `--dev`): open the first listed thread, send the prompt, print
+//!   the streamed and the stored reply on stderr, quit (the Phase 4 live check,
+//!   `scripts/perf/native-thread-check.ps1`; `--dump` is then written when the turn has ended).
 //! - `--quit-after <seconds>`, `--dump <file>` (with `--features dev`): as below.
 //!
 //! Flags of `--spike` (for measuring, CP0.1 step 4):
@@ -73,6 +76,11 @@ fn main() {
             dev_provider: args
                 .iter()
                 .position(|a| a == "--dev-provider")
+                .and_then(|ix| args.get(ix + 1))
+                .cloned(),
+            dev_send: args
+                .iter()
+                .position(|a| a == "--dev-send")
                 .and_then(|ix| args.get(ix + 1))
                 .cloned(),
         });

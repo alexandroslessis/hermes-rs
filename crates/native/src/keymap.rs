@@ -169,6 +169,16 @@ pub fn shortcut_label(command: &CommandDef) -> Option<String> {
     Some(crate::design::kbd::chord_label(&keystroke))
 }
 
+/// A tooltip for the control that runs command `id`: `text` and the shortcut in parentheses
+/// (`Toggle terminal drawer (Ctrl+J)`), from the keymap, so a rebinding changes the tooltip too.
+/// Just `text` for a command without a shortcut.
+pub fn tooltip(id: &str, text: &str) -> String {
+    match find(id).and_then(shortcut_label) {
+        Some(shortcut) => format!("{text} ({shortcut})"),
+        None => text.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;

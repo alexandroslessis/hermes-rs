@@ -65,3 +65,7 @@ card and diff, the work-group row, the changed-files card and the light theme fo
 Light theme; the button variants and sizes in the design system's sense (default, outline, ghost,
 destructive); title bar and Windows caption buttons; command palette; toast; tooltip; badge and kbd;
 empty states. Phase 2 (CP2.1 tokens, CP2.2 components and frame) needs most of these.
+
+CP4.3 took no new screenshot (t3code's window cannot be driven from here): the header follows `ChatHeader.tsx`
+(breadcrumb, rename field, title menu) checked against `app-thread-dark.png` and `app-thread-options.png`; the
+branch and change counts follow `sidebar-thread-details.png`; the light theme follows `index.css`.

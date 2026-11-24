@@ -441,6 +441,33 @@ runs a real `Core` against a `wiremock` provider and fails when the core's event
 turn by hand: `hermes-native --fixture --dev` (the strip under the thread replays the recording), or the real
 core on a synthetic folder with `--dev --dev-provider http://127.0.0.1:47900/v1` and `scripts/perf/mock_llm.py`.
 
+**The header (CP4.3).** `thread/header_tests.rs` renders a `Workspace` over a `FixtureBackend` with a thread open
+and checks the header in the title bar at 640, 1100 and 1920 px with the sidebar open and collapsed (one row
+with the toggles and caption buttons, the drag zone keeps 24 px, the title and its menu keep 40 px) with a
+300-character title, project, branch and model and a folder 30 levels deep (`no_overflow("thread-header")`; the
+title shows an ellipsis); the chips that leave when room is short; renaming (the test helpers always say
+"one click": `double_click` dispatches `click_count: 2` events itself); the toggles and keymap-built tooltips;
+every menu entry's backend operation (`FixtureBackend::ops` / `thread_ops` / `exports`); the "git is read in the
+background, at open and at a turn's end, never per frame" counters (`header_reads`); `git_state` on real repos made
+with `git init` in a `hermes_testdir` folder (clean, dirty, detached, no repo, missing folder); and
+`CoreBackend::header_info` / `export` on a real core (key masked in the file). The pure parts (git mapping, menu
+state, rename rule) are unit tests in `thread/header_data.rs`. Hand-only: the save dialog, the dropdown's look, a
+right click, the real tooltips.
+
+**Phase 4 Done list, and what covers it.** *A recorded fixture session of every event kind replays in the
+gallery:* `thread::recording` (the recorder test and the replay round trip) and the stories `thread`, `thread-live`
+and `thread-tools-*`. *Timeline layout tests:* `thread/tests.rs`, `thread/tests/tools.rs`. *Snapshots of every
+card kind:* `thread-tools-{command,edit,lookup,agent,group,footer}`, `thread-*`, `thread-header`. *A live turn
+against the mock provider streams correctly:* the test `the_recorded_session_is_what_the_real_core_sends` (a real
+`Core` + a wiremock provider) and the live check `scripts/perf/native-thread-check.ps1`: it seeds a synthetic
+folder (`target
+ative-live`, the sidebar's seed test), starts `mock_llm.py` on :47901 and our build with
+`--dev --dev-provider <mock> --dev-send <prompt>`, with which the app opens the first thread, sends the prompt
+through `ThreadModel::submit` (no pointer or keys), waits for the turn and prints `dev-send: reply ...` and, after
+reading the thread back from the store, `dev-send: stored ...`; the check wants the mock's text in both and the
+two equal. A window shows for a few seconds; the folder is deleted afterwards (`-Keep` keeps it). With
+`--features dev`, `--dump <file>` is written when the turn has ended.
+
 **The work log (CP4.2).** `thread/tests/tools.rs` drives the same thread view with tool events: runs of
 calls fold into one group row (a reply, a reasoning row or a notice ends a run; the header counts while
 a call runs), history pages join a run they cut, every card kind's layout (24 px lines aligned, a card

@@ -432,3 +432,207 @@ The two "unexpected" notes: the generic card cut at the top is the thread follow
 **Left for later:** changed files are summed from edit results, not a git diff (edit-then-revert shows counts, renames/deletes by `terminal` are invisible; t3code reads checkpoint diffs: Phase 6 with the diff tab); `live.delegate` holds one delegate call, so two concurrent `delegate_task` calls would mix subagent events; a subagent event for a task with neither id nor index is dropped; retried prompts do not re-send attached images.
 
 **Tests:** `cargo test -p hermes-native` 251 passed (2 ignored); snapshots: 14 baselines re-accepted after looking at them (`thread-tools-*` both themes, `thread-live-t3-*`: the colour, fold-row and copy-button changes above); `scripts/native/check.ps1`: "native check: all ok"; `cargo test -p hermes_core` 140 passed; `cargo test -p hermes-desktop` all passed (130 + 68, the RPC-table fixture unchanged); `cargo build --workspace` passes.
+
+## CP4.3 — Header
+Worktree: C:\Users\alexandros\repos\hermes-rs-n4   Branch: native/p4-thread   Model: Sonnet 5.5 (subagent)
+Uncommitted, on top of CP4.2 (a4f0389). t3code's header is a breadcrumb in the topbar (`ChatHeader.tsx`), so ours is
+the title bar's middle, not a row of the thread area; the Phase 2 toggles are reused, not duplicated.
+
+### Files
+- New: `thread/header.rs` (`ThreadHeader` view: project crumb, title, chevron menu, git and model chips, rename field,
+  export save), `thread/header_data.rs` (no GPUI: `GitSummary` from the core's `RepoStatus`, `GitState`, `HeaderInfo`,
+  `rename_outcome`, `menu_entries`/`MenuState`, `Chips::for_room`), `thread/header_tests.rs` (21 tests),
+  `gallery/header.rs` (story `thread-header`).
+- Edited: `titlebar.rs` (`TitleBar::header`, `DRAG_MIN` 24), `workspace.rs` (makes the header with the thread view, sets its
+  room and the project colours each frame, shows its toasts, takes the focus back after a rename; toggle tooltips from the
+  keymap), `keymap.rs` (`tooltip(id, text)`), `thread/model.rs` (header data read in the background, `can_branch`,
+  `branch_latest`, `has_messages`, `export`, events `ExportReady`/`ExportFailed`), `model/backend.rs`
+  (`Backend::header_info`, `Backend::export`, `git_state`, fixture versions), `design/icons.rs` (Download), `app.rs` (binds
+  the header's Escape), `gallery/mod.rs`.
+- Docs: AGENTS.md row, ARCHITECTURE.md row, TESTING.md section 6 (header paragraph and the Phase 4 Done mapping), PITFALLS.md
+  (5 bullets), PHASES.md (status), native-ui/README.md (module row), reference/t3code/README.md (no new screenshot).
+
+### What it does
+1. **Breadcrumb** `monogram project / title v` (t3code's): the project crumb (tooltip: folder; click: new thread in the
+   project), the title (end-ellipsis, MEDIUM weight), the chevron.
+2. **Rename in place:** double click or the menu. Enter or leaving the field commits, Escape cancels; empty is refused with a
+   warning toast, unchanged does nothing (t3code's `resolveRenameCommit`). A commit is `Op::Rename` through `AppModel`, the
+   sidebar's own path (optimistic list, queue, failure toast).
+3. **Git chip** (branch or "detached HEAD", up/down arrows with counts, `+N -M` green/red, tooltip with staged/modified/untracked
+   counts; nothing without a repo; "folder missing" in warning colour) and **model chip** (read only, tooltip with the
+   endpoint). Both leave when the title bar has no room (`Chips::for_room`: git under 380 px, model under 560).
+4. **Actions menu** (chevron, and right click on the header): Rename, Pin/Unpin, Branch from latest reply, Export as Markdown /
+   HTML (`hermes_core::export::document` over the stored messages, secrets masked, then a save dialog and a background
+   write), Copy thread ID, Archive. Items that cannot run are disabled (archived thread, no reply yet or a turn running, no
+   messages), and `run` ignores them as well.
+5. **Data:** `ThreadModel::refresh_header` (background `Backend::header_info`: store record + `git status`) at open, at a
+   turn's end (not for replays) and when the window comes forward if the last read is over 2 s old; one read at a time,
+   requests meanwhile coalesce. Never from `render` (a test counts reads over 30 frames).
+6. **Toggles:** the existing two (drawer, right panel) in the workspace; tooltips now come from the keymap
+   ("Toggle terminal drawer (Ctrl+J)", "Toggle right panel (Ctrl+Alt+B)").
+
+### Tests (all `CARGO_TARGET_DIR=target/claude`)
+- `cargo test -p hermes-native`: 281 passed, 2 ignored (251 before; +9 `header_data`, +21 `header_tests`). Header tests:
+  placement at 640/1100/1920 x sidebar open/collapsed; 300-character title/project/branch/model and a 30-level folder never
+  overflow (toggles clear, title wrapper >= 40 px, drag >= 24, ellipsis proven by `text_width`); chips by room; git chip
+  cases (clean, dirty with arrows and counts, detached, no repo, no folder) and colours; reads at open / turn end / stale /
+  never per frame; unreadable details keep title and menu; rename commit, Escape, empty (warning toast), unchanged, trim,
+  backend refusal (list goes back, toast), same path as the sidebar; toggles and tooltips; menu state per thread (empty,
+  archived, running); every menu action reaches `ops` / `thread_ops` (pin, unpin, rename, copy id, branch row 2 then opens
+  the branch, archive closes the thread and the header); failed branch notice; chevron opens the dropdown; export written
+  to the chosen path with a success toast, cancelled dialog writes nothing, export failure toast, empty thread exports
+  nothing; `git_state` on real repos (missing, plain, untracked, clean, dirty, detached, subfolder); real core
+  `header_info` and `export` (Markdown with the key masked, HTML, JSON refused, unknown thread).
+- `scripts/native/check.ps1`: "native check: all ok". `cargo test -p hermes_core`: 140 passed. `cargo build --workspace`: ok.
+  `cargo clippy -p hermes-native --all-targets --features snapshots --no-deps`: clean. `cargo fmt` also reformatted five
+  CP4.2 files; I reverted them (not mine).
+- `scripts/clean-test-temp.ps1`: dry run 5 folders (1.0 MB), `-Delete` removed 5, second dry run 0.
+
+### Snapshots
+New (2): `crates/native/snapshots/thread-header-t3-light.png`, `thread-header-t3-dark.png` (two states side by side: default =
+clean / dirty+ahead+behind / no repo; edge = very long names, detached head, folder missing with the title field open, the
+narrow bar with no chips). Pre-existing baselines changed: none (the full snapshot run reported only these two as new). I
+looked at both images (downscaled): aligned rows, chips and counts legible, the field's text not clipped. No `.diff.png`.
+
+### Phase 4 Done list: what covers it
+- Recorded fixture session of every event kind replays in the gallery: `thread::recording` tests, stories `thread`,
+  `thread-live`, `thread-tools-*` (CP4.1/4.2).
+- Timeline layout tests: `thread/tests.rs`, `thread/tests/tools.rs`.
+- Snapshots of every card kind: `thread-tools-*` (6 stories x 2 themes), `thread-*`, and now `thread-header`.
+- A live turn against the mock provider streams: `the_recorded_session_is_what_the_real_core_sends` (real `Core`, wiremock) and
+  the hand run below; PHASES says "a `scripts/perf/` script", but the native app has no page to drive, so a core-level test
+  is the check (TESTING.md says why). `scripts/perf/mock_llm.py` is the provider for the hand run.
+- Header (this checkpoint): above.
+
+### Deviations
+- Menu opens from an always-visible chevron (Kit `DropdownMenu` needs Kit's `Button`, so it is Kit-styled); t3code's appears on
+  hover and the whole title is the trigger. Right click works anywhere on the header.
+- Git state and model are chips in the bar and vanish when narrow (t3code has a separate details card).
+- The menu lacks Find in thread, Settle, Snooze, Regenerate title, Mark unread, Project settings, Delete (the sidebar keeps the
+  confirmed delete). Parent-thread crumb and guest-share indicator: no equivalent.
+- Export offers Markdown and HTML only: JSON is the page's shape, built in `crates/desktop` (`export.rs`), not in `hermes_core`.
+  Files are secret-masked (the page's `/save` masks only on request).
+- The rename field does not select all on focus (the sidebar's does not either).
+- The crumb's monogram colour follows the sidebar's picked colour (`Prefs`), passed by the workspace each frame.
+- "No repo" and "no git installed" read the same (`repo_status` is `None` for both).
+
+### Missing core operations
+None blocking. Everything used exists: `Core::rename`, `set_archived`, `store().set_pinned`, `branch`, `export::{document,
+file_name}`, `git::repo_status`, `archive().is_archived`. Not in core: a JSON export in the native format (see above) and
+an "unarchive" from the header (not asked).
+
+### For the reviewer
+1. `Workspace::render` calls `header.update(.., set_room / set_colors)` while drawing (no notify): check it never loops.
+   `BRAND_BLOCK` (100) and `TOGGLES_WIDTH` (68) are estimates of the bar's other blocks; the `Chips` thresholds (380/560) were
+   tuned by eye at the dump's widths.
+2. `HeaderRead` keeps the last good `HeaderInfo` when a later read fails (stale chips rather than none).
+3. `ThreadHeader::run` re-checks `menu_entries` so a stale menu click cannot do a disabled action.
+4. The dropdown is Kit's: its focus and Escape behaviour with our keymap is untested beyond "opens".
+5. The header is built with the thread view (`sync_thread_view`); a rename's `RenameEnded` refocuses the frame.
+6. Hover and press looks of the Kit chevron button differ slightly from our ghost icon buttons.
+7. Archived-thread state exists only for a thread archived elsewhere while open (the list excludes archived threads).
+
+### User checklist (Phase 4, whole; hand-only items marked)
+Build (PowerShell, in `C:\Users\alexandros\repos\hermes-rs-n4`): `$env:CARGO_TARGET_DIR="target/claude"; cargo build -p hermes-native --bins`,
+then `$env:HERMES_RS_HOME="$PWD\target\native-test"` (a synthetic folder, never `%APPDATA%`).
+A. Recorded fixture, no backend: `.\target\claude\debug\hermes-native.exe --fixture`.
+ 1. Open "halo": breadcrumb `structure / halo v` in the top bar, the git chip `master`, the model chip `fixture-model`, then the
+    panel toggles and the window buttons. Hover a toggle: tooltip "Toggle right panel (Ctrl+Alt+B)". Click it, press Ctrl+J: the
+    right panel and the drawer open and close.
+ 2. Double click "halo": a field with a border; type a new name, Enter: the sidebar row changes too. Again, Escape: no
+    change. Again, clear it and Enter: a toast "Thread title cannot be empty".
+ 3. Click the chevron: the menu (Rename, Pin, Branch from latest reply, Export as Markdown/HTML, Copy thread ID, Archive).
+    Right click on the header: the same menu. Choose "Pin thread": it moves to the top of the sidebar. "Copy thread ID", paste.
+ 4. "Export as Markdown...": a save dialog (hand-only); save; a toast "Thread exported" with the path; open the file.
+ 5. "Branch from latest reply": a "(branch)" thread appears and opens (fixture data; it needs an answered turn, so use a thread
+    whose footer shows "Branch from here"). "Archive thread": the thread closes.
+ 6. Narrow the window: the model chip goes first, then the git chip, the title shortens with "..."; the empty bar area still
+    drags the window (hand-only). Collapse the sidebar (Ctrl+B): the header follows its toggle.
+ 7. Open "Fix the sidebar width" (branch `native/p2-design`) and the other threads: alerts, the wide table, code with copy,
+    a `read_file` card; click a file link: the right panel opens (CP4.1 and CP4.2 checklist items still hold).
+B. Streaming with the dev input: `--fixture --dev`, open "halo", type in the DEV strip, Enter: reasoning, then one work
+   group "Working for..." becoming "Worked for ... 11 steps", the reply, the footer (Retry, Branch from here). Scroll up while it
+   streams: "Scroll to end" appears and works. (Scroll feel while streaming: hand-only.)
+C0. The live check, no hands: `powershell -NoProfile -File scripts/perf/native-thread-check.ps1` (a window shows for a few
+   seconds and closes): it ends with `native-thread-check: ok` and prints the streamed and the stored reply.
+C. Real core and the mock provider: `~/.local/bin/uv.exe run --no-project scripts/perf/mock_llm.py`, then
+   `.\target\claude\debug\hermes-native.exe --dev --dev-provider http://127.0.0.1:47900/v1` with `HERMES_RS_HOME` at a seeded
+   synthetic folder (Phase 3's seed test `seed_synthetic_data_folder`, which writes `target\native-test-seed`): open a thread whose
+   folder is a git repo (the header shows its branch; edit a file there and finish a turn: the `+N -M` updates; switch to another
+   window and back: it refreshes), send a prompt: the mock's markdown streams; reopen the thread: the same reply, cards and footer.
+Hand-only (no test can judge them): mouse selection and Ctrl+C in a reply and in code (also while streaming); wheel feel while
+streaming; caption buttons, the Windows 11 snap flyout, dragging the window by the bar; the save dialog; the look of the
+dropdown and tooltips; right-click menus.
+
+### Visual check (Sonnet 5.5)
+References opened: button-sidebar_toggle-hover.png, app-thread-dark.png, app-thread-options.png, sidebar-thread-details.png, app-codeblock_closeup-dark.png.
+- thread-header-t3-dark: matches — breadcrumb (monogram, muted project, "/", bold title, chevron), toggle icons, caption buttons, black bar as app-thread-dark.png; differs — chevron always visible (t3code: on hover; documented), only two toggles (t3code has a third, left one), git/model chips are ours (t3code has a details card; documented). Tooltip and dropdown not in the image, so not compared.
+- thread-header-t3-light: expected — legible, no clipping or overlap; orange "detached HEAD"/"folder missing" and green/red counts readable; chips drop out in the narrow row as designed.
+- thread-header-t3-dark / -light, long-names row: unexpected — the title shrinks to a bare "..." and the project reads "a-project... it-can-be" with a gap before "/"; legible, no overflow, but odd-looking (edge case).
+- thread-header-t3-*, magenta band: expected — story background.
+- thread-t3-dark: matches app-thread-dark.png / app-codeblock_closeup-dark.png (bubbles, text, code block, copy button).
+- thread-t3-light: expected — legible, code and table borders visible.
+- thread-live-t3-dark/light: matches (dark) / expected (light) — work row, error line, Retry/Branch footer, "Scroll to end" pill.
+- thread-tools-{command,edit,lookup,agent,group,footer}-t3-dark: matches — row layout, icons, diff colours, changed-files card consistent with the references; nothing unexpected.
+- thread-tools-{command,edit,lookup,agent,group,footer}-t3-light: expected — legible, contrast fine, no clipping.
+
+### Review (Opus 5.5)
+Verdict: solid checkpoint; one visible layout flaw (the long-names case), the Phase 4 live-check gap, and small export
+hardening, fixed here. Main had not moved (no merge). `/code-review` was not run (the pass below is by hand).
+
+**Findings and fixes**
+1. **Long names: the title shrank to a bare "..."** (the Sonnet check's (a)). The title wrapper was `flex_1` (basis 0) with
+   40 px minimum, so the project crumb (basis = its text, up to 180 px) and the chips kept their width and the title got
+   what was left. t3code has the same order (`min-w-10 flex-1` beside a `shrink` project) but its bar has no chips. **Fix:**
+   `header_data::title_min_width(title, room)`: the title claims its own (estimated) width, at most 40% of the room left
+   after the chips' hold (`Chips::reserved`: git chip 220 px, model chip 56 px) and at most 240 px, never under 40; the
+   project crumb (cut in the middle) gives way first; the model chip may shrink to 56 px, the git chip to its content
+   (branch cut, counts kept). The long-names test now runs at seven widths (640, 760, 820, 900, 1000, 1100, 1920 x sidebar
+   open/collapsed) and asserts the title keeps its claim and nothing overflows; a unit test pins the rule. A first try
+   (everything shrinking in proportion) cut the project to its monogram and let the git chip's counts overflow; not kept.
+   The "gap before /" was the middle cut's head ellipsis next to the tail, as MiddleTruncate draws it everywhere: left.
+   Snapshots `thread-header-t3-{dark,light}` re-accepted after looking (only the long-names row changed: "a-proj... it-can-be
+   / A very long... v").
+2. **Phase 4 Done (4), a live turn in `scripts/perf/`:** a core-level wiremock test is not "our instance" (AGENTS.md rule 9).
+   **Added** `--dev-send <prompt>` (with `--dev`, `crates/native/src/dev_send.rs`): the app opens the first listed thread,
+   sends through `ThreadModel::submit` (no pointer or keys), waits for the turn, prints `dev-send: reply ...`, reads the
+   thread back from the store (`ThreadModel::restart`, now `pub`) and prints `dev-send: stored ...`, then quits; every stage
+   has a deadline. `scripts/perf/native-thread-check.ps1` seeds `target
+ative-live` with the sidebar's seed test, starts
+   `mock_llm.py` on :47901 (the interpreter itself, stopped afterwards), runs our build, and wants the mock's text in both
+   lines and the two equal. Ran: `native-thread-check: ok` (1200 chars streamed and stored); no process or folder left.
+3. **Export:** the file is now written whole or not at all (`header::write_whole`: a hidden partial file renamed over the
+   target, removed on failure; an existing file is replaced only once the new one is complete); a save dialog that fails
+   to open is an error toast (it was silently nothing). Checked: Windows' `IFileSaveDialog` asks before overwriting (its
+   default `FOS_OVERWRITEPROMPT`, `gpui-pre-windows` does not clear it); cancel writes nothing. New test: unicode path,
+   replacing an existing file, a missing folder leaves no partial file. The real-core export test now also proves HTML
+   escaping (`<script>` in a reply and `&` in the title arrive as text); Markdown fences are longer than any backtick run
+   (core test).
+4. Doc slip: the header's module doc said the chips leave "git first"; it is the model first.
+
+**Checked, no change:** rename: Enter then blur cannot double-commit (`commit_rename` takes the field, dropping its
+subscription), Escape drops the field before any blur, whitespace is refused, a thread gone meanwhile makes the commit a
+no-op, a refused rename reverts with the sidebar's toast (tested). Menu: disabled entries are re-checked in `run`; pin,
+rename, archive are the sidebar's `Op`s with the thread's id; branch uses the newest stored footer only when nothing runs;
+archive of the open thread clears the selection (the main area shows the empty state, as after the sidebar's archive).
+Header reads: background only, one at a time with coalescing, per-thread models so a late read cannot paint on another
+thread (the old model is dropped with its view); the 30-frame counter test is meaningful (the header renders every frame
+in it). `Workspace::render` setting room and colours on the header without `notify`: the header is a child view drawn
+later in the same frame, so it reads the new room in that frame; no notify means no loop; layout tests depend on it and
+pass: left as is. Toggle tooltips come from the keymap ids that exist (`terminal.toggle`, `rightPanel.toggle`,
+`sidebar.toggle`). Sonnet (b): the sidebar toggle exists (in the sidebar's header when open, in the bar when collapsed,
+Phase 2's choice), so no third toggle was added; (c) accepted as documented. Ground rules: views call no core (only
+`model/backend.rs`), t3code sources and screenshots named in the headers, palette tokens only, `hermes_testdir` with
+`TestDir` dropped last, no store schema change, `crates/core` untouched.
+
+**Left, and why:** a hanging `git` (a dead network share, an fsmonitor that never answers) blocks one background thread
+per opened thread: the UI never waits and reads do not pile up per thread, but the process is not killed. The fix is a
+timeout in `hermes_core::git::git`, shared with the Tauri app's git routes: a core change for its own checkpoint (Phase 6,
+when the diff panel reads git much more). "No repo" and "no git" still read the same. The branch's middle cut can show
+only its tail in the tightest case ("the-head"): MiddleTruncate's behaviour, Phase 8 polish.
+
+**Tests:** `cargo test -p hermes-native` 285 passed (2 ignored); `--features snapshots`: only `thread-header-t3-*` differed
+(caused here, looked at, accepted); `scripts/native/check.ps1`: "native check: all ok"; `cargo test -p hermes_core` 140
+passed; `cargo build --workspace` passes; clippy (`--all-targets --features snapshots`) clean; rustfmt on the files touched
+here; `scripts/perf/native-thread-check.ps1`: ok. `cargo test -p hermes-desktop` not run: no core, runtime or desktop
+file changed. `scripts/clean-test-temp.ps1`: swept (see the commit).

@@ -158,6 +158,12 @@ and the `open_file.rs` unit tests.
 imported chat) against a home built by `make-hermes-db.py` with Hermes's own SessionDB; start the
 instance with `HERMES_HOME` set to it.
 
+`native-thread-check.ps1` is the native UI's live turn (Phase 4): our `hermes-native --dev --dev-send` on a
+seeded synthetic folder (`target
+ative-live`) against `mock_llm.py` on :47901; the streamed reply and the same reply
+read back from the store must hold the mock's text (docs/TESTING.md §6). It needs `cargo build -p hermes-native --bins`
+in `target/claude`; no page, no DevTools port.
+
 `aux-models-check.mjs` checks Settings ▸ Model ▸ Auxiliary (the four jobs, refused assignments,
 a title and a compression model with its own and an inherited effort reaching their requests,
 reset).

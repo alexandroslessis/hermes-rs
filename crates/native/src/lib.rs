@@ -9,6 +9,7 @@
 pub mod app;
 pub mod design;
 pub mod dev;
+pub mod dev_send;
 pub mod fake;
 pub mod gallery;
 pub mod keymap;
