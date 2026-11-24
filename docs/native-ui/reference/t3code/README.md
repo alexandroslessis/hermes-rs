@@ -69,3 +69,8 @@ empty states. Phase 2 (CP2.1 tokens, CP2.2 components and frame) needs most of t
 CP4.3 took no new screenshot (t3code's window cannot be driven from here): the header follows `ChatHeader.tsx`
 (breadcrumb, rename field, title menu) checked against `app-thread-dark.png` and `app-thread-options.png`; the
 branch and change counts follow `sidebar-thread-details.png`; the light theme follows `index.css`.
+
+CP5.1 took no new screenshot (t3code's window cannot be driven from here): the composer follows `ChatComposer.tsx`,
+`ComposerSurface.tsx`, `ComposerPrimaryActions.tsx`, `ComposerFooterControls.tsx`, `QueuedRunsControl.tsx` and the existing
+`app-thread-dark.png`, `app-empty-dark.png`, `composer-model-picker.png`, `composer-model-picker-permission.png`; the light
+theme, the grown input, the queue strip, the mode menu in isolation and the context meter follow the source.

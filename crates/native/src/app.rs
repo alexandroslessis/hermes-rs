@@ -42,11 +42,11 @@ pub struct Options {
     pub dump: Option<std::path::PathBuf>,
     /// `--fixture`: fake projects and threads, no core, no lock (tests, screenshots, a look).
     pub fixture: bool,
-    /// `--dev`: a dev-only strip under the open thread sends a prompt (until Phase 5's composer).
-    /// With `--fixture` a sent prompt replays the recorded turn
-    /// (`crates/native/fixtures/thread-session.json`).
+    /// `--dev` (DEV ONLY): enables `--dev-send` and, with `--fixture`, makes a prompt sent from
+    /// the composer replay the recorded turn (`crates/native/fixtures/thread-session.json`).
+    /// (Before Phase 5's composer it added a prompt strip under the thread.)
     pub dev: bool,
-    /// `--dev-provider <url>`: the dev strip's prompts go to this OpenAI-compatible endpoint (a
+    /// `--dev-provider <url>`: the prompts go to this OpenAI-compatible endpoint (a
     /// mock provider such as `scripts/perf/mock_llm.py`'s `http://127.0.0.1:47900/v1`) instead of
     /// the thread's own provider.
     pub dev_provider: Option<String>,
@@ -116,6 +116,7 @@ pub fn run(options: Options) {
             palette::bind(cx);
             sidebar::keys::bind(cx);
             crate::thread::header::bind(cx);
+            crate::thread::composer::view::bind(cx);
 
             let state = data_dir.as_deref().map(UiState::load).unwrap_or_default();
 
@@ -196,9 +197,8 @@ pub fn run(options: Options) {
                             cx,
                         );
                     }
-                    let workspace = cx.new(|cx| {
-                        Workspace::with_model(state, data_dir, model, window, cx).with_dev(dev)
-                    });
+                    let workspace =
+                        cx.new(|cx| Workspace::with_model(state, data_dir, model, window, cx));
                     workspace.update(cx, |w, cx| w.focus(window, cx));
                     // Follow the system's light and dark while no theme was picked.
                     let follow = workspace.clone();

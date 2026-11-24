@@ -7,9 +7,9 @@
 //! - `--theme <name>`: wear that theme (`"Default Dark"`, `"One Light"`, a user file's) instead of
 //!   the remembered one.
 //! - `--fixture`: fake projects and threads, no core and no app lock (for looking and testing).
-//! - `--dev` (DEV ONLY, until Phase 5's composer): a strip under the open thread sends a prompt;
-//!   with `--fixture` it replays the recorded turn. `--dev-provider <url>` sends the prompts to a
-//!   mock OpenAI-compatible endpoint (`scripts/perf/mock_llm.py`: `http://127.0.0.1:47900/v1`).
+//! - `--dev` (DEV ONLY): with `--fixture`, a prompt sent from the composer replays the recorded
+//!   turn; `--dev-send` needs it. `--dev-provider <url>` sends the prompts (the composer's too) to
+//!   a mock OpenAI-compatible endpoint (`scripts/perf/mock_llm.py`: `http://127.0.0.1:47900/v1`).
 //! - `--dev-send <prompt>` (with `--dev`): open the first listed thread, send the prompt, print
 //!   the streamed and the stored reply on stderr, quit (the Phase 4 live check,
 //!   `scripts/perf/native-thread-check.ps1`; `--dump` is then written when the turn has ended).

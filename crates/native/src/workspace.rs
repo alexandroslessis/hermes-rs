@@ -44,7 +44,7 @@ use gpui_kit::{
 
 use crate::{
     design::{
-        EmptyState, Panel, Toasts,
+        Button, EmptyState, Panel, Toasts,
         button::{self, Variant, icon_button},
         panel::Edge,
         toast::{self, ToastId, ToastSpec},
@@ -56,7 +56,11 @@ use crate::{
     palette::{self, Item, Kind, Mode, Palette, PaletteEvent},
     sidebar::{Sidebar, SidebarEvent, data::Snapshot, empty},
     theme::{self, DesignTheme as _, Themes},
-    thread::{HeaderEvent, OpenDiffTab, OpenFileInPanel, OpenScreen, ThreadHeader, ThreadView},
+    thread::{
+        ComposerView, ComposerViewEvent, HeaderEvent, OpenDiffTab, OpenFileInPanel, OpenScreen,
+        ThreadHeader, ThreadView,
+        composer::{Target, data::new_thread_key},
+    },
     titlebar::{self, TitleBar},
     ui_state::{self, MIN_WINDOW, UiState},
 };
@@ -232,8 +236,9 @@ pub struct Workspace {
     /// The open thread's header, in the title bar (made and dropped with the view).
     thread_header: Option<Entity<ThreadHeader>>,
     header_subscription: Option<Subscription>,
-    /// `--dev`: the thread view gets the dev-only prompt strip.
-    dev: bool,
+    /// The composer under the open thread, or in the new-thread screen.
+    composer_view: Option<Entity<ComposerView>>,
+    composer_subscription: Option<Subscription>,
     /// The file a link asked the right panel to open (its view is Phase 6).
     panel_file: Option<OpenFileInPanel>,
     _bounds: Subscription,
@@ -293,17 +298,17 @@ impl Workspace {
             thread_view: None,
             thread_header: None,
             header_subscription: None,
-            dev: false,
+            composer_view: None,
+            composer_subscription: None,
             panel_file: None,
             _bounds: bounds,
             _subscriptions: subscriptions,
         }
     }
 
-    /// With the dev-only prompt strip under an open thread (`hermes-native --dev`).
-    pub fn with_dev(mut self, dev: bool) -> Self {
-        self.dev = dev;
-        self
+    /// The composer of the open thread or of the new-thread screen.
+    pub fn composer_view(&self) -> Option<&Entity<ComposerView>> {
+        self.composer_view.as_ref()
     }
 
     /// The open thread's view.
@@ -318,6 +323,15 @@ impl Workspace {
 
     /// Makes the view of the model's open thread, or drops it when none is open.
     fn sync_thread_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prune_drafts(cx);
+        let wanted_composer = self.model.read(cx).composer().cloned();
+        let current_composer = self
+            .composer_view
+            .as_ref()
+            .map(|v| v.read(cx).model().clone());
+        if wanted_composer != current_composer {
+            self.make_composer_view(wanted_composer, window, cx);
+        }
         let thread = self.model.read(cx).thread().cloned();
         let current = self
             .thread_view
@@ -326,10 +340,10 @@ impl Workspace {
         if thread == current {
             return;
         }
-        let dev = self.dev;
+        let composer = self.composer_view.clone();
         self.thread_view = thread
             .clone()
-            .map(|thread| cx.new(|cx| ThreadView::new(thread, dev, window, cx)));
+            .map(|thread| cx.new(|cx| ThreadView::new(thread, composer, window, cx)));
         // The header is the title bar's middle while a thread is open.
         let app = self.model.clone();
         self.thread_header =
@@ -349,6 +363,63 @@ impl Workspace {
     }
 
     /// The open thread's header.
+    /// Makes the composer's view over `model` (starting from the draft kept for it), or drops it.
+    fn make_composer_view(
+        &mut self,
+        model: Option<Entity<crate::thread::ComposerModel>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer_view = model.map(|model| {
+            let key = match model.read(cx).target() {
+                Target::Thread(id) => id.clone(),
+                Target::Draft(project) => new_thread_key(project),
+            };
+            let draft = self.state.drafts.get(&key).map(str::to_string);
+            cx.new(|cx| ComposerView::new(model, key, draft, window, cx))
+        });
+        self.composer_subscription = self.composer_view.as_ref().map(|view| {
+            cx.subscribe(view, |this, _, event: &ComposerViewEvent, cx| match event {
+                ComposerViewEvent::Draft { key, text } => this.set_draft(key, text, cx),
+                ComposerViewEvent::Notice(spec) => {
+                    this.push_toast(spec.clone(), cx);
+                }
+            })
+        });
+    }
+
+    /// Keeps `text` as the draft of `key` and writes `native-ui.json` after a pause.
+    fn set_draft(&mut self, key: &str, text: &str, cx: &mut Context<Self>) {
+        if self
+            .state
+            .drafts
+            .set(key, text, crate::model::system_now_ms())
+        {
+            self.changed(cx);
+        }
+    }
+
+    /// Drops the drafts of threads and projects the list no longer has once they are a week old
+    /// (a deleted thread's draft does not stay forever; an archived one keeps it a while).
+    fn prune_drafts(&mut self, cx: &mut Context<Self>) {
+        let model = self.model.read(cx);
+        if !matches!(model.phase(), crate::model::Phase::Ready) || self.state.drafts.is_empty() {
+            return;
+        }
+        let snapshot = model.snapshot();
+        let listed = |key: &str| match key.strip_prefix("new:") {
+            Some(project) => snapshot.project(project).is_some(),
+            None => snapshot.thread(key).is_some(),
+        };
+        if self
+            .state
+            .drafts
+            .prune(listed, crate::model::system_now_ms())
+        {
+            self.changed(cx);
+        }
+    }
+
     pub fn thread_header(&self) -> Option<&Entity<ThreadHeader>> {
         self.thread_header.as_ref()
     }
@@ -894,11 +965,24 @@ impl Workspace {
                 let name = snapshot
                     .project(project)
                     .map_or("this project".to_string(), |p| p.name.clone());
-                EmptyState::new("empty", format!("What should we build in {name}?"))
-                    .icon(IconName::MessageSquare)
-                    .description("The composer arrives in Phase 5.")
-                    .size(crate::design::empty_state::Size::Hero)
-                    .into_any_element()
+                let without = (project != crate::sidebar::data::NO_PROJECT).then(|| {
+                    let model = self.model.clone();
+                    Button::new("start-without-project", "or start without a project")
+                        .variant(Variant::GhostMuted)
+                        .size(button::Size::Sm)
+                        .on_click(move |_, _, cx| {
+                            model.update(cx, |m, cx| {
+                                m.new_thread(crate::sidebar::data::NO_PROJECT, cx)
+                            })
+                        })
+                        .into_any_element()
+                });
+                crate::thread::composer::view::hero(
+                    &palette,
+                    format!("What should we build in {name}?"),
+                    without,
+                    self.composer_view.clone(),
+                )
             }
             Selection::None if starting => div().into_any_element(),
             Selection::None if matches!(model.phase(), crate::model::Phase::Failed(_)) => {

@@ -431,6 +431,8 @@ provider in `scripts/perf/` streams correctly in our instance.
 
 ### CP5.1 — Input and sending (M)
 
+**Status (CP5.1, 2026-11-24):** built and reviewed (Opus), committed on `native/p5-composer`, not merged; `thread/composer/`, details and the reviewer's list in `progress/phase-5.md`.
+
 1. Multiline input (GPUI Kit's), grows to a maximum height then scrolls; Enter sends,
    Shift+Enter newline; IME; undo; draft kept per thread in `native-ui.json`.
 2. Send and stop; while a turn runs, sending queues (shown above the input, removable).

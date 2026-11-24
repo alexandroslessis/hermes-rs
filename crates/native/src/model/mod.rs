@@ -41,6 +41,8 @@ use hermes_runtime::TurnStatus;
 
 use crate::design::toast::{Kind, ToastSpec};
 use crate::sidebar::data::{Marks, Op, Snapshot};
+use crate::thread::composer::data::{Picks, SendRequest};
+use crate::thread::composer::{ComposerEvent, ComposerModel, Target};
 use crate::thread::{ThreadEvent, ThreadModel};
 
 pub mod backend;
@@ -109,6 +111,19 @@ pub struct AppModel {
     thread_subscription: Option<Subscription>,
     /// A thread made by "Branch from here", opened as soon as the list has it.
     open_when_listed: Option<String>,
+    /// The open thread's (or the new-thread screen's) composer.
+    composer: Option<Entity<ComposerModel>>,
+    composer_subscription: Option<Subscription>,
+    /// The first prompt of a thread just made from the new-thread screen: sent from the new
+    /// thread's composer once the list has the thread and it is open.
+    first_prompt: Option<FirstPrompt>,
+}
+
+/// A prompt waiting for its new thread to be opened.
+struct FirstPrompt {
+    session: String,
+    request: SendRequest,
+    picks: Picks,
 }
 
 impl EventEmitter<ModelEvent> for AppModel {}
@@ -139,6 +154,9 @@ impl AppModel {
             thread: None,
             thread_clock: None,
             thread_subscription: None,
+            composer: None,
+            composer_subscription: None,
+            first_prompt: None,
             open_when_listed: None,
         }
     }
@@ -303,9 +321,63 @@ impl AppModel {
         self
     }
 
+    /// The composer of the open thread or of the new-thread screen.
+    pub fn composer(&self) -> Option<&Entity<ComposerModel>> {
+        self.composer.as_ref()
+    }
+
+    /// Makes the models of what is open (the thread's, and its composer) and drops the ones of
+    /// what is not.
+    fn sync_thread(&mut self, cx: &mut Context<Self>) {
+        self.sync_thread_model(cx);
+        self.sync_composer(cx);
+    }
+
+    /// The composer follows the selection: a thread's, or a new thread's in a project.
+    fn sync_composer(&mut self, cx: &mut Context<Self>) {
+        let wanted = match &self.selected {
+            Selection::Thread(id) => Some(Target::Thread(id.clone())),
+            Selection::Draft(project) => Some(Target::Draft(project.clone())),
+            Selection::None => None,
+        };
+        let current = self.composer.as_ref().map(|c| c.read(cx).target().clone());
+        if wanted == current {
+            return;
+        }
+        self.composer = match (wanted, self.backend.clone()) {
+            (Some(target), Some(backend)) => {
+                let thread = self
+                    .thread
+                    .clone()
+                    .filter(|_| matches!(target, Target::Thread(_)));
+                Some(cx.new(|cx| ComposerModel::new(target, backend, thread, cx)))
+            }
+            _ => None,
+        };
+        self.composer_subscription = self.composer.as_ref().map(|composer| {
+            cx.subscribe(composer, |this, _, event: &ComposerEvent, cx| {
+                if let ComposerEvent::Created {
+                    session,
+                    request,
+                    picks,
+                } = event
+                {
+                    // The new thread opens once the list has it; its composer sends the prompt.
+                    this.first_prompt = Some(FirstPrompt {
+                        session: session.clone(),
+                        request: request.clone(),
+                        picks: picks.clone(),
+                    });
+                    this.open_when_listed = Some(session.clone());
+                    this.refresh(cx);
+                }
+            })
+        });
+    }
+
     /// Makes the open thread's model if it is not the selection's yet, or drops it when nothing
     /// is open.
-    fn sync_thread(&mut self, cx: &mut Context<Self>) {
+    fn sync_thread_model(&mut self, cx: &mut Context<Self>) {
         let wanted = self.open_thread().map(str::to_string);
         let current = self
             .thread
@@ -452,6 +524,13 @@ impl AppModel {
         if let Some(id) = self.open_when_listed.take() {
             if self.snapshot.thread(&id).is_some() {
                 self.open(&id, cx);
+                // The first prompt of a thread made from the new-thread screen.
+                if self.first_prompt.as_ref().is_some_and(|f| f.session == id)
+                    && let (Some(first), Some(composer)) =
+                        (self.first_prompt.take(), self.composer.clone())
+                {
+                    composer.update(cx, |c, cx| c.send_first(first.request, first.picks, cx));
+                }
             } else {
                 self.open_when_listed = Some(id);
             }
@@ -556,6 +635,10 @@ impl AppModel {
             && thread.read(cx).session() == event.session_id()
         {
             thread.update(cx, |thread, cx| thread.on_event(&event, cx));
+        }
+        // The composer follows the same turn (its queue, whether it runs).
+        if let Some(composer) = &self.composer {
+            composer.update(cx, |composer, cx| composer.on_event(&event, cx));
         }
         match event {
             CoreEvent::TurnStarted { session_id, .. } => {

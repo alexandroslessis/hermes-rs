@@ -1,0 +1,198 @@
+# Phase 5 progress
+
+Worktree: C:\Users\alexandros\repos\hermes-rs-n5   Branch: native/p5-composer
+
+## CP5.1 — Input and sending
+Worktree: C:\Users\alexandros\repos\hermes-rs-n5   Branch: native/p5-composer   Model: Sonnet 5.5 (subagent)
+Cut from `main` at 0b2d005. Uncommitted.
+
+### Files
+- New `crates/native/src/thread/composer/`: `mod.rs`, `data.rs` (no GPUI: `SendRequest`, `Sent`, `QueuedItem`, `QueueOp`, `Picks`/`Pick`,
+  `Mode`, `EFFORTS`, `Controls`, `ModelChoices` + filter, `Drafts`), `model.rs` (`ComposerModel`, `ComposerEvent`, `Target`, `Choices`),
+  `view.rs` (`ComposerView`, the queue strip, the model/effort and mode menus, `hero` = the new-thread screen), tests: `tests.rs`,
+  `wiring_tests.rs`, `real_tests.rs`.
+- New `gallery/composer.rs` (stories `composer`, `composer-menus`, `composer-new`).
+- Edited: `model/backend.rs` (Backend: `controls`, `draft_controls`, `model_choices`, `create_thread`, `send`, `stop`, `queue_op`, `pick`,
+  `set_default_model`; `CoreBackend` implements them; `NativeHooks`; `FixtureBackend` records every `ComposerOp` and plays the queue),
+  `model/mod.rs` (`AppModel` makes the composer beside the thread's model, forwards events, creates-opens-sends for a new thread),
+  `thread/model.rs` (`expect_prompt` / `forget_prompt` / `show_user`: the user's row shows when the turn with that admission id starts),
+  `thread/view.rs` (takes the composer; the dev strip is gone), `workspace.rs` (composer views, drafts, pruning, the hero),
+  `ui_state.rs` (`drafts`), `design/icons.rs` (7 icons), `app.rs`/`main.rs` (flag docs; `--dev` now only enables `--dev-send` and the
+  fixture replay), `Cargo.toml` (`hermes_tools` moved to dependencies: `ApprovalMode`), `thread/tests.rs` (dev-strip test became a
+  `ThreadModel::submit` test).
+- Docs: AGENTS.md row, ARCHITECTURE.md row, TESTING.md §6 (composer paragraph), PITFALLS.md (6 bullets), PHASES.md status,
+  native-ui/README.md module row, reference/t3code/README.md (no new screenshot).
+
+### What it does
+1. **Input.** Kit's `TextareaState` auto-grow 2 to 9 rows (about t3code's `max-h-52`, then it scrolls), `submit_on_enter`: Enter sends, Shift+Enter
+   newline, Ctrl+Enter steers a running turn. An Enter during an IME composition is ignored (`marked_text_range`). Undo/redo are Kit's.
+   Draft per thread (`native-ui.json` `drafts`, key = thread id or `new:<project>`), written by the workspace through its debounced
+   save (500 ms), at most 100 drafts of 100,000 characters, an empty one removed, one of an unlisted thread/project dropped after 7 days
+   (archived threads are unlisted, hence the week; a delete does not remove the draft at once).
+2. **New thread.** The "No active thread" state of a project (`Selection::Draft`) is t3code's `DraftHeroHeadline`: headline, "or start
+   without a project", the composer. Enter creates the session (`Backend::create_thread`: the project's folder, else the home folder, as the
+   Tauri app; Settings' provider/model or the one picked), the app model opens it once listed, then its composer sends the first prompt
+   with the picks made on the screen. A refusal (no provider) keeps the text and toasts.
+3. **Send / stop / queue.** `Backend::send` -> `Core::submit` (Started / Queued) or `Core::steer`. While a turn runs the button is Stop when
+   the input is empty, else the queue icon. The strip above the card lists `Core::queue` (read on `QueueChanged`, `TurnStarted`,
+   `TurnEnded`, `Idle`, `QueuedFailed`; what another front end queued shows too), each with Send now (`steer_queued`), Edit (the text goes
+   to the input, the next send is `replace_queued`, Cancel gives the draft back), Remove. Over 3 items: first two + "Show all N queued".
+   A refused send keeps the draft and toasts; `QueuedFailed` puts the text back with a toast.
+4. **Footer.** Mode chip (Manual, Plan, Accept edits, Auto, YOLO: all five `ApprovalMode`s, as the ACP menu; t3code's segmented
+   icon menu with the hovered mode's name and description), context meter (a bar; tooltip `18k / 200k (9%)`; from
+   `Core::usage_snapshot`, shown once a call has reported input tokens), model chip `model Effort` that opens t3code's picker: search +
+   the endpoints' models (`Core::model_options`, read-only, asked when the picker opens) + "Reasoning effort" (Hermes's eight levels).
+   Model pick on a thread = `Core::switch_model(session_only)` (deferred by the core while a turn runs; the new `NativeHooks` apply it
+   between turns); on the new-thread screen it is also saved as the default (`providers::save_default`). Effort = `pick_effort`, read by
+   `turn_options` at the next turn. Mode = `Runtime::set_approval_mode` at once (a new thread: with its first send).
+
+### Tests (all `CARGO_TARGET_DIR=target/claude`)
+- `cargo test -p hermes-native --lib`: 336 passed, 2 ignored. Composer: 54
+  (10 data, 31 `tests.rs`, 9 `wiring_tests.rs`, 4 `real_tests.rs`). The real-core tests: real `Core` on a `hermes_testdir` folder with
+  `config.json`, wiremock provider whose first reply is held; send, queue two, remove one (the core's own queue checked), the queued one
+  runs and its row appears at its `TurnStarted`, Stop, model/effort/mode picked mid-turn (model applies after the turn, mode at once),
+  a new thread from the new-thread screen (folder, answer, mode). Stable over 6 runs.
+- `scripts/native/check.ps1`, `cargo test -p hermes_core`, `cargo build --workspace`, `scripts/perf/native-thread-check.ps1`,
+  `scripts/clean-test-temp.ps1`: results in "Final checks" below.
+
+### Snapshots
+New (6), `crates/native/snapshots/`: `composer-t3-{light,dark}.png` (idle, typed, grown to the maximum, running with Stop and the
+meter, queue of three + text), `composer-menus-t3-{light,dark}.png` (model/effort picker, permissions menu, narrow 352 px card with a
+long model name), `composer-new-t3-{light,dark}.png` (the new-thread screen). No pre-existing baseline changed (no `.diff.png`).
+I looked at the dark idle sheet, the dark menus and the light new-thread image only; a Haiku check should look at all six.
+
+### Deviations
+- **Context meter in the footer** (t3code shows it in the thread details card, which the native UI has no equivalent of): a bar + tooltip.
+- **No attach button, speech button, stash menu, checkout/branch row under the card** (attachments are CP5.2, the branch is in the header).
+- **Modes**: five, not three: Manual, Plan, Accept edits, Auto, YOLO (the runtime's `ApprovalMode`; Accept edits is the default
+  of `approvals.mode: manual`, YOLO is "Full access"). The picker is the permissions segment menu, not inside the model popup.
+- **Model picker**: no per-provider tabs, favourites or Ctrl+N shortcuts, no arrow-key navigation (search, then Enter takes the first
+  match; the list is clicked). Up to 200 models drawn; a search narrows the rest.
+- **Redirect** (`Core::redirect`, interrupt and send this) has no control: t3code has none (it has "Send now" = steer and Edit).
+- The user's message row appears when the turn starts, not at the Enter (a few ms with a local core; a queued prompt appears when it
+  runs, which is what the queue strip is for).
+- A thread's model pick is the thread's; only the new-thread screen's pick changes the default model.
+- Mode shown for a thread never sent from this run = Settings' `approvals.mode` (the runtime forgets a session's own mode when it is
+  unloaded); picks made in this run are remembered by `CoreBackend`. *(Review: replaced; the mode is read from the runtime,
+  `Runtime::loaded_approval_mode`, else the approvals store; see the review below.)*
+- No title model in `NativeHooks` (a new thread gets the core's provisional title from its first message).
+
+### Missing core operations
+None blocking. Facts: no `Core` call says a session's approval mode while unloaded (see above); `model_options` asks the endpoints over
+the network (done on a background thread; offline it lists the configured models only); a session's context usage exists
+(`usage_snapshot`) but only the last call's input tokens, persisted in the store.
+
+### For the reviewer
+1. `ComposerModel::send` clears nothing itself: the view clears on `Sent` if the text is unchanged; a failed send leaves it. Check the
+   double-Enter guard (`sending`) against a slow `create_thread`.
+2. `Idle` schedules a second controls read 300 ms later (a read between the core taking a pending model pick and applying it showed the
+   old model until the next event; the test clock is manual and the real-core test advances it). *(Review: removed, see below.)*
+3. `REOPEN_GUARD` (250 ms) is a time heuristic against `on_mouse_down_out` closing a menu on the same click that would toggle it.
+   *(Review: removed, see below.)*
+4. `CoreBackend::send` refuses when the session's provider cannot be resolved ("Nothing is changed"), before applying picks; the
+   old `submit` used by `--dev-send` stays lenient.
+5. `NativeHooks::settings` resolves the provider per turn from the record (so a model moved to another provider is followed); `retry`
+   and `branch` still take their provider from `session_provider`. Retry now uses `NativeHooks` too.
+6. Drafts of deleted threads stay up to a week (see 1. in "What it does"); deleting could remove them at once if `AppModel` told the
+   workspace (`ModelEvent` has one variant that the sidebar tests match irrefutably, so I did not add one).
+7. The queue strip's "Edit" turns the next send into `replace_queued`, which goes to the back of the queue (the core's semantics), not in place.
+8. `hermes_tools` is now a normal dependency of `hermes-native` (`ApprovalMode`), used by `model/backend.rs` only.
+9. Pre-existing bug fixed in passing: `CoreBackend::submit` had a stray carriage return in a comment ("As in \retry"), which made a line break.
+
+### Final checks
+`scripts/native/check.ps1`: "native check: all ok". `cargo test -p hermes-native`: 336 passed, 2 ignored. `cargo test -p hermes_core`: 140 passed. `cargo build --workspace`: ok (webapp dist copied from the main checkout, as in earlier phases, then removed). `cargo clippy -p hermes-native --all-targets --no-deps`: clean; `cargo fmt` also reformatted four CP4.2 files, reverted (not mine). `scripts/perf/native-thread-check.ps1`: "native-thread-check: ok" (streamed and stored reply equal). `scripts/clean-test-temp.ps1`: dry run 5 folders (1.4 MB), `-Delete` removed them, second dry run 0.
+
+### User checklist (CP5.1)
+Build (PowerShell, in `C:\Users\alexandros\repos\hermes-rs-n5`): `$env:CARGO_TARGET_DIR="target/claude"; cargo build -p hermes-native --bins`,
+`$env:HERMES_RS_HOME="$PWD\target\native-test"` (a synthetic folder, never `%APPDATA%`).
+A. `.\target\claude\debug\hermes-native.exe --fixture --dev` (recorded turn replays on send):
+ 1. Open "halo": the card at the bottom, "Ask anything...", `Accept edits` at the left, `fixture-model Medium` and a grey arrow at the right.
+ 2. Type a few words: the arrow turns blue. Enter: the words appear as your message, the recorded turn streams, the input is empty.
+ 3. Shift+Enter makes a new line; type 12 lines: the card grows and stops growing, then scrolls inside.
+ 4. While the turn streams: the blue button is a square (Stop) when the input is empty; type something: it becomes the queue icon;
+    Enter queues it above the card (dashed bubble, Send now, pencil, x). The fixture does not queue for real; the real core does (B).
+ 5. Click `fixture-model Medium`: a picker with a search box, four models and "Reasoning effort"; type "llama", Enter: the chip changes.
+ 6. Click `Accept edits`: five icons (lock, clipboard, pencil, shield, crossed shield); hover each: its name and description; click Plan.
+ 7. Escape or a click outside closes either menu.
+ 8. Type text in "halo", open "ayo", type other text, go back: each keeps its own. Quit and start again: still there.
+ 9. In the sidebar click a project's "new thread" button: "What should we build in structure?" with the card; Enter sends (the fixture
+    opens a "new-N" thread).
+B. Real core, optional (as Phase 4's item 11: seeded folder, `scripts/perf/mock_llm.py` via `--dev-provider`): send a prompt, send two more
+   while it streams: both show above the card; remove one; Stop; the turn stops.
+C. **Hand-only, nobody has done these in a real window:** a Japanese or Greek IME (Enter that confirms a composition must not send);
+   Win+. emoji panel into the input; Ctrl+V of text (a multi-line paste), Ctrl+Z after typing; the feel of the menus and of
+   dragging a selection in the input.
+
+### Visual check (Haiku 5.5)
+References opened: `reference/t3code/composer-model-picker.png`, `composer-model-picker-permission.png`, `app-thread-dark.png`, `app-empty-dark.png`. Snapshots viewed as composites and as 2x crops of the dark sheets.
+- composer-t3-light: expected — idle, typed, grown (scrolls at max), running with Stop, queue of three; text legible, nothing clipped beyond the intended scroll.
+- composer-t3-dark: differs — the input placeholder is "Ask anything..." where t3code has "Ask anything. @ files, $ skills, / commands"; the idle send button is a lighter grey than t3code's dark disc (app-thread-dark). Card radius, border and padding look close to t3code.
+- composer-menus-t3-light: expected — model picker (search, list, effort column, check on the selected effort) and the permissions popup overlap the card as designed; the narrow card truncates "openro..." as intended.
+- composer-menus-t3-dark: differs — the model list has no Ctrl+N shortcut badges (declared deviation); the permissions popup shows five icons, t3code four (declared); the popup border is faint on black. Item heights and the check mark match composer-model-picker.png.
+- composer-new-t3-light: differs — no "Current checkout / branch / Full access" row under the card (declared deviation); headline and "or start without a project" subline match app-empty-dark.png; card legible.
+- composer-new-t3-dark: differs — the card border is almost invisible on black where t3code's is faintly visible; placeholder text differs as in composer-t3-dark.
+
+### Review (Opus 5.5)
+Verdict: **good after fixes.** Main had not moved (no merge). The send path, queue and drafts were mostly right; four
+real bugs and the two timing heuristics were fixed, and the mode source was made exact.
+
+Findings and fixes:
+1. **Edit of a queued prompt lost its row** (bug). `replace_queued` was given no admission id, so the core named the edit
+   itself: the thread kept waiting for the old id (a leaked expectation) and never showed the edited prompt when it ran;
+   a `QueuedFailed` for it could not give the text back. Now the composer names the new admission
+   (`QueueOp::Replace { new_id }`), expects it before the op, forgets the old one on success and the new one on failure.
+   Test: the edit's row shows once, under the new id; the replaced id shows nothing.
+2. **Double Enter on the new-thread screen made two threads** (bug). `sending` dropped when `create_thread` returned,
+   but the text stays in the input until the new thread is listed and opened. It now stays "sending" until the screen
+   is replaced (a failed create still clears it). Test: second Enter = one `Create`, the send button disabled.
+3. **Send now on a prompt another front end queued showed no row** (the text came only from this composer's own map);
+   it now falls back to the queue's text. Test.
+4. **The mode could be shown wrong.** The `CoreBackend` cache of picks outlived the runtime's memory of them (a session
+   unloaded by a move starts from Settings again) and missed `/yolo`; `Runtime::approval_mode` says Accept edits for any
+   unloaded session. Added `Runtime::loaded_approval_mode` (additive, nothing else calls it); the footer shows the
+   session's own mode while loaded, else the mode it will start in from the approvals store (smart = Auto, off = YOLO,
+   else Accept edits), exactly `SessionTools::mode`. So the mode is never unknown and needs no "unknown" mark.
+   `Mode::from_settings` and the cache are gone.
+5. **The 300 ms second read after `Idle`** is gone. The core publishes `Idle` before `between_turns` applies a
+   deferred pick, with no event after; `CoreBackend` now keeps a pick made mid-turn (shared with `NativeHooks`) until its
+   `between_turns` has applied it, and `controls` shows it meanwhile. `pick` holds that lock across `switch_model` and
+   `between_turns` across `apply_pending_route`, so the two never interleave. The real-core test now asserts the footer
+   never shows the old model through the turn's end, then that an idle pick applies at once. Picks also bump the read
+   generation (a read in flight from before a pick is read again) and effort/mode picks re-read on success.
+6. **`REOPEN_GUARD` (250 ms)** is gone: `on_mouse_down_out` fires in the capture phase, before the chip sees the press,
+   so the panel records where that press went down and the chip ignores the click whose `down.position` is the same
+   press (`chip_clicked`). The test's 300 ms sleep is gone.
+7. **Tokens.** The card outline was raw `hsla`; it is now the theme's foreground at t3code's 5% / 8% (measured: ours
+   #1d1d1d on #111111, t3code's #1a1a1a on #0e0e0e in `app-empty-dark.png`: the same step; the Haiku "invisible" is
+   t3code's own faintness). The two popups used `--border` and `--popover`; t3code's popovers are `dropdown-glass`, so
+   they now use `panel_edge` / `panel_surface` (the edge is visible on black). Baselines regenerated and looked at
+   (dark menus); no tracked baseline changed.
+8. **Drafts.** Added a total bound (`MAX_TOTAL_BYTES`, 2 MB, oldest dropped) so 100 big drafts cannot make each
+   debounced save copy and write 40 MB; a hand-edited file's draft is cut to `MAX_CHARS` on read. Tests: total bound,
+   unicode/emoji/CRLF round trip, a cut never splits a character. Quit flush exists (`save_now` from
+   `on_window_should_close`; the wiring test calls it and reloads). Malformed file: `UiState::load` per-part fallback.
+9. A 1 MB paste test: laid out, sent whole, input cleared, well under the 20 s bound (headless debug).
+
+Judged and kept:
+- **Five modes, not the plan's three.** t3code offers four permission levels (supervised, auto-accept edits, auto,
+  full access) and the runtime has five `ApprovalMode`s; Accept edits is what `approvals.mode: manual` means, so dropping
+  it would leave the default mode unshowable. Five = t3code's four + Plan, as the ACP menu. Kept.
+- Placeholder "Ask anything..." kept: `@` and `/` arrive in CP5.2; naming them now would lie. The idle send disc
+  (#2d2d2d vs t3code #292929) is within a step; kept. No Ctrl+N badges and no checkout/branch row: declared deviations,
+  accepted (no keyboard model switching yet; the branch is in the header; "Full access" is the mode chip).
+- A failure after `create_thread` but before the first send leaves an empty thread, opened, with the text back in its
+  composer and a toast: clear, and rare (the provider is resolved before the thread is made). No cleanup.
+- If the new thread were never listed, the new-thread screen stays "sending" until left: acceptable.
+- Ground rules: the views never call the core (grep), t3code cited with the reference screenshots, no raw colours left
+  in `composer/`, no Zed code, `TestDir` last, every core call on a background task, the dev strip is gone, no schema
+  change. `hermes-desktop` (Tauri gateway and ACP) unchanged apart from the additive runtime method; its tests run.
+
+Checks after the fixes (`CARGO_TARGET_DIR=target/claude`): `cargo test -p hermes-native` 340 passed, 2 ignored (composer 58);
+`--features snapshots` 343 passed (the six composer baselines regenerated by me after the token change and looked at; no
+tracked baseline changed); `scripts/native/check.ps1` "native check: all ok"; `cargo test -p hermes_core` 140 passed;
+`cargo test -p hermes-desktop` 130 + 68 passed (Tauri gateway and ACP; webapp dist copied from the main checkout and
+removed after); `cargo build --workspace` ok; `scripts/perf/native-thread-check.ps1` ok; `cargo clippy -p hermes-native
+--all-targets` clean (`hermes_runtime`'s findings are older than this checkpoint); `clean-test-temp.ps1`: 1 folder
+removed, then 0.
+
+Left: the hand-only checks in C (IME, emoji panel, paste, the feel of the menus) are still the user's.

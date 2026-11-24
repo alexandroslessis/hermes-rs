@@ -38,6 +38,8 @@ hermes_core.workspace = true
 hermes_llm.workspace = true
 hermes_runtime.workspace = true
 hermes_store.workspace = true
+# The runtime's `ApprovalMode`, which the composer's mode picker sets (the backend module only).
+hermes_tools.workspace = true
 # Pinned exactly (AGENTS.md ground rule 3, the GPUI Kit exception); vendor/SOURCES.md records it.
 # `syntect` highlights fenced code: GPUI Kit's `tree-sitter` features pull tree-sitter 0.26,
 # which Cargo refuses next to crates/highlight's 0.27 (both declare `links = "tree-sitter"`).
@@ -56,8 +58,6 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 hermes_testdir.workspace = true
-# The recorder test turns on YOLO so the mock turn runs commands without asking.
-hermes_tools.workspace = true
 gpui-kit = { version = "=0.10.0", features = ["syntect", "test-support"] }
 # The mock provider of the recorded thread fixture (`thread/recording.rs`), as hermes_core's tests.
 wiremock = "0.6"

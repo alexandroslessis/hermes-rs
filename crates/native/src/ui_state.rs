@@ -21,6 +21,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::thread::composer::data::Drafts;
+
 /// How long after the last change the file is written.
 pub const SAVE_AFTER: Duration = Duration::from_millis(500);
 
@@ -121,6 +123,8 @@ pub struct UiState {
     pub theme: Option<String>,
     /// The sidebar's list: the folders the user closed and the projects' colours (Phase 3).
     pub sidebar_list: crate::sidebar::data::Prefs,
+    /// The composer's unsent text per thread (Phase 5): bounded, see [`Drafts`].
+    pub drafts: Drafts,
 }
 
 impl Default for UiState {
@@ -141,6 +145,7 @@ impl Default for UiState {
             },
             theme: None,
             sidebar_list: Default::default(),
+            drafts: Drafts::default(),
         }
     }
 }
@@ -249,6 +254,9 @@ impl UiState {
             theme: part("theme").and_then(|v| v.as_str().map(str::to_string)),
             sidebar_list: part("sidebar_list")
                 .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            drafts: part("drafts")
+                .map(|v| Drafts::from_json(&v))
                 .unwrap_or_default(),
         }
         .sanitized()

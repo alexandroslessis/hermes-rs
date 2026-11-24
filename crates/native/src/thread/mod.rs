@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 pub mod ansi;
 pub mod cards;
+pub mod composer;
 pub mod data;
 pub mod diff;
 pub mod header;
@@ -29,6 +30,7 @@ pub mod tools;
 pub mod view;
 pub mod work;
 
+pub use composer::{ComposerModel, ComposerView, ComposerViewEvent};
 pub use header::{HeaderEvent, ThreadHeader};
 pub use model::{ThreadEvent, ThreadModel};
 pub use view::ThreadView;

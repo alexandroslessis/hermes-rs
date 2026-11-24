@@ -208,6 +208,9 @@ pub struct ThreadModel {
     header: HeaderRead,
     /// A save is being prepared (the menu's export entries wait).
     exporting: bool,
+    /// Prompts the composer sent, by the core's admission id: the user's row is shown when the
+    /// turn with that id starts (a queued prompt appears when its turn begins).
+    expected: Vec<(String, String)>,
 }
 
 /// How long after one header read the window coming back to the front does not read again.
@@ -284,6 +287,7 @@ impl ThreadModel {
             replaying: false,
             header: HeaderRead::default(),
             exporting: false,
+            expected: Vec::new(),
         };
         model.load_page(None, Load::First, cx);
         model.refresh_header(cx);
@@ -1036,6 +1040,43 @@ impl ThreadModel {
         .detach();
     }
 
+    // --- prompts from the composer -------------------------------------------------------------
+
+    /// The composer is sending `text` as admission `id`: its row appears when that turn starts.
+    pub fn expect_prompt(&mut self, id: &str, text: &str) {
+        self.expected.push((id.to_string(), text.to_string()));
+    }
+
+    /// The send of admission `id` failed or was withdrawn: no row will come for it.
+    pub fn forget_prompt(&mut self, id: &str) {
+        self.expected.retain(|(expected, _)| expected != id);
+    }
+
+    /// The prompts the thread waits to show (the composer's tests read it).
+    pub fn expected_prompts(&self) -> usize {
+        self.expected.len()
+    }
+
+    /// Shows `text` as the user's message now (a steer into the running turn has no turn of its
+    /// own to start).
+    pub fn show_user(&mut self, text: &str, now_ms: i64, cx: &mut Context<Self>) {
+        self.push(
+            RowKind::User {
+                text: text.to_string().into(),
+                images: Vec::new(),
+            },
+            Some(now_ms),
+            cx,
+        );
+        self.scroll_to_end(cx);
+    }
+
+    /// [`Self::show_user`] at the model's clock.
+    pub fn show_user_now(&mut self, text: &str, cx: &mut Context<Self>) {
+        let now = (self.clock)();
+        self.show_user(text, now, cx);
+    }
+
     // --- the live turn ------------------------------------------------------------------------
 
     /// Takes in one of the core's events for this thread (others are ignored).
@@ -1050,7 +1091,14 @@ impl ThreadModel {
             return;
         }
         match event {
-            CoreEvent::TurnStarted { .. } => {
+            CoreEvent::TurnStarted { admission_id, .. } => {
+                // The composer's prompt: its row is shown now that its turn has begun (unless
+                // the history is not read yet: the store has the prompt and the end reconciles).
+                let prompt = self
+                    .expected
+                    .iter()
+                    .position(|(id, _)| id == admission_id)
+                    .map(|at| self.expected.remove(at).1);
                 // Before the history is read, the store may already hold part of this turn
                 // (its prompt): the end reconciles.
                 self.live = Some(LiveTurn {
@@ -1059,6 +1107,11 @@ impl ThreadModel {
                     started_ms: now_ms,
                     ..LiveTurn::default()
                 });
+                if let Some(text) = prompt
+                    && self.phase == ThreadPhase::Ready
+                {
+                    self.show_user(&text, now_ms, cx);
+                }
             }
             CoreEvent::ReasoningDelta { text, .. } => self.reasoning_delta(text, now_ms, cx),
             CoreEvent::TextDelta { text, .. } => {

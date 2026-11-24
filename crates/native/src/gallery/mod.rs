@@ -9,6 +9,7 @@
 //! Like Zed's storybook and GPUI Kit's `story` crate (structure only; no code from either).
 
 mod button;
+mod composer;
 mod design;
 mod frame;
 mod header;
@@ -129,6 +130,9 @@ register_stories![
     sidebar::SIDEBAR,
     sidebar::SIDEBAR_MORE,
     sidebar::EMPTY_STATES,
+    composer::COMPOSER,
+    composer::COMPOSER_MENUS,
+    composer::COMPOSER_NEW,
     thread::THREAD,
     thread::THREAD_LIVE,
     thread::TOOLS_COMMAND,

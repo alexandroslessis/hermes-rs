@@ -13,8 +13,7 @@ use std::time::Instant;
 
 use gpui_kit::{
     AnyWindowHandle, AppContext as _, ClipboardItem, Entity, HeadlessAppContext, InputEvent as _,
-    MouseButton, Point, ScrollDelta, ScrollEvent, Window, point, px, size,
-    test::{TestEventExt as _, TestWindowExt as _},
+    MouseButton, Point, ScrollDelta, ScrollEvent, Window, point, px, size, test::TestEventExt as _,
 };
 use hermes_core::CoreEvent;
 
@@ -34,7 +33,6 @@ struct Rig {
     window: AnyWindowHandle,
     backend: Arc<FixtureBackend>,
     model: Entity<ThreadModel>,
-    view: Entity<ThreadView>,
 }
 
 /// A thread view of `session` (its history `items` when given) in an 800 x 600 window.
@@ -47,7 +45,7 @@ fn rig_sized(
     items: Option<Vec<HistoryItem>>,
     page: usize,
     (w, h): (f32, f32),
-    dev: bool,
+    _dev: bool,
 ) -> Rig {
     let mut cx = headless_app();
     cx.update(|cx| crate::theme::apply_theme(ThemeChoice::T3Dark, cx));
@@ -66,20 +64,13 @@ fn rig_sized(
     };
     let root = model.clone();
     let window = open_window(&mut cx, size(px(w), px(h)), move |window, cx| {
-        cx.new(|cx| ThreadView::new(root, dev, window, cx))
+        cx.new(|cx| ThreadView::new(root, None, window, cx))
     });
-    let view = cx
-        .update_window(window.into(), |root, _, _| {
-            root.downcast::<ThreadView>()
-                .expect("the root is the thread view")
-        })
-        .unwrap();
     let mut rig = Rig {
         cx,
         window: window.into(),
         backend,
         model,
-        view,
     };
     rig.settle();
     rig
@@ -721,7 +712,7 @@ select this code line
             cx,
             |window, cx| {
                 let model = cx.new(|cx| ThreadModel::new("sel", backend, cx));
-                cx.new(|cx| ThreadView::new(model, false, window, cx))
+                cx.new(|cx| ThreadView::new(model, None, window, cx))
             },
         )
         .unwrap()
@@ -774,24 +765,12 @@ select this code line
     assert!(found, "a drag inside the code block selected its text");
 }
 
-// --- sending (dev) ------------------------------------------------------------------------------
+// --- sending (the `--dev-send` driver's path; the composer's tests are `composer/tests.rs`) -----
 
 #[core::prelude::v1::test]
-fn the_dev_prompt_sends_through_the_backend_and_shows_the_users_row() {
-    let mut rig = rig_sized("t1", None, PAGE, (800., 600.), true);
-    let view = rig.view.clone();
-    let input = rig
-        .cx
-        .update(|cx| view.read(cx).dev_input().cloned())
-        .unwrap();
-    rig.layout().bounds("dev-prompt");
-    rig.with_window(|window, cx| {
-        input.update(cx, |i, cx| {
-            i.set_value("hello there", window, cx);
-            i.focus(window, cx);
-        });
-    });
-    rig.with_window(|window, cx| window.press("enter", cx));
+fn submit_sends_through_the_backend_and_shows_the_users_row() {
+    let mut rig = rig("t1", None, PAGE);
+    rig.model(|m, cx| m.submit("hello there", cx));
     assert_eq!(
         rig.backend.sent(),
         [("t1".to_string(), "hello there".to_string())]
@@ -1103,8 +1082,12 @@ fn the_core_backend_reads_a_stored_thread_a_page_at_a_time() {
     assert!(!core.is_live(&record.id), "reading opened the session");
 
     // Retry: a row that is not a typed prompt is refused and nothing is cut.
-    let stored = |core: &hermes_core::Core| core.runtime().store().load_messages(&record.id).unwrap();
-    assert!(backend.retry(&record.id, 142).is_err(), "row 142 is a reply");
+    let stored =
+        |core: &hermes_core::Core| core.runtime().store().load_messages(&record.id).unwrap();
+    assert!(
+        backend.retry(&record.id, 142).is_err(),
+        "row 142 is a reply"
+    );
     assert_eq!(stored(&core).len(), 142);
     // With no provider to send it to, the retry is refused before anything is cut (a rewind
     // followed by a failed send would have lost the turn).
@@ -1122,7 +1105,11 @@ fn the_core_backend_reads_a_stored_thread_a_page_at_a_time() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let after = stored(&core);
-    assert_eq!(after[140].as_concat_text(), "q69", "the prompt was sent again");
+    assert_eq!(
+        after[140].as_concat_text(),
+        "q69",
+        "the prompt was sent again"
+    );
     assert!(
         !after.iter().any(|m| m.as_concat_text() == "a69"),
         "the retried turn's old reply is gone"

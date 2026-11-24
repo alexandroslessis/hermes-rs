@@ -10,8 +10,8 @@
 //! messages is not built: the copy buttons cover it, docs/native-ui/README.md, *Risks*).
 //!
 //! The view reads its [`ThreadModel`] and asks it to do things (load older, toggle a reasoning
-//! row, send the dev prompt); it never calls the core. In a `--dev` app (and only there) a strip
-//! under the timeline sends a prompt, until Phase 5's composer.
+//! row); it never calls the core. Under the timeline sits the composer ([`super::composer`],
+//! Phase 5), when the workspace gives it one.
 //!
 //! t3code: `apps/web/src/components/ChatView.tsx` and `chat/ChatCanvas.tsx` (the main area),
 //! `chat/MessagesTimeline.tsx` (the rows, older history), `chat/TimelineOverlays.tsx`
@@ -24,22 +24,16 @@
 //! (the reply's hover footer: copy, time), `app-codeblock_closeup-dark.png` (code).
 
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, FontWeight,
-    ImageSource, InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render,
-    SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _,
-    Subscription, Task, Window,
-    assets::IconName,
-    component::Sizable as _,
-    component::Size as KitSize,
-    component::input::{Input, InputEvent, InputState},
-    component::message_scroller::MessageScroller,
-    component::text::TextView,
-    div, img,
-    prelude::FluentBuilder as _,
-    px, relative,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable, ImageSource, InteractiveElement as _,
+    IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, Subscription,
+    Task, Window, assets::IconName, component::Sizable as _, component::Size as KitSize,
+    component::message_scroller::MessageScroller, component::text::TextView, div, img,
+    prelude::FluentBuilder as _, px, relative,
 };
 
 use super::cards;
+use super::composer::ComposerView;
 use super::data::reasoning_label;
 use super::markdown;
 use super::model::{Body, Row, RowKind, ThreadModel, ThreadPhase, Thumb};
@@ -63,7 +57,7 @@ const ROW_GAP: f32 = 12.;
 pub struct ThreadView {
     model: Entity<ThreadModel>,
     focus: FocusHandle,
-    dev_input: Option<Entity<InputState>>,
+    composer: Option<Entity<ComposerView>>,
     _subscriptions: Vec<Subscription>,
     /// Redraws once a second while a work group counts its seconds.
     _ticker: Task<()>,
@@ -76,15 +70,15 @@ impl Focusable for ThreadView {
 }
 
 impl ThreadView {
-    /// The view of `model`; `dev` adds the dev-only prompt strip.
+    /// The view of `model`, with `composer` under the timeline.
     pub fn new(
         model: Entity<ThreadModel>,
-        dev: bool,
-        window: &mut Window,
+        composer: Option<Entity<ComposerView>>,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let scroller = model.read(cx).scroller().clone();
-        let mut subscriptions = vec![
+        let subscriptions = vec![
             cx.observe(&model, |_, _, cx| cx.notify()),
             // The list notifies on every scroll: redraw (the jump button) and load older rows
             // when the top comes near.
@@ -99,25 +93,6 @@ impl ThreadView {
                 scroller.update(cx, |list, cx| list.remeasure(cx));
             }),
         ];
-        let dev_input = dev.then(|| {
-            let input = cx.new(|cx| {
-                InputState::new(window, cx).placeholder(
-                    "Dev only: send a prompt (the thread's provider, or --dev-provider)",
-                )
-            });
-            subscriptions.push(cx.subscribe_in(
-                &input,
-                window,
-                |this, input, event: &InputEvent, window, cx| {
-                    if let InputEvent::PressEnter { .. } = event {
-                        let text = input.read(cx).value().to_string();
-                        input.update(cx, |input, cx| input.set_value("", window, cx));
-                        this.model.update(cx, |model, cx| model.submit(&text, cx));
-                    }
-                },
-            ));
-            input
-        });
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -136,7 +111,7 @@ impl ThreadView {
         Self {
             model,
             focus: cx.focus_handle(),
-            dev_input,
+            composer,
             _subscriptions: subscriptions,
             _ticker: ticker,
         }
@@ -147,9 +122,9 @@ impl ThreadView {
         &self.model
     }
 
-    /// The dev prompt's input, when there is one.
-    pub fn dev_input(&self) -> Option<&Entity<InputState>> {
-        self.dev_input.as_ref()
+    /// The composer under the timeline.
+    pub fn composer(&self) -> Option<&Entity<ComposerView>> {
+        self.composer.as_ref()
     }
 
     /// Asks for an older page when the top of the list is near the first loaded row.
@@ -235,30 +210,7 @@ impl Render for ThreadView {
             .text_size(text::SM.size)
             .line_height(text::SM.line_height)
             .child(timeline)
-            .when_some(self.dev_input.clone(), |d, input| {
-                d.child(
-                    div()
-                        .id("dev-prompt")
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .px(px(12.))
-                        .py(px(8.))
-                        .border_t_1()
-                        .border_color(palette.warning.hsla())
-                        .bg(palette.warning_surface.hsla())
-                        .child(
-                            div()
-                                .text_size(text::XXS2.size)
-                                .line_height(text::XXS2.line_height)
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(palette.warning.hsla())
-                                .child("DEV ONLY"),
-                        )
-                        .child(div().flex_1().child(Input::new(&input)))
-                        .probe(),
-                )
-            })
+            .when_some(self.composer.clone(), |d, composer| d.child(composer))
             .probe()
     }
 }

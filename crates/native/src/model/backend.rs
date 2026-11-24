@@ -35,8 +35,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use hermes_core::{
-    BranchError, BranchPoint, BranchRequest, Core, CoreEvent, NoHooks, SubmitError, SubmitTurn,
-    Truncate,
+    BranchError, BranchPoint, BranchRequest, Core, CoreEvent, SubmitError, SubmitTurn, Truncate,
     archive::Filter,
     projects::{self, NodeKind, ProjectEdit, TreeRow},
     workspace::MoveError,
@@ -48,6 +47,9 @@ use tokio::sync::mpsc;
 
 use crate::sidebar::data::{
     NO_PROJECT, NO_PROJECT_LABEL, Op, ProjectItem, ProjectKind, Snapshot, ThreadItem,
+};
+use crate::thread::composer::data::{
+    Controls, Mode, ModelChoices, ModelEntry, Pick, Picks, QueueOp, QueuedItem, SendRequest, Sent,
 };
 use crate::thread::data::{Attachment, HistoryItem, HistoryPage, items_from_entries, page};
 use crate::thread::header_data::{Exported, GitState, GitSummary, HeaderInfo};
@@ -101,6 +103,98 @@ pub trait Backend: Send + Sync + 'static {
     ) -> Result<Exported, String> {
         Err("Exporting is not available here.".to_string())
     }
+    /// What the composer's footer shows about a thread: its model, effort and mode, the queue
+    /// behind a running turn and how full the context is. Reads the store and the core's
+    /// session state, so it blocks.
+    fn controls(&self, _session: &str) -> Result<Controls, String> {
+        Err("Thread controls are not available here.".to_string())
+    }
+    /// The same for a new thread: Settings' default model, effort and mode.
+    fn draft_controls(&self) -> Result<Controls, String> {
+        Err("Thread controls are not available here.".to_string())
+    }
+    /// The models the configured endpoints list (`session`'s current one is marked by the caller).
+    /// Asks the endpoints over the network, so it can be slow.
+    fn model_choices(&self, _session: Option<&str>) -> Result<ModelChoices, String> {
+        Err("The model list is not available here.".to_string())
+    }
+    /// A new, empty thread in `project`'s folder (a model `(provider, model)` for it, else
+    /// Settings' default); the new thread's id. Nothing is sent.
+    fn create_thread(
+        &self,
+        _project: &str,
+        _model: Option<(String, String)>,
+    ) -> Result<String, String> {
+        Err("Creating a thread is not available here.".to_string())
+    }
+    /// Sends the composer's text in a thread: `picks` (effort, mode of a new thread) are applied
+    /// first; then the prompt starts a turn, waits behind the running one, or is steered into it.
+    /// The turn's events arrive through [`Backend::events`].
+    fn send(&self, _session: &str, _request: &SendRequest, _picks: &Picks) -> Result<Sent, String> {
+        Err("Sending a prompt is not available here.".to_string())
+    }
+    /// Stops the thread's running turn.
+    fn stop(&self, _session: &str) -> Result<(), String> {
+        Err("Stopping is not available here.".to_string())
+    }
+    /// Takes a queued prompt out, runs it now inside the turn, or replaces its text.
+    fn queue_op(&self, _session: &str, _op: &QueueOp) -> Result<(), String> {
+        Err("The queue is not available here.".to_string())
+    }
+    /// A footer pick for a stored thread (the model applies from the next turn, as the core
+    /// defers it while a turn runs).
+    fn pick(&self, _session: &str, _pick: &Pick) -> Result<(), String> {
+        Err("Changing this is not available here.".to_string())
+    }
+    /// Makes `provider`'s `model` the default for new threads (a pick on the new-thread screen).
+    fn set_default_model(&self, _provider: &str, _model: &str) -> Result<(), String> {
+        Err("Changing the default model is not available here.".to_string())
+    }
+}
+
+/// What a turn started by the native app asks of its front end: the session's provider (the
+/// `--dev-provider` one when given), the options every turn runs with, computed when the turn
+/// starts (so an effort picked since applies), and, between a turn and the next queued prompt,
+/// the model picked while the turn ran (the core defers such a pick; the Tauri page does this in
+/// its own hooks, `gateway/turn.rs`). No title model: a new thread gets the core's provisional
+/// title from its first message.
+pub struct NativeHooks {
+    core: Arc<Core>,
+    dev_provider: Option<ProviderConfig>,
+    picked: PickedRoutes,
+}
+
+/// The model each session was given while a turn ran, until [`NativeHooks::between_turns`] has
+/// applied it: the composer's footer reads it, so a read between the core taking the deferred pick
+/// and storing it (the core publishes `Idle` before it applies the pick, with no event after)
+/// still shows the picked model, without a timed second read.
+type PickedRoutes = Arc<Mutex<HashMap<String, (String, String)>>>;
+
+impl hermes_core::TurnHooks for NativeHooks {
+    fn settings(&self, record: &hermes_store::SessionRecord) -> hermes_core::TurnSettings {
+        let provider = self.dev_provider.clone().or_else(|| {
+            hermes_core::providers::Settings::load(self.core.data_dir())
+                .provider(&record.provider)
+                .map(|p| p.runtime())
+        });
+        hermes_core::TurnSettings {
+            provider,
+            titles_configured: false,
+            title_model: None,
+        }
+    }
+
+    fn options(&self, session_id: &str) -> hermes_runtime::TurnOptions {
+        self.core.turn_options(session_id)
+    }
+
+    fn between_turns(&self, session_id: &str) {
+        // One step with a pick being made (`CoreBackend::pick` holds the lock across its switch).
+        let mut picked = self.picked.lock().unwrap_or_else(|e| e.into_inner());
+        self.core.apply_pending_route(session_id);
+        // Stored now (or dropped by a failed move): the record says what the next turn runs on.
+        picked.remove(session_id);
+    }
 }
 
 /// The git state of a folder, for the header: not on disk, not in a repository, or the repository's
@@ -113,6 +207,30 @@ pub fn git_state(cwd: &str) -> GitState {
     match hermes_core::git::repo_status(folder) {
         Some(status) => GitState::Repo(GitSummary::from_status(&status)),
         None => GitState::NoRepo,
+    }
+}
+
+/// The composer's name for one of the runtime's modes.
+pub fn mode_of_runtime(mode: hermes_tools::ApprovalMode) -> Mode {
+    use hermes_tools::ApprovalMode as A;
+    match mode {
+        A::Manual => Mode::Manual,
+        A::AcceptEdits => Mode::AcceptEdits,
+        A::Auto => Mode::Auto,
+        A::Plan => Mode::Plan,
+        A::Yolo => Mode::Yolo,
+    }
+}
+
+/// The runtime's name for a mode.
+pub fn approval_mode(mode: Mode) -> hermes_tools::ApprovalMode {
+    use hermes_tools::ApprovalMode as A;
+    match mode {
+        Mode::Manual => A::Manual,
+        Mode::AcceptEdits => A::AcceptEdits,
+        Mode::Auto => A::Auto,
+        Mode::Plan => A::Plan,
+        Mode::Yolo => A::Yolo,
     }
 }
 
@@ -224,6 +342,8 @@ pub struct CoreBackend {
     /// `--dev-provider <url>`: the dev-only input's prompts go to this OpenAI-compatible endpoint
     /// (a mock provider) instead of the thread's configured one.
     dev_provider: Option<ProviderConfig>,
+    /// Models picked while a turn ran, until applied between turns (shared with the hooks).
+    picked: PickedRoutes,
 }
 
 impl CoreBackend {
@@ -231,7 +351,56 @@ impl CoreBackend {
         Self {
             core,
             dev_provider: None,
+            picked: PickedRoutes::default(),
         }
+    }
+
+    /// The provider a prompt of `session` goes to: `--dev-provider`'s, else the session's own.
+    fn provider_of(&self, session: &str) -> Result<ProviderConfig, String> {
+        match &self.dev_provider {
+            Some(provider) => Ok(provider.clone()),
+            None => self
+                .core
+                .session_provider(
+                    session,
+                    &hermes_core::providers::Settings::load(self.core.data_dir()),
+                )
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    fn hooks(&self) -> Arc<NativeHooks> {
+        Arc::new(NativeHooks {
+            core: self.core.clone(),
+            dev_provider: self.dev_provider.clone(),
+            picked: self.picked.clone(),
+        })
+    }
+
+    /// The mode a session runs in: its own while it is loaded in the runtime (a pick, `/yolo`),
+    /// else the one it starts from when it is loaded, Settings' (`SessionTools::mode`: smart
+    /// approvals are Auto, approvals off are YOLO, else Accept edits). Never a guess: an unloaded
+    /// session forgets an earlier pick, and so does this.
+    fn mode_of(&self, session: Option<&str>) -> Mode {
+        let runtime = self.core.runtime();
+        if let Some(mode) = session.and_then(|id| runtime.loaded_approval_mode(id)) {
+            return mode_of_runtime(mode);
+        }
+        let approvals = runtime.approvals();
+        if approvals.smart() {
+            Mode::Auto
+        } else if !approvals.asks() {
+            Mode::Yolo
+        } else {
+            Mode::AcceptEdits
+        }
+    }
+
+    fn set_mode(&self, session: &str, mode: Mode) -> Result<(), String> {
+        self.core
+            .runtime()
+            .set_approval_mode(session, approval_mode(mode))
+            .map_err(|e| format!("{e:#}"))
     }
 
     /// Sends the dev-only input's prompts to `base_url` (e.g. `scripts/perf/mock_llm.py`'s
@@ -378,10 +547,8 @@ impl Backend for CoreBackend {
                 )
                 .map_err(|e| format!("Nothing was changed: {e}"))?,
         };
-        let hooks = Arc::new(NoHooks {
-            provider: Some(provider),
-            options: core.turn_options(session),
-        });
+        let _ = provider;
+        let hooks = self.hooks();
         let turn = SubmitTurn {
             text: typed,
             truncate: Some(Truncate::BeforeRow(user_row)),
@@ -467,28 +634,253 @@ impl Backend for CoreBackend {
 
     fn submit(&self, session: &str, text: &str) -> Result<(), String> {
         let core = &self.core;
-        let provider = match &self.dev_provider {
-            Some(provider) => Some(provider.clone()),
-            None => core
-                .session_provider(
-                    session,
-                    &hermes_core::providers::Settings::load(core.data_dir()),
-                )
-                .ok(),
-        };
-        let hooks = Arc::new(NoHooks {
-            provider,
-            options: core.turn_options(session),
-        });
+        // The `--dev-send` driver keeps its old leniency: no provider is a failed turn, not a
+        // refusal.
+        let hooks = self.hooks();
         let turn = SubmitTurn {
             text: text.to_string(),
             ..SubmitTurn::default()
         };
-        // As in etry: the turn is spawned on the core's runtime.
+        // As in retry: the turn is spawned on the core's runtime.
         let _runtime = core.handle().enter();
         core.submit(session, turn, hooks)
             .map(|_| ())
             .map_err(|e| e.message().to_string())
+    }
+
+    fn controls(&self, session: &str) -> Result<Controls, String> {
+        let core = &self.core;
+        let record = core
+            .runtime()
+            .store()
+            .session(session)
+            .map_err(|e| format!("{e:#}"))?
+            .ok_or_else(|| "That thread no longer exists.".to_string())?;
+        let settings = hermes_core::providers::Settings::load(core.data_dir());
+        // A model picked while a turn runs already shows (it applies from the next turn); ours
+        // until the hooks applied it, so the moment between the core taking it and storing it
+        // shows it too.
+        let picked = self
+            .picked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session)
+            .cloned();
+        let (provider, model) = picked
+            .or_else(|| core.pending_route(session))
+            .unwrap_or((record.provider.clone(), record.model));
+        let queue = core
+            .queue(session)
+            .into_iter()
+            .map(|turn| QueuedItem {
+                id: turn.admission_id.unwrap_or_default(),
+                text: turn.text,
+                shown: turn.shown,
+            })
+            .collect();
+        let usage = core.usage_snapshot(session, None);
+        Ok(Controls {
+            running: core.is_live(session) || core.runtime().is_running(session),
+            queue,
+            provider_name: settings
+                .provider(&provider)
+                .map_or_else(|| provider.clone(), |p| p.name.clone()),
+            provider,
+            model,
+            effort: core.effort(session),
+            mode: self.mode_of(Some(session)),
+            context: usage.context.map(|c| (c.used, c.max)),
+        })
+    }
+
+    fn draft_controls(&self) -> Result<Controls, String> {
+        let core = &self.core;
+        let settings = hermes_core::providers::Settings::load(core.data_dir());
+        let provider = settings.active();
+        let model = settings
+            .model
+            .clone()
+            .or_else(|| provider.and_then(|p| p.default_model.clone()))
+            .unwrap_or_default();
+        Ok(Controls {
+            provider: provider.map(|p| p.id.clone()).unwrap_or_default(),
+            provider_name: provider.map(|p| p.name.clone()).unwrap_or_default(),
+            model,
+            effort: core
+                .config()
+                .value("agent.reasoning_effort")
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+            mode: self.mode_of(None),
+            ..Controls::default()
+        })
+    }
+
+    fn model_choices(&self, session: Option<&str>) -> Result<ModelChoices, String> {
+        let core = &self.core;
+        let settings = hermes_core::providers::Settings::load(core.data_dir());
+        // Asks each endpoint's `/models` (async in the core): this is a background thread, not a
+        // tokio worker, so `block_on` is allowed (as for `delete_session`).
+        let options = core
+            .handle()
+            .block_on(core.model_options(&settings, session));
+        let mut entries = Vec::new();
+        for provider in options.providers {
+            for model in provider.models {
+                entries.push(ModelEntry {
+                    provider: provider.id.clone(),
+                    provider_name: provider.name.clone(),
+                    model,
+                });
+            }
+        }
+        Ok(ModelChoices { entries })
+    }
+
+    fn create_thread(
+        &self,
+        project: &str,
+        model: Option<(String, String)>,
+    ) -> Result<String, String> {
+        let core = &self.core;
+        let settings = hermes_core::providers::Settings::load(core.data_dir());
+        let chosen = model.as_ref().and_then(|(id, _)| settings.provider(id));
+        let provider = match (&self.dev_provider, chosen.or(settings.active())) {
+            (Some(provider), _) => provider.clone(),
+            (None, Some(provider)) => provider.runtime(),
+            (None, None) => return Err("No provider is configured.".to_string()),
+        };
+        let model = model
+            .map(|(_, model)| model)
+            .or_else(|| settings.model.clone())
+            .or_else(|| {
+                settings
+                    .active()
+                    .and_then(|provider| provider.default_model.clone())
+            })
+            .filter(|m| !m.is_empty())
+            .ok_or_else(|| "No model is chosen.".to_string())?;
+        let cwd = self
+            .folder_of(project)
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("C:/"));
+        let (record, _) = core
+            .create_session(hermes_core::NewSession {
+                provider,
+                model,
+                cwd,
+                title: None,
+                seeded: Vec::new(),
+                parent: None,
+            })
+            .map_err(|e| format!("{e:#}"))?;
+        Ok(record.id)
+    }
+
+    fn send(&self, session: &str, request: &SendRequest, picks: &Picks) -> Result<Sent, String> {
+        let core = &self.core;
+        // Refused before anything is changed: no provider, no turn.
+        let provider = self.provider_of(session)?;
+        if let Some(effort) = &picks.effort {
+            core.pick_effort(session, effort.clone());
+        }
+        if let Some(mode) = picks.mode {
+            self.set_mode(session, mode)?;
+        }
+        // The turn is spawned on the core's runtime; this is a GPUI background thread.
+        let _runtime = core.handle().enter();
+        if request.steer && core.runtime().is_running(session) && core.steer(session, &request.text)
+        {
+            return Ok(Sent::Steered);
+        }
+        let turn = SubmitTurn {
+            admission_id: Some(request.admission_id.clone()).filter(|id| !id.is_empty()),
+            text: request.text.clone(),
+            ..SubmitTurn::default()
+        };
+        let _ = provider;
+        match core.submit(session, turn, self.hooks()) {
+            Ok(hermes_core::Submitted::Started { .. }) => Ok(Sent::Started),
+            Ok(hermes_core::Submitted::Queued { .. }) => Ok(Sent::Queued),
+            Err(e) => Err(e.message().to_string()),
+        }
+    }
+
+    fn stop(&self, session: &str) -> Result<(), String> {
+        self.core.stop(session);
+        Ok(())
+    }
+
+    fn queue_op(&self, session: &str, op: &QueueOp) -> Result<(), String> {
+        let core = &self.core;
+        let hooks = self.hooks();
+        match op {
+            QueueOp::Remove(id) => {
+                core.remove_queued(session, id, &*hooks);
+                Ok(())
+            }
+            QueueOp::Steer(id) => core
+                .steer_queued(session, id, &*hooks)
+                .map_err(|e| match e {
+                    hermes_core::turns::SteerQueued::Idle => {
+                        "No turn is running: the prompt starts by itself.".to_string()
+                    }
+                    hermes_core::turns::SteerQueued::Started => {
+                        "That prompt has already started.".to_string()
+                    }
+                }),
+            QueueOp::Replace { id, text, new_id } => core
+                .replace_queued(
+                    session,
+                    id,
+                    text.clone(),
+                    Some(new_id.clone()).filter(|id| !id.is_empty()),
+                    &*hooks,
+                )
+                .map(|_| ())
+                .ok_or_else(|| "That prompt has already started.".to_string()),
+        }
+    }
+
+    fn pick(&self, session: &str, pick: &Pick) -> Result<(), String> {
+        let core = &self.core;
+        match pick {
+            Pick::Model { provider, model } => {
+                let settings = hermes_core::providers::Settings::load(core.data_dir());
+                // Held across the switch: the hooks applying a pick between turns wait for it, so
+                // the two are one after the other (never a pick remembered after it was applied).
+                let mut picked = self.picked.lock().unwrap_or_else(|e| e.into_inner());
+                core.switch_model(
+                    &hermes_core::settings::ModelSwitch {
+                        model: model.clone(),
+                        provider: Some(provider.clone()),
+                        // A thread's pick is the thread's; the new-thread screen sets the default.
+                        session_only: true,
+                        session_id: Some(session.to_string()),
+                    },
+                    &settings,
+                    &|_| {},
+                )?;
+                // Deferred (a turn runs): remembered until the hooks apply it between turns. Not
+                // deferred (applied now, or the running model picked again): nothing pending.
+                match core.pending_route(session) {
+                    Some(route) => picked.insert(session.to_string(), route),
+                    None => picked.remove(session),
+                };
+                Ok(())
+            }
+            Pick::Effort(effort) => {
+                core.pick_effort(session, effort.clone());
+                Ok(())
+            }
+            Pick::Mode(mode) => self.set_mode(session, *mode),
+        }
+    }
+
+    fn set_default_model(&self, provider: &str, model: &str) -> Result<(), String> {
+        hermes_core::providers::save_default(self.core.data_dir(), provider, model)
+            .map_err(|e| format!("{e:#}"))
     }
 }
 
@@ -512,6 +904,40 @@ pub struct FixtureBackend {
     headers: Mutex<HashMap<String, HeaderInfo>>,
     header_reads: Mutex<usize>,
     exports: Mutex<Vec<(String, hermes_core::export::Format)>>,
+    /// The composer's footer: each thread's controls (a thread without set ones gets the default).
+    controls: Mutex<HashMap<String, Controls>>,
+    choices: Mutex<ModelChoices>,
+    /// What the composer asked for, in order.
+    composer_log: Mutex<Vec<ComposerOp>>,
+}
+
+/// A composer operation that reached a [`FixtureBackend`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComposerOp {
+    /// A send, with the picks it carried.
+    Send {
+        session: String,
+        request: SendRequest,
+        picks: Picks,
+    },
+    Stop(String),
+    Queue {
+        session: String,
+        op: QueueOp,
+    },
+    Pick {
+        session: String,
+        pick: Pick,
+    },
+    /// A new thread in `project`, with the model chosen for it.
+    Create {
+        project: String,
+        model: Option<(String, String)>,
+    },
+    DefaultModel {
+        provider: String,
+        model: String,
+    },
 }
 
 /// A turn footer's action that reached a [`FixtureBackend`].
@@ -536,7 +962,82 @@ impl FixtureBackend {
             headers: Mutex::default(),
             header_reads: Mutex::default(),
             exports: Mutex::default(),
+            controls: Mutex::default(),
+            choices: Mutex::new(Self::default_choices()),
+            composer_log: Mutex::default(),
         })
+    }
+
+    /// The models a fixture offers: two providers, a handful of models.
+    pub fn default_choices() -> ModelChoices {
+        let entry = |provider: &str, name: &str, model: &str| ModelEntry {
+            provider: provider.into(),
+            provider_name: name.into(),
+            model: model.into(),
+        };
+        ModelChoices {
+            entries: vec![
+                entry("fixture", "Fixture", "fixture-model"),
+                entry("fixture", "Fixture", "fixture-large"),
+                entry("local", "Local", "qwen3-coder"),
+                entry("local", "Local", "llama-3.3-70b"),
+            ],
+        }
+    }
+
+    /// What a thread's controls read before a test sets them: the fixture model, medium effort,
+    /// the default mode, nothing queued, nothing running.
+    pub fn default_controls() -> Controls {
+        Controls {
+            provider: "fixture".into(),
+            provider_name: "Fixture".into(),
+            model: "fixture-model".into(),
+            effort: "medium".into(),
+            ..Controls::default()
+        }
+    }
+
+    /// Gives a thread these controls (the key `""` is the new-thread screen's).
+    pub fn set_controls(&self, session: &str, controls: Controls) {
+        self.controls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session.to_string(), controls);
+    }
+
+    /// Changes a thread's controls in place.
+    pub fn update_controls(&self, session: &str, f: impl FnOnce(&mut Controls)) {
+        let mut all = self.controls.lock().unwrap_or_else(|e| e.into_inner());
+        f(all
+            .entry(session.to_string())
+            .or_insert_with(Self::default_controls));
+    }
+
+    /// The model list the picker gets.
+    pub fn set_choices(&self, choices: ModelChoices) {
+        *self.choices.lock().unwrap_or_else(|e| e.into_inner()) = choices;
+    }
+
+    /// What the composer asked for so far, in order.
+    pub fn composer_ops(&self) -> Vec<ComposerOp> {
+        self.composer_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn log_composer(&self, op: ComposerOp) {
+        self.composer_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(op);
+    }
+
+    fn scripted_failure(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Gives a thread this header (folder, model, git state).
@@ -795,6 +1296,169 @@ impl Backend for FixtureBackend {
                 }
             });
         }
+        Ok(())
+    }
+
+    fn controls(&self, session: &str) -> Result<Controls, String> {
+        Ok(self
+            .controls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session)
+            .cloned()
+            .unwrap_or_else(Self::default_controls))
+    }
+
+    fn draft_controls(&self) -> Result<Controls, String> {
+        Ok(self
+            .controls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("")
+            .cloned()
+            .unwrap_or_else(Self::default_controls))
+    }
+
+    fn model_choices(&self, _session: Option<&str>) -> Result<ModelChoices, String> {
+        Ok(self
+            .choices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone())
+    }
+
+    fn create_thread(
+        &self,
+        project: &str,
+        model: Option<(String, String)>,
+    ) -> Result<String, String> {
+        self.log_composer(ComposerOp::Create {
+            project: project.to_string(),
+            model: model,
+        });
+        if let Some(message) = self.scripted_failure() {
+            return Err(message);
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let id = format!("new-{}", state.threads.len() + 1);
+        let cwd = state
+            .project(project)
+            .and_then(|p| p.path.clone())
+            .unwrap_or_default();
+        state.threads.push(crate::sidebar::data::ThreadItem {
+            id: id.clone(),
+            title: String::new(),
+            project: project.to_string(),
+            cwd,
+            pinned: false,
+            updated_ms: crate::model::fixture::NOW_MS,
+            working: false,
+            waiting: false,
+            branch: None,
+        });
+        Ok(id)
+    }
+
+    fn send(&self, session: &str, request: &SendRequest, picks: &Picks) -> Result<Sent, String> {
+        self.log_composer(ComposerOp::Send {
+            session: session.to_string(),
+            request: request.clone(),
+            picks: picks.clone(),
+        });
+        if let Some(message) = self.scripted_failure() {
+            return Err(message);
+        }
+        let running = self
+            .controls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session)
+            .is_some_and(|c| c.running);
+        if running && request.steer {
+            return Ok(Sent::Steered);
+        }
+        if running {
+            self.update_controls(session, |c| {
+                c.queue.push(QueuedItem {
+                    id: request.admission_id.clone(),
+                    text: request.text.clone(),
+                    shown: false,
+                })
+            });
+            self.emit(CoreEvent::QueueChanged {
+                session_id: session.to_string(),
+            });
+            return Ok(Sent::Queued);
+        }
+        // Not running: it starts (a replay set with `replay_on_submit` plays out).
+        self.submit(session, &request.text)?;
+        Ok(Sent::Started)
+    }
+
+    fn stop(&self, session: &str) -> Result<(), String> {
+        self.log_composer(ComposerOp::Stop(session.to_string()));
+        if let Some(message) = self.scripted_failure() {
+            return Err(message);
+        }
+        Ok(())
+    }
+
+    fn queue_op(&self, session: &str, op: &QueueOp) -> Result<(), String> {
+        self.log_composer(ComposerOp::Queue {
+            session: session.to_string(),
+            op: op.clone(),
+        });
+        if let Some(message) = self.scripted_failure() {
+            return Err(message);
+        }
+        self.update_controls(session, |c| match op {
+            QueueOp::Remove(id) | QueueOp::Steer(id) => c.queue.retain(|q| &q.id != id),
+            QueueOp::Replace { id, text, new_id } => {
+                if let Some(at) = c.queue.iter().position(|q| &q.id == id) {
+                    let mut item = c.queue.remove(at);
+                    item.text = text.clone();
+                    item.id = new_id.clone();
+                    c.queue.push(item);
+                }
+            }
+        });
+        self.emit(CoreEvent::QueueChanged {
+            session_id: session.to_string(),
+        });
+        Ok(())
+    }
+
+    fn pick(&self, session: &str, pick: &Pick) -> Result<(), String> {
+        self.log_composer(ComposerOp::Pick {
+            session: session.to_string(),
+            pick: pick.clone(),
+        });
+        if let Some(message) = self.scripted_failure() {
+            return Err(message);
+        }
+        self.update_controls(session, |c| match pick {
+            Pick::Model { provider, model } => {
+                c.provider = provider.clone();
+                c.model = model.clone();
+            }
+            Pick::Effort(effort) => c.effort = effort.clone().unwrap_or_default(),
+            Pick::Mode(mode) => c.mode = *mode,
+        });
+        Ok(())
+    }
+
+    fn set_default_model(&self, provider: &str, model: &str) -> Result<(), String> {
+        self.log_composer(ComposerOp::DefaultModel {
+            provider: provider.to_string(),
+            model: model.to_string(),
+        });
+        if let Some(message) = self.scripted_failure() {
+            return Err(message);
+        }
+        self.update_controls("", |c| {
+            c.provider = provider.to_string();
+            c.model = model.to_string();
+        });
         Ok(())
     }
 }

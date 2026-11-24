@@ -99,7 +99,7 @@ fn cell(state: &State, window: &mut Window, cx: &mut App) -> AnyElement {
                 }
                 model
             });
-            ThreadView::new(model, false, window, cx)
+            ThreadView::new(model, None, window, cx)
         },
     );
     if name == "scrolled-up" {
@@ -417,7 +417,7 @@ fn tools_cell(state: &State, window: &mut Window, cx: &mut App) -> AnyElement {
             let backend = FixtureBackend::new(fixture::snapshot());
             backend.set_history("rec", Vec::new());
             let model = cx.new(|cx| tools_model(name, cx, backend));
-            ThreadView::new(model, false, window, cx)
+            ThreadView::new(model, None, window, cx)
         },
     );
     div()

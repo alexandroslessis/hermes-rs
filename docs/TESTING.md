@@ -454,6 +454,21 @@ with `git init` in a `hermes_testdir` folder (clean, dirty, detached, no repo, m
 state, rename rule) are unit tests in `thread/header_data.rs`. Hand-only: the save dialog, the dropdown's look, a
 right click, the real tooltips.
 
+**The composer (CP5.1).** `thread/composer/tests.rs` renders the card headless over a `FixtureBackend` (which records
+every `ComposerOp` and plays the core's queue): Enter, Shift+Enter, white space, an IME composition's Enter (marked
+text), undo, a failed send (text kept, toast, no row waited for), the queue from the core's list (also what another
+front end queued), remove, send now, edit, Ctrl+Enter steer, Stop, `QueuedFailed` giving the text back, the three
+menus, escape and outside clicks, the new-thread screen's picks and its create-then-send, drafts reported; layout at
+640/1100/1920 (card = lane width, centred, footer on one row, a 300-character model name cut), the input growing to its
+maximum and scrolling, the queue above the card, the menus inside the window. `wiring_tests.rs`: the app model makes the
+composer and hands it the core's events, the new thread is created, opened and sent to with its picks, the workspace keeps
+drafts per thread in `native-ui.json` (restored, saved, emptied = removed, stale ones of unlisted threads pruned) and lays
+the card out with the sidebar open or collapsed and the right panel open. `real_tests.rs`: a real `Core` on a
+`hermes_testdir` folder with a wiremock provider whose first reply is held: send, queue two, remove one, the queued
+one runs and shows its row when its turn starts, Stop, a model/effort/mode picked mid-turn (the model applies after the
+turn), a new thread started from the new-thread screen. Snapshots `composer`, `composer-menus`, `composer-new`. Hand-only:
+IME with a real IME, Win+. emoji, paste, the feel of the menus.
+
 **Phase 4 Done list, and what covers it.** *A recorded fixture session of every event kind replays in the
 gallery:* `thread::recording` (the recorder test and the replay round trip) and the stories `thread`, `thread-live`
 and `thread-tools-*`. *Timeline layout tests:* `thread/tests.rs`, `thread/tests/tools.rs`. *Snapshots of every

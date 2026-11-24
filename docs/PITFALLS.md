@@ -173,6 +173,29 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 
 ## Native UI (`crates/native`, GPUI Kit; [docs/native-ui/](native-ui/README.md))
 
+- **Composer input (CP5.1).** Kit's textarea with `submit_on_enter` emits `InputEvent::PressEnter` for Shift+Enter too
+  (it inserts the newline and still emits), so the handler must ignore `shift`; `set_value` announces no `Change`, so
+  the view emits the draft itself; an Enter that ends an IME composition is told by `EntityInputHandler::marked_text_range`
+  (the input's own `ime_marked_range` is private).
+- **`on_mouse_down_out` on a wrapper counts its absolutely placed child (the menu) as outside** whenever the pointer is
+  outside the wrapper's own box, so a click inside the menu would close it. The composer puts it on the panel. It
+  fires in the capture phase, before the chip under the pointer sees the press, so a click on the chip of an open menu
+  first closes it; the chip then ignores the click of that same press, told by the mouse-down position
+  (`ComposerView::chip_clicked`), not by a timer.
+- **`NoHooks` never applies a model picked during a turn**: `Core::switch_model` defers it (`pending_route`) and only a
+  hook's `between_turns` applies it. The native app's turns use `NativeHooks` (`model/backend.rs`), which does.
+  The core publishes `Idle` *before* `between_turns`, and nothing after it: a read in between sees neither the pending
+  pick (taken) nor the new model (not stored yet). `CoreBackend` keeps the pick until its hooks have applied it, so
+  `controls` never shows the old model (no timed re-read).
+- **`Runtime::approval_mode` says Accept edits for a session that is not loaded**, whatever Settings say. The composer
+  reads `Runtime::loaded_approval_mode` and, for an unloaded session, the mode it will start from (the approvals store:
+  smart = Auto, off = YOLO, else Accept edits); a pick is forgotten when the runtime unloads the session (a move).
+- **Composer sends one at a time** (`ComposerModel::sending`): a second Enter before the core answered the first is
+  ignored. Tests that queue several prompts wait for each to land.
+- **The store keeps a session's folder with forward slashes** (`C:/Users/..`); compare after normalising.
+- **Layout names are global per window** (`Layout::get` wants exactly one match): the new-thread screen is
+  `new-thread-screen` because `new-thread` is already the sidebar's button.
+
 - **Debug builds overflowed the main thread's 1 MB stack** before the first frame ("thread 'main'
   has overflowed its stack"). `crates/native/build.rs` links the binaries with an 8 MB stack, as
   Zed does. Tests were unaffected (test threads have their own stacks).

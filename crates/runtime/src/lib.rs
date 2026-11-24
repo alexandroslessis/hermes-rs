@@ -2077,6 +2077,12 @@ impl Runtime {
             })
     }
 
+    /// The session's approval mode when it is loaded in this process; `None` when it is not (it
+    /// then starts from Settings' at its next load: [`hermes_tools::SessionTools::mode`]).
+    pub fn loaded_approval_mode(&self, session_id: &str) -> Option<hermes_tools::ApprovalMode> {
+        self.loaded(session_id).map(|open| open.tools.mode())
+    }
+
     pub fn set_approval_mode(
         &self,
         session_id: &str,
