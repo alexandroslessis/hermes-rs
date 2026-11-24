@@ -441,6 +441,8 @@ provider in `scripts/perf/` streams correctly in our instance.
 
 ### CP5.2 — Mentions, commands, attachments (M)
 
+**Status (CP5.2, 2026-11-24):** built, not reviewed, uncommitted in `hermes-rs-n5`; `thread/composer/{mention,suggest,attach,strip}.rs`, details and the reviewer's list in `progress/phase-5.md`.
+
 1. `@` path completion (the core's completion), inserted as an inline chip.
 2. `/` command menu from our catalog, with arguments; commands that answer locally (`/usage`,
    `/diff`) show their answer in the timeline as today.

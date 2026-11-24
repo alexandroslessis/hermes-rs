@@ -24,7 +24,7 @@ dev = ["gpui-kit/test-support"]
 # The snapshot tests: `cargo test -p hermes-native --features snapshots`. GPUI's offscreen
 # renderer on Windows is its wgpu one (`gpui-pre-wgpu`'s `WgpuHeadlessRenderer`):
 # `gpui-pre-platform` offers it on Linux only, so it is depended on directly.
-snapshots = ["dev", "dep:gpui-pre-wgpu", "dep:image"]
+snapshots = ["dev", "dep:gpui-pre-wgpu"]
 
 [dependencies]
 anyhow.workspace = true
@@ -48,7 +48,9 @@ gpui-kit = { version = "=0.10.0", features = ["syntect"] }
 # renderer; only with `snapshots`.
 gpui-pre-wgpu = { version = "=0.3.12", features = ["test-support"], optional = true }
 rfd = "0.15"
-image = { version = "0.25.1", default-features = false, features = ["png"], optional = true }
+# Thumbnails of attached images are made off the UI thread (`thread/composer/attach.rs`), and
+# the snapshot tests read PNGs: the codecs the core accepts as images (`attachments::IMAGE_TYPES`).
+image = { version = "0.25.1", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 similar.workspace = true

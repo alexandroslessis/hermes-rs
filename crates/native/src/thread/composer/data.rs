@@ -29,6 +29,18 @@ pub struct SendRequest {
     /// While a turn runs: put this into the running turn now (Ctrl+Enter, t3code's "steer")
     /// instead of queueing it behind the turn (Enter).
     pub steer: bool,
+    /// What the user's row shows when it is not `text`: a skill's loaded message is sent, the
+    /// `/name instruction` typed is shown (`CommandOutcome::Skill::display`).
+    pub display: Option<String>,
+    /// Images and files that go with the prompt.
+    pub attachments: Vec<super::attach::Attachment>,
+}
+
+impl SendRequest {
+    /// What the timeline shows as the user's message.
+    pub fn shown_text(&self) -> &str {
+        self.display.as_deref().unwrap_or(&self.text)
+    }
 }
 
 /// What the core did with a send.

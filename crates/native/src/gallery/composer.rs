@@ -4,6 +4,11 @@
 //! themes; the references are named in `thread/composer/view.rs` (`app-thread-dark.png`,
 //! `app-empty-dark.png`, `composer-model-picker.png`, `composer-model-picker-permission.png`).
 //!
+//! CP5.2 adds `composer-mentions` (the `@` drawer, chips in the text), `composer-commands` (the `/`
+//! drawer, an argument hint, a command's answer in the timeline) and `composer-attachments` (the
+//! strip: images, files, many, a narrow card); t3code's `ComposerCommandMenu.tsx` and
+//! `ComposerAttachmentStrip.tsx` (no capture of them is in `reference/t3code/`).
+//!
 //! The views live in the story window's element state (`use_keyed_state`), so the controls read
 //! and the model list survive the frames the harness draws.
 
@@ -232,3 +237,172 @@ pub static COMPOSER_NEW: Story = Story {
     states: &NEW_STATES,
     render: cell,
 };
+
+// --- CP5.2 -----------------------------------------------------------------------------------------
+
+const MENTION_STATES: [State; 3] = [at_rest("at-menu"), at_rest("chips"), at_rest("chips-narrow")];
+const COMMAND_STATES: [State; 3] = [
+    at_rest("slash-menu"),
+    at_rest("arguments"),
+    at_rest("local-answer"),
+];
+const ATTACH_STATES: [State; 4] = [
+    at_rest("images"),
+    at_rest("files"),
+    at_rest("many"),
+    at_rest("narrow"),
+];
+
+fn prepared(
+    name: &str,
+    size: usize,
+    kind: crate::thread::composer::attach::Kind,
+    shade: u8,
+) -> crate::thread::composer::attach::Prepared {
+    use crate::thread::composer::attach::{Kind, Prepared, Source, sample_png};
+    let thumb = (kind == Kind::Image).then(|| std::sync::Arc::new(sample_png(96, 72, shade)));
+    Prepared {
+        name: name.to_string(),
+        size,
+        kind,
+        source: Source::Bytes {
+            data: std::sync::Arc::new(vec![shade]),
+            mime: "image/png".into(),
+        },
+        thumb,
+        key: format!("{name}-{shade}"),
+    }
+}
+
+fn cell_cp52(state: &State, window: &mut Window, cx: &mut App) -> AnyElement {
+    use crate::thread::composer::attach::Kind;
+    let name = state.name;
+    let palette = cx.design_theme().palette;
+    let (view, thread) = window
+        .use_keyed_state(
+            gpui_kit::ElementId::Name(format!("composer52-story-{name}").into()),
+            cx,
+            |window, cx| {
+                let backend = FixtureBackend::new(fixture::snapshot());
+                let thread_model = (name == "local-answer").then(|| {
+                    cx.new(|cx| {
+                        let mut t = crate::thread::ThreadModel::new("t1", backend.clone(), cx)
+                            .with_clock(|| fixture::NOW_MS);
+                        t.show_command_note(
+                            "/usage",
+                            "Session usage\n  input tokens     12,345\n  output tokens     1,234\n  cost            $0.0123",
+                            cx,
+                        );
+                        t
+                    })
+                });
+                let model = {
+                    let (b, t) = (backend.clone(), thread_model.clone());
+                    cx.new(|cx| ComposerModel::new(Target::Thread("t1".into()), b, t, cx))
+                };
+                let text = match name {
+                    "at-menu" => Some("Look at @ma".to_string()),
+                    "chips" | "chips-narrow" => Some(
+                        "Compare @file:src/main.rs with @file:crates/native/src/thread/composer/view.rs and @folder:docs/ please"
+                            .to_string(),
+                    ),
+                    "slash-menu" => Some("/in".to_string()),
+                    "arguments" => Some("/diff ".to_string()),
+                    "images" => Some("What is wrong in these screenshots?".to_string()),
+                    _ => None,
+                };
+                let view =
+                    cx.new(|cx| ComposerView::new(model.clone(), "t1".into(), text, window, cx));
+                let seeded = match name {
+                    "images" => vec![
+                        prepared("one.png", 245_000, Kind::Image, 40),
+                        prepared("two.png", 1_200_000, Kind::Image, 120),
+                        prepared("three.png", 90_000, Kind::Image, 200),
+                    ],
+                    "files" => vec![
+                        prepared("shot.png", 245_000, Kind::Image, 90),
+                        prepared("error.log", 12_800, Kind::File, 1),
+                        prepared(
+                            "a-rather-long-file-name-for-the-design-review-notes-final-v2.md",
+                            4_096,
+                            Kind::File,
+                            2,
+                        ),
+                    ],
+                    "many" => (0..12u8)
+                        .map(|n| prepared(&format!("image-{n}.png"), 50_000, Kind::Image, n * 18))
+                        .chain((0..4u8).map(|n| {
+                            prepared(&format!("notes-{n}.txt"), 2_000, Kind::File, 100 + n)
+                        }))
+                        .collect(),
+                    "narrow" => vec![
+                        prepared("a.png", 245_000, Kind::Image, 60),
+                        prepared(
+                            "a-name-that-is-far-too-long-for-a-narrow-card.pdf",
+                            3_145_728,
+                            Kind::File,
+                            3,
+                        ),
+                    ],
+                    _ => Vec::new(),
+                };
+                if !seeded.is_empty() {
+                    model.update(cx, |m, cx| m.seed_attachments(seeded, cx));
+                }
+                let thread_view = thread_model
+                    .map(|t| cx.new(|cx| crate::thread::ThreadView::new(t, None, window, cx)));
+                (view, thread_view)
+            },
+        )
+        .read(cx)
+        .clone();
+    if matches!(name, "at-menu" | "slash-menu" | "arguments") {
+        let opened = window.use_keyed_state("composer52-opened", cx, |_, _| false);
+        if !*opened.read(cx) {
+            opened.update(cx, |o, _| *o = true);
+            view.update(cx, |v, cx| v.caret_to_end(cx));
+        }
+    }
+    let (w, h) = match name {
+        "at-menu" => (720., 420.),
+        "chips" => (720., 200.),
+        "chips-narrow" => (352., 260.),
+        "slash-menu" => (720., 420.),
+        "arguments" => (720., 220.),
+        "local-answer" => (720., 380.),
+        "images" => (720., 240.),
+        "files" => (720., 310.),
+        "many" => (720., 340.),
+        _ => (352., 290.),
+    };
+    let w = if name == "chips-narrow" || name == "narrow" { 352. } else { w };
+    div()
+        .id("composer-frame")
+        .w(px(w))
+        .h(px(h))
+        .flex()
+        .flex_col()
+        .justify_end()
+        .bg(palette.background.hsla())
+        .children(thread.map(|t| div().flex_1().min_h_0().child(t)))
+        .child(view)
+        .probe()
+        .into_any_element()
+}
+
+macro_rules! cp52_story {
+    ($name:ident, $id:literal, $title:literal, $states:ident, $size:expr) => {
+        pub static $name: Story = Story {
+            name: $id,
+            title: $title,
+            size: $size,
+            themes: Themes::T3,
+            states: &$states,
+            render: cell_cp52,
+        };
+    };
+}
+
+cp52_story!(COMPOSER_MENTIONS, "composer-mentions", "Composer: @ menu and chips", MENTION_STATES, (760., 470.));
+cp52_story!(COMPOSER_COMMANDS, "composer-commands", "Composer: / menu and answers", COMMAND_STATES, (760., 470.));
+cp52_story!(COMPOSER_ATTACHMENTS, "composer-attachments", "Composer: attachments", ATTACH_STATES, (760., 380.));

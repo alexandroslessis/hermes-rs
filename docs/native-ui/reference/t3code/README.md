@@ -74,3 +74,7 @@ CP5.1 took no new screenshot (t3code's window cannot be driven from here): the c
 `ComposerSurface.tsx`, `ComposerPrimaryActions.tsx`, `ComposerFooterControls.tsx`, `QueuedRunsControl.tsx` and the existing
 `app-thread-dark.png`, `app-empty-dark.png`, `composer-model-picker.png`, `composer-model-picker-permission.png`; the light
 theme, the grown input, the queue strip, the mode menu in isolation and the context meter follow the source.
+
+CP5.2 took no new screenshot either (the window cannot be driven from here, and nothing was changed in the user's t3code): the
+`@`/`/` drawer follows `ComposerCommandMenu.tsx` and `ComposerCommandMenuLayer.tsx`, the strip `ComposerAttachmentStrip.tsx`, the
+chip `ContextChip.tsx`; the sent thumbnails reuse `app-hover_reply_closeup-dark.png`. No README row to add: no file was added.

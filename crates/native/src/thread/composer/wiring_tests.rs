@@ -490,3 +490,43 @@ fn the_new_thread_screen_keeps_its_own_draft_per_project() {
     assert_eq!(ws.composer_text(), "an idea for structure");
     let _ = &ws.backend;
 }
+
+#[core::prelude::v1::test]
+fn a_draft_with_a_mention_is_kept_as_text_and_comes_back_with_its_chip() {
+    let mut ws = workspace((1100., 700.), UiState::default(), None);
+    ws.open("t1");
+    ws.type_into_composer("see @file:src/main.rs now");
+    assert_eq!(ws.draft("t1").as_deref(), Some("see @file:src/main.rs now"));
+    ws.open("t2");
+    ws.open("t1");
+    assert_eq!(ws.composer_text(), "see @file:src/main.rs now");
+    let wsc = ws.ws.clone();
+    let chips = ws.cx.update(|cx| {
+        let view = wsc.read(cx).composer_view().cloned().unwrap();
+        view.read(cx).input().read(cx).tokens().len()
+    });
+    assert_eq!(chips, 1, "the chip is back");
+}
+
+#[core::prelude::v1::test]
+fn an_app_command_typed_in_the_composer_reaches_the_frame() {
+    let mut ws = workspace((1100., 700.), UiState::default(), None);
+    ws.open("t1");
+    let wsc = ws.ws.clone();
+    let composer = ws
+        .cx
+        .update(|cx| ws.model.read(cx).composer().cloned())
+        .unwrap();
+    // `/settings` is not built yet (Phase 7): the frame says so in a toast, as the palette does.
+    ws.cx.update(|cx| composer.update(cx, |c, cx| c.send("/settings", false, cx)));
+    ws.settle();
+    let titles: Vec<String> = ws.cx.update(|cx| {
+        wsc.read(cx)
+            .toasts()
+            .all()
+            .iter()
+            .map(|t| t.spec.title.clone())
+            .collect()
+    });
+    assert!(titles.iter().any(|t| t == "Settings"), "{titles:?}");
+}

@@ -1139,3 +1139,5 @@ fn the_context_meter_is_there_only_when_the_core_knows_how_full_the_context_is()
     let mut rig = running_rig(Vec::new());
     assert!(rig.present("context-meter"));
 }
+
+mod input;

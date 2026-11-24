@@ -469,6 +469,20 @@ one runs and shows its row when its turn starts, Stop, a model/effort/mode picke
 turn), a new thread started from the new-thread screen. Snapshots `composer`, `composer-menus`, `composer-new`. Hand-only:
 IME with a real IME, Win+. emoji, paste, the feel of the menus.
 
+**Mentions, commands, attachments (CP5.2).** `thread/composer/tests/input.rs` (same rig, a child of `tests.rs`): the `@` drawer
+(opens on `@`, filters with the word, arrows wrap, Enter/Tab/Escape/click, chips deleted as a unit, copy/paste and drafts bring the
+chips back, an old plain draft loads as it was), the `/` drawer (catalog + reports + app commands, argument hint, a local answer is a
+`RowKind::Command` row and sends nothing, a skill is sent shown as what was typed, `/new` `/settings` `/terminal` reach the frame,
+`/model` opens the picker), attachments (picked/pasted/dropped through the real `FileDrop` events and the clipboard, the paperclip
+through a fake `FilePicker`, duplicates, the count limit, the core's size and type sentences as toasts, sent with the prompt, kept when
+the send is refused, handed back when the first send of a new thread fails) and the layout of the drawer (on the card, inside the
+window, at most 288 px, scrolling the highlighted row into view), the chip (one line high, on the text's row) and the strip
+(wraps, capped at 166 px, scrolls) at 640/1100/1920 px. `thread/tests.rs`: the command-answer card in the lane, live thumbnails.
+`composer/real_tests.rs`: a real core and wiremock provider receive a prompt with an `@file:` mention, an attached image and an
+attached file (what the provider got, the stored row and its image, the copy in `.hermes/attachments`). Snapshots
+`composer-mentions`, `composer-commands`, `composer-attachments` (strip pictures are synthetic: `ComposerModel::seed_attachments`).
+Hand-only: a real clipboard image, a drag from Explorer, the Windows file dialog.
+
 **Phase 4 Done list, and what covers it.** *A recorded fixture session of every event kind replays in the
 gallery:* `thread::recording` (the recorder test and the replay round trip) and the stories `thread`, `thread-live`
 and `thread-tools-*`. *Timeline layout tests:* `thread/tests.rs`, `thread/tests/tools.rs`. *Snapshots of every

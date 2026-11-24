@@ -28,13 +28,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui_kit::{AppContext as _, Context, Entity, EventEmitter};
+use gpui_kit::{AppContext as _, Context, Entity, EventEmitter, ImageFormat};
 use hermes_core::CoreEvent;
 
+use super::attach::{self, Attachment, MAX_ATTACHMENTS};
 use super::data::{
     Controls, ModelChoices, Pick, Picks, QueueOp, QueuedItem, SendRequest, Sent, sendable,
 };
+use super::mention::{self, AppCommand, CommandSpec, Suggestion};
 use crate::model::Backend;
+use crate::model::backend::{AttachmentSource, CommandAnswer, CompletionScope};
 use crate::thread::ThreadModel;
 
 /// What the composer is for.
@@ -59,6 +62,29 @@ pub enum Choices {
     Failed(String),
 }
 
+/// The commands of the core's catalog.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum Catalog {
+    /// Not asked yet.
+    #[default]
+    Idle,
+    Loading,
+    Ready(Vec<CommandSpec>),
+    Failed(String),
+}
+
+/// The `@` menu's entries for the word being typed.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Mentions {
+    /// The word the entries are for (`@src/ma`).
+    pub word: String,
+    pub items: Vec<Suggestion>,
+    /// The core is being asked.
+    pub loading: bool,
+    /// Why it could not be asked.
+    pub error: Option<String>,
+}
+
 /// What the composer tells its view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComposerEvent {
@@ -74,6 +100,12 @@ pub enum ComposerEvent {
     EditEnded,
     /// Something the user asked for did not work (a toast).
     Problem { title: String, why: String },
+    /// Something to tell that is not a failure (a toast).
+    Notice { title: String, why: String },
+    /// A command answered while there is no thread to show it in (the new-thread screen).
+    Answer { command: String, text: String },
+    /// The user ran a command of the app (`/new`, `/model`, ...): the view or the frame does it.
+    App(AppCommand),
     /// A new thread was made for the first send: the app model opens it and sends there.
     Created {
         session: String,
@@ -106,6 +138,17 @@ pub struct ComposerModel {
     /// Queued prompts this composer sent: the text, to give back if one cannot start.
     queued_texts: HashMap<String, String>,
     show_all_queued: bool,
+    /// The files and images that go with the next prompt.
+    attachments: Vec<Attachment>,
+    /// Their thumbnails, made once (an image is decoded once, whatever the frame count).
+    thumbs: HashMap<u64, Arc<gpui_kit::Image>>,
+    /// Attachments being read off the UI thread.
+    preparing: usize,
+    next_attachment: u64,
+    catalog: Catalog,
+    mentions: Option<Mentions>,
+    /// Bumped by every `@` request: an answer for an older word is dropped.
+    mention_seq: u64,
 }
 
 impl EventEmitter<ComposerEvent> for ComposerModel {}
@@ -135,6 +178,13 @@ impl ComposerModel {
             editing: None,
             queued_texts: HashMap::new(),
             show_all_queued: false,
+            attachments: Vec::new(),
+            thumbs: HashMap::new(),
+            preparing: 0,
+            next_attachment: 0,
+            catalog: Catalog::Idle,
+            mentions: None,
+            mention_seq: 0,
         };
         model.refresh(cx);
         model
@@ -328,12 +378,14 @@ impl ComposerModel {
 
     // --- sending ------------------------------------------------------------------------------
 
-    /// Sends `text` (the user pressed Enter, or Ctrl+Enter for `steer`). On a stored thread the
-    /// core starts a turn, queues it behind the running one, or steers it into it; on the
-    /// new-thread screen a thread is made first. Nothing happens for white space, or while a
-    /// send is on its way.
+    /// Sends `text` (the user pressed Enter, or Ctrl+Enter for `steer`) with the attachments.
+    /// A text that is a command (`/usage`) runs it. On a stored thread the core starts a turn,
+    /// queues it behind the running one, or steers it into it; on the new-thread screen a thread
+    /// is made first. Nothing happens for white space with nothing attached, while a send is on
+    /// its way, or while an attachment is still being read.
     pub fn send(&mut self, text: &str, steer: bool, cx: &mut Context<Self>) {
-        if self.sending || !sendable(text) {
+        let empty = !sendable(text) && self.attachments.is_empty();
+        if self.sending || self.preparing > 0 || empty {
             return;
         }
         let original = text.to_string();
@@ -342,10 +394,30 @@ impl ComposerModel {
             self.replace_queued(&id, &trimmed, original, cx);
             return;
         }
+        if self.attachments.is_empty()
+            && let Some((name, argument)) = mention::parse_command(&trimmed)
+            && self.run_command(name, argument, &trimmed, steer, original.clone(), cx)
+        {
+            return;
+        }
+        self.send_prompt(trimmed, None, steer, original, cx);
+    }
+
+    /// Sends `text` as the prompt (shown as `display` when that is not it).
+    fn send_prompt(
+        &mut self,
+        text: String,
+        display: Option<String>,
+        steer: bool,
+        original: String,
+        cx: &mut Context<Self>,
+    ) {
         let request = SendRequest {
-            text: trimmed,
+            text,
             admission_id: self.next_admission(),
             steer: steer && self.controls.running,
+            display,
+            attachments: self.attachments.clone(),
         };
         match self.target.clone() {
             Target::Thread(session) => {
@@ -391,6 +463,311 @@ impl ComposerModel {
         }
     }
 
+    // --- commands ---------------------------------------------------------------------------
+
+    /// The command called `name` is ours to run (the app's) or the core's (a coding command, a
+    /// report, a skill): runs it and returns true. False when the text is no command (the
+    /// catalog is read and does not list the name): it is an ordinary prompt.
+    fn run_command(
+        &mut self,
+        name: &str,
+        argument: &str,
+        typed: &str,
+        steer: bool,
+        original: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if let Some(app) = AppCommand::named(name) {
+            cx.emit(ComposerEvent::App(app));
+            cx.emit(ComposerEvent::Sent { text: original });
+            return true;
+        }
+        if let Catalog::Ready(listed) = &self.catalog
+            && !mention::merged(listed.clone())
+                .iter()
+                .any(|c| c.name == name)
+        {
+            return false;
+        }
+        self.sending = true;
+        cx.notify();
+        let (backend, session) = (self.backend.clone(), self.session().map(str::to_string));
+        let (name, argument, typed) = (name.to_string(), argument.to_string(), typed.to_string());
+        cx.spawn(async move |this, cx| {
+            let (n, a) = (name.clone(), argument.clone());
+            let answered = cx
+                .background_spawn(async move { backend.run_command(session.as_deref(), &n, &a) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.sending = false;
+                match answered {
+                    Ok(CommandAnswer::Output(text)) => {
+                        this.show_answer(&typed, &text, cx);
+                        cx.emit(ComposerEvent::Sent { text: original });
+                    }
+                    Ok(CommandAnswer::Send { message, display })
+                    | Ok(CommandAnswer::Skill { message, display }) => {
+                        this.send_prompt(message, Some(display), steer, original, cx)
+                    }
+                    Ok(CommandAnswer::NotACommand) => {
+                        this.send_prompt(typed.clone(), None, steer, original, cx)
+                    }
+                    Err(why) => cx.emit(ComposerEvent::Problem {
+                        title: format!("/{name} did not run"),
+                        why,
+                    }),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        true
+    }
+
+    /// Shows what a command answered: in the timeline of the thread, or, with no thread yet, as
+    /// a notice.
+    fn show_answer(&mut self, command: &str, text: &str, cx: &mut Context<Self>) {
+        match &self.thread {
+            Some(thread) => thread.update(cx, |t, cx| t.show_command_note(command, text, cx)),
+            None => cx.emit(ComposerEvent::Answer {
+                command: command.to_string(),
+                text: text.to_string(),
+            }),
+        }
+    }
+
+    /// The catalog the `/` menu searches: the core's (once read), the reports and the app's.
+    pub fn commands(&self) -> Vec<CommandSpec> {
+        match &self.catalog {
+            Catalog::Ready(listed) => mention::merged(listed.clone()),
+            _ => mention::merged(Vec::new()),
+        }
+    }
+
+    /// Whether the core's commands are still being read.
+    pub fn commands_loading(&self) -> bool {
+        matches!(self.catalog, Catalog::Idle | Catalog::Loading)
+    }
+
+    /// Reads the core's commands (once; again after a failure).
+    pub fn load_commands(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.catalog, Catalog::Loading | Catalog::Ready(_)) {
+            return;
+        }
+        self.catalog = Catalog::Loading;
+        let backend = self.backend.clone();
+        cx.spawn(async move |this, cx| {
+            let listed = cx.background_spawn(async move { backend.commands() }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.catalog = match listed {
+                    Ok(commands) => Catalog::Ready(commands),
+                    Err(why) => Catalog::Failed(why),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // --- the `@` menu ---------------------------------------------------------------------------
+
+    /// The entries of the `@` menu for the word being typed.
+    pub fn mentions(&self) -> Option<&Mentions> {
+        self.mentions.as_ref()
+    }
+
+    /// Asks the core for the entries of `word` (`@src/ma`). Newest wins: an answer for an older
+    /// word is dropped when it lands. The old entries stay shown meanwhile, so the menu does not
+    /// flicker as the word grows.
+    pub fn request_mentions(&mut self, word: &str, cx: &mut Context<Self>) {
+        if self.mentions.as_ref().is_some_and(|m| m.word == word) {
+            return;
+        }
+        self.mention_seq += 1;
+        let seq = self.mention_seq;
+        let kept = self.mentions.take().map(|m| m.items).unwrap_or_default();
+        self.mentions = Some(Mentions {
+            word: word.to_string(),
+            items: kept,
+            loading: true,
+            error: None,
+        });
+        cx.notify();
+        let backend = self.backend.clone();
+        let scope = match &self.target {
+            Target::Thread(id) => CompletionScope::Thread(id.clone()),
+            Target::Draft(project) => CompletionScope::Project(project.clone()),
+        };
+        let asked = word.to_string();
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_spawn(async move { backend.complete_path(&scope, &asked) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.mention_seq != seq {
+                    return;
+                }
+                let Some(mentions) = this.mentions.as_mut() else {
+                    return;
+                };
+                mentions.loading = false;
+                match found {
+                    Ok(items) => {
+                        mentions.items = items;
+                        mentions.error = None;
+                    }
+                    Err(why) => {
+                        mentions.items.clear();
+                        mentions.error = Some(why);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The `@` menu is not needed now.
+    pub fn clear_mentions(&mut self, cx: &mut Context<Self>) {
+        if self.mentions.take().is_some() {
+            // Its answer, if one is on its way, is for nobody.
+            self.mention_seq += 1;
+            cx.notify();
+        }
+    }
+
+    // --- attachments ----------------------------------------------------------------------------
+
+    /// The attachments waiting to go with the next prompt.
+    pub fn attachments(&self) -> &[Attachment] {
+        &self.attachments
+    }
+
+    /// How many are being read.
+    pub fn preparing(&self) -> usize {
+        self.preparing
+    }
+
+    /// The thumbnail of an image attachment, ready to draw.
+    pub fn thumb(&self, id: u64) -> Option<Arc<gpui_kit::Image>> {
+        self.thumbs.get(&id).cloned()
+    }
+
+    /// Adds files or images (dropped, picked or pasted). They are read off the UI thread; what
+    /// the core refuses (too large, not readable) comes back as [`ComposerEvent::Problem`] with
+    /// the core's sentence, a file already attached as a notice, and what goes over
+    /// [`MAX_ATTACHMENTS`] is left out.
+    pub fn add_attachments(&mut self, sources: Vec<AttachmentSource>, cx: &mut Context<Self>) {
+        if sources.is_empty() {
+            return;
+        }
+        let room = MAX_ATTACHMENTS.saturating_sub(self.attachments.len() + self.preparing);
+        if sources.len() > room {
+            cx.emit(ComposerEvent::Problem {
+                title: "Too many attachments".into(),
+                why: attach::too_many().0,
+            });
+        }
+        let sources: Vec<AttachmentSource> = sources.into_iter().take(room).collect();
+        if sources.is_empty() {
+            return;
+        }
+        self.preparing += sources.len();
+        cx.notify();
+        let backend = self.backend.clone();
+        let count = sources.len();
+        cx.spawn(async move |this, cx| {
+            let read = cx
+                .background_spawn(async move {
+                    sources
+                        .iter()
+                        .map(|source| backend.prepare_attachment(source))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.preparing = this.preparing.saturating_sub(count);
+                for prepared in read {
+                    match prepared {
+                        Ok(prepared) => this.take_prepared(prepared, cx),
+                        Err(refusal) => cx.emit(ComposerEvent::Problem {
+                            title: "Could not attach".into(),
+                            why: refusal.0,
+                        }),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn take_prepared(&mut self, prepared: attach::Prepared, cx: &mut Context<Self>) {
+        if self.attachments.iter().any(|a| a.key == prepared.key) {
+            cx.emit(ComposerEvent::Notice {
+                title: "Already attached".into(),
+                why: prepared.name,
+            });
+            return;
+        }
+        if self.attachments.len() >= MAX_ATTACHMENTS {
+            cx.emit(ComposerEvent::Problem {
+                title: "Too many attachments".into(),
+                why: attach::too_many().0,
+            });
+            return;
+        }
+        self.next_attachment += 1;
+        let attachment = prepared.into_attachment(self.next_attachment);
+        self.keep_thumb(&attachment);
+        self.attachments.push(attachment);
+    }
+
+    fn keep_thumb(&mut self, attachment: &Attachment) {
+        if let Some(png) = &attachment.thumb {
+            self.thumbs.insert(
+                attachment.id,
+                Arc::new(gpui_kit::Image::from_bytes(
+                    ImageFormat::Png,
+                    png.as_ref().clone(),
+                )),
+            );
+        }
+    }
+
+    /// Puts attachments in the strip as they are (stories and tests: nothing is read).
+    pub fn seed_attachments(&mut self, prepared: Vec<attach::Prepared>, cx: &mut Context<Self>) {
+        for prepared in prepared {
+            self.take_prepared(prepared, cx);
+        }
+        cx.notify();
+    }
+
+    /// Takes an attachment off the prompt.
+    pub fn remove_attachment(&mut self, id: u64, cx: &mut Context<Self>) {
+        let before = self.attachments.len();
+        self.attachments.retain(|a| a.id != id);
+        self.thumbs.remove(&id);
+        if self.attachments.len() != before {
+            cx.notify();
+        }
+    }
+
+    /// The images of the attachments as the thread's row shows them.
+    fn row_images(attachments: &[Attachment]) -> Vec<crate::thread::data::Attachment> {
+        attachments
+            .iter()
+            .filter(|a| a.kind == attach::Kind::Image)
+            .filter_map(|a| {
+                a.thumb.as_ref().map(|png| crate::thread::data::Attachment {
+                    name: a.name.clone(),
+                    mime: "image/png".into(),
+                    bytes: png.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// A new admission id for a prompt this composer hands the core.
     fn next_admission(&mut self) -> String {
         self.counter += 1;
@@ -403,7 +780,8 @@ impl ComposerModel {
         let Target::Thread(session) = self.target.clone() else {
             return;
         };
-        let original = request.text.clone();
+        // A command's prompt gives back what was typed (`/plan x`), not what it loaded.
+        let original = request.shown_text().to_string();
         self.dispatch(&session, request, picks, original, cx);
     }
 
@@ -417,8 +795,12 @@ impl ComposerModel {
     ) {
         self.sending = true;
         if let Some(thread) = &self.thread {
-            let (id, text) = (request.admission_id.clone(), request.text.clone());
-            thread.update(cx, |thread, _| thread.expect_prompt(&id, &text));
+            let id = request.admission_id.clone();
+            let text = request.shown_text().to_string();
+            let images = Self::row_images(&request.attachments);
+            thread.update(cx, |thread, _| {
+                thread.expect_prompt_with(&id, &text, images)
+            });
         }
         cx.notify();
         let (backend, session) = (self.backend.clone(), session.to_string());
@@ -444,15 +826,33 @@ impl ComposerModel {
                                 // No turn starts for it: the row is shown now.
                                 this.drop_expected(&request.admission_id, cx);
                                 if let Some(thread) = &this.thread {
-                                    thread.update(cx, |t, cx| t.show_user_now(&request.text, cx));
+                                    thread.update(cx, |t, cx| {
+                                        t.show_user_now(request.shown_text(), cx)
+                                    });
                                 }
                             }
                         }
+                        // What went with the prompt is the thread's now; what was added while
+                        // the send was on its way stays for the next one.
+                        let sent: Vec<u64> = request.attachments.iter().map(|a| a.id).collect();
+                        this.attachments.retain(|a| !sent.contains(&a.id));
+                        this.thumbs.retain(|id, _| !sent.contains(id));
                         cx.emit(ComposerEvent::Sent { text: original });
                         this.invalidate(cx);
                     }
                     Err(why) => {
                         this.drop_expected(&request.admission_id, cx);
+                        // The first send of a new thread fails in a composer that never held
+                        // the attachments: they are given back.
+                        if this.attachments.is_empty() && !request.attachments.is_empty() {
+                            for attachment in &request.attachments {
+                                this.keep_thumb(attachment);
+                            }
+                            this.attachments = request.attachments.clone();
+                            // Their ids came from the other composer: the next one is past them.
+                            let top = this.attachments.iter().map(|a| a.id).max().unwrap_or(0);
+                            this.next_attachment = this.next_attachment.max(top);
+                        }
                         cx.emit(ComposerEvent::Failed {
                             text: original,
                             why,

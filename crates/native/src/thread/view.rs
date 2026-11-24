@@ -27,9 +27,9 @@ use gpui_kit::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable, ImageSource, InteractiveElement as _,
     IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, Subscription,
-    Task, Window, assets::IconName, component::Sizable as _, component::Size as KitSize,
-    component::message_scroller::MessageScroller, component::text::TextView, div, img,
-    prelude::FluentBuilder as _, px, relative,
+    Task, Window, assets::IconName, component::ActiveTheme as _, component::Sizable as _,
+    component::Size as KitSize, component::message_scroller::MessageScroller,
+    component::text::TextView, div, img, prelude::FluentBuilder as _, px, relative,
 };
 
 use super::cards;
@@ -245,6 +245,7 @@ fn render_row(model: &Entity<ThreadModel>, ix: usize, _: &mut Window, cx: &mut A
         RowKind::Work(group) => cards::work_row(model, row, group, cx),
         RowKind::Footer(footer) => cards::footer_row(model, row, footer, cx),
         RowKind::Notice { error, text } => notice_row(row, *error, text, cx),
+        RowKind::Command { command, text } => command_row(row, command, text, cx),
     };
     div()
         .id(("row", key))
@@ -463,6 +464,53 @@ fn reasoning_row(
                     .probe(),
             )
         })
+        .probe()
+        .into_any_element()
+}
+
+/// What a `/command` answered, as t3code shows a command's output (`CommandOutputPanel.tsx`): a
+/// quiet card with the command above its text, in the mono font so a table stays a table.
+fn command_row(row: &Row, command: &SharedString, text_: &SharedString, cx: &App) -> AnyElement {
+    let palette = cx.design_theme().palette;
+    let mono = cx.theme().mono_font_family.clone();
+    let key = row.key as usize;
+    div()
+        .id(("command-note", key))
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .w_full()
+        .min_w_0()
+        .px(px(12.))
+        .py(px(10.))
+        .rounded(px(12.))
+        .border_1()
+        .border_color(palette.border.with_alpha(128).hsla())
+        .bg(palette.muted.with_alpha(32).hsla())
+        .child(
+            div()
+                .id(("command-name", key))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(text::XS.size)
+                .line_height(text::XS.line_height)
+                .text_color(palette.muted_foreground.hsla())
+                .child(icon(IconName::Terminal).with_size(KitSize::Size(px(12.))))
+                .child(div().font_family(mono.clone()).child(command.clone()))
+                .probe(),
+        )
+        .child(
+            div()
+                .id(("command-text", key))
+                .min_w_0()
+                .font_family(mono)
+                .text_size(text::XS.size)
+                .line_height(px(18.))
+                .text_color(palette.foreground.hsla())
+                .child(text_.clone())
+                .probe(),
+        )
         .probe()
         .into_any_element()
 }

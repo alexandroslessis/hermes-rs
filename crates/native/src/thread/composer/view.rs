@@ -23,20 +23,34 @@
 //! `composer-model-picker.png` (the picker) and `composer-model-picker-permission.png` (the
 //! permissions menu).
 //!
-//! Not copied: the speech button, the attach button and the context row under the card (the
-//! checkout, the branch; attachments are CP5.2, the branch is in the header), the stash menu.
-//! The context meter is a chip in the footer: t3code shows it in the thread details card.
+//! CP5.2 adds, around the same input: the `@` and `/` menus ([`super::suggest`]: the drawer above
+//! the card, mentions as atomic chips in the text), the strip of attachments above the text
+//! ([`super::strip`]; paste, drop and the paperclip all end in the model's `add_attachments`),
+//! and the commands of the app (`/new`, `/model`, ...), which the view does itself or hands to the
+//! frame as [`ComposerViewEvent::App`]. t3code: `ComposerCommandMenu.tsx`,
+//! `ComposerAttachmentStrip.tsx`, `useComposerAttachmentIntake.ts` (paste and drop).
+//!
+//! Not copied: the speech button and the context row under the card (the checkout, the branch;
+//! the branch is in the header), the stash menu. The context meter is a chip in the footer:
+//! t3code shows it in the thread details card.
+
+use std::path::PathBuf;
+use std::rc::Rc;
 
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity,
-    EntityInputHandler as _, EventEmitter, FocusHandle, Focusable, FontWeight,
-    InteractiveElement as _, IntoElement, MouseDownEvent, ParentElement as _, Pixels, Point,
-    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    AnyElement, App, AppContext as _, ClickEvent, ClipboardEntry, Context, ElementId, Entity,
+    EntityInputHandler as _, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight,
+    ImageFormat, InteractiveElement as _, IntoElement, MouseDownEvent, ParentElement as _, Pixels,
+    Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, Window,
     assets::IconName,
     base,
     component::{
         Icon, Sizable as _, Size as KitSize,
-        input::{Input, InputEvent, InputState, Textarea, TextareaState},
+        input::{
+            Enter, Escape, IndentInline, Input, InputContent, InputEvent, InputState, MoveDown,
+            MoveUp, Paste, Textarea, TextareaState,
+        },
     },
     div,
     prelude::FluentBuilder as _,
@@ -46,7 +60,10 @@ use gpui_kit::{
 use super::data::{
     EFFORTS, MODELS_SHOWN, Mode, context_label, effort_label, sendable, visible_queue,
 };
+use super::mention::{self, Trigger};
 use super::model::{Choices, ComposerEvent, ComposerModel};
+use super::strip;
+use super::suggest::{self, Key};
 use crate::design::{
     Button,
     button::{Size, Variant, icon_button},
@@ -55,6 +72,7 @@ use crate::design::{
     tokens::{Palette, radius, text},
 };
 use crate::dev::ProbeExt as _;
+use crate::model::backend::AttachmentSource;
 use crate::theme::DesignTheme as _;
 
 /// The most rows the input shows before it scrolls (t3code's `max-h-52`, 208 px, at 14 px text
@@ -64,6 +82,19 @@ pub const MAX_ROWS: usize = 9;
 pub const MIN_ROWS: usize = 2;
 /// The composer's widest (the timeline's content lane, `--chat-content-max-width`).
 pub const LANE: f32 = crate::thread::view::LANE;
+/// What the input says while it is empty: t3code's "Ask anything. @ files, $ skills, / commands"
+/// without the `$` part (skills are commands here: `/name`).
+pub const PLACEHOLDER: &str = "Ask anything. @ files, / commands";
+/// The file dialog of the paperclip, behind a seam so a test answers without a window: it gives
+/// the paths picked (`None`: cancelled).
+pub type FilePicker = Rc<dyn Fn(&mut App) -> Task<Option<Vec<PathBuf>>>>;
+/// The narrowest the model chip gets: its icon (the name is shown from [`LABEL_MIN`] of room).
+pub const MODEL_FLOOR: f32 = 32.;
+/// The narrowest the mode chip gets: its icon alone.
+pub const MODE_FLOOR: f32 = 32.;
+/// The least room a footer chip's label is shown in (about four letters and the ellipsis);
+/// with less, the chip is its icon.
+pub const LABEL_MIN: f32 = 36.;
 /// The model picker's size.
 const PICKER_WIDTH: f32 = 560.;
 const PICKER_HEIGHT: f32 = 340.;
@@ -102,14 +133,17 @@ pub enum ComposerViewEvent {
     Draft { key: String, text: String },
     /// A notice to show as a toast.
     Notice(ToastSpec),
+    /// An app command the user typed (`/new`, `/settings`, `/terminal`): the frame's command id
+    /// (`keymap::COMMANDS`).
+    App(&'static str),
 }
 
 /// The composer of one thread (or of the new-thread screen).
 pub struct ComposerView {
-    model: Entity<ComposerModel>,
+    pub(super) model: Entity<ComposerModel>,
     /// The draft's key (the thread's id, or `new:<project>`).
     key: String,
-    input: Entity<TextareaState>,
+    pub(super) input: Entity<TextareaState>,
     search: Entity<InputState>,
     focus: FocusHandle,
     menu: Option<Menu>,
@@ -120,6 +154,18 @@ pub struct ComposerView {
     preview: Option<Mode>,
     /// The text the input held before a queued prompt was loaded into it to be edited.
     stash: Option<String>,
+    /// What the caret asks a menu for now (`@` entries, the commands, a command's arguments).
+    pub(super) trigger: Option<Trigger>,
+    /// The trigger Escape put away: the menu stays closed until the trigger changes.
+    pub(super) dismissed: Option<(u8, usize)>,
+    /// The highlighted row of the drawer.
+    pub(super) highlight: usize,
+    pub(super) list_scroll: ScrollHandle,
+    /// A paste is on its way into the input: its references become chips when its change lands
+    /// (a paste that changes nothing leaves this set until the next edit, which then makes chips
+    /// of the references in the text: harmless).
+    pasting: bool,
+    file_picker: FilePicker,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -144,16 +190,21 @@ impl ComposerView {
             TextareaState::new(window, cx)
                 .auto_grow(MIN_ROWS, MAX_ROWS)
                 .submit_on_enter(true)
-                .placeholder("Ask anything...")
+                .placeholder(PLACEHOLDER)
         });
         if let Some(draft) = draft.filter(|d| !d.is_empty()) {
-            input.update(cx, |input, cx| input.set_value(draft, window, cx));
+            // A draft is plain text; the references in it are chips again.
+            input.update(cx, |input, cx| {
+                input.set_value(content_of(&draft), window, cx)
+            });
         }
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models..."));
         let subscriptions = vec![
             cx.observe(&model, |_, _, cx| cx.notify()),
             cx.subscribe_in(&model, window, Self::on_model_event),
             cx.subscribe_in(&input, window, Self::on_input_event),
+            // The caret moving is no change of the text, but it moves the trigger.
+            cx.observe(&input, |this, _, cx| this.sync_trigger(cx)),
             cx.subscribe_in(&search, window, Self::on_search_event),
         ];
         let view = Self {
@@ -166,6 +217,12 @@ impl ComposerView {
             closed_by_outside: None,
             preview: None,
             stash: None,
+            trigger: None,
+            dismissed: None,
+            highlight: 0,
+            list_scroll: ScrollHandle::new(),
+            pasting: false,
+            file_picker: real_file_picker(),
             _subscriptions: subscriptions,
         };
         view.focus_input(window, cx);
@@ -210,7 +267,7 @@ impl ComposerView {
     /// Replaces what the input holds (without telling anyone but the draft).
     pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |input, cx| {
-            input.set_value(text.to_string(), window, cx)
+            input.set_value(content_of(text), window, cx)
         });
         // `set_value` is not a change the input announces: the draft follows it here.
         cx.emit(ComposerViewEvent::Draft {
@@ -218,6 +275,105 @@ impl ComposerView {
             text: text.to_string(),
         });
         cx.notify();
+    }
+
+    /// The input changed by a call, not a key: the draft and the menus follow.
+    pub(super) fn edited(&mut self, cx: &mut Context<Self>) {
+        let text = self.text(cx);
+        cx.emit(ComposerViewEvent::Draft {
+            key: self.key.clone(),
+            text,
+        });
+        self.sync_trigger(cx);
+        cx.notify();
+    }
+
+    /// Makes the references in the text chips again (after a paste).
+    fn retokenise(&mut self, cx: &mut Context<Self>) {
+        let text = self.text(cx);
+        self.input.update(cx, |input, cx| {
+            let _ = input.set_tokens(content_of(&text), cx);
+        });
+    }
+
+    /// Puts the caret at the end of the text and reads what it asks for (stories: a menu open
+    /// over a draft).
+    pub fn caret_to_end(&mut self, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| {
+            let end = input.value().len();
+            input.set_selected_range(end..end, cx);
+        });
+        self.sync_trigger(cx);
+    }
+
+    /// Replaces the file dialog (a test's).
+    pub fn set_file_picker(&mut self, picker: FilePicker) {
+        self.file_picker = picker;
+    }
+
+    // --- attachments --------------------------------------------------------------------------
+
+    /// The paperclip: asks for files, which are attached once chosen.
+    pub fn pick_files(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let picked = (self.file_picker)(cx);
+        cx.spawn(async move |this, cx| {
+            if let Some(paths) = picked.await {
+                let _ = this.update(cx, |this, cx| this.attach_paths(paths, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Attaches files (dropped, picked or pasted from Explorer).
+    pub fn attach_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let sources = paths.into_iter().map(AttachmentSource::Path).collect();
+        self.model
+            .update(cx, |m, cx| m.add_attachments(sources, cx));
+    }
+
+    /// What Ctrl+V finds on the clipboard: an image or files with no text are attached (the
+    /// paste is taken); anything else is the input's own paste, and the references in it become
+    /// chips when it lands. True when the paste was taken.
+    pub fn paste_attachments(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(item) = cx.read_from_clipboard() else {
+            self.pasting = true;
+            return false;
+        };
+        // A spreadsheet cell puts a picture beside its text: the text is what was meant.
+        if item.text().is_some_and(|t| !t.trim().is_empty()) {
+            self.pasting = true;
+            return false;
+        }
+        let mut sources = Vec::new();
+        for entry in item.entries() {
+            match entry {
+                ClipboardEntry::Image(image) => {
+                    let mime = match image.format {
+                        ImageFormat::Jpeg => "image/jpeg",
+                        ImageFormat::Gif => "image/gif",
+                        ImageFormat::Webp => "image/webp",
+                        ImageFormat::Bmp => "image/bmp",
+                        ImageFormat::Tiff => "image/tiff",
+                        _ => "image/png",
+                    };
+                    sources.push(AttachmentSource::Bytes {
+                        data: std::sync::Arc::new(image.bytes.clone()),
+                        name: super::attach::pasted_name(mime),
+                    });
+                }
+                ClipboardEntry::ExternalPaths(paths) => {
+                    sources.extend(paths.paths().iter().cloned().map(AttachmentSource::Path))
+                }
+                ClipboardEntry::String(_) => {}
+            }
+        }
+        if sources.is_empty() {
+            self.pasting = true;
+            return false;
+        }
+        self.model
+            .update(cx, |m, cx| m.add_attachments(sources, cx));
+        true
     }
 
     // --- events -------------------------------------------------------------------------------
@@ -231,11 +387,15 @@ impl ComposerView {
     ) {
         match event {
             InputEvent::Change => {
+                if std::mem::take(&mut self.pasting) {
+                    self.retokenise(cx);
+                }
                 let text = input.read(cx).value().to_string();
                 cx.emit(ComposerViewEvent::Draft {
                     key: self.key.clone(),
                     text,
                 });
+                self.sync_trigger(cx);
                 cx.notify();
             }
             InputEvent::PressEnter { secondary, shift } => {
@@ -332,6 +492,25 @@ impl ComposerView {
                     ToastSpec::new(Kind::Error, title.clone()).description(why.clone()),
                 ));
             }
+            ComposerEvent::Notice { title, why } => {
+                cx.emit(ComposerViewEvent::Notice(
+                    ToastSpec::new(Kind::Info, title.clone()).description(why.clone()),
+                ));
+            }
+            ComposerEvent::Answer { command, text } => {
+                cx.emit(ComposerViewEvent::Notice(
+                    ToastSpec::new(Kind::Info, command.clone()).description(text.clone()),
+                ));
+            }
+            ComposerEvent::App(command) => match command.workspace_id() {
+                Some(id) => cx.emit(ComposerViewEvent::App(id)),
+                // The model picker is this composer's own.
+                None => {
+                    if self.menu != Some(Menu::Model) {
+                        self.toggle_menu(Menu::Model, window, cx);
+                    }
+                }
+            },
             ComposerEvent::Created { .. } => {
                 // The text moves to the new thread's first send: this draft is done.
                 cx.emit(ComposerViewEvent::Draft {
@@ -396,6 +575,9 @@ impl ComposerView {
         }
         self.menu = Some(menu);
         self.preview = None;
+        if let Some(trigger) = &self.trigger {
+            self.dismissed = Some(trigger.key());
+        }
         match menu {
             Menu::Model => {
                 self.model.update(cx, |m, cx| m.load_choices(cx));
@@ -497,7 +679,14 @@ impl Render for ComposerView {
                 model.show_all_queued(),
             )
         };
-        let has_text = sendable(&self.input.read(cx).value());
+        let (has_attachments, preparing) = {
+            let model = self.model.read(cx);
+            (!model.attachments().is_empty(), model.preparing() > 0)
+        };
+        // Attachments alone can be sent; not while one is still being read.
+        let has_text = (sendable(&self.input.read(cx).value()) || has_attachments) && !preparing;
+        let strip = self.attachment_strip(&palette, cx);
+        let drawer = self.suggest_drawer(&palette, window, cx);
 
         // The surface and its 1 px outline (`--chat-composer-outline`: white at 5% in the dark,
         // black at 8% in the light; the theme's foreground at those strengths, so another theme's
@@ -520,6 +709,7 @@ impl Render for ComposerView {
             .px(px(12.))
             .pb(px(12.))
             .min_w_0()
+            .child(self.attach_button(&palette, cx))
             .child(self.mode_menu(&controls, &palette, cx))
             .child(div().flex_1().min_w(px(4.)))
             .when_some(controls.context, |row, (used, max)| {
@@ -529,9 +719,16 @@ impl Render for ComposerView {
             .child(div().ml(px(4.)).flex_shrink_0().child(primary))
             .probe();
 
+        let ring = palette.ring.hsla();
+        let dropped = cx.entity();
         let card = div()
             .id("composer")
             .relative()
+            .drag_over::<ExternalPaths>(move |style, _, _, _| style.border_color(ring))
+            .on_drop(move |paths: &ExternalPaths, _, cx| {
+                let paths = paths.paths().to_vec();
+                dropped.update(cx, |this, cx| this.attach_paths(paths, cx));
+            })
             .flex()
             .flex_col()
             .w_full()
@@ -547,15 +744,56 @@ impl Render for ComposerView {
                     .pb(px(8.))
                     .text_size(text::SM.size)
                     .text_color(palette.foreground.hsla())
+                    .children(strip)
                     .child(
                         div()
                             .id("composer-input")
                             .w_full()
-                            .child(Textarea::new(&self.input).appearance(false).bordered(false))
+                            .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
+                                if this.suggest_key(Key::Up, window, cx) {
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
+                                if this.suggest_key(Key::Down, window, cx) {
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .capture_action(cx.listener(|this, enter: &Enter, window, cx| {
+                                // Enter picks; Shift+Enter and Ctrl+Enter are the input's.
+                                if !enter.secondary
+                                    && !enter.shift
+                                    && this.suggest_key(Key::Enter, window, cx)
+                                {
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                                if this.suggest_key(Key::Tab, window, cx) {
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .capture_action(cx.listener(|this, _: &Escape, window, cx| {
+                                if this.suggest_key(Key::Escape, window, cx) {
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .capture_action(cx.listener(|this, _: &Paste, _, cx| {
+                                if this.paste_attachments(cx) {
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .child(
+                                Textarea::new(&self.input)
+                                    .token(strip::chip_element)
+                                    .appearance(false)
+                                    .bordered(false),
+                            )
                             .probe(),
                     ),
             )
             .child(footer)
+            .children(drawer)
             .probe();
 
         div()
@@ -588,6 +826,20 @@ impl Render for ComposerView {
 }
 
 impl ComposerView {
+    /// The paperclip at the left of the footer.
+    fn attach_button(&self, _palette: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity();
+        icon_button(
+            "attach-button",
+            IconName::Paperclip,
+            "Attach files or images",
+        )
+        .variant(Variant::GhostMuted)
+        .size(Size::Sm)
+        .on_click(move |_, window, cx| view.update(cx, |this, cx| this.pick_files(window, cx)))
+        .into_any_element()
+    }
+
     /// The send, queue and stop button (t3code's round `size-8` button).
     fn primary_button(
         &self,
@@ -844,14 +1096,20 @@ impl ComposerView {
             ),
             palette,
             move |event, window, cx| {
-                view.update(cx, |this, cx| this.chip_clicked(Menu::Mode, event, window, cx))
+                view.update(cx, |this, cx| {
+                    this.chip_clicked(Menu::Mode, event, window, cx)
+                })
             },
         );
         div()
             .id("mode-menu")
             .relative()
             .flex()
-            .flex_shrink_0()
+            // In a narrow footer the model chip gives way first (to its floor); only in a
+            // footer narrower still does the mode's name, down to its icon (the tooltip names
+            // it), so the send button never leaves the card.
+            .min_w(px(MODE_FLOOR))
+            .flex_shrink(0.001)
             .child(chip)
             .when(open, |d| {
                 d.child(self.mode_panel(controls.mode, palette, cx))
@@ -1002,15 +1260,20 @@ impl ComposerView {
             },
             palette,
             move |event, window, cx| {
-                view.update(cx, |this, cx| this.chip_clicked(Menu::Model, event, window, cx))
+                view.update(cx, |this, cx| {
+                    this.chip_clicked(Menu::Model, event, window, cx)
+                })
             },
         );
         div()
             .id("model-menu")
             .relative()
             .flex()
-            .min_w(px(96.))
-            .flex_shrink(1.)
+            // It shrinks first (the long names are models'): its name is cut, then, with less
+            // than `LABEL_MIN` for it, hidden (the icon stays; the tooltip names the model);
+            // only then does the mode chip shrink.
+            .min_w(px(MODEL_FLOOR))
+            .flex_shrink(64.)
             .child(chip)
             .when(open, |d| d.child(self.model_panel(controls, palette, cx)))
             .into_any_element()
@@ -1228,7 +1491,8 @@ pub fn hero(
 
 /// A footer chip (t3code's `ComposerControl`, 28 px, muted until hovered): an icon and a label
 /// that is cut with an ellipsis when the footer is narrow (a long model name must not push the
-/// send button out of the card).
+/// send button out of the card). With less than [`LABEL_MIN`] for the label, the label goes and
+/// the chip is its icon (the tooltip names it), so a narrow footer never shows a lone `o...`.
 fn chip(
     id: &'static str,
     glyph: IconName,
@@ -1269,12 +1533,28 @@ fn chip(
                 .child(icon(glyph).with_size(KitSize::Size(px(16.)))),
         )
         .child(
+            // The label's room: it wraps, with an empty first item, so a label that needs more
+            // than the room has falls to a second line, which the 28 px clip.
             div()
-                .id("label")
+                .flex_grow(1.)
                 .min_w_0()
-                .truncate()
-                .child(label.clone())
-                .probe_text(label),
+                .h(px(28.))
+                .overflow_hidden()
+                .flex()
+                .flex_wrap()
+                .content_start()
+                .child(div().w(px(0.)).h(px(28.)))
+                .child(
+                    div()
+                        .id("label")
+                        .flex_basis(relative(1.))
+                        .min_w(px(LABEL_MIN))
+                        .h(px(28.))
+                        .line_height(px(28.))
+                        .truncate()
+                        .child(label.clone())
+                        .probe_text(label),
+                ),
         )
         .into_any_element()
 }
@@ -1320,4 +1600,28 @@ fn context_meter(used: usize, max: usize, palette: &Palette) -> AnyElement {
         )
         .probe()
         .into_any_element()
+}
+
+/// The text with the references in it as chips: what a draft, a restored prompt or a paste loads.
+pub fn content_of(text: &str) -> InputContent {
+    let mut content = InputContent::new(text.to_string());
+    for (range, chip) in mention::reference_chips(text) {
+        if let Ok(next) = content.clone().with_token(range, suggest::token_of(&chip)) {
+            content = next;
+        }
+    }
+    content
+}
+
+/// The paperclip's dialog: the system's file picker, several files.
+fn real_file_picker() -> FilePicker {
+    Rc::new(|cx: &mut App| {
+        let asked = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        cx.spawn(async move |_| asked.await.ok().and_then(|r| r.ok()).flatten())
+    })
 }

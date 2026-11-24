@@ -379,10 +379,15 @@ impl Workspace {
             cx.new(|cx| ComposerView::new(model, key, draft, window, cx))
         });
         self.composer_subscription = self.composer_view.as_ref().map(|view| {
-            cx.subscribe(view, |this, _, event: &ComposerViewEvent, cx| match event {
-                ComposerViewEvent::Draft { key, text } => this.set_draft(key, text, cx),
-                ComposerViewEvent::Notice(spec) => {
-                    this.push_toast(spec.clone(), cx);
+            cx.subscribe_in(view, window, |this, _, event: &ComposerViewEvent, window, cx| {
+                match event {
+                    ComposerViewEvent::Draft { key, text } => this.set_draft(key, text, cx),
+                    ComposerViewEvent::Notice(spec) => {
+                        this.push_toast(spec.clone(), cx);
+                    }
+                    // A command of the app typed in the composer (`/new`, `/settings`): the same
+                    // handler the palette and the shortcuts reach.
+                    ComposerViewEvent::App(id) => this.run_command(id, window, cx),
                 }
             })
         });

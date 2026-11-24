@@ -196,3 +196,176 @@ removed after); `cargo build --workspace` ok; `scripts/perf/native-thread-check.
 removed, then 0.
 
 Left: the hand-only checks in C (IME, emoji panel, paste, the feel of the menus) are still the user's.
+
+## CP5.2 — Mentions, commands, attachments
+Worktree: C:\Users\alexandros\repos\hermes-rs-n5   Branch: native/p5-composer   Model: Sonnet 5.5 (subagent)
+Cut from CP5.1 (ba704b3). Uncommitted.
+
+### Files
+- New in `crates/native/src/thread/composer/`: `mention.rs` (no GPUI: `trigger` = where the caret asks for a menu, `Suggestion`, `Chip`,
+  `reference_chips`, the `/` entries `CommandSpec`/`merged`/`filter_commands`, `AppCommand`), `attach.rs` (no GPUI: limits, `prepare_path` /
+  `prepare_bytes`: size and kind checks, decode and shrink to a 256 px PNG thumbnail, duplicate keys, `format_size`), `suggest.rs` (the drawer,
+  keys, what a pick does), `strip.rs` (the attachment strip, the chip element), `tests/input.rs` (47 tests).
+- Edited: `model.rs` (attachments, thumbnails, `preparing`, catalog, `request_mentions`, command running, `send` split into `send_prompt`),
+  `view.rs` (fields, capture-phase key actions, paste/drop/pick, `content_of`, placeholder, paperclip), `data.rs` (`SendRequest.display`,
+  `.attachments`), `model/backend.rs` (trait: `complete_path`, `commands`, `run_command`, `prepare_attachment`; `CoreBackend::send` saves
+  images through `image_from_base64` and copies files through `Core::attach_file`; the fixture records and scripts all of it),
+  `thread/model.rs` (`expect_prompt_with`, `show_user_with`, `RowKind::Command`, `show_command_note`), `thread/view.rs` (`command_row`),
+  `workspace.rs` (composer events: `App(id)` runs the frame command), `gallery/composer.rs` + `mod.rs` (3 stories), `Cargo.toml` (`image` is a
+  normal dependency with png/jpeg/gif/webp/bmp/tiff), `real_tests.rs`, `wiring_tests.rs`, `thread/tests.rs`.
+- Docs: TESTING.md section 6, PITFALLS.md (4 bullets), PHASES.md status, ARCHITECTURE.md and native-ui/README.md rows, reference/t3code/README.md (no new screenshot).
+
+### What it does
+1. **`@`.** The word before the caret that starts with `@` (not an email, not inside a chip) opens a drawer above the card (t3code's, over the
+   card width, at most 288 px, scrolling, the highlighted row kept in view) filled by the core path completion (`paths::complete`, in the thread folder, or
+   the project folder on the new-thread screen). Arrows (wrap), Enter, Tab, Escape (stays away until the word changes), click. A file or
+   folder becomes an atomic Kit inline token (deleted by one Backspace, undone as a unit); `@file:`/`@url:` prefixes are typed on; Tab on a
+   folder walks into it (`@src/`). The text under the chip is the reference the runtime expands (`@file:src/a.rs`, quoted when it has a
+   space): the same text the Tauri page sends, so drafts (`native-ui.json` unchanged), copy and the prompt need no other format; pasted or
+   loaded references become chips again; an old plain draft loads as it was.
+2. **`/`.** At the start of the text: the core catalog (`Core::commands`: coding commands, skills, bundles) plus the reports
+   `Core::run_command` answers but does not list (`/status /context /usage /insights /diff /tools /memory /refine`) plus the app commands `/new /model
+   /settings /terminal`, with argument hints (ours) in a bar once the name is typed. Enter runs a command without arguments and completes one
+   with; Tab always completes. `Core::run_command` through `Backend::run_command`: `Output` becomes a `RowKind::Command` card in the timeline
+   (screen only, the core does not store it; nothing goes to the model), `Send`/`Skill` are sent as a normal prompt with `display` as the user
+   row, `NotACommand` (or a name the loaded catalog lacks, or a path) is an ordinary prompt, a refusal keeps the text and toasts. App commands: `/new`
+   -> `chat.new`, `/terminal` -> `terminal.toggle`, `/settings` -> `settings.open` (the existing stub toast: Phase 7), `/model` opens the picker.
+3. **Attachments.** Paste (a clipboard image or Explorer files, only when there is no text), drop on the card (outline while dragging), the
+   paperclip (the system file dialog behind a `FilePicker` seam). Read off the UI thread (`Backend::prepare_attachment`): the core 16 MiB limit
+   and image kinds with its sentences as toasts ("huge.bin: The file is larger than 16 MiB."), folders, unreadable and broken files refused,
+   duplicates noticed, 100 per message (t3code's; the core has none; review: was 20), photos decoded with a 512 MiB cap and shrunk. Strip above the input: 64 px image
+   tiles with a remove button, rows with name and size for other files, wraps and scrolls over 166 px (review: was 152). Sent with the prompt: images saved by the
+   core under `images` and sent as `SubmitTurn::images`, files copied into `.hermes/attachments` and referenced with `@file:` appended to the text;
+   the user row shows the image thumbnails when its turn starts; attachments-only sends are allowed; a refused send keeps them.
+4. Placeholder: "Ask anything. @ files, / commands".
+
+### Tests (CARGO_TARGET_DIR=target/claude)
+- Unit: `mention.rs` (12), `attach.rs` (8). Behaviour and layout: `tests/input.rs` 47 (menus, chips, commands, attachments, drawer/chip/strip layout at 640/1100/1920,
+  clipboard and `FileDrop` events through the real window), `wiring_tests.rs` +2, `thread/tests.rs` +2 (command card in the lane, live thumbnails).
+- Real core + wiremock (`real_tests.rs`, +2): a prompt with `@file:notes.txt`, an attached PNG and an attached text file: the provider request holds the
+  expansions and `[Attached image: ...]`, the file is copied into `.hermes/attachments`, the image is saved in `images`, the stored user message has the image,
+  the row has one thumbnail; and a broken image is refused with a sentence naming the file.
+- Results of the full runs: "Final checks" below.
+
+### Snapshots
+New (6), `crates/native/snapshots/`: `composer-mentions-t3-{light,dark}.png` (`@` drawer, chips, chips on a 352 px card), `composer-commands-t3-{light,dark}.png`
+(`/` drawer, argument hint, a command answer in the timeline over the composer), `composer-attachments-t3-{light,dark}.png` (images, files, many, narrow).
+Changed pre-existing (6): `composer-t3-{light,dark}.png`, `composer-menus-t3-{light,dark}.png`, `composer-new-t3-{light,dark}.png` (the paperclip at the footer left
+and the new placeholder; the model chip floor is 64 px); their `.diff.png` were in `target/claude/snapshots/` before the update. I looked at the dark mentions, commands and
+attachments sheets; a Haiku check should look at all twelve.
+
+### Deviations
+- No t3code capture of the drawer, chip or strip (window not driven; source only): chip colour is the theme `info` (t3code `--context-chip-mention` is not in our tokens). *(Review: now `info_foreground`, ink only, see below.)*
+- The drawer is anchored to the card (as t3code), not the caret; no `$ skills` (skills are `/` commands); no tile preview dialog on click; non-image files show in the strip but
+  not in the sent row (their `@file:` reference shows when the history is read again); command cards are not stored (as the core output).
+- A reference typed by hand stays text until pasted or reloaded (t3code chips it at the next space).
+- Attachments are not kept in drafts (a file may be gone tomorrow). Ctrl+Enter with attachments queues instead of steering.
+- Model chip floor 96 -> 64 px and the footer gained the paperclip: pre-existing composer baselines changed.
+
+### Missing core operations
+`Core::commands` has no argument hints or the reports (`/usage` ...), and `attachments` no count limit: all native-side (`mention.rs`, `attach.rs`).
+`Core::attach_file` needs a stored session, so files are copied at send time, not when added.
+
+### For the reviewer
+1. `ComposerView::pasting` is consumed only by `Change`; an empty-clipboard Ctrl+V leaves it set until the next edit (harmless: it chips complete references).
+2. `sync_trigger` runs on every notify of the input (observe) and copies the text; fine to 1 MB (test: 2.3 s), could read only the caret neighbourhood.
+3. `reference_chips` skips texts over 200 kB (regex cost); `content_of` is used by `set_text`, so Restore/Edit get chips too.
+4. `CoreBackend::send` saves images and copies files before applying picks and before `submit`: a later refusal leaves the copies behind (`.hermes/attachments`, `images`).
+5. `run_command` blocks a GPUI background thread on the core runtime (`block_on`), as `delete`/`move` already do.
+6. The command card is not a message: copy gives its text; no actions row.
+7. The count limit 20 is a guess; the core accepts any number.
+
+### User checklist (CP5.2), added to the CP5.1 list
+Build as in CP5.1 and run `.\target\claude\debug\hermes-native.exe --fixture --dev`.
+ 1. In "halo" type `@`: a list of files above the card; type `ma`, Down/Up, Enter: a blue chip with the file name; Backspace deletes it whole.
+ 2. Type `/`: the commands; `/usage` + Enter: a grey card with the answer appears in the thread (nothing is sent); `/diff ` shows the argument hint.
+ 3. `/new` starts a new thread; `/settings` shows the Phase 7 toast; `/model` opens the model picker.
+ 4. Click the paperclip, pick a PNG and a text file: a thumbnail and a file row appear; the x removes them; Enter sends: the message shows the thumbnail.
+ 5. **Hand-only:** copy an image (browser, screenshot tool) and Ctrl+V in the composer; drag files from Explorer onto the card (it gets an outline); the Windows file dialog.
+ 6. Pick a file over 16 MiB: a toast with the core sentence.
+
+### Final checks (CP5.2)
+`scripts/native/check.ps1 -Update`: "native check: all ok" (`cargo test -p hermes-native` 414 passed with the snapshot run, 2 ignored; the 12 baselines above written, no other
+baseline changed). `cargo test -p hermes_core`: 140 passed. `cargo build --workspace`: ok (webapp dist copied from the main checkout, then removed).
+`scripts/perf/native-thread-check.ps1`: ok. `scripts/clean-test-temp.ps1`: dry run 23 folders (6.2 MB), `-Delete` removed 23, second dry run 0.
+Stories were sized after `every_design_story_is_registered_and_fits_its_window` (a scrolling drawer list trips `no_overflow`, so the `/` story shows `/in`).
+
+### Visual check (Haiku 5.5)
+References opened: `reference/t3code/composer-model-picker.png`, `composer-model-picker-permission.png`, `app-thread-dark.png`. (No t3code capture of the mention or command drawer exists; those are judged on legibility and layout only.)
+- composer-mentions-t3-light: expected — drawer row and blue chips legible; drawer highlight low-contrast on white but readable.
+- composer-mentions-t3-dark: differs — chips use theme `info` blue, not t3code's chip tint (declared); drawer row height and icon not checked against a reference.
+- composer-commands-t3-light: expected — highlighted `/init` row, argument-hint bar, usage card; the usage card's text is faint grey on near-white but legible.
+- composer-commands-t3-dark: differs — command rows show no kbd element; no t3code command capture to compare against.
+- composer-attachments-t3-light: unexpected — faint red corner marks on the thumbnail tile edges, and a stray dash above the placeholder in the many-tiles panel; check for a leftover focus or drop ring.
+- composer-attachments-t3-dark: unexpected — same red corner marks on the tiles and stray dash above the placeholder in the many-tiles panel.
+- composer-t3-light: changed-as-expected — paperclip added at footer left; placeholder now "Ask anything. @ files, / commands".
+- composer-t3-dark: changed-as-expected — same paperclip and placeholder change; send disc unchanged.
+- composer-menus-t3-light: changed-as-expected — paperclip and new placeholder; narrow card model chip now truncates to "o..." (was "openro...") from the 64 px floor, a consequence of the declared change.
+- composer-menus-t3-dark: changed-as-expected — same as light; model list and permissions popup match composer-model-picker.png and composer-model-picker-permission.png except the declared five icons and no Ctrl+N badges.
+- composer-new-t3-light: changed-as-expected — paperclip and new placeholder; "Accept edits" label no longer clipped at the card's bottom edge (fixed as a side effect).
+- composer-new-t3-dark: changed-as-expected — same paperclip and placeholder; card matches app-thread-dark.png apart from the declared missing "$ skills" and checkout row.
+
+### Review (Opus 5.5)
+Verdict: **good after fixes.** Main had not moved (no merge). The mention, command and attachment paths were sound;
+the fixes are leftovers after a refused send, a few send-path edges, the visual defects the Haiku check found, and a
+footer that could push the send button out of a narrow card.
+
+Checked and right as it was:
+- **Mention safety.** The text under a chip is the plain reference (`@file:src/a.rs`, quoted when needed); the
+  runtime expands it relative to the session's folder (`hermes_tools::references::resolve`: canonicalised, symlinks
+  followed, refused outside the folder or on credential files). The completion root is the thread's folder (the new
+  thread's is the project's, the same folder `create_thread` uses). So the native app can mention exactly what the
+  Tauri page can; a path outside the folder is offered by completion (as there) but refused by the runtime.
+- Stale `@` answers are dropped (`mention_seq`); the core's completion is capped (30 items, 20,000 files). Commands:
+  every `CommandOutcome`/`CommandError` variant is handled (`Output` = a screen-only `RowKind::Command`, nothing stored
+  or sent; `Send`/`Skill` sent with `display` as the row; `NotACommand` and paths an ordinary prompt; errors a toast
+  with the text kept). A `/` mid-text opens nothing. t3code's command rows have no kbd (Haiku item c): nothing to do.
+- Attachments: images are checked by magic bytes again by the core at send (`image_from_base64`), files and images go
+  only to the data folder's `images` and the thread's `.hermes/attachments` (unique names). Decoding is off the UI
+  thread; a tile being read has no remove button, so there is nothing to cancel.
+- Ground rules: no view calls the core, tokens only, t3code cited in every new module, `TestDir` last, no schema change.
+  `sync_trigger` copies the text per caret move: measured 0.8 ms on a 1.1 MB draft (debug); kept, with a bound test.
+
+Fixed:
+1. **Leftovers after a refused send.** `CoreBackend::send` now records every file it writes (`SavedAttachments`) and
+   removes them when anything after fails (a later attachment, the mode pick, `submit`). Real-core test: a text file is
+   copied, then the image (broken after it was added) is refused: `.hermes/attachments` and `images` hold nothing new,
+   the strip keeps both. An image that grew past 16 MiB is refused from its size, not read whole first.
+2. **Attachments added while a send was on its way were dropped** (`attachments.clear()` on success): only the sent
+   ids are removed now. Restored attachments of a failed first send move the id counter past theirs (ids came from the
+   new-thread screen's composer and could collide).
+3. A steered command prompt showed the loaded skill's text in the row, and a failed first send gave back that text
+   instead of `/name args`: both use `display` now.
+4. **Count limit** 20 -> 100: t3code's `PROVIDER_SEND_TURN_MAX_ATTACHMENTS` (`packages/contracts/src/chatAttachment.ts`).
+5. **Visual (a), red corners:** not a ring: the tile's `overflow_hidden` clips to its box, not its rounded corners, so
+   the thumbnail's square corners showed past the border. The image is rounded itself now.
+   **The stray dash:** the top 2 px of the first file row's icon under two rows of tiles (the strip cut at 152 px).
+   `MAX_HEIGHT` is 166: the cut shows a third of a tile or most of a row, which reads as "scrolls".
+6. **Visual (b), chip colour:** t3code's `ContextChip` is ink only (no fill), its file accent solved to 5:1 contrast per
+   theme; the chip now uses `info_foreground` (the palette's blue text at that contrast) with no fill, filled only when
+   selected.
+7. **Visual (d), footer:** at 352 px the send button stuck out of the card (with the context meter) and the model chip
+   read `o...`. Now the model chip gives way first, the mode chip only after it (its label floor 32 = icon), and a chip's
+   label shows only with at least 36 px (else the chip is its icon; the tooltip names it): a wrap with an empty first
+   item drops a label that needs more onto a clipped second line. Tests: send inside the card at 352-1100, label
+   either >= 36 px and centred or hidden, the mode's name whole at a 330 px window.
+8. Baselines: the six pre-existing ones changed only by the paperclip, the placeholder and the footer chips (item e,
+   compared with HEAD's); re-accepted after the fixes above, with the six new ones.
+
+Left, with reasons:
+- The sent row shows non-image files only after a reload: the reference names are made by the core inside the send
+  (`unique_path`), and `Sent` does not carry them; adding that is beyond this checkpoint. Declared above.
+- Command cards are screen-only (as the core's output); `/ctx` (an alias the core answers) is not in the merged list,
+  so with the catalog loaded it is sent as text.
+- The hand-only checks (IME next to a chip, real clipboard images, Explorer drag, the Windows dialog) are still the user's.
+
+Checks after the fixes (`CARGO_TARGET_DIR=target/claude`): `cargo test -p hermes-native` 415 passed, 2 ignored;
+`--features snapshots`: the 12 composer baselines differed (all by these fixes, looked at: rounded tiles, the 166 px
+cut, ink chips, icon-only model chip at 352 px with the send inside), accepted with `UPDATE_SNAPSHOTS=1`, no other
+story changed; `scripts/native/check.ps1` "native check: all ok"; `cargo test -p hermes_core` 140 passed;
+`scripts/perf/native-thread-check.ps1` ok; `cargo build --workspace` ok (webapp dist copied from the main checkout,
+removed after). Core, runtime and desktop untouched by the review, so `hermes-desktop` was not re-run.
+`clean-test-temp.ps1`: 24 folders removed, then 0.
+
+User checklist addition: in a narrow window (about 640 px with the right panel open) the model chip shows only its
+icon (hover names the model), "Accept edits" stays whole, the send button stays inside the card.

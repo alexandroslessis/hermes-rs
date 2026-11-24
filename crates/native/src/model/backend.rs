@@ -48,9 +48,11 @@ use tokio::sync::mpsc;
 use crate::sidebar::data::{
     NO_PROJECT, NO_PROJECT_LABEL, Op, ProjectItem, ProjectKind, Snapshot, ThreadItem,
 };
+use crate::thread::composer::attach::{self, Prepared, Refusal};
 use crate::thread::composer::data::{
     Controls, Mode, ModelChoices, ModelEntry, Pick, Picks, QueueOp, QueuedItem, SendRequest, Sent,
 };
+use crate::thread::composer::mention::{CommandOrigin, CommandSpec, Suggestion};
 use crate::thread::data::{Attachment, HistoryItem, HistoryPage, items_from_entries, page};
 use crate::thread::header_data::{Exported, GitState, GitSummary, HeaderInfo};
 use crate::thread::recording::Recording;
@@ -137,6 +139,38 @@ pub trait Backend: Send + Sync + 'static {
     fn stop(&self, _session: &str) -> Result<(), String> {
         Err("Stopping is not available here.".to_string())
     }
+    /// The `@` menu's entries for `word` (`@src/ma`): the core's path completion in the folder of
+    /// the thread (or, on the new-thread screen, of the project). Walks folders: it blocks.
+    fn complete_path(
+        &self,
+        _scope: &CompletionScope,
+        _word: &str,
+    ) -> Result<Vec<Suggestion>, String> {
+        Ok(Vec::new())
+    }
+    /// The `/` menu's entries the core lists (the coding commands, the skills and bundles). Reads
+    /// the skills' folders: it blocks.
+    fn commands(&self) -> Result<Vec<CommandSpec>, String> {
+        Ok(Vec::new())
+    }
+    /// Runs `/name argument` through the core (`Core::run_command`); `session` is the thread the
+    /// composer is in (`None` on the new-thread screen).
+    fn run_command(
+        &self,
+        _session: Option<&str>,
+        _name: &str,
+        _argument: &str,
+    ) -> Result<CommandAnswer, String> {
+        Err("Commands are not available here.".to_string())
+    }
+    /// Reads what an attachment holds before it is shown in the strip: its size and kind, the
+    /// thumbnail of an image. The limits are the core's. Reads files and decodes images: it blocks.
+    fn prepare_attachment(&self, source: &AttachmentSource) -> Result<Prepared, Refusal> {
+        match source {
+            AttachmentSource::Path(path) => attach::prepare_path(path),
+            AttachmentSource::Bytes { data, name } => attach::prepare_bytes(data.to_vec(), name),
+        }
+    }
     /// Takes a queued prompt out, runs it now inside the turn, or replaces its text.
     fn queue_op(&self, _session: &str, _op: &QueueOp) -> Result<(), String> {
         Err("The queue is not available here.".to_string())
@@ -149,6 +183,56 @@ pub trait Backend: Send + Sync + 'static {
     /// Makes `provider`'s `model` the default for new threads (a pick on the new-thread screen).
     fn set_default_model(&self, _provider: &str, _model: &str) -> Result<(), String> {
         Err("Changing the default model is not available here.".to_string())
+    }
+}
+
+/// Where the `@` menu looks for files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompletionScope {
+    /// The folder of this thread.
+    Thread(String),
+    /// The folder of this project (a new thread's).
+    Project(String),
+}
+
+/// Something to attach, as the user gave it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttachmentSource {
+    /// A file (dropped, picked, or pasted from Explorer).
+    Path(PathBuf),
+    /// An image from the clipboard.
+    Bytes { data: Arc<Vec<u8>>, name: String },
+}
+
+/// What running a command answered (`hermes_core::commands::CommandOutcome`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandAnswer {
+    /// Text for the timeline; nothing is sent to the model.
+    Output(String),
+    /// A prompt to send as a normal turn, shown as `display`.
+    Send { message: String, display: String },
+    /// A skill or bundle loaded: `message` is the prompt, `display` what the timeline shows.
+    Skill { message: String, display: String },
+    /// Not a command of the core's: the text is an ordinary prompt.
+    NotACommand,
+}
+
+/// What [`CoreBackend::send`] wrote for a prompt's attachments: the images' paths (under the data
+/// folder's `images`), the `@file:` references of the files copied into the thread's
+/// `.hermes/attachments`, and every file written, removed again when the prompt is not sent.
+#[derive(Debug, Default)]
+struct SavedAttachments {
+    images: Vec<String>,
+    references: Vec<String>,
+    written: Vec<PathBuf>,
+}
+
+impl SavedAttachments {
+    /// Removes what was written (a prompt the core did not take leaves no copies behind).
+    fn discard(&self) {
+        for path in &self.written {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -412,6 +496,98 @@ impl CoreBackend {
             api_key: Some("mock".into()),
         });
         self
+    }
+
+    /// Saves the images of a prompt (under the data folder) and copies its other files into the
+    /// thread's folder: the images' paths, and the `@file:` references to add to the text. The
+    /// core refuses what is too large or not an image with its own sentence.
+    fn save_attachments(
+        &self,
+        session: &str,
+        attachments: &[attach::Attachment],
+    ) -> Result<SavedAttachments, String> {
+        let mut saved = SavedAttachments::default();
+        match self.save_into(session, attachments, &mut saved) {
+            Ok(()) => Ok(saved),
+            Err(why) => {
+                // Nothing of a prompt that was not sent stays behind.
+                saved.discard();
+                Err(why)
+            }
+        }
+    }
+
+    fn save_into(
+        &self,
+        session: &str,
+        attachments: &[attach::Attachment],
+        saved: &mut SavedAttachments,
+    ) -> Result<(), String> {
+        use base64::Engine as _;
+        use hermes_core::attachments::{AttachSource, MAX_BYTES, image_from_base64};
+        if attachments.is_empty() {
+            return Ok(());
+        }
+        let cwd = self
+            .core
+            .runtime()
+            .store()
+            .session(session)
+            .ok()
+            .flatten()
+            .map(|record| PathBuf::from(record.cwd));
+        for attachment in attachments {
+            let name = &attachment.name;
+            match (attachment.kind, &attachment.source) {
+                (attach::Kind::Image, source) => {
+                    let bytes = match source {
+                        attach::Source::Bytes { data, .. } => data.to_vec(),
+                        attach::Source::Path(path) => {
+                            // A file that grew since it was added is not read whole to be refused.
+                            let size = std::fs::metadata(path)
+                                .map_err(|e| format!("{name}: Can't read it ({e})."))?
+                                .len();
+                            if size as usize > MAX_BYTES {
+                                return Err(format!(
+                                    "{name}: The image is larger than {} MiB.",
+                                    MAX_BYTES >> 20
+                                ));
+                            }
+                            std::fs::read(path)
+                                .map_err(|e| format!("{name}: Can't read it ({e})."))?
+                        }
+                    };
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                    let image = image_from_base64(self.core.data_dir(), &encoded, name)
+                        .map_err(|e| format!("{name}: {}", e.message()))?;
+                    saved.written.push(image.path.clone());
+                    saved.images.push(image.path.display().to_string());
+                }
+                (attach::Kind::File, source) => {
+                    let source = match source {
+                        attach::Source::Path(path) => {
+                            AttachSource::Path(path.display().to_string())
+                        }
+                        attach::Source::Bytes { data, .. } => AttachSource::DataUrl(
+                            base64::engine::general_purpose::STANDARD.encode(data.as_slice()),
+                        ),
+                    };
+                    let attached = self
+                        .core
+                        .attach_file(session, name, Some(source))
+                        .map_err(|e| format!("{name}: {e}"))?;
+                    // `ref_path` is relative to the thread's folder (absolute when outside it).
+                    let copy = cwd
+                        .as_ref()
+                        .map_or_else(|| PathBuf::from(&attached.ref_path), |cwd| {
+                            cwd.join(&attached.ref_path)
+                        });
+                    saved.written.push(copy);
+                    saved.references.push(attached.ref_text);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The folder a thread moves into when dropped on `project`: a user project's primary folder,
@@ -782,28 +958,113 @@ impl Backend for CoreBackend {
         let core = &self.core;
         // Refused before anything is changed: no provider, no turn.
         let provider = self.provider_of(session)?;
+        // Images are saved for the prompt, other files copied into the thread's folder and named
+        // in it (`@file:`): the core's own checks run here, and its sentence is what is shown.
+        let saved = self.save_attachments(session, &request.attachments)?;
+        let mut text = request.text.clone();
+        if !saved.references.is_empty() {
+            text = format!("{text}\n\n{}", saved.references.join("\n"));
+        }
         if let Some(effort) = &picks.effort {
             core.pick_effort(session, effort.clone());
         }
-        if let Some(mode) = picks.mode {
-            self.set_mode(session, mode)?;
+        if let Some(mode) = picks.mode
+            && let Err(why) = self.set_mode(session, mode)
+        {
+            saved.discard();
+            return Err(why);
         }
         // The turn is spawned on the core's runtime; this is a GPUI background thread.
         let _runtime = core.handle().enter();
-        if request.steer && core.runtime().is_running(session) && core.steer(session, &request.text)
+        // A steer carries text only: with attachments the prompt waits its turn instead.
+        if request.steer
+            && request.attachments.is_empty()
+            && core.runtime().is_running(session)
+            && core.steer(session, &text)
         {
             return Ok(Sent::Steered);
         }
         let turn = SubmitTurn {
             admission_id: Some(request.admission_id.clone()).filter(|id| !id.is_empty()),
-            text: request.text.clone(),
+            text,
+            images: saved.images.clone(),
             ..SubmitTurn::default()
         };
         let _ = provider;
         match core.submit(session, turn, self.hooks()) {
             Ok(hermes_core::Submitted::Started { .. }) => Ok(Sent::Started),
             Ok(hermes_core::Submitted::Queued { .. }) => Ok(Sent::Queued),
-            Err(e) => Err(e.message().to_string()),
+            Err(e) => {
+                saved.discard();
+                Err(e.message().to_string())
+            }
+        }
+    }
+
+    fn complete_path(
+        &self,
+        scope: &CompletionScope,
+        word: &str,
+    ) -> Result<Vec<Suggestion>, String> {
+        let root = match scope {
+            CompletionScope::Thread(session) => self
+                .core
+                .runtime()
+                .store()
+                .session(session)
+                .ok()
+                .flatten()
+                .map(|record| PathBuf::from(record.cwd)),
+            CompletionScope::Project(project) => self.folder_of(project),
+        }
+        .or_else(dirs::home_dir)
+        .unwrap_or_default();
+        Ok(hermes_core::paths::complete(word, &root)
+            .into_iter()
+            .map(|item| Suggestion::from_item(&item.text, &item.display, &item.meta))
+            .collect())
+    }
+
+    fn commands(&self) -> Result<Vec<CommandSpec>, String> {
+        use hermes_core::commands::Origin;
+        Ok(self
+            .core
+            .commands()
+            .into_iter()
+            .map(|entry| {
+                let origin = match entry.origin {
+                    Origin::Builtin => CommandOrigin::Builtin,
+                    _ => CommandOrigin::Skill,
+                };
+                CommandSpec::from_core(&entry.name, &entry.description, origin)
+            })
+            .collect())
+    }
+
+    fn run_command(
+        &self,
+        session: Option<&str>,
+        name: &str,
+        argument: &str,
+    ) -> Result<CommandAnswer, String> {
+        use hermes_core::commands::{CommandError, CommandOutcome, CoreCommands};
+        let settings = hermes_core::providers::Settings::load(self.core.data_dir());
+        let env = CoreCommands::with_settings(&self.core, settings);
+        // Called from a GPUI background thread: the core's runtime does the async part.
+        let answered = self
+            .core
+            .handle()
+            .block_on(self.core.run_command(session, name, argument, &env));
+        match answered {
+            Ok(CommandOutcome::Output(text)) => Ok(CommandAnswer::Output(text)),
+            Ok(CommandOutcome::Send { message, display }) => {
+                Ok(CommandAnswer::Send { message, display })
+            }
+            Ok(CommandOutcome::Skill {
+                message, display, ..
+            }) => Ok(CommandAnswer::Skill { message, display }),
+            Err(CommandError::NotACommand) => Ok(CommandAnswer::NotACommand),
+            Err(CommandError::Invalid(why)) | Err(CommandError::Failed(why)) => Err(why),
         }
     }
 
@@ -909,6 +1170,12 @@ pub struct FixtureBackend {
     choices: Mutex<ModelChoices>,
     /// What the composer asked for, in order.
     composer_log: Mutex<Vec<ComposerOp>>,
+    /// The `@` menu's entries (those whose text holds the word asked for are returned).
+    paths: Mutex<Vec<Suggestion>>,
+    /// The `/` menu's entries from the core.
+    catalog: Mutex<Vec<CommandSpec>>,
+    /// Answers of commands set by a test; a command without one answers with a line of output.
+    answers: Mutex<HashMap<String, CommandAnswer>>,
 }
 
 /// A composer operation that reached a [`FixtureBackend`].
@@ -938,6 +1205,19 @@ pub enum ComposerOp {
         provider: String,
         model: String,
     },
+    /// The `@` menu asked for `word`.
+    Complete {
+        scope: CompletionScope,
+        word: String,
+    },
+    /// A command was run.
+    Command {
+        session: Option<String>,
+        name: String,
+        argument: String,
+    },
+    /// An attachment was read for the strip.
+    Prepare(AttachmentSource),
 }
 
 /// A turn footer's action that reached a [`FixtureBackend`].
@@ -965,6 +1245,9 @@ impl FixtureBackend {
             controls: Mutex::default(),
             choices: Mutex::new(Self::default_choices()),
             composer_log: Mutex::default(),
+            paths: Mutex::new(Self::default_paths()),
+            catalog: Mutex::new(Self::default_catalog()),
+            answers: Mutex::default(),
         })
     }
 
@@ -983,6 +1266,66 @@ impl FixtureBackend {
                 entry("local", "Local", "llama-3.3-70b"),
             ],
         }
+    }
+
+    /// The files the `@` menu offers in the fixture.
+    pub fn default_paths() -> Vec<Suggestion> {
+        let items = [
+            ("@file:src/main.rs", "main.rs", "src"),
+            ("@file:src/lib.rs", "lib.rs", "src"),
+            ("@file:README.md", "README.md", ""),
+            ("@file:Cargo.toml", "Cargo.toml", ""),
+            ("@folder:src/", "src/", "dir"),
+            ("@folder:docs/", "docs/", "dir"),
+        ];
+        items
+            .iter()
+            .map(|(text, display, meta)| Suggestion::from_item(text, display, meta))
+            .collect()
+    }
+
+    /// The core's commands in the fixture.
+    pub fn default_catalog() -> Vec<CommandSpec> {
+        vec![
+            CommandSpec::from_core(
+                "plan",
+                "Write a markdown implementation plan without executing anything",
+                CommandOrigin::Builtin,
+            ),
+            CommandSpec::from_core(
+                "review",
+                "Spawn an independent subagent to review the work just discussed",
+                CommandOrigin::Builtin,
+            ),
+            CommandSpec::from_core(
+                "init",
+                "Generate or update AGENTS.md project instructions from a repo scan",
+                CommandOrigin::Builtin,
+            ),
+            CommandSpec::from_core(
+                "deploy-checklist",
+                "Walk through the release checklist",
+                CommandOrigin::Skill,
+            ),
+        ]
+    }
+
+    /// The `@` menu's entries.
+    pub fn set_paths(&self, paths: Vec<Suggestion>) {
+        *self.paths.lock().unwrap_or_else(|e| e.into_inner()) = paths;
+    }
+
+    /// The `/` menu's entries from the core.
+    pub fn set_catalog(&self, catalog: Vec<CommandSpec>) {
+        *self.catalog.lock().unwrap_or_else(|e| e.into_inner()) = catalog;
+    }
+
+    /// What `/name` answers.
+    pub fn set_answer(&self, name: &str, answer: CommandAnswer) {
+        self.answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string(), answer);
     }
 
     /// What a thread's controls read before a test sets them: the fixture model, medium effort,
@@ -1393,6 +1736,95 @@ impl Backend for FixtureBackend {
         // Not running: it starts (a replay set with `replay_on_submit` plays out).
         self.submit(session, &request.text)?;
         Ok(Sent::Started)
+    }
+
+    fn complete_path(
+        &self,
+        scope: &CompletionScope,
+        word: &str,
+    ) -> Result<Vec<Suggestion>, String> {
+        self.log_composer(ComposerOp::Complete {
+            scope: scope.clone(),
+            word: word.to_string(),
+        });
+        if let Some(message) = self.scripted_failure() {
+            return Err(message);
+        }
+        let lower = word.trim_start_matches('@').to_lowercase();
+        let query = lower
+            .strip_prefix("file:")
+            .or_else(|| lower.strip_prefix("folder:"))
+            .unwrap_or(&lower)
+            .to_string();
+        Ok(self
+            .paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|s| query.is_empty() || s.text.to_lowercase().contains(&query))
+            .cloned()
+            .collect())
+    }
+
+    fn commands(&self) -> Result<Vec<CommandSpec>, String> {
+        if let Some(message) = self.scripted_failure() {
+            return Err(message);
+        }
+        Ok(self
+            .catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone())
+    }
+
+    fn run_command(
+        &self,
+        session: Option<&str>,
+        name: &str,
+        argument: &str,
+    ) -> Result<CommandAnswer, String> {
+        self.log_composer(ComposerOp::Command {
+            session: session.map(str::to_string),
+            name: name.to_string(),
+            argument: argument.to_string(),
+        });
+        if let Some(message) = self.scripted_failure() {
+            return Err(message);
+        }
+        if let Some(answer) = self
+            .answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+        {
+            return Ok(answer.clone());
+        }
+        let known = self
+            .catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|c| c.name == name)
+            || crate::thread::composer::mention::report_commands()
+                .iter()
+                .any(|c| c.name == name);
+        Ok(if known {
+            CommandAnswer::Output(
+                format!("Output of /{name} {argument}")
+                    .trim_end()
+                    .to_string(),
+            )
+        } else {
+            CommandAnswer::NotACommand
+        })
+    }
+
+    fn prepare_attachment(&self, source: &AttachmentSource) -> Result<Prepared, Refusal> {
+        self.log_composer(ComposerOp::Prepare(source.clone()));
+        match source {
+            AttachmentSource::Path(path) => attach::prepare_path(path),
+            AttachmentSource::Bytes { data, name } => attach::prepare_bytes(data.to_vec(), name),
+        }
     }
 
     fn stop(&self, session: &str) -> Result<(), String> {

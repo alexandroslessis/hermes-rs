@@ -6,6 +6,8 @@
 //! app model drains. The first reply is held until the test releases it, so the turn runs for as
 //! long as the test needs, with no timing assumed.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -463,4 +465,189 @@ fn a_new_thread_from_the_new_thread_screen_is_made_opened_and_answered_on_a_real
         hermes_tools::ApprovalMode::Manual,
         "the mode picked on the screen went to the new thread"
     );
+}
+
+#[core::prelude::v1::test]
+fn a_prompt_with_a_mention_an_image_and_a_file_reaches_the_provider_and_the_store_on_a_real_core() {
+    let mut w = world();
+    // A file of the thread's folder, mentioned by its reference.
+    std::fs::write(w._work.path().join("notes.txt"), "NOTES-CONTENT-42\n").unwrap();
+    let (composer, thread) = w.open();
+    w.release.take();
+    // An image and another file, from outside the thread's folder.
+    let outside = hermes_testdir::tempdir().unwrap();
+    let image = outside.path().join("shot.png");
+    std::fs::write(&image, super::attach::test_png(40, 30)).unwrap();
+    let log = outside.path().join("log.txt");
+    std::fs::write(&log, "LOG-CONTENT-7\n").unwrap();
+    w.cx.update(|cx| {
+        composer.update(cx, |c, cx| {
+            c.add_attachments(
+                vec![
+                    crate::model::backend::AttachmentSource::Path(image.clone()),
+                    crate::model::backend::AttachmentSource::Path(log.clone()),
+                ],
+                cx,
+            )
+        })
+    });
+    let c = composer.clone();
+    w.wait("both attachments read", |cx| {
+        cx.update(|cx| c.read(cx).attachments().len() == 2)
+    });
+    w.cx.update(|cx| composer.update(cx, |c, cx| c.send("look at @file:notes.txt", false, cx)));
+    let (c, t) = (composer.clone(), thread.clone());
+    w.wait("the turn", |cx| {
+        let idle = !cx.update(|cx| c.read(cx).running());
+        idle && reply_rows(cx, &t).len() == 1
+    });
+    // What the provider received: the mention expanded, the attached file referenced from the
+    // thread's folder and expanded, the image noted by its saved path.
+    let requests = w
+        ._runtime
+        .block_on(w._server.received_requests())
+        .expect("requests are recorded");
+    let body: Value = requests.last().expect("a request").body_json().unwrap();
+    let sent = body["messages"].to_string();
+    assert!(sent.contains("NOTES-CONTENT-42"), "the mention is expanded: {sent}");
+    assert!(sent.contains("LOG-CONTENT-7"), "the attached file is read: {sent}");
+    assert!(sent.contains("[Attached image: "), "the image is named: {sent}");
+    assert!(
+        w._work
+            .path()
+            .join(".hermes")
+            .join("attachments")
+            .join("log.txt")
+            .is_file(),
+        "the file was copied into the thread's folder"
+    );
+    // The image was saved under the data folder (the core's own `images`).
+    let saved: Vec<_> = std::fs::read_dir(w._data.path().join("images"))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert_eq!(saved.len(), 1);
+    // What the store holds: the typed text with the file's reference, and the image.
+    let stored = w.core.runtime().store().load_messages(&w.session).unwrap();
+    let typed: Vec<&hermes_llm::conversation::message::Message> = stored
+        .iter()
+        .filter(|m| hermes_core::transcript::is_typed(m))
+        .collect();
+    assert_eq!(typed.len(), 1);
+    // The message starts with what was typed and the reference the send added (what follows is
+    // the runtime's expansion of both).
+    let text = hermes_runtime::preinject::user_text(typed[0]);
+    assert!(
+        text.starts_with("look at @file:notes.txt\n\n@file:.hermes/attachments/log.txt\n\n"),
+        "{text}"
+    );
+    assert_eq!(crate::model::backend::images_of(Some(typed[0])).len(), 1);
+    // The row the thread showed has the image as a thumbnail, and the strip is empty again.
+    let t = thread.clone();
+    let thumbs: Vec<usize> = w.cx.update(|cx| {
+        t.read(cx)
+            .rows()
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RowKind::User { images, .. } => Some(images.len()),
+                _ => None,
+            })
+            .collect()
+    });
+    assert_eq!(thumbs, [1]);
+    assert!(w.cx.update(|cx| composer.read(cx).attachments().is_empty()));
+}
+
+#[core::prelude::v1::test]
+fn the_core_refuses_an_image_that_is_not_one_and_nothing_is_sent_on_a_real_core() {
+    let mut w = world();
+    let (composer, thread) = w.open();
+    w.release.take();
+    // A file with an image's name that the core's sniffing refuses at send time (the strip's
+    // own check is lighter: it decodes a thumbnail, which fails first).
+    let outside = hermes_testdir::tempdir().unwrap();
+    let image = outside.path().join("fake.png");
+    std::fs::write(&image, b"not an image").unwrap();
+    let failures = Rc::new(RefCell::new(Vec::<ComposerEvent>::new()));
+    let seen = failures.clone();
+    let _sub = w.cx.update(|cx| {
+        cx.subscribe(&composer, move |_, e: &ComposerEvent, _| {
+            seen.borrow_mut().push(e.clone())
+        })
+    });
+    w.cx.update(|cx| {
+        composer.update(cx, |c, cx| {
+            c.add_attachments(
+                vec![crate::model::backend::AttachmentSource::Path(image)],
+                cx,
+            )
+        })
+    });
+    w.cx.run_until_parked();
+    std::thread::sleep(Duration::from_millis(200));
+    w.cx.run_until_parked();
+    assert!(w.cx.update(|cx| composer.read(cx).attachments().is_empty()));
+    assert!(failures
+        .borrow()
+        .iter()
+        .any(|e| matches!(e, ComposerEvent::Problem { why, .. } if why.starts_with("fake.png: "))));
+    assert!(user_rows(&mut w.cx, &thread).is_empty());
+}
+
+#[core::prelude::v1::test]
+fn a_send_the_core_refuses_leaves_no_copies_behind_on_a_real_core() {
+    let mut w = world();
+    let (composer, thread) = w.open();
+    w.release.take();
+    // A file (copied first into the thread's folder) and an image that is broken by send time.
+    let outside = hermes_testdir::tempdir().unwrap();
+    let log = outside.path().join("log.txt");
+    std::fs::write(&log, "LOG\n").unwrap();
+    let image = outside.path().join("later.png");
+    std::fs::write(&image, super::attach::test_png(8, 8)).unwrap();
+    w.cx.update(|cx| {
+        composer.update(cx, |c, cx| {
+            c.add_attachments(
+                vec![
+                    crate::model::backend::AttachmentSource::Path(log.clone()),
+                    crate::model::backend::AttachmentSource::Path(image.clone()),
+                ],
+                cx,
+            )
+        })
+    });
+    let c = composer.clone();
+    w.wait("both attachments read", |cx| {
+        cx.update(|cx| c.read(cx).attachments().len() == 2)
+    });
+    std::fs::write(&image, b"no longer an image").unwrap();
+    let images_before = std::fs::read_dir(w.core.data_dir().join("images"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    let failures = Rc::new(RefCell::new(Vec::<ComposerEvent>::new()));
+    let seen = failures.clone();
+    let _sub = w.cx.update(|cx| {
+        cx.subscribe(&composer, move |_, e: &ComposerEvent, _| {
+            seen.borrow_mut().push(e.clone())
+        })
+    });
+    w.cx.update(|cx| composer.update(cx, |c, cx| c.send("look", false, cx)));
+    let f = failures.clone();
+    w.wait("the refusal", |_| {
+        f.borrow()
+            .iter()
+            .any(|e| matches!(e, ComposerEvent::Failed { .. }))
+    });
+    // The copy of log.txt made before the image was refused is gone again, no image was saved,
+    // the attachments stay in the strip and nothing reached the thread.
+    let copies: Vec<_> = std::fs::read_dir(w._work.path().join(".hermes").join("attachments"))
+        .map(|d| d.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(copies.is_empty(), "{copies:?}");
+    let images_after = std::fs::read_dir(w.core.data_dir().join("images"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(images_after, images_before);
+    assert_eq!(w.cx.update(|cx| composer.read(cx).attachments().len()), 2);
+    assert!(user_rows(&mut w.cx, &thread).is_empty());
 }

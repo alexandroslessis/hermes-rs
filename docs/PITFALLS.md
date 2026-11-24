@@ -190,6 +190,23 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **`Runtime::approval_mode` says Accept edits for a session that is not loaded**, whatever Settings say. The composer
   reads `Runtime::loaded_approval_mode` and, for an unloaded session, the mode it will start from (the approvals store:
   smart = Auto, off = YOLO, else Accept edits); a pick is forgotten when the runtime unloads the session (a move).
+- **Chips are Kit's inline tokens** (`InputContent` / `InlineToken`): the token's text IS the reference (`@file:src/a.rs`), so
+  drafts, copy and the prompt need no other format. Tokens do not survive a paste by themselves: `ComposerView` sets a `pasting`
+  flag in a capture-phase `Paste` handler and re-reads the references (`content_of`) when that paste's `Change` lands (the flag is
+  consumed only by `Change`; a render in between must not clear it). A reference typed by hand stays text. `reference_chips`
+  skips texts over 200 kB and texts with no `@` (the reference regex took minutes on a 1 MB paste).
+- **The drawer's keys are capture-phase actions** (`MoveUp`, `MoveDown`, `Enter`, `IndentInline`, `Escape` on the input's wrapper,
+  `cx.stop_propagation()` only when the menu took the key), because the textarea's own bindings sit deeper in the key context.
+- **`overflow_hidden` clips to the box, not to rounded corners**: an `img` in a rounded tile shows its square corners past
+  the border unless the `img` is `.rounded(...)` itself (CP5.2's "red corner marks").
+- **Flex intrinsic size uses a definite `flex_basis`**: a chip label given `flex_basis(px(36))` stayed 36 px wide even with
+  room. To hide a label that has too little room, the footer chips wrap their label's box with an empty first item and a
+  `flex_basis(relative(1.))` + `min_w` label: a label that needs more falls to a second line that the 28 px clip
+  (`view.rs` `chip`). Shrink order is by `flex_shrink` x base size: the mode chip's 0.001 makes it give way only after the
+  model chip reached its floor.
+- **Element ids with an index dump as `name:index`** (`suggest-item:2`, `attach-tile:1`), not `name-2`.
+- **A headless test that hangs leaves its `hermes_native-*.exe` running** and the next link fails with LNK1104: stop processes
+  under `target\claude` only (`Get-Process | ? Path -like '*target\claude*' | Stop-Process`).
 - **Composer sends one at a time** (`ComposerModel::sending`): a second Enter before the core answered the first is
   ignored. Tests that queue several prompts wait for each to land.
 - **The store keeps a session's folder with forward slashes** (`C:/Users/..`); compare after normalising.

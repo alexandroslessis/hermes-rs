@@ -563,6 +563,7 @@ fn a_recorded_turn_replays_into_its_rows() {
                 RowKind::Work(g) => format!("work:{}", g.entries.len()),
                 RowKind::Footer(_) => "footer".to_string(),
                 RowKind::Notice { .. } => "notice".to_string(),
+                RowKind::Command { .. } => "command".to_string(),
             })
             .collect()
     });
@@ -1120,3 +1121,54 @@ fn the_core_backend_reads_a_stored_thread_a_page_at_a_time() {
 }
 
 mod tools;
+
+// --- what the composer shows in the timeline (CP5.2) ------------------------------------------------
+
+#[core::prelude::v1::test]
+fn a_command_answer_is_a_quiet_card_in_the_lane_at_three_widths() {
+    let report = "Session usage\n  input tokens     12,345\n  output tokens     1,234\n  cost            $0.0123\n\n\
+                  A very long line that must wrap inside the card and not push it past the lane: \
+                  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for w in [640., 1100., 1920.] {
+        let mut rig = rig_sized("t1", None, PAGE, (w, 700.), false);
+        rig.model(|m, cx| m.show_command_note("/usage", report, cx));
+        let key = rig.read(|m, _| m.rows().last().unwrap().key);
+        let layout = rig.layout();
+        let (note, lane) = (format!("command-note:{key}"), format!("lane:{key}"));
+        let mut check = layout.check();
+        check
+            .inside(&note, &lane)
+            .inside(&format!("command-name:{key}"), &note)
+            .inside(&format!("command-text:{key}"), &note);
+        check.assert();
+        let card = layout.bounds(&note);
+        assert!(card.size.width.as_f32() <= LANE_FOR_TEST + 1., "{w}: within the lane");
+        assert!(card.right().as_f32() <= w, "{w}: inside the window");
+        // The row copies as its text, and is no message: it has no user or assistant row.
+        let copied = rig.read(|m, cx| m.copy_text(key, cx));
+        assert_eq!(copied.as_deref(), Some(report));
+    }
+}
+
+const LANE_FOR_TEST: f32 = crate::thread::view::LANE;
+
+#[core::prelude::v1::test]
+fn a_sent_message_with_images_shows_their_thumbnails_at_once() {
+    let mut rig = rig("t1", Some(Vec::new()), PAGE);
+    let png = crate::thread::composer::attach::test_png(32, 24);
+    let image = super::data::Attachment {
+        name: "shot.png".into(),
+        mime: "image/png".into(),
+        bytes: Arc::new(png),
+    };
+    rig.model(|m, cx| m.show_user_with("what is this", vec![image.clone(), image], NOW_MS, cx));
+    let key = rig.read(|m, _| m.rows().last().unwrap().key);
+    let layout = rig.layout();
+    let strip = format!("thumbs:{key}");
+    let mut check = layout.check();
+    check
+        .inside("thumb:0", &strip)
+        .inside("thumb:1", &strip)
+        .same_row("thumb:0", "thumb:1");
+    check.assert();
+}
