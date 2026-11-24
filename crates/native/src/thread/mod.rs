@@ -11,13 +11,18 @@
 use gpui_kit::Action;
 use serde::Deserialize;
 
+pub mod ansi;
+pub mod cards;
 pub mod data;
+pub mod diff;
 pub mod markdown;
 pub mod model;
 pub mod recording;
 #[cfg(test)]
 mod tests;
+pub mod tools;
 pub mod view;
+pub mod work;
 
 pub use model::{ThreadEvent, ThreadModel};
 pub use view::ThreadView;
@@ -29,6 +34,24 @@ pub use view::ThreadView;
 pub struct OpenFileInPanel {
     pub path: String,
     pub line: Option<u32>,
+}
+
+/// Open the diff tab, on one file when `path` is given (an edit card's "open diff", a changed
+/// file of a turn's footer). The right panel's diff is Phase 6; until then the workspace opens the
+/// panel and says which file.
+#[derive(Action, Clone, Debug, PartialEq, Eq, Deserialize)]
+#[action(namespace = thread, no_json)]
+pub struct OpenDiffTab {
+    pub path: Option<String>,
+}
+
+/// Open a Hermes screen from a memory or skill write card: `screen` is `memory`, `user` or
+/// `skill`, `target` the skill's name. The screens are Phase 7; until then the workspace says so.
+#[derive(Action, Clone, Debug, PartialEq, Eq, Deserialize)]
+#[action(namespace = thread, no_json)]
+pub struct OpenScreen {
+    pub screen: String,
+    pub target: String,
 }
 
 impl OpenFileInPanel {

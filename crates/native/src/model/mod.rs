@@ -35,13 +35,13 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-use gpui_kit::{AppContext as _, Context, Entity, EventEmitter, Task};
+use gpui_kit::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 use hermes_core::CoreEvent;
 use hermes_runtime::TurnStatus;
 
 use crate::design::toast::{Kind, ToastSpec};
 use crate::sidebar::data::{Marks, Op, Snapshot};
-use crate::thread::ThreadModel;
+use crate::thread::{ThreadEvent, ThreadModel};
 
 pub mod backend;
 pub mod fixture;
@@ -105,6 +105,10 @@ pub struct AppModel {
     thread: Option<Entity<ThreadModel>>,
     /// The clock the open thread's durations use.
     thread_clock: Option<fn() -> i64>,
+    /// What the open thread tells (a branch was made).
+    thread_subscription: Option<Subscription>,
+    /// A thread made by "Branch from here", opened as soon as the list has it.
+    open_when_listed: Option<String>,
 }
 
 impl EventEmitter<ModelEvent> for AppModel {}
@@ -134,6 +138,8 @@ impl AppModel {
             events_task: None,
             thread: None,
             thread_clock: None,
+            thread_subscription: None,
+            open_when_listed: None,
         }
     }
 
@@ -321,6 +327,14 @@ impl AppModel {
             }
             _ => None,
         };
+        self.thread_subscription = self.thread.as_ref().map(|thread| {
+            cx.subscribe(thread, |this, _, event: &ThreadEvent, cx| {
+                if let ThreadEvent::Branched(id) = event {
+                    this.open_when_listed = Some(id.clone());
+                    this.refresh(cx);
+                }
+            })
+        });
     }
 
     /// The project the main area is about: the open thread's, or the draft's.
@@ -433,6 +447,14 @@ impl AppModel {
         if snapshot != self.snapshot {
             self.snapshot = snapshot;
             cx.notify();
+        }
+        // A branch just made: open it once the list has it.
+        if let Some(id) = self.open_when_listed.take() {
+            if self.snapshot.thread(&id).is_some() {
+                self.open(&id, cx);
+            } else {
+                self.open_when_listed = Some(id);
+            }
         }
     }
 

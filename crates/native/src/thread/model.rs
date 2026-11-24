@@ -36,8 +36,11 @@ use gpui_kit::{
     component::{message_scroller::MessageScrollerState, text::TextViewState},
 };
 use hermes_core::{CoreEvent, Outcome};
+use serde_json::Value;
 
 use super::data::{Attachment, HistoryItem, HistoryPage, PAGE};
+use super::tools::{Detail, Status, SubTool, ToolCard, ToolKind, changed_files};
+use super::work::{Footer, ToolEntry, Usage, WorkGroup};
 use crate::model::Backend;
 
 /// A row's markdown: text from history, or the `TextViewState` a turn streamed into.
@@ -90,7 +93,6 @@ impl Thumb {
 }
 
 /// What a row shows.
-#[derive(Clone)]
 pub enum RowKind {
     User {
         text: SharedString,
@@ -106,12 +108,10 @@ pub enum RowKind {
         open: bool,
         live: bool,
     },
-    /// A tool call's placeholder line (the cards are CP4.2).
-    Tool {
-        name: SharedString,
-        summary: SharedString,
-        done: bool,
-    },
+    /// A run of tool calls (one call is shown as its card, more fold under a header).
+    Work(WorkGroup),
+    /// The end of a turn: changed files, usage, Retry and Branch.
+    Footer(Footer),
     /// A line about the turn: a failure (`error`) or a status (compacting, stopped).
     Notice {
         error: bool,
@@ -120,7 +120,6 @@ pub enum RowKind {
 }
 
 /// One row of the timeline. `key` is stable for the row's life (element ids, toggles).
-#[derive(Clone)]
 pub struct Row {
     pub key: u64,
     pub kind: RowKind,
@@ -151,6 +150,14 @@ struct LiveTurn {
     text: Option<u64>,
     /// Tool call ids to their rows.
     tools: HashMap<String, u64>,
+    /// The work group the next tool call joins: the last row, while nothing came between.
+    work: Option<u64>,
+    /// Every work group row of the turn, in order (its changed files, its running label).
+    work_rows: Vec<u64>,
+    /// The `delegate_task` call whose subagents' events are arriving.
+    delegate: Option<String>,
+    started_ms: i64,
+    usage: Option<Usage>,
 }
 
 impl LiveTurn {
@@ -202,6 +209,8 @@ pub struct ThreadModel {
 pub enum ThreadEvent {
     /// Sending a prompt failed (why); the view shows it.
     SendFailed(String),
+    /// "Branch from here" made this thread (the app model lists it and opens it).
+    Branched(String),
 }
 
 impl EventEmitter<ThreadEvent> for ThreadModel {}
@@ -326,15 +335,36 @@ impl ThreadModel {
     /// Puts a page in front of the rows (the first page goes before any row a turn streamed
     /// meanwhile), or, for a reload, in place of the rows before `keep_from`.
     fn install(&mut self, page: HistoryPage, load: Load, cx: &mut Context<Self>) {
-        let rows: Vec<Row> = page.items.iter().map(|item| self.row_of(item)).collect();
-        let count = rows.len();
+        let mut rows = self.rows_of(&page.items);
         self.start = page.start;
         self.loading_older = false;
         match load {
             Load::First | Load::Older => {
+                // A run of tool calls cut by the page's edge is one group: the page's last group
+                // joins the first group of the rows already here.
+                let merged = matches!(rows.last().map(|r| &r.kind), Some(RowKind::Work(_)))
+                    && matches!(self.rows.first().map(|r| &r.kind), Some(RowKind::Work(_)));
+                if merged
+                    && let Some(Row {
+                        kind: RowKind::Work(earlier),
+                        ..
+                    }) = rows.pop()
+                    && let Some(Row {
+                        kind: RowKind::Work(later),
+                        ..
+                    }) = self.rows.first_mut()
+                {
+                    let mut entries = earlier.entries;
+                    entries.append(&mut later.entries);
+                    later.entries = entries;
+                }
+                let count = rows.len();
                 self.rows.splice(0..0, rows);
                 self.scroller.update(cx, |list, cx| {
                     list.prepend(count, cx);
+                    if merged {
+                        list.remeasure_items(count..count + 1, cx);
+                    }
                     if load == Load::First {
                         list.scroll_to_end(cx);
                     }
@@ -362,6 +392,58 @@ impl ThreadModel {
         self.generation += 1;
         self.loading_older = true;
         self.load_page(None, Load::Reload { keep_from }, cx);
+    }
+
+    /// The rows of a page of items: tool calls with nothing between them are one group row.
+    fn rows_of(&mut self, items: &[HistoryItem]) -> Vec<Row> {
+        let mut rows = Vec::with_capacity(items.len());
+        let mut run: Vec<&HistoryItem> = Vec::new();
+        for item in items {
+            if matches!(item, HistoryItem::Tool { .. }) {
+                run.push(item);
+                continue;
+            }
+            if !run.is_empty() {
+                let row = self.stored_work(&std::mem::take(&mut run));
+                rows.push(row);
+            }
+            rows.push(self.row_of(item));
+        }
+        if !run.is_empty() {
+            let row = self.stored_work(&run);
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// A group row of stored tool calls (all `HistoryItem::Tool`).
+    fn stored_work(&mut self, calls: &[&HistoryItem]) -> Row {
+        let mut group = WorkGroup::default();
+        for call in calls {
+            let HistoryItem::Tool {
+                id,
+                name,
+                args,
+                result,
+                is_error,
+                at_ms,
+            } = call
+            else {
+                continue;
+            };
+            let card = ToolCard::from_stored(name, args, result.as_deref(), *is_error);
+            let key = self.key();
+            // What the store knows of the times: the message's, and a command's own duration.
+            let mut entry = ToolEntry::new(key, id, card);
+            entry.started_ms = Some(*at_ms);
+            entry.ended_ms = Some(*at_ms + entry.card.duration_ms.unwrap_or(0) as i64);
+            group.entries.push(entry);
+        }
+        Row {
+            key: self.key(),
+            kind: RowKind::Work(group),
+            at_ms: None,
+        }
     }
 
     fn row_of(&mut self, item: &HistoryItem) -> Row {
@@ -393,12 +475,14 @@ impl ThreadModel {
                 },
                 None,
             ),
-            HistoryItem::Tool { name, summary } => (
-                RowKind::Tool {
-                    name: name.clone().into(),
-                    summary: summary.clone().into(),
-                    done: true,
-                },
+            // Runs of calls are grouped by `rows_of`; one on its own is a group of one.
+            HistoryItem::Tool { .. } => return self.stored_work(&[item]),
+            HistoryItem::TurnFooter {
+                files,
+                user_row,
+                last_row,
+            } => (
+                RowKind::Footer(Footer::new(files.clone(), None, None, *user_row, *last_row)),
                 None,
             ),
             HistoryItem::Failed { text } => (
@@ -424,6 +508,12 @@ impl ThreadModel {
     // --- rows ---------------------------------------------------------------------------------
 
     fn push(&mut self, kind: RowKind, at_ms: Option<i64>, cx: &mut Context<Self>) -> u64 {
+        // Anything but a tool call between two calls ends the run.
+        if !matches!(kind, RowKind::Work(_))
+            && let Some(live) = &mut self.live
+        {
+            live.work = None;
+        }
         let key = self.key();
         self.rows.push(Row { key, kind, at_ms });
         self.scroller.update(cx, |list, cx| {
@@ -452,6 +542,261 @@ impl ThreadModel {
         }
     }
 
+    /// The row `key` and its index, to change.
+    fn row_mut(&mut self, key: u64) -> Option<(usize, &mut Row)> {
+        let ix = self.index_of(key)?;
+        Some((ix, &mut self.rows[ix]))
+    }
+
+    /// Opens or closes a group's list of calls.
+    pub fn toggle_group(&mut self, key: u64, cx: &mut Context<Self>) {
+        if let Some((ix, row)) = self.row_mut(key)
+            && let RowKind::Work(group) = &mut row.kind
+        {
+            group.open = !group.open;
+            self.remeasure(ix, cx);
+            cx.notify();
+        }
+    }
+
+    /// Opens or closes one call's card (its output is parsed as it opens).
+    pub fn toggle_entry(&mut self, key: u64, entry: u64, cx: &mut Context<Self>) {
+        if let Some((ix, row)) = self.row_mut(key)
+            && let RowKind::Work(group) = &mut row.kind
+            && let Some(e) = group.entries.iter_mut().find(|e| e.key == entry)
+        {
+            e.open = !e.open;
+            if e.open {
+                e.card.prepare_open();
+            }
+            self.remeasure(ix, cx);
+            cx.notify();
+        }
+    }
+
+    /// Opens or closes one subagent's task under a `delegate_task` card.
+    pub fn toggle_subtask(&mut self, key: u64, entry: u64, task: usize, cx: &mut Context<Self>) {
+        if let Some((ix, row)) = self.row_mut(key)
+            && let RowKind::Work(group) = &mut row.kind
+            && let Some(e) = group.entries.iter_mut().find(|e| e.key == entry)
+            && let Detail::Delegate(tasks) = &mut e.card.detail
+            && let Some(t) = tasks.get_mut(task)
+        {
+            t.open = !t.open;
+            self.remeasure(ix, cx);
+            cx.notify();
+        }
+    }
+
+    /// Opens or closes a folder of the footer's changed files.
+    pub fn toggle_dir(&mut self, key: u64, path: &str, cx: &mut Context<Self>) {
+        if let Some((ix, row)) = self.row_mut(key)
+            && let RowKind::Footer(footer) = &mut row.kind
+        {
+            if !footer.closed.remove(path) {
+                footer.closed.insert(path.to_string());
+            }
+            self.remeasure(ix, cx);
+            cx.notify();
+        }
+    }
+
+    /// Opens every folder of the footer's changed files, or closes them all.
+    pub fn toggle_all_dirs(&mut self, key: u64, cx: &mut Context<Self>) {
+        if let Some((ix, row)) = self.row_mut(key)
+            && let RowKind::Footer(footer) = &mut row.kind
+        {
+            footer.toggle_all();
+            self.remeasure(ix, cx);
+            cx.notify();
+        }
+    }
+
+    /// Opens every group, card and subagent task (stories, tests): what a person would see
+    /// after clicking through.
+    pub fn expand_all(&mut self, cx: &mut Context<Self>) {
+        for row in &mut self.rows {
+            if let RowKind::Work(group) = &mut row.kind {
+                group.open = true;
+                for entry in &mut group.entries {
+                    entry.open = true;
+                    entry.card.prepare_open();
+                    if let Detail::Delegate(tasks) = &mut entry.card.detail {
+                        tasks.iter_mut().for_each(|t| t.open = true);
+                    }
+                }
+            }
+        }
+        self.scroller.update(cx, |list, cx| list.remeasure(cx));
+        cx.notify();
+    }
+
+    /// Opens every group's list, the cards staying closed (stories, tests).
+    pub fn open_groups(&mut self, cx: &mut Context<Self>) {
+        for row in &mut self.rows {
+            if let RowKind::Work(group) = &mut row.kind {
+                group.open = true;
+            }
+        }
+        self.scroller.update(cx, |list, cx| list.remeasure(cx));
+        cx.notify();
+    }
+
+    /// Closes every folder of the footers' changed files (stories, tests).
+    pub fn close_all_dirs(&mut self, cx: &mut Context<Self>) {
+        for row in &mut self.rows {
+            if let RowKind::Footer(footer) = &mut row.kind
+                && !footer.all_closed()
+            {
+                footer.toggle_all();
+            }
+        }
+        self.scroller.update(cx, |list, cx| list.remeasure(cx));
+        cx.notify();
+    }
+
+    /// Marks the newest footer as waiting for a Retry or Branch (stories, tests).
+    pub fn mark_footer_busy(&mut self, cx: &mut Context<Self>) {
+        if let Some(RowKind::Footer(footer)) = self
+            .rows
+            .iter_mut()
+            .rev()
+            .map(|r| &mut r.kind)
+            .find(|k| matches!(k, RowKind::Footer(_)))
+        {
+            footer.busy = true;
+        }
+        self.scroller.update(cx, |list, cx| list.remeasure(cx));
+        cx.notify();
+    }
+
+    /// The time the durations on screen are counted to.
+    pub fn now_ms(&self) -> i64 {
+        (self.clock)()
+    }
+
+    /// Whether a work group of the running turn is running a call (its header counts seconds).
+    pub fn counting(&self) -> bool {
+        let Some(key) = self.live.as_ref().and_then(|l| l.work_rows.last().copied()) else {
+            return false;
+        };
+        self.index_of(key)
+            .is_some_and(|ix| matches!(&self.rows[ix].kind, RowKind::Work(g) if g.running()))
+    }
+
+    // --- retry and branch ---------------------------------------------------------------------
+
+    /// Retry: the footer's turn is dropped and its prompt sent again (`Backend::retry`:
+    /// `Core::rewind_to_row`, then `submit`); the thread is read again from the store, which no
+    /// longer has the turn, and the new turn streams in.
+    pub fn retry(&mut self, key: u64, cx: &mut Context<Self>) {
+        let Some(row) = self.footer_rows(key, true) else {
+            return;
+        };
+        let (backend, session) = (self.backend.clone(), self.session.clone());
+        cx.spawn(async move |this, cx| {
+            let done = cx
+                .background_spawn(async move { backend.retry(&session, row) })
+                .await;
+            let _ = this.update(cx, |this, cx| match done {
+                Ok(()) => this.restart(cx),
+                Err(why) => this.action_failed(key, "Could not retry", &why, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Branch from here: a new thread with the conversation up to the footer's last reply
+    /// (`Backend::branch`: `Core::branch`). The app model opens it.
+    pub fn branch(&mut self, key: u64, cx: &mut Context<Self>) {
+        let Some(row) = self.footer_rows(key, false) else {
+            return;
+        };
+        let (backend, session) = (self.backend.clone(), self.session.clone());
+        cx.spawn(async move |this, cx| {
+            let done = cx
+                .background_spawn(async move { backend.branch(&session, row) })
+                .await;
+            let _ = this.update(cx, |this, cx| match done {
+                Ok(id) => {
+                    this.set_busy(key, false, cx);
+                    cx.emit(ThreadEvent::Branched(id));
+                }
+                Err(why) => this.action_failed(key, "Could not branch", &why, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// The stored row a footer action names, marking the footer busy; `None` when there is
+    /// nothing to do (no row, already busy, a turn is running, `retry` of a stored prompt only).
+    fn footer_rows(&mut self, key: u64, retry: bool) -> Option<usize> {
+        if retry && !self.can_retry(key) {
+            return None;
+        }
+        let (_, row) = self.row_mut(key)?;
+        let RowKind::Footer(footer) = &mut row.kind else {
+            return None;
+        };
+        let target = if retry {
+            footer.user_row
+        } else {
+            footer.last_row
+        }?;
+        if footer.busy {
+            return None;
+        }
+        footer.busy = true;
+        Some(target)
+    }
+
+    /// Whether the footer `key` may Retry: it is the newest turn's (a retry re-runs the last
+    /// prompt, as Hermes's `/retry`; an older turn is branched from instead) and no turn runs.
+    pub fn can_retry(&self, key: u64) -> bool {
+        self.live.is_none()
+            && self
+                .rows
+                .iter()
+                .rev()
+                .find(|r| matches!(r.kind, RowKind::Footer(_)))
+                .is_some_and(|r| r.key == key)
+    }
+
+    fn set_busy(&mut self, key: u64, busy: bool, cx: &mut Context<Self>) {
+        if let Some((_, row)) = self.row_mut(key)
+            && let RowKind::Footer(footer) = &mut row.kind
+        {
+            footer.busy = busy;
+            cx.notify();
+        }
+    }
+
+    fn action_failed(&mut self, key: u64, what: &str, why: &str, cx: &mut Context<Self>) {
+        self.set_busy(key, false, cx);
+        self.push(
+            RowKind::Notice {
+                error: true,
+                text: format!("{what}: {why}").into(),
+            },
+            None,
+            cx,
+        );
+        self.scroll_to_end(cx);
+    }
+
+    /// Reads the thread from the store again, from its newest page: after a retry dropped rows.
+    fn restart(&mut self, cx: &mut Context<Self>) {
+        self.generation += 1;
+        self.rows.clear();
+        self.live = None;
+        self.start = 0;
+        self.phase = ThreadPhase::Loading;
+        self.loading_older = false;
+        self.scroller.update(cx, |list, cx| list.reset(0, cx));
+        self.load_page(None, Load::First, cx);
+        cx.notify();
+    }
+
     /// The text "copy message" puts on the clipboard: the message's markdown.
     pub fn copy_text(&self, key: u64, cx: &App) -> Option<String> {
         let row = &self.rows[self.index_of(key)?];
@@ -461,7 +806,7 @@ impl ThreadModel {
                 Some(body.text(cx).to_string())
             }
             RowKind::Notice { text, .. } => Some(text.to_string()),
-            RowKind::Tool { .. } => None,
+            RowKind::Work(_) | RowKind::Footer(_) => None,
         }
     }
 
@@ -529,7 +874,9 @@ impl ThreadModel {
                 // Before the history is read, the store may already hold part of this turn
                 // (its prompt): the end reconciles.
                 self.live = Some(LiveTurn {
-                    partial: self.phase != ThreadPhase::Ready,
+                    // A replay is whole by definition (the gallery's thread is never "read").
+                    partial: self.phase != ThreadPhase::Ready && !self.replaying,
+                    started_ms: now_ms,
                     ..LiveTurn::default()
                 });
             }
@@ -545,30 +892,53 @@ impl ThreadModel {
                 ..
             } => {
                 self.end_reasoning(now_ms, cx);
-                let summary = super::data::tool_summary(name, args);
-                let key = self.push(
-                    RowKind::Tool {
-                        name: name.clone().into(),
-                        summary: summary.into(),
-                        done: false,
-                    },
-                    None,
-                    cx,
-                );
-                let live = self.live.get_or_insert_with(LiveTurn::partial);
-                live.text = None;
-                live.tools.insert(tool_id.clone(), key);
+                self.tool_started(tool_id, name, args, now_ms, cx);
             }
-            CoreEvent::ToolCompleted { tool_id, .. } => {
-                let key = self
-                    .live
-                    .as_ref()
-                    .and_then(|live| live.tools.get(tool_id).copied());
-                if let Some(ix) = key.and_then(|key| self.index_of(key))
-                    && let RowKind::Tool { done, .. } = &mut self.rows[ix].kind
-                {
-                    *done = true;
+            CoreEvent::ToolProgress {
+                tool_id, message, ..
+            } => {
+                if let Some((ix, entry)) = self.entry_of(tool_id) {
+                    self.with_entry(ix, entry, |e| {
+                        let open = e.open;
+                        e.card.progress(message, open);
+                    });
+                    self.remeasure(ix, cx);
                     cx.notify();
+                }
+            }
+            CoreEvent::ToolCompleted {
+                tool_id,
+                text,
+                is_error,
+                ..
+            } => {
+                if let Some((ix, entry)) = self.entry_of(tool_id) {
+                    self.with_entry(ix, entry, |e| {
+                        e.card.finish(text, *is_error);
+                        e.ended_ms = Some(now_ms);
+                        if e.open {
+                            e.card.prepare_open();
+                        }
+                    });
+                    if let Some(live) = &mut self.live
+                        && live.delegate.as_deref() == Some(tool_id.as_str())
+                    {
+                        live.delegate = None;
+                    }
+                    self.remeasure(ix, cx);
+                    cx.notify();
+                }
+            }
+            CoreEvent::Subagent { kind, payload, .. } => self.subagent(kind, payload, cx),
+            CoreEvent::Usage {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                if let Some(live) = &mut self.live {
+                    let usage = live.usage.get_or_insert_with(Usage::default);
+                    usage.input += input_tokens.unwrap_or(0).max(0);
+                    usage.output += output_tokens.unwrap_or(0).max(0);
                 }
             }
             CoreEvent::Status { text, .. } => {
@@ -624,17 +994,24 @@ impl ThreadModel {
                     Outcome::Complete => {}
                 }
                 // A tool call the turn never finished stops spinning with it.
-                let tools: Vec<u64> = self
+                let tools: Vec<(String, u64)> = self
                     .live
                     .as_ref()
-                    .map(|live| live.tools.values().copied().collect())
+                    .map(|live| live.tools.iter().map(|(c, k)| (c.clone(), *k)).collect())
                     .unwrap_or_default();
-                for key in tools {
+                for (call, key) in tools {
                     if let Some(ix) = self.index_of(key)
-                        && let RowKind::Tool { done, .. } = &mut self.rows[ix].kind
+                        && let RowKind::Work(group) = &mut self.rows[ix].kind
+                        && let Some(entry) = group.entries.iter_mut().rfind(|e| e.call_id == call)
                     {
-                        *done = true;
+                        entry.card.interrupt();
+                        self.remeasure(ix, cx);
                     }
+                }
+                // The turn's footer (a turn read back from the store has its own).
+                if !partial {
+                    let footer = self.footer_of(end, now_ms);
+                    self.push(RowKind::Footer(footer), None, cx);
                 }
                 // The streamed rows stay as they are: no copy, no parse.
                 self.live = None;
@@ -725,12 +1102,156 @@ impl ThreadModel {
         self.live.get_or_insert_with(LiveTurn::partial).text = Some(key);
     }
 
+    // --- tool calls ---------------------------------------------------------------------------
+
+    /// A call started: it joins the group at the end of the rows when nothing came between, else
+    /// it starts a group row. Only that row is touched.
+    fn tool_started(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        args: &Value,
+        now_ms: i64,
+        cx: &mut Context<Self>,
+    ) {
+        let mut entry = ToolEntry::new(self.key(), call_id, ToolCard::started(name, args));
+        entry.started_ms = Some(now_ms);
+        let live = self.live.get_or_insert_with(LiveTurn::partial);
+        let extend = live.work;
+        let joined = extend
+            .and_then(|key| self.index_of(key))
+            .filter(|ix| ix + 1 == self.rows.len());
+        let row_key = match joined {
+            Some(ix) => {
+                let RowKind::Work(group) = &mut self.rows[ix].kind else {
+                    unreachable!("the live group row is a work row");
+                };
+                group.entries.push(entry);
+                self.remeasure(ix, cx);
+                cx.notify();
+                self.rows[ix].key
+            }
+            None => {
+                let mut group = WorkGroup::default();
+                group.entries.push(entry);
+                let key = self.push(RowKind::Work(group), None, cx);
+                let live = self.live.get_or_insert_with(LiveTurn::partial);
+                live.work = Some(key);
+                live.work_rows.push(key);
+                key
+            }
+        };
+        let live = self.live.get_or_insert_with(LiveTurn::partial);
+        live.text = None;
+        live.tools.insert(call_id.to_string(), row_key);
+        if ToolKind::of(name) == ToolKind::Delegate {
+            live.delegate = Some(call_id.to_string());
+        }
+    }
+
+    /// The row index and the entry key of the live call `call_id`.
+    fn entry_of(&self, call_id: &str) -> Option<(usize, u64)> {
+        let key = *self.live.as_ref()?.tools.get(call_id)?;
+        let ix = self.index_of(key)?;
+        let RowKind::Work(group) = &self.rows[ix].kind else {
+            return None;
+        };
+        let entry = group.entries.iter().rfind(|e| e.call_id == call_id)?;
+        Some((ix, entry.key))
+    }
+
+    fn with_entry<R>(
+        &mut self,
+        ix: usize,
+        entry: u64,
+        f: impl FnOnce(&mut ToolEntry) -> R,
+    ) -> Option<R> {
+        let RowKind::Work(group) = &mut self.rows.get_mut(ix)?.kind else {
+            return None;
+        };
+        group.entries.iter_mut().find(|e| e.key == entry).map(f)
+    }
+
+    /// A subagent's activity under the running `delegate_task` card (Hermes's `subagent.*`:
+    /// `start`, `tool`, `complete`; its thinking and progress text are not shown).
+    fn subagent(&mut self, kind: &str, payload: &Value, cx: &mut Context<Self>) {
+        let Some(call) = self.live.as_ref().and_then(|l| l.delegate.clone()) else {
+            return;
+        };
+        let Some((ix, entry)) = self.entry_of(&call) else {
+            return;
+        };
+        let id = payload.get("subagent_id").and_then(Value::as_str);
+        let index = payload.get("task_index").and_then(Value::as_u64);
+        let text = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or_default();
+        let changed = self.with_entry(ix, entry, |e| {
+            let Detail::Delegate(tasks) = &mut e.card.detail else {
+                return false;
+            };
+            let at = tasks
+                .iter()
+                .position(|t| id.is_some() && t.id.as_deref() == id)
+                .or_else(|| index.map(|i| i as usize).filter(|i| *i < tasks.len()));
+            let Some(task) = at.and_then(|i| tasks.get_mut(i)) else {
+                return false;
+            };
+            match kind {
+                "subagent.start" => {
+                    task.id = id.map(str::to_string);
+                    task.status = Status::Running;
+                    if task.goal.is_empty() {
+                        task.goal = text("goal").to_string();
+                    }
+                }
+                "subagent.tool" => task.tools.push(SubTool {
+                    name: text("tool_name").to_string(),
+                    preview: text("tool_preview").to_string(),
+                    failed: false,
+                }),
+                "subagent.complete" => {
+                    task.status = match text("status") {
+                        "completed" | "complete" | "ok" | "success" => Status::Done,
+                        _ => Status::Failed,
+                    };
+                    task.summary = text("summary").to_string();
+                    task.duration_s = payload.get("duration_seconds").and_then(Value::as_f64);
+                }
+                _ => return false,
+            }
+            true
+        });
+        if changed == Some(true) {
+            self.remeasure(ix, cx);
+            cx.notify();
+        }
+    }
+
+    /// The footer a live turn ends with: the files its edit cards changed, its usage and
+    /// duration, and the stored rows its actions name.
+    fn footer_of(&self, end: &hermes_core::TurnEnd, now_ms: i64) -> Footer {
+        let live = self.live.as_ref();
+        let mut cards: Vec<&ToolCard> = Vec::new();
+        for key in live.map(|l| l.work_rows.as_slice()).unwrap_or_default() {
+            if let Some(ix) = self.index_of(*key)
+                && let RowKind::Work(group) = &self.rows[ix].kind
+            {
+                cards.extend(group.entries.iter().map(|e| &e.card));
+            }
+        }
+        Footer::new(
+            changed_files(cards),
+            live.and_then(|l| l.usage),
+            live.map(|l| now_ms.saturating_sub(l.started_ms).max(0) as u64),
+            end.persisted.user_row_ids.first().copied(),
+            end.persisted.final_assistant_row_id,
+        )
+    }
+
     /// Replays a recorded turn as if it arrived now, one event every
     /// [`super::recording::REPLAY_STEP`] (the gallery and the tests): the prompt's row, then
     /// every event.
     pub fn replay(&mut self, recording: &super::recording::Recording, cx: &mut Context<Self>) {
-        let step = super::recording::REPLAY_STEP.as_millis() as i64;
-        let mut now = (self.clock)();
+        let now = (self.clock)();
         self.push(
             RowKind::User {
                 text: recording.prompt.clone().into(),
@@ -739,6 +1260,13 @@ impl ThreadModel {
             Some(now),
             cx,
         );
+        self.replay_turn(recording, cx);
+    }
+
+    /// [`Self::replay`] without the prompt's row: the events alone (stories of one card).
+    pub fn replay_turn(&mut self, recording: &super::recording::Recording, cx: &mut Context<Self>) {
+        let step = super::recording::REPLAY_STEP.as_millis() as i64;
+        let mut now = (self.clock)();
         self.replaying = true;
         for event in recording.events_for(&self.session) {
             now += step;

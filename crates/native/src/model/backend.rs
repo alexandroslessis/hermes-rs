@@ -14,6 +14,10 @@
 //! core's own tokio handle with `block_on`, which is allowed from a thread that is not a tokio
 //! worker, as the background executor's threads are not.
 //!
+//! The thread view's turn footer (CP4.2) asks for two more core operations through the same seam:
+//! Retry ([`Backend::retry`]: `Core::submit` of the turn's typed prompt with the conversation cut
+//! before it, `Truncate::BeforeRow`, as one step) and Branch ([`Backend::branch`]: `Core::branch` through the turn's last reply).
+//!
 //! The thread view (CP4.1) reads a thread's history a page at a time ([`Backend::history`]: the
 //! stored messages through `hermes_core::transcript::entries`, read from the store, so opening a
 //! thread does not wake its session in the runtime) and, in a `--dev` build of the app only, sends
@@ -27,7 +31,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use hermes_core::{
-    Core, CoreEvent, NoHooks, SubmitTurn,
+    BranchError, BranchPoint, BranchRequest, Core, CoreEvent, NoHooks, SubmitError, SubmitTurn,
+    Truncate,
     archive::Filter,
     projects::{self, NodeKind, ProjectEdit, TreeRow},
     workspace::MoveError,
@@ -67,6 +72,16 @@ pub trait Backend: Send + Sync + 'static {
     /// events arrive through [`Backend::events`].
     fn submit(&self, _session: &str, _text: &str) -> Result<(), String> {
         Err("Sending a prompt is not available here.".to_string())
+    }
+    /// Retry: drops the turn whose typed prompt is stored row `user_row` and everything after it,
+    /// then sends that prompt again. The new turn's events arrive through [`Backend::events`].
+    fn retry(&self, _session: &str, _user_row: usize) -> Result<(), String> {
+        Err("Retry is not available here.".to_string())
+    }
+    /// Branch from here: a new thread with the conversation through stored row `through_row`;
+    /// the new thread's id.
+    fn branch(&self, _session: &str, _through_row: usize) -> Result<String, String> {
+        Err("Branching is not available here.".to_string())
     }
 }
 
@@ -306,6 +321,80 @@ impl Backend for CoreBackend {
         Ok(history_page(&messages, before, limit))
     }
 
+    /// One step, not "rewind, then submit": everything that can refuse is checked before the
+    /// conversation is cut (the prompt is read first; a missing provider fails here), and the cut
+    /// is the submit's own (`SubmitTurn::truncate`, which the core refuses while a turn runs
+    /// without cutting anything). A rewind followed by a failed submit would lose the turn and
+    /// the prompt.
+    fn retry(&self, session: &str, user_row: usize) -> Result<(), String> {
+        let core = &self.core;
+        let messages = core
+            .runtime()
+            .store()
+            .load_messages(session)
+            .map_err(|e| format!("{e:#}"))?;
+        let typed = messages
+            .get(hermes_core::transcript::kept_before_row(user_row))
+            .filter(|m| hermes_core::transcript::is_typed(m))
+            .map(hermes_runtime::preinject::user_text)
+            .ok_or_else(|| "That message is no longer in the thread.".to_string())?;
+        let provider = match &self.dev_provider {
+            Some(provider) => provider.clone(),
+            None => core
+                .session_provider(
+                    session,
+                    &hermes_core::providers::Settings::load(core.data_dir()),
+                )
+                .map_err(|e| format!("Nothing was changed: {e}"))?,
+        };
+        let hooks = Arc::new(NoHooks {
+            provider: Some(provider),
+            options: core.turn_options(session),
+        });
+        let turn = SubmitTurn {
+            text: typed,
+            truncate: Some(Truncate::BeforeRow(user_row)),
+            ..SubmitTurn::default()
+        };
+        // Core::submit spawns the turn on the core's runtime: this is a GPUI background
+        // thread, not one of its workers.
+        let _runtime = core.handle().enter();
+        core.submit(session, turn, hooks)
+            .map(|_| ())
+            .map_err(|e| match e {
+                SubmitError::Busy => {
+                    "A turn is running in this thread: retry when it finishes.".to_string()
+                }
+                other => other.message().to_string(),
+            })
+    }
+
+    fn branch(&self, session: &str, through_row: usize) -> Result<String, String> {
+        let core = &self.core;
+        let request = BranchRequest {
+            parent: session.to_string(),
+            point: BranchPoint::ThroughRow(through_row),
+            cwd: None,
+            name: None,
+            idempotency_key: None,
+        };
+        let provider = || match &self.dev_provider {
+            Some(provider) => Ok(provider.clone()),
+            None => core.session_provider(
+                session,
+                &hermes_core::providers::Settings::load(core.data_dir()),
+            ),
+        };
+        let _runtime = core.handle().enter();
+        match core.branch(request, provider) {
+            Ok(branch) => Ok(branch.child),
+            Err(BranchError::UnknownSession(_)) => Err("That thread no longer exists.".to_string()),
+            Err(BranchError::Empty) => Err("There is nothing to branch from there.".to_string()),
+            Err(BranchError::Provider(e)) => Err(e.to_string()),
+            Err(BranchError::Failed(e)) => Err(format!("{e:#}")),
+        }
+    }
+
     fn submit(&self, session: &str, text: &str) -> Result<(), String> {
         let core = &self.core;
         let provider = match &self.dev_provider {
@@ -325,6 +414,8 @@ impl Backend for CoreBackend {
             text: text.to_string(),
             ..SubmitTurn::default()
         };
+        // As in etry: the turn is spawned on the core's runtime.
+        let _runtime = core.handle().enter();
         core.submit(session, turn, hooks)
             .map(|_| ())
             .map_err(|e| e.message().to_string())
@@ -345,6 +436,14 @@ pub struct FixtureBackend {
     pages: Mutex<Vec<(String, Option<usize>)>>,
     sent: Mutex<Vec<(String, String)>>,
     replay: Mutex<Option<Recording>>,
+    thread_ops: Mutex<Vec<ThreadOp>>,
+}
+
+/// A turn footer's action that reached a [`FixtureBackend`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThreadOp {
+    Retry { session: String, user_row: usize },
+    Branch { session: String, through_row: usize },
 }
 
 impl FixtureBackend {
@@ -358,6 +457,7 @@ impl FixtureBackend {
             pages: Mutex::default(),
             sent: Mutex::default(),
             replay: Mutex::default(),
+            thread_ops: Mutex::default(),
         })
     }
 
@@ -383,6 +483,14 @@ impl FixtureBackend {
     /// turn would arrive.
     pub fn replay_on_submit(&self, recording: Recording) {
         *self.replay.lock().unwrap_or_else(|e| e.into_inner()) = Some(recording);
+    }
+
+    /// The footer actions received so far (Retry, Branch), in order.
+    pub fn thread_ops(&self) -> Vec<ThreadOp> {
+        self.thread_ops
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The edits received so far, in order.
@@ -457,6 +565,46 @@ impl Backend for FixtureBackend {
             .cloned()
             .unwrap_or_else(|| Arc::new(super::fixture::history(session)));
         Ok(page(&items, before, limit))
+    }
+
+    fn retry(&self, session: &str, user_row: usize) -> Result<(), String> {
+        self.thread_ops
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(ThreadOp::Retry {
+                session: session.to_string(),
+                user_row,
+            });
+        if let Some(message) = &*self.failure.lock().unwrap_or_else(|e| e.into_inner()) {
+            return Err(message.clone());
+        }
+        Ok(())
+    }
+
+    fn branch(&self, session: &str, through_row: usize) -> Result<String, String> {
+        self.thread_ops
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(ThreadOp::Branch {
+                session: session.to_string(),
+                through_row,
+            });
+        if let Some(message) = &*self.failure.lock().unwrap_or_else(|e| e.into_inner()) {
+            return Err(message.clone());
+        }
+        // The branch is a new thread beside its parent, titled as the core would.
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let child = format!("{session}-branch");
+        if let Some(parent) = state.threads.iter().find(|t| t.id == session).cloned() {
+            let mut thread = parent;
+            thread.id = child.clone();
+            thread.title = format!("{} (branch)", thread.title);
+            thread.pinned = false;
+            thread.working = false;
+            thread.waiting = false;
+            state.threads.push(thread);
+        }
+        Ok(child)
     }
 
     fn submit(&self, session: &str, text: &str) -> Result<(), String> {

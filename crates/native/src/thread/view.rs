@@ -1,8 +1,8 @@
 //! The thread view: the open thread's timeline in the main area. A virtual list (GPUI Kit's
 //! `MessageScroller`, GPUI's `list` with tail following) of rows in t3code's content lane
 //! (46rem wide, centred): user messages on the message surface at the right, replies as markdown,
-//! reasoning collapsed under "Thought for 2.8s", a placeholder line per tool call (the cards are
-//! CP4.2), notices. It stays pinned to the newest row while a turn streams unless the user scrolled
+//! reasoning collapsed under "Thought for 2.8s", tool calls as cards folded into work groups and a
+//! footer per turn (`cards.rs`, CP4.2), notices. It stays pinned to the newest row while a turn streams unless the user scrolled
 //! up; then t3code's "Scroll to end" button brings it back. Coming near the top loads an older page.
 //!
 //! Hovering a message shows its time and a copy button (the message as markdown); a code block's
@@ -27,9 +27,8 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, FontWeight,
     ImageSource, InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render,
     SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _,
-    Subscription, Window,
+    Subscription, Task, Window,
     assets::IconName,
-    component::ActiveTheme as _,
     component::Sizable as _,
     component::Size as KitSize,
     component::input::{Input, InputEvent, InputState},
@@ -40,6 +39,7 @@ use gpui_kit::{
     px, relative,
 };
 
+use super::cards;
 use super::data::reasoning_label;
 use super::markdown;
 use super::model::{Body, Row, RowKind, ThreadModel, ThreadPhase, Thumb};
@@ -65,6 +65,8 @@ pub struct ThreadView {
     focus: FocusHandle,
     dev_input: Option<Entity<InputState>>,
     _subscriptions: Vec<Subscription>,
+    /// Redraws once a second while a work group counts its seconds.
+    _ticker: Task<()>,
 }
 
 impl Focusable for ThreadView {
@@ -116,11 +118,27 @@ impl ThreadView {
             ));
             input
         });
+        let ticker = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                let alive = this.update(cx, |this, cx| {
+                    if this.model.read(cx).counting() {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             model,
             focus: cx.focus_handle(),
             dev_input,
             _subscriptions: subscriptions,
+            _ticker: ticker,
         }
     }
 
@@ -255,27 +273,26 @@ pub fn time_label(at_ms: i64) -> String {
         .unwrap_or_default()
 }
 
-/// One row, in the content lane.
+/// One row, in the content lane. The row is read in place (a card's output and diff are not
+/// copied per frame).
 fn render_row(model: &Entity<ThreadModel>, ix: usize, _: &mut Window, cx: &mut App) -> AnyElement {
-    let Some(row) = model.read(cx).rows().get(ix).cloned() else {
+    let cx: &App = cx;
+    let Some(row) = model.read(cx).rows().get(ix) else {
         return div().into_any_element();
     };
     let key = row.key as usize;
     let content = match &row.kind {
-        RowKind::User { text, images } => user_row(model, &row, text, images, cx),
-        RowKind::Assistant { body } => assistant_row(model, &row, body, cx),
+        RowKind::User { text, images } => user_row(model, row, text, images, cx),
+        RowKind::Assistant { body } => assistant_row(model, row, body, cx),
         RowKind::Reasoning {
             body,
             duration_ms,
             open,
             live,
-        } => reasoning_row(model, &row, body, *duration_ms, *open, *live, cx),
-        RowKind::Tool {
-            name,
-            summary,
-            done,
-        } => tool_row(&row, name, summary, *done, cx),
-        RowKind::Notice { error, text } => notice_row(&row, *error, text, cx),
+        } => reasoning_row(model, row, body, *duration_ms, *open, *live, cx),
+        RowKind::Work(group) => cards::work_row(model, row, group, cx),
+        RowKind::Footer(footer) => cards::footer_row(model, row, footer, cx),
+        RowKind::Notice { error, text } => notice_row(row, *error, text, cx),
     };
     div()
         .id(("row", key))
@@ -492,51 +509,6 @@ fn reasoning_row(
                     .text_color(muted)
                     .child(body_view(body, ("reasoning-text", key as usize), cx).text_color(muted))
                     .probe(),
-            )
-        })
-        .probe()
-        .into_any_element()
-}
-
-fn tool_row(
-    row: &Row,
-    name: &SharedString,
-    summary: &SharedString,
-    done: bool,
-    cx: &App,
-) -> AnyElement {
-    let palette = cx.design_theme().palette;
-    div()
-        .id(("tool", row.key as usize))
-        .flex()
-        .items_center()
-        .gap(px(6.))
-        .min_w_0()
-        .text_size(text::SM.size)
-        .line_height(text::SM.line_height)
-        .text_color(palette.muted_foreground.hsla())
-        .child(
-            icon(if done {
-                IconName::Wrench
-            } else {
-                IconName::LoaderCircle
-            })
-            .with_size(KitSize::Size(px(14.))),
-        )
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_color(palette.secondary_label.hsla())
-                .child(name.clone()),
-        )
-        .when(!summary.is_empty(), |d| {
-            d.child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .text_size(text::XS.size)
-                    .child(summary.clone()),
             )
         })
         .probe()

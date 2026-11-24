@@ -407,6 +407,8 @@ row state.
 3. Turn footer: changed files of the turn (`ChangedFilesTree`), usage of the turn, retry and
    branch-from-here actions.
 
+**Status (CP4.2, 2026-11-24):** built; details, deviations and the reviewer's list in `progress/phase-4.md`. Cards are `thread/tools.rs` + `cards.rs`, groups and the footer `work.rs`; the recorded fixture holds a call of every tool kind.
+
 ### CP4.3 — Header (S)
 
 Thread title (editable), project and folder, git branch and status (from core git reads), model

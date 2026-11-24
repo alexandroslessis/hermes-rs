@@ -55,6 +55,11 @@ CP4.1 took no new screenshot either (same reason: no input automation for t3code
 available to the implementer): the light thread, alerts, tables, a user message with attachments and the
 reasoning row follow `ChatMarkdown.tsx`, `TimelineUserMessageRow.tsx` and `TimelineWorkEntryRow.tsx`.
 
+CP4.2 took no new screenshot either (t3code's window cannot be driven from here): the command card, file edit
+card and diff, the work-group row, the changed-files card and the light theme follow `WorkLog.tsx`,
+`TimelineWorkGroupRows.tsx`, `CommandOutputPanel.tsx`, `ChangedFilesTree.tsx`, `DiffStatLabel.tsx` and
+`index.css` (`--diff-*`); `app-thread-dark.png` and `sidebar-diff-content.png` were the colour references.
+
 ## Not covered yet (take them when the checkpoint needs them)
 
 Light theme; the button variants and sizes in the design system's sense (default, outline, ghost,

@@ -207,6 +207,8 @@ fn ended() -> CoreEvent {
         outcome: "complete".into(),
         error: None,
         text: String::new(),
+        user_row: None,
+        last_row: None,
     }
     .to_core("s")
 }
@@ -470,14 +472,17 @@ fn finishing_a_streamed_message_copies_and_reparses_nothing() {
     // The row still holds the same state (no copy into a String, no new parse), and every
     // earlier row's text is the same allocation.
     rig.read(|m, cx| {
-        match &m.rows().last().unwrap().kind {
+        // The turn's footer is the last row; the reply is the one before it.
+        let reply = &m.rows()[m.rows().len() - 2];
+        assert!(matches!(m.rows().last().unwrap().kind, RowKind::Footer(_)));
+        match &reply.kind {
             RowKind::Assistant {
                 body: Body::Live(after),
             } => assert_eq!(after.entity_id(), state.entity_id()),
             _ => panic!("the streamed row changed kind"),
         }
         assert_eq!(
-            m.copy_text(m.rows().last().unwrap().key, cx).unwrap(),
+            m.copy_text(reply.key, cx).unwrap(),
             "Streaming **now**, and more."
         );
     });
@@ -515,6 +520,8 @@ fn a_turn_seen_from_the_middle_is_read_back_from_the_store_when_it_ends() {
             outcome: "error".into(),
             error: Some("The provider failed.".into()),
             text: String::new(),
+            user_row: None,
+            last_row: None,
         }
         .to_core("s"),
     );
@@ -545,7 +552,8 @@ fn a_turn_seen_from_the_middle_is_read_back_from_the_store_when_it_ends() {
     rig.emit(text_delta("next"));
     rig.emit(ended());
     assert_eq!(rig.backend.pages().len(), pages);
-    assert_eq!(rig.read(|m, _| m.rows().len()), 4);
+    // The prompt, the earlier turn's reply and notice, and this turn's reply and footer.
+    assert_eq!(rig.read(|m, _| m.rows().len()), 5);
 }
 
 #[core::prelude::v1::test]
@@ -561,7 +569,8 @@ fn a_recorded_turn_replays_into_its_rows() {
                 RowKind::Reasoning {
                     duration_ms, live, ..
                 } => format!("reasoning:{duration_ms:?}:{live}"),
-                RowKind::Tool { name, done, .. } => format!("tool:{name}:{done}"),
+                RowKind::Work(g) => format!("work:{}", g.entries.len()),
+                RowKind::Footer(_) => "footer".to_string(),
                 RowKind::Notice { .. } => "notice".to_string(),
             })
             .collect()
@@ -582,9 +591,11 @@ fn a_recorded_turn_replays_into_its_rows() {
             "user".to_string(),
             // Three reasoning deltas, then the text: 3 steps of 120 ms.
             "reasoning:Some(360):false".to_string(),
-            "reply:22".to_string(),
-            "tool:read_file:true".to_string(),
+            "reply:19".to_string(),
+            // Eleven calls with nothing between them are one group.
+            "work:11".to_string(),
             format!("reply:{final_len}"),
+            "footer".to_string(),
         ]
     );
 }
@@ -814,6 +825,8 @@ fn errors_and_statuses_become_notice_rows() {
             outcome: "error".into(),
             error: Some("The provider failed.".into()),
             text: String::new(),
+            user_row: None,
+            last_row: None,
         }
         .to_core("s"),
     );
@@ -838,7 +851,8 @@ fn errors_and_statuses_become_notice_rows() {
         session_id: "other".into(),
         text: "x".into(),
     });
-    assert_eq!(rig.read(|m, _| m.rows().len()), 2);
+    // The two notices and the footer of the turn that failed.
+    assert_eq!(rig.read(|m, _| m.rows().len()), 3);
 }
 
 #[core::prelude::v1::test]
@@ -1063,8 +1077,13 @@ fn the_core_backend_reads_a_stored_thread_a_page_at_a_time() {
         .unwrap();
     let backend = CoreBackend::new(core.clone());
     let last = backend.history(&record.id, None, PAGE).unwrap();
-    assert_eq!((last.total, last.start, last.items.len()), (143, 83, 60));
-    assert!(matches!(&last.items[59], HistoryItem::Assistant { text, .. } if text == "a69"));
+    // 143 items from 142 messages (one reasoning item) and the footer of each of the 71
+    // answered turns.
+    assert_eq!((last.total, last.start, last.items.len()), (214, 154, 60));
+    assert!(matches!(&last.items[58], HistoryItem::Assistant { text, .. } if text == "a69"));
+    assert!(
+        matches!(&last.items[59], HistoryItem::TurnFooter { files, user_row: Some(_), last_row: Some(_) } if files.is_empty())
+    );
     let first = backend.history(&record.id, Some(PAGE), PAGE).unwrap();
     assert_eq!(first.start, 0);
     match &first.items[..3] {
@@ -1082,7 +1101,35 @@ fn the_core_backend_reads_a_stored_thread_a_page_at_a_time() {
         other => panic!("unexpected first items: {other:?}"),
     }
     assert!(!core.is_live(&record.id), "reading opened the session");
+
+    // Retry: a row that is not a typed prompt is refused and nothing is cut.
+    let stored = |core: &hermes_core::Core| core.runtime().store().load_messages(&record.id).unwrap();
+    assert!(backend.retry(&record.id, 142).is_err(), "row 142 is a reply");
+    assert_eq!(stored(&core).len(), 142);
+    // With no provider to send it to, the retry is refused before anything is cut (a rewind
+    // followed by a failed send would have lost the turn).
+    let refused = backend.retry(&record.id, 141).unwrap_err();
+    assert!(refused.contains("Nothing was changed"), "{refused}");
+    assert_eq!(stored(&core).len(), 142);
+    // The newest prompt (row 141, "q69"): the conversation is cut before it and it is sent
+    // again, in one step (the turn then fails on the unreachable provider: the cut stays, the
+    // prompt is stored again).
+    let sending =
+        CoreBackend::new(core.clone()).with_dev_provider(Some("http://127.0.0.1:9/v1".into()));
+    sending.retry(&record.id, 141).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while core.is_live(&record.id) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let after = stored(&core);
+    assert_eq!(after[140].as_concat_text(), "q69", "the prompt was sent again");
+    assert!(
+        !after.iter().any(|m| m.as_concat_text() == "a69"),
+        "the retried turn's old reply is gone"
+    );
     drop(backend);
     drop(core);
     drop(runtime);
 }
+
+mod tools;

@@ -139,7 +139,7 @@ copies a layout cites its source in its header, like the Hermes port map
 | App frame, sidebar layout | `components/AppSidebarLayout.tsx`, `components/ui/sidebar.tsx` | `workspace.rs` |
 | Sidebar | `components/Sidebar.tsx`, `components/sidebar/*` (`SidebarThreadRow`, `SidebarProjectFolderHeader`), `ThreadStatusIndicators.tsx` | `sidebar/` |
 | Thread header, branch bar | `components/chat/ChatHeader.tsx`, `BranchToolbar.tsx`, `GitActionsControl.tsx` | `thread/header.rs` |
-| Timeline | `components/ChatView.tsx`, `components/chat/ChatCanvas.tsx`, `ChatMarkdown.tsx`, `CommandBlock.tsx`, `chat/ChangedFilesTree.tsx` | `thread/` (CP4.1: `view.rs`, `model.rs`, `markdown.rs`) |
+| Timeline | `components/ChatView.tsx`, `components/chat/ChatCanvas.tsx`, `ChatMarkdown.tsx`, `CommandBlock.tsx`, `chat/ChangedFilesTree.tsx` | `thread/` (CP4.1: `view.rs`, `model.rs`, `markdown.rs`; CP4.2: `tools.rs`, `work.rs`, `cards.rs`, `ansi.rs`, `diff.rs`) |
 | Composer | `components/chat/ChatComposer.tsx`, `Composer*` (model and effort, command menu, pending approval, user input panel, attachments) | `thread/composer/` |
 | Right panel | `components/RightPanelTabs.tsx`, `rightPanelStore.ts`, `DiffPanel.tsx`, `components/diffs/*`, `components/files/*` | `panel/` |
 | Terminal drawer | `components/ThreadTerminalDrawer.tsx` | `terminal/` |

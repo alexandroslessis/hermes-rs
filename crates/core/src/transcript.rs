@@ -144,6 +144,8 @@ pub struct ToolEntry {
     pub args: Value,
     pub call_id: String,
     pub result: Option<String>,
+    /// The result is the tool's error ([`tool_result_is_error`]); false while there is none.
+    pub is_error: bool,
     /// Seconds since the epoch.
     pub timestamp: f64,
 }
@@ -219,6 +221,7 @@ pub fn entries(messages: &[Message]) -> Vec<Entry> {
                         args,
                         call_id: request.id.clone(),
                         result: None,
+                        is_error: false,
                         timestamp,
                     }));
                 }
@@ -228,6 +231,7 @@ pub fn entries(messages: &[Message]) -> Vec<Entry> {
                         calls.get(&response.id).and_then(|&at| out.get_mut(at))
                     {
                         tool.result = Some(result);
+                        tool.is_error = tool_result_is_error(content);
                     }
                 }
                 // A provider error the turn ended on: the boundary entry. It gets Hermes's short
@@ -302,6 +306,18 @@ pub fn tool_result_text(content: &MessageContent) -> String {
             Err(error) => error.message.to_string(),
         },
         _ => String::new(),
+    }
+}
+
+/// Whether a tool response is the tool's error: the call failed in the harness (`Err`), or the
+/// tool flagged its result (`is_error`, which every tool of ours sets with `success: false`).
+pub fn tool_result_is_error(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::ToolResponse(response) => match &response.tool_result {
+            Ok(result) => result.is_error == Some(true),
+            Err(_) => true,
+        },
+        _ => false,
     }
 }
 
@@ -455,8 +471,32 @@ mod tests {
         };
         assert_eq!(tool.name, "read_file");
         assert_eq!(tool.result.as_deref(), Some("the file"));
+        assert!(!tool.is_error);
         assert_eq!(all[1].row_id(), None);
         assert_eq!(all[0].row_id(), Some(1));
+    }
+
+    #[test]
+    fn a_failed_call_stays_failed_through_the_store() {
+        let call = Message::assistant().with_tool_request(
+            "c1",
+            Ok(rmcp::model::CallToolRequestParams::new("read_file")),
+        );
+        let result = Message::user().with_tool_response(
+            "c1",
+            Ok(rmcp::model::CallToolResult::error(vec![
+                rmcp::model::ContentBlock::text(r#"{"success":false,"error":"missing"}"#),
+            ])),
+        );
+        // As the store keeps them: JSON and back.
+        let stored: Vec<Message> = [Message::user().with_text("read it"), call, result]
+            .iter()
+            .map(|m| serde_json::from_str(&serde_json::to_string(m).unwrap()).unwrap())
+            .collect();
+        let Entry::Tool(tool) = &entries(&stored)[1] else {
+            panic!("a tool entry")
+        };
+        assert!(tool.is_error);
     }
 
     #[test]

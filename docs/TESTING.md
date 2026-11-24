@@ -441,6 +441,26 @@ runs a real `Core` against a `wiremock` provider and fails when the core's event
 turn by hand: `hermes-native --fixture --dev` (the strip under the thread replays the recording), or the real
 core on a synthetic folder with `--dev --dev-provider http://127.0.0.1:47900/v1` and `scripts/perf/mock_llm.py`.
 
+**The work log (CP4.2).** `thread/tests/tools.rs` drives the same thread view with tool events: runs of
+calls fold into one group row (a reply, a reasoning row or a notice ends a run; the header counts while
+a call runs), history pages join a run they cut, every card kind's layout (24 px lines aligned, a card
+opens under its line and gives its height back), a 10,000-line command stays a 16-line virtual list
+and is parsed once, live output touches only its own card and costs the same in a 2,000-row thread,
+the footer's tree, Retry and Branch reaching `FixtureBackend::thread_ops` (and failing into a notice;
+Retry on the newest turn only), `CoreBackend::retry` on a real core (a refused retry cuts nothing, a
+retry cuts and resends in one submit: `the_core_backend_reads_a_stored_thread_a_page_at_a_time`),
+and the actions a card sends (`OpenDiffTab`, `OpenScreen`). The pure rules have their own unit tests:
+`thread/ansi.rs`, `diff.rs`, `tools.rs` (every card from its real result shape; the changed-files
+tree), `work.rs` (group labels). **The live check for tool events is a core-level test, not a
+script:** `thread::recording::tests::the_recorded_session_is_what_the_real_core_sends` runs a real
+`Core` against a `wiremock` provider that makes a call of every tool kind (a command with coloured
+output and one that exits 1, read, search, patch, write, memory, skill, a blocked web fetch, a
+delegated task with a subagent, a failing read) and checks the events against
+`crates/native/fixtures/thread-session.json` (`UPDATE_FIXTURES=1` rewrites it; times, ids and the
+temporary folders are scrubbed so it is deterministic) and that the cards the live events build equal
+the ones the stored transcript builds. The gallery's `thread-tools-*` stories replay slices of that
+recording through the model.
+
 **The gallery** (`hermes-native-gallery.exe`, `cargo run -p hermes-native --bin
 hermes-native-gallery`): every story in every state, with t3code's default / GPUI Kit / Zed One and
 light / dark switches, for a person to judge hover, press and focus by hand (the user's checklist).

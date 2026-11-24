@@ -266,6 +266,28 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
   expiry) fire only after `cx.advance_clock(..)` and `cx.run_until_parked()`; sleeping the thread
   does nothing.
 
+- **A tool result's text is not always JSON, even from our own tools, and plain text is not an
+  error.** `tool_result_text` joins a result's text blocks with newlines, so the guardrails' notes
+  (a loop warning, "identical call") follow the JSON, and an oversized result is replaced by a
+  plain-text note saying where it was saved. Whether a call failed is the core's flag
+  (`CoreEvent::ToolCompleted::is_error`, `transcript::ToolEntry::is_error`, since CP4.2's review),
+  not the shape of its text; `thread/tools.rs` reads the leading JSON value and ignores the rest
+  (`leading_json`). A command that exits non-zero is not a failed call.
+- **`Color::with_alpha` replaces the alpha, it does not scale it.** Dark-theme tokens such as
+  `border` (white 8%) and `accent` (white 4%) carry their alpha: `border.with_alpha(180)` is white
+  70%. For t3code's `border/60` or `accent/60`, use `token.hsla().opacity(0.6)`.
+- **`Core::submit` and `Core::branch` spawn on the core's tokio runtime.** From a GPUI background
+  thread (the model's `background_spawn`), enter it first (`core.handle().enter()`); otherwise the
+  call panics with "no reactor running".
+- **A tool result's text is JSON, and big.** Do not parse it on every page read or every frame:
+  `items_from_entries` builds cards only for edits (the footer's files), the model builds the cards of
+  the page it shows, and a card's output is parsed into lines when the card is opened
+  (`tools::Output::ensure`).
+- **`ElementId::NamedChild` is named by its child only in the dump** (`("a", 1)` nested in another id
+  is just `1`): give repeated parts `ElementId::NamedInteger` (`cards::id2`) so a test can name them.
+- **A work group has no scroll position of its own to restore.** Opened, its list is a plain
+  scrolling div capped at 368 px that draws its last 150 calls; t3code virtualises it. A long list
+  that matters needs a real inner list (and its measuring) first.
 - **A Kit context menu wraps the element** (`ContextMenuExt::context_menu` returns a `ContextMenu<E>`,
   not an element you can `.probe()`), and its id lands in every descendant's dump path
   (`context-menu-Name("row")/row/title`). The sidebar probes an outer element and gives each part an

@@ -49,12 +49,15 @@ rfd = "0.15"
 image = { version = "0.25.1", default-features = false, features = ["png"], optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+similar.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 hermes_testdir.workspace = true
+# The recorder test turns on YOLO so the mock turn runs commands without asking.
+hermes_tools.workspace = true
 gpui-kit = { version = "=0.10.0", features = ["syntect", "test-support"] }
 # The mock provider of the recorded thread fixture (`thread/recording.rs`), as hermes_core's tests.
 wiremock = "0.6"

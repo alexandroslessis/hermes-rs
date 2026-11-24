@@ -130,6 +130,12 @@ register_stories![
     sidebar::EMPTY_STATES,
     thread::THREAD,
     thread::THREAD_LIVE,
+    thread::TOOLS_COMMAND,
+    thread::TOOLS_EDIT,
+    thread::TOOLS_LOOKUP,
+    thread::TOOLS_AGENT,
+    thread::TOOLS_GROUP,
+    thread::TOOLS_FOOTER,
 ];
 
 /// One story in one state, on the theme's background: the root view of a snapshot window, and

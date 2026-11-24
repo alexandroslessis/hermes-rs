@@ -65,12 +65,14 @@ pub enum CoreEvent {
         progress: f64,
         message: String,
     },
-    /// A tool call finished; `text` is its result as text.
+    /// A tool call finished; `text` is its result as text, `is_error` whether it is the tool's
+    /// error (`transcript::tool_result_is_error`; the Tauri gateway's protocol does not carry it).
     ToolCompleted {
         session_id: String,
         tool_id: String,
         name: String,
         text: String,
+        is_error: bool,
     },
     /// A line for the conversation's status row: `kind` names it (`compacting`, `compacted`,
     /// `fallback`, `quota`, the taint notices), `text` is what it says.

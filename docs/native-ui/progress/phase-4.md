@@ -271,3 +271,164 @@ Build (PowerShell, in `C:\Users\alexandros\repos\hermes-rs-n4`):
     `.\target\claude\debug\hermes-native.exe --dev --dev-provider http://127.0.0.1:47900/v1` with
     `HERMES_RS_HOME` at the seeded folder: send a prompt in a thread: the mock's markdown streams in;
     close and reopen the thread: the same reply comes back from the store.
+
+## CP4.2 — Tool calls and the work log
+Worktree: C:\Users\alexandros\repos\hermes-rs-n4   Branch: native/p4-thread   Model: Sonnet 5.5 (subagent)
+Uncommitted, on top of CP4.1 (aeb5428). Resumed once after a rate-limit stop; the worktree was re-checked
+against the brief and finished.
+
+### Files
+- New in `crates/native/src/thread/`: `tools.rs` (no GPUI: `ToolCard` from a call's name, args and result;
+  `Output`, `Detail`, `ChangedFile`, the changed-files tree), `ansi.rs` (ANSI to styled lines), `diff.rs`
+  (mini diff: unified-diff parser, `similar`-based diff of two strings, counts as t3code spells them),
+  `work.rs` (`WorkGroup`, `ToolEntry`, group header summary, `Footer`, `Usage`), `cards.rs` (the rows
+  drawn: group, card per kind, output list, diff, subagent tasks, footer and its tree), `tests/tools.rs`.
+- Edited: `model.rs` (rows `Work` and `Footer` replace the placeholder `Tool`; grouping, tool events,
+  progress, subagent events, usage, footer, toggles, Retry, Branch, `restart`), `data.rs` (`HistoryItem::Tool`
+  carries id, args, result, time; `TurnFooter`), `view.rs` (dispatch, 1 s ticker while a group counts),
+  `recording.rs` (`Recorded::Subagent`, `Usage`, rows on `TurnEnded`; the recorder runs a turn with a call of
+  every tool kind), `mod.rs` (`OpenDiffTab`, `OpenScreen` actions), `model/backend.rs` (`Backend::retry`,
+  `Backend::branch`, `FixtureBackend::thread_ops`), `model/mod.rs` (opens a branch once listed),
+  `workspace.rs` (answers the two actions with the panel and a toast), `design/icons.rs` (5 icons),
+  `gallery/thread.rs` + `mod.rs` (6 stories), `fixtures/thread-session.json` (regenerated), `Cargo.toml`
+  (`similar`; dev: `hermes_tools` for YOLO in the recorder).
+- Docs: AGENTS.md row, ARCHITECTURE.md, TESTING.md §6 (work log paragraph), PITFALLS.md (4 bullets),
+  PHASES.md (status), native-ui/README.md (module table), reference/t3code/README.md (no new screenshot).
+
+### What it does
+1. **Cards** (`tools.rs` + `cards.rs`), from the real event and stored shapes (`tools.rs` header lists them):
+   command (`$ command`, exit code when not 0, duration, output list with ANSI colours, cwd, notes such as
+   timeout / background / saved output file), file edit (`patch`: counts and diff from the result's unified
+   diff, or from the arguments while it runs; `write_file`: all lines added; "Open diff" action), read and
+   search (one line + count; the result opens as plain text), web (`web_search` and `web_extract`; a page
+   blocked or failed makes the card failed with the reason), delegate (tasks as collapsible rows with their
+   tools and summary; live from `Subagent` events, from `tool_trace` when stored), memory and skill write
+   (the tool's message + an "Open ..." button = `OpenScreen`), generic (name, args, result as they are).
+   Failures: `success: false` / `error` in the result, or a plain-text answer from one of our own tools.
+2. **Work group.** Tool calls with nothing between them are one row: header "Worked for 1m 12s · 8 steps"
+   ("Working for 12s" while one runs, redrawn each second), a failure mark when the latest call failed,
+   a chevron; opened, the calls as lines (a max-368 px list, last 150 drawn). One call is the card itself.
+   Stored runs are grouped when a page is turned into rows and joined across page edges.
+3. **Turn footer.** Changed files as t3code's tree (folders first, single folders joined, natural sort,
+   `+N -M`, collapse-all, "Open diff" per file and for all), the turn's usage and duration (live turns),
+   Retry and "Branch from here". Live turns push it at `TurnEnded`; from the store, a turn that changed files
+   gets one, and the newest answered turn always (it carries the actions).
+4. **Retry / Branch.** `Backend::retry` = `Core::rewind_to_row(prompt row)` then `submit` of the typed text;
+   the thread model then reads the thread again from the store. `Backend::branch` = `Core::branch(ThroughRow(last
+   reply))`; `ThreadEvent::Branched` makes `AppModel` list and open the new thread. Failures are error
+   notices and the buttons come back.
+
+### Tests (all `CARGO_TARGET_DIR=target/claude`)
+- `cargo test -p hermes-native`: 249 passed, 2 ignored (Phase 3's seed helpers). CP4.1 had 191 + 29 new then; this checkpoint adds about 57: `thread::ansi` (7: colours, carry across lines, 256/true colour, dropped sequences and carriage returns, dim/underline/italic, empty input, 10,000 lines parsed in one pass), `thread::diff` (5), `thread::tools` (16: every card kind from its real result shape, failures, interrupted, changed files, the tree and its rows), `thread::work` (4: group labels live and ended, steps, stored spans, footer folders), `thread::data` (+1 footers), `thread::tests::tools` (24: grouping and what ends a run, header counting, a stopped turn, history runs cut by a page, lazy parse, layout of the group and a card opened and closed, error colour and exit code, diff and "open diff", memory and skill links, delegate tasks, 10,000-line output, live output touching only its card, a 100-event timing at 20 vs 2,000 rows, the footer tree and actions, Retry and Branch to the backend and their failures, disabled buttons, no files card, the frame opening a branch and answering the two actions). Updated CP4.1 tests: row counts now include footers, history totals 144/84.
+- **The live check** is `thread::recording::tests::the_recorded_session_is_what_the_real_core_sends`: a real `Core` + wiremock provider, a call of every tool kind (11 calls), the events equal `fixtures/thread-session.json` (deterministic over 5+ runs), live cards equal stored cards. TESTING.md says why it is a test and not a `*-check.mjs`.
+- `cargo test -p hermes-native --features snapshots` (via `scripts/native/check.ps1`): "native check: all ok", after accepting the 16 snapshots below.
+- `cargo test -p hermes_core`: 139 passed. `cargo build --workspace`: passes. `cargo clippy -p hermes-native --all-targets --features snapshots --no-deps`: clean; `cargo fmt -p hermes-native`: applied.
+- Timing (debug, headless): mean per progress event + frame 15 to 20 ms in a 20-row and in a 2,000-row thread (the assertion is `mean(2000) < 3 x mean(20) + 10 ms`; `--nocapture` prints it); 10 frames of an opened 10,000-line command card: well under the 3 s bound.
+- `scripts/clean-test-temp.ps1`: dry run 3 folders (0.5 MB), `-Delete` removed them, second dry run 0.
+
+### Snapshots
+New (12), `crates/native/snapshots/`: `thread-tools-{command,edit,lookup,agent,group,footer}-t3-{light,dark}.png`
+(4 states each: command ok / failed / running with live output / closed; patch / write / patch closed / failed
+read; read / search / blocked web fetch / good web fetch; delegate / memory / skill / generic; run folded / open /
+running / stopped; footer tree / folders closed / usage only / buttons waiting). Pre-existing baselines that
+changed (4), because the tool placeholder line became a card and the newest answered turn got a footer:
+`thread-t3-{light,dark}.png`, `thread-live-t3-{light,dark}.png` (the diffs were written by the run before
+accepting, as `target/claude/snapshots/thread-t3-light.diff.png`, `thread-t3-dark.diff.png`,
+`thread-live-t3-light.diff.png`, `thread-live-t3-dark.diff.png`; the next snapshot run overwrites them).
+`UPDATE_SNAPSHOTS=1` was used for these 16 only; no other baseline changed. I looked at two of the new sheets
+(command and footer, dark): lines aligned, colours and counts as intended; the Haiku check should look at all
+16 changed or new images.
+
+### Deviations
+- **Reasoning breaks a run.** t3code folds thoughts into the group; ours keeps CP4.1's reasoning row (it owns a
+  streaming `TextViewState`) so a run is calls only. A model that thinks between calls gets several groups.
+- **No virtual inner list for an opened group**: a plain scrolling list capped at 368 px drawing the last 150
+  calls ("N earlier steps not shown"). A command's output is virtual (`uniform_list`, 16 lines, follows the
+  tail while it runs); long lines are clipped, not wrapped (fixed row height).
+- **History has no usage or duration** (the store keeps neither): only live turns' footers show them. History
+  group durations are the messages' times (second resolution) plus the last command's own duration.
+- **Edit counts come from the diff, not the file**: `write_file` does not say what was there, so it counts every
+  line as added; a running `patch` shows only the changed lines (no context) until its result arrives.
+- **Retry** re-sends the typed text only (attached images are not re-sent: `rewind_to_row` returns the text).
+- `Recorded::TurnEnded` gained `user_row` and `last_row` (serde default); the fixture was regenerated.
+- **Missing core operations:** none for what was asked. Facts the cards work around: `CoreEvent::ToolCompleted`
+  has no error flag (cards read it from the JSON, PITFALLS), `Usage` is per model call (summed here), usage is
+  not stored per turn, and `AgentEvent::SubagentProgress` is not published as a `CoreEvent` (the `Subagent`
+  events carry the same tools).
+- Web-fetch success, a generic tool and the "running" states in the stories are made up from the documented
+  result shapes (the real core blocks the recorder's fetch at a local address, and no tool the cards do not
+  know ran); every recorded call is real.
+
+### For the reviewer
+1. `ToolCard::finish`'s failure rule (JSON `success: false` / string `error`, or non-JSON from a tool in
+   `answers_json`) is a heuristic; check it against tools that answer in plain text on purpose.
+2. `Output` is parsed when a card opens and on progress while open; a stored 10,000-line command is parsed in
+   the click handler (test `ten_thousand_lines...`: fast, debug build). Raw text is cut at 400,000 bytes.
+3. `render_row` now borrows the row (no clone); `RowKind` and `Row` are no longer `Clone`.
+4. The 1 s ticker in `ThreadView` lives with the view and notifies only while `ThreadModel::counting()`.
+5. A run cut by a history page: the later row keeps its key and gets the earlier entries first; the list's
+   `prepend` count is one less and the merged row is re-measured. Group times for stored runs are per entry.
+6. `ThreadModel::restart` (after Retry) drops `live` and the rows and reads the newest page; a turn that is
+   already streaming again is then `partial` and reconciles at its end, as in CP4.1.
+7. A live turn always gets a footer; a stored one only with files or as the newest answered turn, so a reopened
+   thread shows fewer footers than it did live.
+8. `hermes_tools` is a dev-dependency of `hermes-native` (YOLO mode in the recorder), nothing else uses it.
+9. The recorder's commands run through Git Bash (`printf`); without it the recorder test fails.
+
+### User checklist (CP4.2)
+Build (PowerShell, in `C:\Users\alexandros\repos\hermes-rs-n4`): `$env:CARGO_TARGET_DIR="target/claude"; cargo build -p hermes-native --bins`,
+`$env:HERMES_RS_HOME="$PWD\target\native-test"`.
+1. `.\target\claude\debug\hermes-native.exe --fixture --dev`, open "halo", type anything in the DEV strip, Enter:
+   reasoning, a few words, then ONE row "Working for ..." that becomes "Worked for ... · 11 steps", then the
+   reply and a footer ("2 changed files +6 -1", Retry, Branch from here).
+2. Click the group row: eleven lines (command, command, read, search, edit, write, memory, skill, web, delegate,
+   read). Click the first command: `$ printf ...` and its output with green "pass" and red "fail". Click the
+   second: "exit 1" in red.
+3. Click the patch line: a diff, green and red lines, "Open diff": the right panel opens and a toast says Phase 6.
+4. Click the delegate line, then its task: the subagent's tool (`read_file notes.md`) and its summary.
+5. Click the memory or skill line, then "Open memory" / "Open skill ...": a toast says Phase 7.
+6. In the footer: click the `docs` folder (closes), the double-chevron button (opens or closes all), a file (toast).
+7. "Branch from here": a thread "... (branch)" appears in the sidebar and opens (fixture data). "Retry": the
+   thread is read again.
+8. Open "Fix the sidebar width": a one-line `read_file` card where CP4.1 had the placeholder.
+9. Real core (optional, as CP4.1 item 11, `scripts/perf/mock_llm.py`): a sent prompt streams; reopen the thread:
+   the cards come back from the store, the footer only on the last turn.
+
+### Visual check (Haiku 5.5)
+No `target/claude/snapshots/*.diff.png` files were present, so the four changed baselines were checked as images. The dark t3code references were not opened, so no dark line below is a reference match.
+- thread-tools-command-t3-dark: matches — four states (ok, exit 1 in red, running with live output, closed) with green pass and red fail lines; expected | legible.
+- thread-tools-command-t3-light: expected | legible, contrast fine, nothing clipped.
+- thread-tools-edit-t3-dark: matches — +/- counts, path header, "Open diff", green and red mini-diff lines; expected | ok.
+- thread-tools-edit-t3-light: expected | ok, diff colours readable.
+- thread-tools-lookup-t3-dark: matches — read/search lines, blocked fetch in red, file-not-found in red; expected | ok.
+- thread-tools-lookup-t3-light: expected | ok.
+- thread-tools-agent-t3-dark: matches — delegate nesting with subtask and tool line, memory and skill buttons; expected | the generic JSON card is cut at the top, inside its own scroll area, which is intended.
+- thread-tools-agent-t3-light: expected | same scroll cut as dark, intended.
+- thread-tools-group-t3-dark: matches — "Worked for ... steps" row, opened list of 11 lines, failure mark, stopped state; expected | ok.
+- thread-tools-group-t3-light: expected | ok.
+- thread-tools-footer-t3-dark: matches — changed-files tree (folder, nested files, +/- counts), usage line, Retry and Branch from here; expected | ok.
+- thread-tools-footer-t3-light: expected | ok, tree and usage legible.
+- thread-t3-dark: matches — reasoning closed/open, two-bubble user message, code block with language and copy, table, alerts, red failure line; expected | ok.
+- thread-t3-light: expected | ok.
+- thread-live-t3-dark: matches — code cut mid-stream, provider error, 200-row scroll with "Scroll to end"; expected | the floating "Scroll to end" button sits over code text, as intended.
+- thread-live-t3-light: expected | ok.
+
+### Review (Opus 5.5)
+Verdict: good work with three real bugs (failure heuristic, Retry losing a turn, dark-theme alphas), fixed here; main had not moved (no merge).
+
+**Findings and fixes**
+1. **Failure heuristic: false positives.** `tool_result_text` joins a result's text blocks with `\n`, so the guardrails' notes (loop warning, "identical call") follow the JSON, and an oversized result becomes a plain-text "saved in ..." note: both made `serde_json::from_str` fail and the "plain text from our tool = harness error" rule marked a good call failed. Our tools all set `CallToolResult::is_error` (`ToolOutput::error`), and a harness failure is `Err`. **Fix (additive, contained):** `CoreEvent::ToolCompleted { is_error }` (`stream.rs`) and `transcript::ToolEntry::is_error` from `transcript::tool_result_is_error` (the stored message keeps the flag; a core test round-trips it through JSON). The Tauri hub ignores the field (`..`); no protocol shape changed. `ToolCard::finish(text, is_error)`: failed = the flag, or JSON `success: false` / non-empty `error` (timed-out command, old rows); `leading_json` reads the first JSON value and keeps the trailing notes as the command's note. `answers_json` is gone. Non-zero exit stays "ran, exit N". The recorder test now also asserts exactly two failed cards (blocked fetch via `results[].error`, the missing read via the flag) and that the flag is recorded; fixture regenerated (`is_error`, serde default).
+2. **Retry was not atomic.** `rewind_to_row` then `submit`: a submit that refused (no provider, unknown session) after the rewind lost the turn and the prompt. **Fix:** `CoreBackend::retry` reads the typed prompt from the store (refuses a row that is not a typed prompt), resolves the provider first ("Nothing was changed: ..."), then one `Core::submit` with `truncate: Truncate::BeforeRow(row)` (the core refuses while busy without cutting). Same user-visible semantics as the Tauri app's rewind + resend. New real-core test (in `the_core_backend_reads_...`): refused retry leaves 142 messages; a retry cuts and resends "q69", the old reply is gone.
+3. **`Core::submit`/`branch` from a GPUI background thread panicked** ("no reactor running": the turn is `tokio::spawn`ed). That also hit CP4.1's `--dev` submit. Fixed with `core.handle().enter()` in `submit`, `retry`, `branch` (PITFALLS).
+4. **Retry on any footer** would rewind every later turn. Now only the newest footer may Retry and not while a turn runs (`ThreadModel::can_retry`, the button disabled); Branch stays on every footer. Test `only_the_newest_turn_can_retry_and_not_while_a_turn_runs`.
+5. **History/live parity.** A reopened thread lost the footers of answered turns without files. t3code keeps per-turn meta under each answer, so history now gives every answered turn a footer (Branch; Retry on the newest), as live does. Usage/duration remain live-only (not stored). Row totals in tests updated (214/154).
+6. **Dark-theme colours.** `with_alpha` replaces alpha: `border.with_alpha(180)` was white 70% (the bright card borders in the dark sheets), `accent.with_alpha(110/150)` a 43%/59% white hover. Now `token.hsla().opacity(..)`; diff colours were Tailwind v3 hex, now the palette's `success_foreground` / `destructive_foreground` (t3code's v4 emerald/red 700/400); the stat font was "Consolas", now the mono token.
+
+**t3code comparison** (`TimelineWorkGroupRows.tsx`, `MessagesTimeline.tsx` `TurnFoldTimelineRow`, `WorkLog.tsx`, `CommandBlock.tsx`, `CommandOutputPanel.tsx`, `ChangedFilesTree.tsx`, `DiffStatLabel.tsx`; `app-thread-dark.png`, `app-codeblock_closeup-dark.png`): fixed: the group row is the turn fold (no icon, muted label turning foreground on hover, 14 px chevron right after it, `px-1`, `pt-1 pb-2` with an `border/60` hairline); the command block is `border-border bg-muted/50` with output in muted text and a copy button (copies the command and the whole output as plain text, built on click: the reachable form of clipped lines); changed-files card `py-2` header in foreground, `dark:bg-input/20`, tree counts in `DiffStatLabel`'s aligned 3xs columns, the file spacer only in a tree with folders. Deferred: t3code folds the whole turn (reasoning, interim text) under one "Worked for" and shows tool groups ("Read 3 files") inside; ours folds runs of calls (the spec's wording) and a reasoning row ends a run, since the reasoning row owns a live `TextViewState` (a structural change, Phase 8 polish); `PierreEntryIcon` per-file icons and `MiddleTruncate` in the tree; virtualised group list and tree (>150 calls show "N earlier steps not shown", >250 tree rows "N more rows", recoverable through Open diff in Phase 6); a diff past 60 lines likewise.
+The two "unexpected" notes: the generic card cut at the top is the thread following its tail in a 648 px story (the card is taller), not a card bug; "Scroll to end" floating over content is t3code's placement. Both left.
+
+**Checked, no change:** per-delta cost (progress touches one entry, `index_of` scans from the end, the 1 s ticker notifies only while `counting()` and the list re-renders visible rows only; the 2,000-row timing test covers tool progress); ANSI parser (malformed/truncated escapes dropped, 256/truecolor, `\r`, 400 KB cap, parsed once on open); views call no core (only `model/backend.rs` does); action seams only dispatch `OpenDiffTab`/`OpenScreen`; no store schema change. The live/stored card equality is meaningful now that the error flag travels through the store.
+
+**Left for later:** changed files are summed from edit results, not a git diff (edit-then-revert shows counts, renames/deletes by `terminal` are invisible; t3code reads checkpoint diffs: Phase 6 with the diff tab); `live.delegate` holds one delegate call, so two concurrent `delegate_task` calls would mix subagent events; a subagent event for a task with neither id nor index is dropped; retried prompts do not re-send attached images.
+
+**Tests:** `cargo test -p hermes-native` 251 passed (2 ignored); snapshots: 14 baselines re-accepted after looking at them (`thread-tools-*` both themes, `thread-live-t3-*`: the colour, fold-row and copy-button changes above); `scripts/native/check.ps1`: "native check: all ok"; `cargo test -p hermes_core` 140 passed; `cargo test -p hermes-desktop` all passed (130 + 68, the RPC-table fixture unchanged); `cargo build --workspace` passes.

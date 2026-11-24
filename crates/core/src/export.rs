@@ -229,6 +229,7 @@ mod tests {
                 args: json!({"command": "ls"}),
                 call_id: "c1".into(),
                 result: Some("a.txt\n```b```".into()),
+                is_error: false,
                 timestamp: 0.0,
             }),
             said(Speaker::Assistant, "Done <ok>."),

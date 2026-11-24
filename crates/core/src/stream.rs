@@ -14,7 +14,7 @@ use rmcp::model::Role;
 use serde_json::Value;
 
 use crate::events::CoreEvent;
-use crate::transcript::{tool_result_text, without_think_tags};
+use crate::transcript::{tool_result_is_error, tool_result_text, without_think_tags};
 
 /// Hermes's compaction status lines (`COMPACTION_STATUS`, `COMPACTION_DONE_STATUS`).
 pub const COMPACTING_TEXT: &str =
@@ -140,6 +140,7 @@ impl TurnStream {
                         tool_id: response.id.clone(),
                         name: self.tools.get(&response.id).cloned().unwrap_or_default(),
                         text: tool_result_text(content),
+                        is_error: tool_result_is_error(content),
                     });
                 }
                 _ => {}
@@ -181,9 +182,36 @@ mod tests {
         )));
         assert!(matches!(
             done.as_slice(),
-            [CoreEvent::ToolCompleted { name, text, .. }] if name == "terminal" && text == "ok"
+            [CoreEvent::ToolCompleted { name, text, is_error: false, .. }]
+                if name == "terminal" && text == "ok"
         ));
         assert_eq!(stream.text(), "Hello");
+        // A result the tool flagged, and a call that failed in the harness, are errors.
+        stream.agent_event(AgentEvent::Message(
+            Message::assistant()
+                .with_tool_request("c2", Ok(rmcp::model::CallToolRequestParams::new("read_file")))
+                .with_tool_request("c3", Ok(rmcp::model::CallToolRequestParams::new("nope"))),
+        ));
+        let failed = stream.agent_event(AgentEvent::Message(
+            Message::user()
+                .with_tool_response(
+                    "c2",
+                    Ok(rmcp::model::CallToolResult::error(vec![
+                        rmcp::model::ContentBlock::text(r#"{"success":false,"error":"x"}"#),
+                    ])),
+                )
+                .with_tool_response(
+                    "c3",
+                    Err(rmcp::model::ErrorData::invalid_params("no such tool", None)),
+                ),
+        ));
+        assert!(matches!(
+            failed.as_slice(),
+            [
+                CoreEvent::ToolCompleted { is_error: true, .. },
+                CoreEvent::ToolCompleted { is_error: true, text, .. },
+            ] if text == "no such tool"
+        ));
     }
 
     #[test]

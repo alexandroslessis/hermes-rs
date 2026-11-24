@@ -56,7 +56,7 @@ use crate::{
     palette::{self, Item, Kind, Mode, Palette, PaletteEvent},
     sidebar::{Sidebar, SidebarEvent, data::Snapshot, empty},
     theme::{self, DesignTheme as _, Themes},
-    thread::{OpenFileInPanel, ThreadView},
+    thread::{OpenDiffTab, OpenFileInPanel, OpenScreen, ThreadView},
     titlebar::{self, TitleBar},
     ui_state::{self, MIN_WINDOW, UiState},
 };
@@ -337,6 +337,36 @@ impl Workspace {
             cx,
         );
         cx.notify();
+    }
+
+    /// A card or the turn footer asked for the diff tab: the right panel opens (the diff is
+    /// Phase 6).
+    pub fn open_diff_tab(&mut self, diff: &OpenDiffTab, cx: &mut Context<Self>) {
+        if !self.state.right_panel.open {
+            self.state.right_panel.open = true;
+            self.changed(cx);
+        }
+        let what = diff.path.clone().unwrap_or_else(|| "this turn".to_string());
+        self.push_toast(
+            ToastSpec::new(toast::Kind::Info, "Open diff")
+                .description(format!("{what}: the diff tab arrives in Phase 6.")),
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// A memory or skill write card asked for its screen (Phase 7).
+    pub fn open_screen(&mut self, screen: &OpenScreen, cx: &mut Context<Self>) {
+        let what = match screen.screen.as_str() {
+            "skill" => format!("Skill {}", screen.target),
+            "user" => "Your profile".to_string(),
+            _ => "Memory".to_string(),
+        };
+        self.push_toast(
+            ToastSpec::new(toast::Kind::Info, what)
+                .description("This screen arrives in Phase 7.".to_string()),
+            cx,
+        );
     }
 
     /// The app model (projects, threads, the open one).
@@ -1098,6 +1128,8 @@ impl Render for Workspace {
                     this.open_file_in_panel(file, cx)
                 }),
             )
+            .on_action(cx.listener(|this, diff: &OpenDiffTab, _, cx| this.open_diff_tab(diff, cx)))
+            .on_action(cx.listener(|this, screen: &OpenScreen, _, cx| this.open_screen(screen, cx)))
             .on_action(cx.listener(|_, _: &FocusNextRegion, window, cx| window.focus_next(cx)))
             .on_action(cx.listener(|_, _: &FocusPreviousRegion, window, cx| window.focus_prev(cx)))
             .on_drag_move(

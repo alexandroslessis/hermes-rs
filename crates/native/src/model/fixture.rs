@@ -189,8 +189,15 @@ pub fn history(id: &str) -> Vec<HistoryItem> {
         "t4" => vec![
             user("Why does the sidebar get wider after a restart?", 4 * MIN),
             HistoryItem::Tool {
+                id: "call-1".into(),
                 name: "read_file".into(),
-                summary: "crates/native/src/workspace.rs".into(),
+                args: serde_json::json!({"path": "crates/native/src/workspace.rs"}),
+                result: Some(
+                    serde_json::json!({"content": "1|//! The frame", "total_lines": 412, "file_size": 15000})
+                        .to_string(),
+                ),
+                is_error: false,
+                at_ms: NOW_MS - 4 * MIN,
             },
             reply(RICH, 3 * MIN),
             user("Try it on the small window.", 3 * MIN),

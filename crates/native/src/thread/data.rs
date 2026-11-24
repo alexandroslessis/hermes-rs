@@ -1,8 +1,8 @@
 //! The thread view's data with no GPUI in it: what the backend hands over for a page of history
 //! ([`HistoryItem`], [`HistoryPage`]), how the core's stored transcript becomes those items
 //! ([`items_from_entries`]), and the small rules the view follows: which link is a file
-//! ([`file_target`]), how a duration reads ([`duration_label`]), what a tool call's placeholder line
-//! says ([`tool_summary`]).
+//! ([`file_target`]), how a duration reads ([`duration_label`]), what a generic tool card says
+//! ([`tool_summary`]).
 //!
 //! A stored assistant message carries its reasoning; here they are two items (the reasoning first,
 //! collapsed), as t3code shows a reasoning work entry above the reply. A stored message does not
@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use hermes_core::transcript::{Entry, Speaker};
 use serde_json::Value;
+
+use super::tools::{ChangedFile, ToolCard, ToolKind, changed_files};
 
 /// How many items a page of history holds (the first page, and each older one).
 pub const PAGE: usize = 60;
@@ -48,8 +50,24 @@ pub enum HistoryItem {
         text: String,
         duration_ms: Option<u64>,
     },
-    /// A tool call: a placeholder line until CP4.2 builds the cards.
-    Tool { name: String, summary: String },
+    /// A tool call and, once it has one, its result text (a call with none was stopped). `at_ms` is
+    /// when its message was stored (second resolution).
+    Tool {
+        id: String,
+        name: String,
+        args: Value,
+        result: Option<String>,
+        /// The stored error flag (`transcript::ToolEntry::is_error`).
+        is_error: bool,
+        at_ms: i64,
+    },
+    /// The end of a turn: the files it changed and the stored rows its Retry and Branch actions
+    /// name (the turn's typed prompt and its last reply).
+    TurnFooter {
+        files: Vec<ChangedFile>,
+        user_row: Option<usize>,
+        last_row: Option<usize>,
+    },
     /// A failed turn's boundary ("Your request was not processed...").
     Failed { text: String },
 }
@@ -89,13 +107,47 @@ pub fn items_from_entries(
     entries: &[Entry],
     images: impl Fn(usize, usize) -> Vec<Attachment>,
 ) -> Vec<HistoryItem> {
+    /// What the turn being read has so far, for its footer.
+    #[derive(Default)]
+    struct Turn {
+        user_row: Option<usize>,
+        last_row: Option<usize>,
+        edits: Vec<ToolCard>,
+    }
+    fn close(turn: Turn, items: &mut Vec<HistoryItem>) {
+        let files = changed_files(&turn.edits);
+        // A turn that answered or changed files has a footer, as every live turn does (its
+        // Branch; Retry is the newest turn's only, `ThreadModel::retry`).
+        if turn.user_row.is_some() && (!files.is_empty() || turn.last_row.is_some()) {
+            items.push(HistoryItem::TurnFooter {
+                files,
+                user_row: turn.user_row,
+                last_row: turn.last_row,
+            });
+        }
+    }
     let mut items = Vec::with_capacity(entries.len());
+    let mut turn = Turn::default();
     for entry in entries {
         match entry {
-            Entry::Tool(tool) => items.push(HistoryItem::Tool {
-                name: tool.name.clone(),
-                summary: tool_summary(&tool.name, &tool.args),
-            }),
+            Entry::Tool(tool) => {
+                if ToolKind::of(&tool.name) == ToolKind::Edit {
+                    turn.edits.push(ToolCard::from_stored(
+                        &tool.name,
+                        &tool.args,
+                        tool.result.as_deref(),
+                        tool.is_error,
+                    ));
+                }
+                items.push(HistoryItem::Tool {
+                    id: tool.call_id.clone(),
+                    name: tool.name.clone(),
+                    args: tool.args.clone(),
+                    result: tool.result.clone(),
+                    is_error: tool.is_error,
+                    at_ms: (tool.timestamp * 1000.) as i64,
+                });
+            }
             Entry::Message(message) => {
                 let at_ms = (message.timestamp * 1000.) as i64;
                 if message.failed_turn.is_some() {
@@ -105,11 +157,15 @@ pub fn items_from_entries(
                     continue;
                 }
                 match message.speaker {
-                    Speaker::User => items.push(HistoryItem::User {
-                        text: message.text.clone(),
-                        images: images(message.row_id, items.len()),
-                        at_ms,
-                    }),
+                    Speaker::User => {
+                        close(std::mem::take(&mut turn), &mut items);
+                        turn.user_row = Some(message.row_id);
+                        items.push(HistoryItem::User {
+                            text: message.text.clone(),
+                            images: images(message.row_id, items.len()),
+                            at_ms,
+                        });
+                    }
                     Speaker::Assistant => {
                         if let Some(reasoning) =
                             message.reasoning.as_ref().filter(|r| !r.is_empty())
@@ -120,6 +176,7 @@ pub fn items_from_entries(
                             });
                         }
                         if !message.text.trim().is_empty() {
+                            turn.last_row = Some(message.row_id);
                             items.push(HistoryItem::Assistant {
                                 text: message.text.clone(),
                                 at_ms,
@@ -130,10 +187,11 @@ pub fn items_from_entries(
             }
         }
     }
+    close(turn, &mut items);
     items
 }
 
-/// The one-line summary a tool call's placeholder shows: its most telling argument (a path, a
+/// The one-line summary of a tool the cards do not know: its most telling argument (a path, a
 /// command, a query, a URL), else nothing.
 pub fn tool_summary(_name: &str, args: &Value) -> String {
     const KEYS: [&str; 8] = [
@@ -308,6 +366,7 @@ mod tests {
                 args: json!({"path": "src/main.rs"}),
                 call_id: "c1".into(),
                 result: Some("fn main() {}".into()),
+                is_error: false,
                 timestamp: 0.,
             }),
         ];
@@ -340,10 +399,74 @@ mod tests {
                     at_ms: 1_700_000_000_000
                 },
                 HistoryItem::Tool {
+                    id: "c1".into(),
                     name: "read_file".into(),
-                    summary: "src/main.rs".into()
+                    args: json!({"path": "src/main.rs"}),
+                    result: Some("fn main() {}".into()),
+                    is_error: false,
+                    at_ms: 0,
+                },
+                // The turn answered, so it has a footer (Branch; Retry on the newest).
+                HistoryItem::TurnFooter {
+                    files: vec![],
+                    user_row: Some(1),
+                    last_row: Some(2),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn an_answered_turn_has_a_footer_with_its_files_and_an_unanswered_one_has_none() {
+        let patch = |path: &str| {
+            Entry::Tool(ToolEntry {
+                name: "patch".into(),
+                args: json!({"path": path, "old_string": "a", "new_string": "b"}),
+                call_id: format!("p-{path}"),
+                result: Some(
+                    json!({"success": true, "diff": format!("--- a/{path}
++++ b/{path}
+@@ -1,1 +1,1 @@
+-a
++b
+"), "files_modified": [path]})
+                    .to_string(),
+                ),
+                is_error: false,
+                timestamp: 0.,
+            })
+        };
+        let entries = vec![
+            message(Speaker::User, "fix it", 1),
+            patch("src/a.rs"),
+            message(Speaker::Assistant, "done", 4),
+            message(Speaker::User, "thanks", 5),
+            message(Speaker::Assistant, "welcome", 6),
+            message(Speaker::User, "one more", 7),
+        ];
+        let items = items_from_entries(&entries, |_, _| Vec::new());
+        let footers: Vec<(usize, &HistoryItem)> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| matches!(i, HistoryItem::TurnFooter { .. }))
+            .collect();
+        assert_eq!(
+            footers.len(),
+            2,
+            "the two answered turns: the newest has no answer yet"
+        );
+        assert!(matches!(
+            footers[1].1,
+            HistoryItem::TurnFooter { files, user_row: Some(5), last_row: Some(6) } if files.is_empty()
+        ));
+        assert!(matches!(
+            footers[0].1,
+            HistoryItem::TurnFooter { files, user_row: Some(1), last_row: Some(4) }
+                if files.len() == 1 && files[0].path == "src/a.rs" && files[0].additions == 1
+        ));
+        assert_eq!(
+            footers[0].0, 3,
+            "after the turn's last item, before the next prompt"
         );
     }
 

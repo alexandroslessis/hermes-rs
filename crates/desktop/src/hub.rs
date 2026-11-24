@@ -334,6 +334,7 @@ mod tests {
             tool_id: "c1".into(),
             name: "terminal".into(),
             text: r#"{"exit_code": 0}"#.into(),
+            is_error: false,
         });
         let payload = &frames(&mut page)[0]["params"]["payload"];
         assert_eq!(payload["result"]["exit_code"], 0);
