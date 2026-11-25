@@ -173,6 +173,46 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 
 ## Native UI (`crates/native`, GPUI Kit; [docs/native-ui/](native-ui/README.md))
 
+- **GPUI Kit ships a diff view (CP6.1): use it.** `gpui_kit::component::diff` (`DiffFile::parse_with`, `DiffState`,
+  `Diff`) parses git's unified diffs (renames, deletions, binary notes, `\ No newline at end of file`, CRLF, a patch
+  cut at a size limit with `truncated_hunks`) and draws one virtual list of every file with hunk separators, word-level
+  changes, collapsible files, selection and horizontal scroll or soft wrap. Its syntax colours and word-level emphasis
+  are prepared on the background executor for the *whole* patch after `set_files` (about 10 s for 6,000 lines in a
+  debug build, in which the frames stay 22 ms; the text shows plain until it lands). `set_files_collapsed` takes the
+  whole list at once (one rebuild); calling `set_file_collapsed` per file rebuilds the rows each time.
+- **A `uniform_list` row needs `w_full()`.** Its items are laid out as roots with the list's width as the definite
+  space, and an `auto`-width flex row then takes its max-content width (a 728 px row in a 319 px list, its right-aligned
+  counts off screen). Give the row `w_full().overflow_hidden()`.
+- **Probe ids with a slash.** `Layout::get(name)` matches the last segment of a dump path, and a path that contains `/`
+  (the diff's per-file buttons are named after the file: `diff-open:src/main.rs`) can not be told from two segments:
+  match `entry.path.last()` yourself. And two probes with one name make a check fail as ambiguous: GPUI Kit's diff names
+  its own elements `diff-body`, `diff-file:0`, `file-header`..., so ours are `diff-view`, `diff-code`, `diff-row:N`.
+- **`hermes_core::git` kills a hung `git` (CP6.1).** `git()` and `git_review`'s `run()` go through
+  `run_limited`: the pipes are read on their own threads; at `GIT_TIMEOUT` (30 s; `gh` 120 s) the child's whole
+  process tree is killed (`taskkill /T /F` from System32, while the child is alive: the tree is found through it;
+  `git` starts credential helpers, hooks, `ssh`) and the pipes are abandoned after a short grace, since a process that
+  left the tree could otherwise keep `read_to_end` waiting for ever. A timeout answers like a missing `git`
+  (`(false, "")`); `git_timed` and `review_patch` return it as an `Err` the diff tab shows with a retry.
+- **`git diff` names files from the repository's root, not from the thread's folder; `ls-files` from the folder.**
+  `review_patch` therefore runs everything from `--show-toplevel` (from a subfolder the untracked list was named
+  relative to it, so `sub/new.txt` became `new.txt` and a revert would have aimed at the top's `new.txt`). The diff tab
+  resolves a path against the top (open in editor) and reverts with the pathspec `:(top,literal)path`.
+- **`git_review::revert` never says it failed** (`checkout HEAD` and `clean` with their results dropped), and the diff
+  may be older than the file: before reverting, the panel's backend asks `git status` that the file is still changed and
+  `git hash-object` that it is still the blob the diff's `index` line named (`Parsed::blobs`), and refuses otherwise
+  ("nothing was done"); afterwards it asks `git status` again and reports "still changed". A new file that is only
+  staged (no `HEAD` version) is reported as not reverted. Renamed and copied files are not offered a revert (the new
+  name is not in `HEAD`); there is no hunk revert in the core.
+- **GPUI Kit's diff highlights every file it holds, collapsed or not** (one file after another on the background
+  executor, ~1.6 ms a line in a debug build): files past `HIGHLIGHT_BUDGET` (2,000 changed lines) or over `HUGE_FILE`
+  are given the language `text` (`DiffFile::with_language`), which Kit skips.
+- **The turn footer is git's account, the cards' account is the fallback (CP6.1).** At a live turn's end
+  `refine_footer` asks for the turn's patch from the commit `HEAD` was at when it began and replaces the edit
+  cards' list with it (`merge_turn_files`): tracked changes git lists (also those a terminal command made), a new file
+  only when a card wrote it (an untracked file that was already there is not the turn's), files a card named that git
+  does not list (ignored, or written and put back: the cards cannot tell) and git's counts. No base (a turn from the
+  store), no repository or a failed read: the cards' list stays.
+
 - **Composer input (CP5.1).** Kit's textarea with `submit_on_enter` emits `InputEvent::PressEnter` for Shift+Enter too
   (it inserts the newline and still emits), so the handler must ignore `shift`; `set_value` announces no `Change`, so
   the view emits the draft itself; an Enter that ends an IME composition is told by `EntityInputHandler::marked_text_range`

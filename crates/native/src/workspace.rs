@@ -17,9 +17,9 @@
 //! The sidebar is the real one since Phase 3 ([`crate::sidebar`], over the app model
 //! [`crate::model::AppModel`]); the main area shows the empty states of the sidebar's world (no
 //! project yet, no open thread) or the open thread ([`crate::thread::ThreadView`], Phase 4); the
-//! panel and the drawer are placeholders for Phase 6. A file link in a message
-//! ([`crate::thread::OpenFileInPanel`]) opens the right panel, which says which file it will show
-//! once Phase 6 builds its file view.
+//! right panel is [`crate::panel::RightPanel`] (Phase 6: its tab strip and the diff tab; "Open
+//! diff" and a file link, [`crate::thread::OpenDiffTab`] and [`crate::thread::OpenFileInPanel`],
+//! open it); the drawer is a placeholder for CP6.3.
 //!
 //! t3code: `apps/web/src/components/AppSidebarLayout.tsx` (the frame, the sidebar width limits:
 //! `threadSidebarWidth.ts`), `components/ui/sidebar.tsx` (`Sidebar`, `SidebarRail`: the drag
@@ -56,6 +56,7 @@ use crate::{
     notify::{self, Attention, Notifier, Policy},
     model::{AppModel, ModelEvent, Selection, fixture},
     palette::{self, Item, Kind, Mode, Palette, PaletteEvent},
+    panel::{RightPanel, RightPanelEvent},
     sidebar::{Sidebar, SidebarEvent, data::Snapshot, empty},
     theme::{self, DesignTheme as _, Themes},
     thread::{
@@ -252,8 +253,8 @@ pub struct Workspace {
     clicks: Option<Task<()>>,
     /// Tests say whether the window is in front (the headless one has no answer).
     active_override: Option<bool>,
-    /// The file a link asked the right panel to open (its view is Phase 6).
-    panel_file: Option<OpenFileInPanel>,
+    /// The right panel: the tab strip and the diff (Phase 6).
+    right_panel: Entity<RightPanel>,
     _bounds: Subscription,
     _subscriptions: Vec<Subscription>,
 }
@@ -286,7 +287,12 @@ impl Workspace {
             this.window_moved(window, cx);
         });
         let sidebar = cx.new(|cx| Sidebar::new(model.clone(), state.sidebar_list.clone(), cx));
+        let right_panel = cx.new(|cx| RightPanel::new(model.clone(), window, cx));
+        // The panel reads only while it is open: it is open from the start when it was left open.
+        let open = state.right_panel.open;
+        right_panel.update(cx, |panel, cx| panel.set_visible(open, cx));
         let subscriptions = vec![
+            cx.subscribe(&right_panel, Self::on_panel_event),
             cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
             cx.subscribe_in(&model, window, Self::on_model_event),
             // The palette's list, the title and the open thread follow the model.
@@ -319,7 +325,7 @@ impl Workspace {
             holding: HashMap::new(),
             clicks: None,
             active_override: None,
-            panel_file: None,
+            right_panel,
             _bounds: bounds,
             _subscriptions: subscriptions,
         }
@@ -335,9 +341,28 @@ impl Workspace {
         self.thread_view.as_ref()
     }
 
-    /// The file the right panel was asked to open.
-    pub fn panel_file(&self) -> Option<&OpenFileInPanel> {
-        self.panel_file.as_ref()
+    /// The right panel.
+    pub fn right_panel(&self) -> &Entity<RightPanel> {
+        &self.right_panel
+    }
+
+    /// What the right panel says: toasts, and a revert changing the folder's git state.
+    fn on_panel_event(
+        &mut self,
+        _: Entity<RightPanel>,
+        event: &RightPanelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            RightPanelEvent::Notice(spec) => {
+                self.push_toast(spec.clone(), cx);
+            }
+            RightPanelEvent::Reverted => {
+                if let Some(thread) = self.model.read(cx).thread().cloned() {
+                    thread.update(cx, |t, cx| t.refresh_header(cx));
+                }
+            }
+        }
     }
 
     /// Makes the view of the model's open thread, or drops it when none is open.
@@ -352,6 +377,8 @@ impl Workspace {
             self.make_composer_view(wanted_composer, window, cx);
         }
         let thread = self.model.read(cx).thread().cloned();
+        self.right_panel
+            .update(cx, |panel, cx| panel.set_thread(thread.clone(), cx));
         let current = self
             .thread_view
             .as_ref()
@@ -448,37 +475,29 @@ impl Workspace {
         self.thread_header.as_ref()
     }
 
-    /// A file link was clicked: the right panel opens and will show it (Phase 6).
+    /// A file link was clicked: the right panel opens on the file (in the diff when it is
+    /// changed, else the Files tab's placeholder until CP6.2).
     pub fn open_file_in_panel(&mut self, file: &OpenFileInPanel, cx: &mut Context<Self>) {
-        self.panel_file = Some(file.clone());
-        if !self.state.right_panel.open {
-            self.state.right_panel.open = true;
-            self.changed(cx);
-        }
-        self.push_toast(
-            ToastSpec::new(toast::Kind::Info, "Open file").description(format!(
-                "{}: the file view arrives in Phase 6.",
-                file.label()
-            )),
-            cx,
-        );
+        self.open_right_panel(cx);
+        self.right_panel
+            .update(cx, |panel, cx| panel.open_file(file, cx));
         cx.notify();
     }
 
-    /// A card or the turn footer asked for the diff tab: the right panel opens (the diff is
-    /// Phase 6).
+    /// A card or the turn footer asked for the diff tab: the right panel opens on it.
     pub fn open_diff_tab(&mut self, diff: &OpenDiffTab, cx: &mut Context<Self>) {
+        self.open_right_panel(cx);
+        self.right_panel
+            .update(cx, |panel, cx| panel.open_diff(diff.path.as_deref(), cx));
+        cx.notify();
+    }
+
+    /// Opens the right panel when it is closed.
+    fn open_right_panel(&mut self, cx: &mut Context<Self>) {
         if !self.state.right_panel.open {
             self.state.right_panel.open = true;
             self.changed(cx);
         }
-        let what = diff.path.clone().unwrap_or_else(|| "this turn".to_string());
-        self.push_toast(
-            ToastSpec::new(toast::Kind::Info, "Open diff")
-                .description(format!("{what}: the diff tab arrives in Phase 6.")),
-            cx,
-        );
-        cx.notify();
     }
 
     /// A memory or skill write card asked for its screen (Phase 7).
@@ -702,6 +721,10 @@ impl Workspace {
 
     /// Something remembered changed: redraw and write the file after a pause.
     fn changed(&mut self, cx: &mut Context<Self>) {
+        // The right panel reads only while it is open.
+        let open = self.state.right_panel.open;
+        self.right_panel
+            .update(cx, |panel, cx| panel.set_visible(open, cx));
         cx.notify();
         let Some(dir) = self.data_dir.clone() else {
             return;
@@ -1246,26 +1269,8 @@ impl Render for Workspace {
                 .h_full()
                 .child(
                     Panel::pane("right-panel", Edge::Left)
-                        .title("Right panel")
                         .size_full()
-                        .child(
-                            div()
-                                .id("right-body")
-                                .flex()
-                                .flex_col()
-                                .gap(px(8.))
-                                .p(px(12.))
-                                .text_size(text::SM.size)
-                                .text_color(palette.muted_foreground.hsla())
-                                .child("Diff, files and terminal tabs arrive in Phase 6.")
-                                .children(self.panel_file.as_ref().map(|file| {
-                                    div()
-                                        .id("panel-file")
-                                        .text_color(palette.foreground.hsla())
-                                        .child(format!("File to open: {}", file.label()))
-                                        .probe()
-                                })),
-                        ),
+                        .child(self.right_panel.clone()),
                 )
         });
         let drawer = (frame.drawer > 0.).then(|| {

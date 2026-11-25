@@ -184,11 +184,16 @@ impl Checks<'_> {
             .filter(|e| e.path.len() > entry.path.len() && e.path.starts_with(&entry.path))
             // The rows of a scrolling list (the sidebar's `threads`, the thread view's
             // `timeline-list`) are clipped by it, not overflowing: only the list has to fit. The question panel's `ask-body`
-            // scrolls too (CP5.3).
+            // scrolls too (CP5.3), and so do the diff tab's file list and GPUI Kit's diff (CP6.1).
             .filter(|e| {
                 !e.path[entry.path.len()..e.path.len() - 1]
                     .iter()
-                    .any(|s| matches!(s.as_str(), "threads" | "timeline-list" | "ask-body"))
+                    .any(|s| {
+                        matches!(
+                            s.as_str(),
+                            "threads" | "timeline-list" | "ask-body" | "diff-list" | "diff-code"
+                        )
+                    })
             })
             .cloned()
             .collect();

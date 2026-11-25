@@ -41,9 +41,10 @@ use serde_json::Value;
 
 use super::data::{Attachment, HistoryItem, HistoryPage, PAGE};
 use super::header_data::{Exported, HeaderInfo};
-use super::tools::{Detail, Status, SubTool, ToolCard, ToolKind, changed_files};
+use super::tools::{ChangedFile, Detail, Status, SubTool, ToolCard, ToolKind, changed_files};
 use super::work::{Footer, ToolEntry, Usage, WorkGroup};
 use crate::model::Backend;
+use crate::panel::data::{DiffRequest, Scope, TurnContext, merge_turn_files, parse_patch};
 
 /// A row's markdown: text from history, or the `TextViewState` a turn streamed into.
 #[derive(Clone)]
@@ -217,6 +218,10 @@ pub struct ThreadModel {
     /// Prompts the composer sent, by the core's admission id: the user's row is shown when the
     /// turn with that id starts (a queued prompt appears when its turn begins).
     expected: Vec<ExpectedPrompt>,
+    /// The commit `HEAD` was at when the newest live turn started (what its diff is taken
+    /// against), read in the background; `turn_generation` drops a read that arrives late.
+    turn_base: Option<String>,
+    turn_generation: u64,
 }
 
 /// A prompt the composer sent: what its row shows once its turn starts.
@@ -265,6 +270,8 @@ pub enum ThreadEvent {
     ExportReady(Exported),
     /// The export could not be made (why).
     ExportFailed(String),
+    /// A live turn ended: the folder may have changed (the right panel's diff reads again).
+    TurnEnded,
 }
 
 impl EventEmitter<ThreadEvent> for ThreadModel {}
@@ -301,6 +308,8 @@ impl ThreadModel {
             header: HeaderRead::default(),
             exporting: false,
             expected: Vec::new(),
+            turn_base: None,
+            turn_generation: 0,
         };
         model.load_page(None, Load::First, cx);
         model.refresh_header(cx);
@@ -1163,6 +1172,9 @@ impl ThreadModel {
                     .iter()
                     .position(|expected| expected.id == *admission_id)
                     .map(|at| self.expected.remove(at));
+                if !self.replaying {
+                    self.read_turn_base(cx);
+                }
                 // Before the history is read, the store may already hold part of this turn
                 // (its prompt): the end reconciles.
                 self.live = Some(LiveTurn {
@@ -1308,7 +1320,10 @@ impl ThreadModel {
                 // The turn's footer (a turn read back from the store has its own).
                 if !partial {
                     let footer = self.footer_of(end, now_ms);
-                    self.push(RowKind::Footer(footer), None, cx);
+                    let key = self.push(RowKind::Footer(footer), None, cx);
+                    if !self.replaying {
+                        self.refine_footer(key, cx);
+                    }
                 }
                 // The streamed rows stay as they are: no copy, no parse.
                 self.live = None;
@@ -1319,6 +1334,7 @@ impl ThreadModel {
                 // again (a replay is in no folder).
                 if !self.replaying {
                     self.refresh_header(cx);
+                    cx.emit(ThreadEvent::TurnEnded);
                 }
                 cx.notify();
             }
@@ -1526,6 +1542,91 @@ impl ThreadModel {
             self.remeasure(ix, cx);
             cx.notify();
         }
+    }
+
+    /// What the right panel's "this turn" needs: the commit the newest live turn started from (when
+    /// this run saw it start) and the files the newest turn's footer names.
+    pub fn turn_context(&self) -> TurnContext {
+        let files = self
+            .rows
+            .iter()
+            .rev()
+            .find_map(|r| match &r.kind {
+                RowKind::Footer(f) => Some(f.files.iter().map(|c| c.path.clone()).collect()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        TurnContext {
+            base: self.turn_base.clone(),
+            files,
+        }
+    }
+
+    /// Reads, in the background, the commit `HEAD` is at as a turn starts.
+    fn read_turn_base(&mut self, cx: &mut Context<Self>) {
+        self.turn_base = None;
+        self.turn_generation += 1;
+        let generation = self.turn_generation;
+        let (backend, session) = (self.backend.clone(), self.session.clone());
+        cx.spawn(async move |this, cx| {
+            let base = cx
+                .background_spawn(async move { backend.head_commit(&session) })
+                .await;
+            let _ = this.update(cx, |this, _| {
+                if this.turn_generation == generation {
+                    this.turn_base = base;
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Replaces the files a live turn's footer names (what its edit cards said) with what the
+    /// folder's git says changed since the turn started, when the turn's base commit is known
+    /// ([`merge_turn_files`]). Where git cannot say (no repository, no base, a failed read) the
+    /// cards' list stays.
+    fn refine_footer(&mut self, key: u64, cx: &mut Context<Self>) {
+        let Some(base) = self.turn_base.clone() else {
+            return;
+        };
+        let Some(ix) = self.index_of(key) else {
+            return;
+        };
+        let RowKind::Footer(footer) = &self.rows[ix].kind else {
+            return;
+        };
+        let edited: Vec<ChangedFile> = footer.files.as_ref().clone();
+        let request = DiffRequest {
+            session: self.session.clone(),
+            scope: Scope::Turn,
+            turn: TurnContext {
+                base: Some(base),
+                files: edited.iter().map(|f| f.path.clone()).collect(),
+            },
+        };
+        let backend = self.backend.clone();
+        cx.spawn(async move |this, cx| {
+            let merged = cx
+                .background_spawn(async move {
+                    let data = backend.diff(&request).ok()?;
+                    let parsed = parse_patch(&data.patch);
+                    Some(merge_turn_files(&edited, &parsed.entries))
+                })
+                .await;
+            let Some(files) = merged else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                if let Some(ix) = this.index_of(key)
+                    && let RowKind::Footer(footer) = &mut this.rows[ix].kind
+                {
+                    footer.replace_files(files);
+                    this.remeasure(ix, cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// The footer a live turn ends with: the files its edit cards changed, its usage and

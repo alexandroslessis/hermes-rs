@@ -331,6 +331,11 @@ impl AppModel {
     }
 
     /// The open thread's model (once [`Self::open`] made it).
+    /// The backend the model reads and edits through (`None` while it is still starting).
+    pub fn backend(&self) -> Option<Arc<dyn Backend>> {
+        self.backend.clone()
+    }
+
     pub fn thread(&self) -> Option<&Entity<ThreadModel>> {
         self.thread.as_ref()
     }

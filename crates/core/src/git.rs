@@ -8,27 +8,142 @@
 use std::os::windows::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// `CREATE_NO_WINDOW`: no console flashes for a child process.
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// `(succeeded, stdout)` of `git args` in `cwd`.
-pub fn git(cwd: &Path, args: &[&str]) -> (bool, String) {
-    let output = Command::new("git")
+/// How long a `git` (or `gh`) child may run before it is killed. A repository on a dead network
+/// share, an `fsmonitor` that never answers or a credential helper waiting on a prompt would
+/// otherwise block its caller (a background thread per call) for ever.
+pub const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How a limited child ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ran {
+    /// It exited by itself: `(succeeded, stdout, stderr)`.
+    Exited(bool, String, String),
+    /// It ran past the limit and was killed.
+    TimedOut,
+    /// It could not be started: the reason.
+    NotStarted(String),
+}
+
+/// Runs `command` with piped output and no stdin, killing it when it runs past `limit`. The
+/// pipes are read on their own threads (a full pipe would stall the child); after a kill they are
+/// given a moment and then abandoned, since a grandchild that inherited them (`git`'s helpers)
+/// may hold them open for as long as it lives.
+pub fn run_limited(command: &mut Command, limit: Duration) -> Ran {
+    use std::sync::mpsc;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return Ran::NotStarted(error.to_string()),
+    };
+    fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+        let (send, receive) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut data = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut data);
+            }
+            let _ = send.send(data);
+        });
+        receive
+    }
+    let (stdout, stderr) = (drain(child.stdout.take()), drain(child.stderr.take()));
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                // The whole tree: `git` starts helpers (credential managers, hooks, `ssh`,
+                // pagers) that would otherwise live on, holding locks and the pipes. Found
+                // through the live parent, so before the parent itself is killed.
+                kill_tree(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                // The pipes may still be open (a process that left the tree): a short grace,
+                // then leave them.
+                let _ = stdout.recv_timeout(Duration::from_millis(200));
+                return Ran::TimedOut;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(error) => {
+                kill_tree(child.id());
+                let _ = child.kill();
+                return Ran::NotStarted(error.to_string());
+            }
+        }
+    };
+    // The child has exited; what it wrote is in the pipes already unless a helper keeps them.
+    let grace = Duration::from_secs(2).max(deadline.saturating_duration_since(Instant::now()));
+    let text = |receive: mpsc::Receiver<Vec<u8>>| {
+        receive
+            .recv_timeout(grace)
+            .map(|data| String::from_utf8_lossy(&data).into_owned())
+            .unwrap_or_default()
+    };
+    let (out, err) = (text(stdout), text(stderr));
+    Ran::Exited(status.success(), out, err)
+}
+
+/// Kills process `pid` and every process it started (`taskkill /T /F`, from System32 by its full
+/// path so a `taskkill` on the `PATH` is never the one run). Called while `pid` is still alive:
+/// `taskkill` finds the tree through the live parent.
+fn kill_tree(pid: u32) {
+    let system = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let taskkill = Path::new(&system).join("System32").join("taskkill.exe");
+    let _ = Command::new(taskkill)
+        .args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+}
+
+/// `(succeeded, stdout)` of `git args` in `cwd`, or `Err` with a reason when `git` could not be
+/// started or ran past `limit` and was killed.
+pub fn git_timed(cwd: &Path, args: &[&str], limit: Duration) -> Result<(bool, String), String> {
+    git_program("git", cwd, args, limit)
+}
+
+/// [`git_timed`] for any `program` (the seam the timeout test uses with a slow script).
+pub fn git_program(
+    program: &str,
+    cwd: &Path,
+    args: &[&str],
+    limit: Duration,
+) -> Result<(bool, String), String> {
+    let mut command = Command::new(program);
+    command
         .args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    match output {
-        Ok(output) => (
-            output.status.success(),
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-        ),
-        Err(_) => (false, String::new()),
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    match run_limited(&mut command, limit) {
+        Ran::Exited(ok, out, _) => Ok((ok, out)),
+        Ran::TimedOut => {
+            tracing::warn!("{program} {} timed out after {limit:?}", args.join(" "));
+            Err(format!(
+                "{program} {} did not answer within {} s and was stopped",
+                args.first().copied().unwrap_or(""),
+                limit.as_secs()
+            ))
+        }
+        Ran::NotStarted(reason) => Err(reason),
     }
+}
+
+/// `(succeeded, stdout)` of `git args` in `cwd`. A `git` that runs past [`GIT_TIMEOUT`] is killed
+/// and answers as a failure (`(false, "")`), like one that is not installed.
+pub fn git(cwd: &Path, args: &[&str]) -> (bool, String) {
+    git_timed(cwd, args, GIT_TIMEOUT).unwrap_or((false, String::new()))
 }
 
 /// `git args`' output, trimmed; empty when it failed.
@@ -147,7 +262,7 @@ pub fn untracked_lines(cwd: &Path, relative: &str) -> u64 {
     }
 }
 
-/// The repository's trunk ("main", "master"…), preferring origin's default branch.
+/// The repository's trunk ("main", "master"â€¦), preferring origin's default branch.
 pub fn default_branch(cwd: &Path) -> Option<String> {
     let head = git_line(cwd, &["rev-parse", "--abbrev-ref", "origin/HEAD"]);
     if !head.is_empty() && head != "origin/HEAD" {
@@ -262,6 +377,83 @@ pub fn repo_status(cwd: &Path) -> Option<RepoStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hung_child_is_killed_at_the_limit() {
+        let started = Instant::now();
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"]);
+        assert_eq!(
+            run_limited(&mut command, Duration::from_millis(400)),
+            Ran::TimedOut
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_hung_git_answers_with_an_error_even_when_a_helper_holds_its_pipes() {
+        // A fake `git`: a script that starts a long-lived grandchild which inherits the pipes.
+        let dir = hermes_testdir::tempdir().unwrap();
+        let script = dir.path().join("slow-git.cmd");
+        std::fs::write(&script, "@echo off\r\nping -n 60 127.0.0.1 > nul\r\n").unwrap();
+        let started = Instant::now();
+        let error = git_program(
+            script.to_str().unwrap(),
+            dir.path(),
+            &["status"],
+            Duration::from_millis(500),
+        )
+        .unwrap_err();
+        assert!(error.contains("did not answer"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_timeout_kills_the_whole_process_tree() {
+        // A fake `git` whose grandchild would write a file three seconds later: killed with
+        // its parent, it never does.
+        let dir = hermes_testdir::tempdir().unwrap();
+        let script = dir.path().join("tree-git.cmd");
+        std::fs::write(
+            &script,
+            "@echo off\r\npowershell -NoProfile -Command \"Start-Sleep -Seconds 3; Set-Content -Path marker.txt -Value x\"\r\n",
+        )
+        .unwrap();
+        let error = git_program(
+            script.to_str().unwrap(),
+            dir.path(),
+            &["status"],
+            Duration::from_millis(1500),
+        )
+        .unwrap_err();
+        assert!(error.contains("did not answer"), "{error}");
+        std::thread::sleep(Duration::from_secs(6));
+        assert!(
+            !dir.path().join("marker.txt").exists(),
+            "the grandchild outlived the timeout"
+        );
+    }
+
+    #[test]
+    fn a_quick_git_is_not_disturbed_by_the_limit() {
+        let dir = hermes_testdir::tempdir().unwrap();
+        let limit = Duration::from_secs(30);
+        assert!(git_timed(dir.path(), &["init", "-q"], limit).unwrap().0);
+        // A failure is still just `false`, and `git()` keeps its shape.
+        assert!(!git(dir.path(), &["no-such-subcommand"]).0);
+        let (ok, out) = git_timed(dir.path(), &["--version"], limit).unwrap();
+        assert!(ok && out.starts_with("git version"));
+        assert!(git_timed(dir.path(), &["--version"], limit).is_ok());
+        assert!(git_program("no-such-program-xyz", dir.path(), &[], limit).is_err());
+    }
 
     #[test]
     fn porcelain_records_name_each_changed_path() {

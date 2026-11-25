@@ -48,6 +48,10 @@ use tokio::sync::mpsc;
 use crate::sidebar::data::{
     NO_PROJECT, NO_PROJECT_LABEL, Op, ProjectItem, ProjectKind, Snapshot, ThreadItem,
 };
+use crate::panel::{
+    backend as panel_backend,
+    data::{DiffData, DiffRequest},
+};
 use crate::thread::composer::ask::{Answer, Choice};
 use crate::thread::composer::attach::{self, Prepared, Refusal};
 use crate::thread::composer::data::{
@@ -190,6 +194,37 @@ pub trait Backend: Send + Sync + 'static {
     /// settled), which is not an error: asking twice is harmless. `Settled` follows on the events.
     fn answer(&self, _prompt_id: &str, _answer: &Answer) -> Result<bool, String> {
         Err("Answering is not available here.".to_string())
+    }
+    /// The right panel's diff: a Git-style patch of every changed file of `request.scope` in the
+    /// thread's folder (CP6.1). Runs `git`, so it blocks.
+    fn diff(&self, _request: &DiffRequest) -> Result<DiffData, String> {
+        Err("The diff is not available here.".to_string())
+    }
+    /// Puts one changed file back (what [`DiffData::revert`] said the scope allows). `seen` is
+    /// the file's blob id as the shown diff named it: the revert is refused when the file is no
+    /// longer what the user saw (it changed after the diff was read). Blocks.
+    fn revert_file(
+        &self,
+        _request: &DiffRequest,
+        _path: &str,
+        _seen: Option<&str>,
+    ) -> Result<(), String> {
+        Err("Reverting is not available here.".to_string())
+    }
+    /// The commit `HEAD` is at in the thread's folder: what a turn that is starting is compared
+    /// with when it ends. `None` outside a repository.
+    fn head_commit(&self, _session: &str) -> Option<String> {
+        None
+    }
+    /// Opens a changed file (a path as the diff names it) in the user's editor at `line`; the
+    /// name of what opened it ("Zed", "VS Code", "the default app").
+    fn open_in_editor(
+        &self,
+        _session: &str,
+        _path: &str,
+        _line: Option<u32>,
+    ) -> Result<String, String> {
+        Err("Opening a file is not available here.".to_string())
     }
 }
 
@@ -1152,6 +1187,32 @@ impl Backend for CoreBackend {
             .map_err(|e| format!("{e:#}"))
     }
 
+    fn diff(&self, request: &DiffRequest) -> Result<DiffData, String> {
+        panel_backend::read_diff(&self.core, request)
+    }
+
+    fn revert_file(
+        &self,
+        request: &DiffRequest,
+        path: &str,
+        seen: Option<&str>,
+    ) -> Result<(), String> {
+        panel_backend::revert(&self.core, request, path, seen)
+    }
+
+    fn head_commit(&self, session: &str) -> Option<String> {
+        panel_backend::head_commit(&self.core, session)
+    }
+
+    fn open_in_editor(
+        &self,
+        session: &str,
+        path: &str,
+        line: Option<u32>,
+    ) -> Result<String, String> {
+        panel_backend::open_in_editor(&self.core, session, path, line)
+    }
+
     fn answer(&self, prompt_id: &str, answer: &Answer) -> Result<bool, String> {
         use hermes_tools::approval::ApprovalChoice;
         Ok(match answer {
@@ -1205,6 +1266,8 @@ pub struct FixtureBackend {
     open_asks: Mutex<HashMap<String, (String, hermes_core::QuestionKind)>>,
     /// The questions an answer reached (a second answer is "no longer open").
     answered_asks: Mutex<std::collections::HashSet<String>>,
+    /// The right panel's diff: what each scope answers, and what was asked of it.
+    diffs: Mutex<crate::panel::fixture::FixtureDiffs>,
 }
 
 /// A composer operation that reached a [`FixtureBackend`].
@@ -1281,7 +1344,13 @@ impl FixtureBackend {
             answers: Mutex::default(),
             open_asks: Mutex::default(),
             answered_asks: Mutex::default(),
+            diffs: Mutex::new(crate::panel::fixture::FixtureDiffs::sample()),
         })
+    }
+
+    /// The right panel's fake repository (what each scope answers, what was asked of it).
+    pub fn diffs(&self) -> std::sync::MutexGuard<'_, crate::panel::fixture::FixtureDiffs> {
+        self.diffs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The models a fixture offers: two providers, a handful of models.
@@ -1947,6 +2016,44 @@ impl Backend for FixtureBackend {
             c.model = model.to_string();
         });
         Ok(())
+    }
+
+    fn diff(&self, request: &DiffRequest) -> Result<DiffData, String> {
+        self.diffs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .read(request)
+    }
+
+    fn revert_file(
+        &self,
+        request: &DiffRequest,
+        path: &str,
+        seen: Option<&str>,
+    ) -> Result<(), String> {
+        self.diffs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .revert(request, path, seen)
+    }
+
+    fn head_commit(&self, _session: &str) -> Option<String> {
+        self.diffs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .head
+            .clone()
+    }
+
+    fn open_in_editor(
+        &self,
+        session: &str,
+        path: &str,
+        line: Option<u32>,
+    ) -> Result<String, String> {
+        let mut diffs = self.diffs.lock().unwrap_or_else(|e| e.into_inner());
+        diffs.opened.push((session.to_string(), path.to_string(), line));
+        Ok("the fixture editor".to_string())
     }
 
     fn answer(&self, prompt_id: &str, answer: &Answer) -> Result<bool, String> {

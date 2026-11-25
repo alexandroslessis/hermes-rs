@@ -470,6 +470,8 @@ approval and a question, answered from the composer in our instance.
 
 ### CP6.1 — Diff (M)
 
+**Status (CP6.1, 2026-11-25):** built, not reviewed or committed, on `native/p6-panel`; `panel/`, details and the reviewer's list in `progress/phase-6.md`. The diff is GPUI Kit's own diff view fed by `hermes_core::git_review::review_patch`; `hermes_core::git` kills a hung `git` after 30 s.
+
 Changed files tree (status letters, +/− counts), unified diff with syntax highlighting, scope
 switch (this turn, this thread, working tree against `HEAD`), revert a file or a hunk where the core
 supports it, open in editor.

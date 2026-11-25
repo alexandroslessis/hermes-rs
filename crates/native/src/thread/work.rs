@@ -173,6 +173,13 @@ impl Footer {
         }
     }
 
+    /// Replaces the files (git's account of a turn instead of the edit cards'): the tree is
+    /// rebuilt, the folders the user closed stay closed.
+    pub fn replace_files(&mut self, files: Vec<ChangedFile>) {
+        self.tree = Arc::new(build_tree(&files));
+        self.files = Arc::new(files);
+    }
+
     /// Whether every folder is closed.
     pub fn all_closed(&self) -> bool {
         let dirs = dir_paths(&self.tree);

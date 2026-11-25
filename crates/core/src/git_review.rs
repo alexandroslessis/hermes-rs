@@ -6,14 +6,16 @@
 //! Hermes: `hermes_cli/web_git.py` (all of it but `repo_status`, which is `git.rs`), served by
 //! `hermes_cli/web_routers/git.py` (the routes and their JSON: `crates/desktop/src/git_review.rs`).
 
-use std::os::windows::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::files::is_sensitive;
-use crate::git::{CREATE_NO_WINDOW, entries, git, git_line, renamed_to, untracked_lines};
+use crate::git::{
+    GIT_TIMEOUT, Ran, entries, git, git_line, renamed_to, run_limited, untracked_lines,
+};
 
 /// The commit-message context's diff cap (`_COMMIT_CONTEXT_DIFF_MAX_CHARS`) and untracked list
 /// cap (`_COMMIT_CONTEXT_UNTRACKED_MAX`).
@@ -142,25 +144,37 @@ pub struct BaseBranch {
     pub is_default: bool,
 }
 
+/// How long `gh` may take (`gh pr create` talks to GitHub); `git` has [`GIT_TIMEOUT`].
+const GH_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// `(succeeded, stdout, stderr)` of `program args` in `cwd`: no window, no stdin, no prompts (a
-/// credential prompt could never be answered from the page).
+/// credential prompt could never be answered from the page). A child that runs past its limit is
+/// killed and answers as a failure whose stderr says so.
 fn run(program: &str, cwd: &Path, args: &[&str]) -> (bool, String, String) {
-    let output = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
-        .env("GH_PROMPT_DISABLED", "1")
-        .stdin(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    match output {
-        Ok(output) => (
-            output.status.success(),
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
+        .env("GH_PROMPT_DISABLED", "1");
+    let limit = if program == "git" {
+        GIT_TIMEOUT
+    } else {
+        GH_TIMEOUT
+    };
+    match run_limited(&mut command, limit) {
+        Ran::Exited(ok, out, err) => (ok, out, err),
+        Ran::TimedOut => (
+            false,
+            String::new(),
+            format!(
+                "{program} {} did not answer within {} s and was stopped",
+                args.first().copied().unwrap_or(""),
+                limit.as_secs()
+            ),
         ),
-        Err(error) => (false, String::new(), error.to_string()),
+        Ran::NotStarted(reason) => (false, String::new(), reason),
     }
 }
 
@@ -327,7 +341,17 @@ fn all_added(cwd: &Path, file: &Path) -> String {
     run(
         "git",
         cwd,
-        &["diff", "--no-index", "--", "/dev/null", &file],
+        // Plain text whatever the user's config says (`color.ui = always` would put escape
+        // codes in it; an external diff tool would run).
+        &[
+            "diff",
+            "--no-index",
+            "--no-color",
+            "--no-ext-diff",
+            "--",
+            "/dev/null",
+            &file,
+        ],
     )
     .1
 }
@@ -404,6 +428,100 @@ pub fn review_diff(
         }
     };
     Ok(diff)
+}
+
+/// The empty tree: what a repository without a first commit is compared with.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/// How many untracked files [`review_patch`] writes out as all-added diffs, and the size past
+/// which one is left out (`review_list` still names it).
+const PATCH_UNTRACKED_MAX: usize = 100;
+const PATCH_UNTRACKED_BYTES: u64 = 1024 * 1024;
+
+/// A scope's whole patch ([`review_patch`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReviewPatch {
+    /// One unified, Git-style diff of every changed file, renames detected, untracked files as
+    /// all-added files. Empty outside a repository or when nothing changed.
+    pub patch: String,
+    /// Untracked files left out (past the count or size caps).
+    pub untracked_skipped: usize,
+}
+
+/// Every changed file of a scope as one patch, in one `git diff` (plus one `--no-index` diff per
+/// untracked file, capped): `uncommitted` (the working tree against `HEAD`, or the empty tree in a
+/// repository with no commit), `lastTurn` (against `base_ref`, which a front end took at the
+/// turn's start) or `branch` (since the merge-base with the default branch). `Err` when `git`
+/// failed to answer (it ran past [`GIT_TIMEOUT`] and was killed) or the base is no longer there.
+/// Untracked files are not part of `branch`.
+pub fn review_patch(cwd: &Path, scope: &str, base_ref: Option<&str>) -> Outcome<ReviewPatch> {
+    if !cwd.is_dir() {
+        return Ok(ReviewPatch::default());
+    }
+    let (inside, top) = crate::git::git_timed(cwd, &["rev-parse", "--show-toplevel"], GIT_TIMEOUT)?;
+    if !inside || top.trim().is_empty() {
+        return Ok(ReviewPatch::default());
+    }
+    // Everything from the repository's top: `git diff` names files from there whatever the
+    // folder, and the untracked list must too (from a subfolder `ls-files` would name them
+    // relative to it, and only those under it), so a path means one file for every caller.
+    let top = PathBuf::from(top.trim().replace('/', "\\"));
+    let cwd = top.as_path();
+    let ask = |args: &[&str]| crate::git::git_timed(cwd, args, GIT_TIMEOUT);
+    let target = match scope {
+        "branch" => match branch_base(cwd) {
+            Some(base) => format!("{base}...HEAD"),
+            None => return Ok(ReviewPatch::default()),
+        },
+        "lastTurn" => match base_ref.filter(|b| !b.is_empty()) {
+            Some(base) => base.to_string(),
+            None => return Ok(ReviewPatch::default()),
+        },
+        _ => {
+            if ask(&["rev-parse", "--verify", "--quiet", "HEAD"])?.0 {
+                "HEAD".to_string()
+            } else {
+                EMPTY_TREE.to_string()
+            }
+        }
+    };
+    let (ok, mut patch) = ask(&[
+        "-c",
+        "core.quotepath=false",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "-M",
+        &target,
+        "--",
+    ])?;
+    if !ok {
+        return Err(format!("git could not compare with {target}"));
+    }
+    let mut skipped = 0;
+    if scope != "branch" {
+        let (_, listed) = ask(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        for (at, relative) in listed.split('\0').filter(|n| !n.is_empty()).enumerate() {
+            let big = std::fs::metadata(cwd.join(relative))
+                .map(|m| m.len() > PATCH_UNTRACKED_BYTES)
+                .unwrap_or(true);
+            if at >= PATCH_UNTRACKED_MAX || big {
+                skipped += 1;
+                continue;
+            }
+            let added = all_added(cwd, Path::new(relative));
+            if !added.is_empty() {
+                if !patch.is_empty() && !patch.ends_with('\n') {
+                    patch.push('\n');
+                }
+                patch.push_str(&added);
+            }
+        }
+    }
+    Ok(ReviewPatch {
+        patch,
+        untracked_skipped: skipped,
+    })
 }
 
 /// The working tree against HEAD for the preview's diff view; an
@@ -1144,6 +1262,132 @@ mod tests {
             "one\n"
         );
         assert!(!cwd.join("stray.txt").exists());
+    }
+
+    #[test]
+    fn a_scope_comes_as_one_patch_with_renames_deletes_binaries_and_untracked_files() {
+        let dir = repo();
+        let cwd = dir.path();
+        let lines: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(cwd.join("old.txt"), &lines).unwrap();
+        std::fs::write(cwd.join("gone.txt"), "bye\n").unwrap();
+        std::fs::write(cwd.join("logo.bin"), [0u8, 1, 2, 3]).unwrap();
+        git_ok(cwd, &["add", "-A"]).unwrap();
+        git_ok(cwd, &["commit", "-q", "-m", "more"]).unwrap();
+        let base = git_line(cwd, &["rev-parse", "HEAD"]);
+
+        git_ok(cwd, &["mv", "old.txt", "new name.txt"]).unwrap();
+        std::fs::write(
+            cwd.join("new name.txt"),
+            lines.replace("line 3\n", "line three\n"),
+        )
+        .unwrap();
+        std::fs::remove_file(cwd.join("gone.txt")).unwrap();
+        std::fs::write(cwd.join("logo.bin"), [0u8, 9, 9, 9]).unwrap();
+        std::fs::write(cwd.join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(cwd.join("brand new.txt"), "x\ny\n").unwrap();
+
+        let all = review_patch(cwd, "uncommitted", None).unwrap();
+        let patch = &all.patch;
+        assert_eq!(all.untracked_skipped, 0);
+        assert!(patch.contains("rename from old.txt"), "{patch}");
+        assert!(patch.contains("rename to new name.txt"), "{patch}");
+        assert!(patch.contains("deleted file mode"), "{patch}");
+        assert!(patch.contains("Binary files"), "{patch}");
+        assert!(patch.contains("+two"), "{patch}");
+        assert!(patch.contains("+++ b/brand new.txt"), "untracked: {patch}");
+        assert!(
+            patch.contains("-line 3") && patch.contains("+line three"),
+            "{patch}"
+        );
+
+        // Since a commit taken at the turn's start: the same files, nothing committed since.
+        let turn = review_patch(cwd, "lastTurn", Some(&base)).unwrap();
+        assert_eq!(turn.patch, all.patch);
+        // A turn that committed: its commit is in the patch, later edits too.
+        git_ok(cwd, &["add", "-A"]).unwrap();
+        git_ok(cwd, &["commit", "-q", "-m", "turn"]).unwrap();
+        std::fs::write(cwd.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let turn = review_patch(cwd, "lastTurn", Some(&base)).unwrap().patch;
+        assert!(
+            turn.contains("+three") && turn.contains("rename to new name.txt"),
+            "{turn}"
+        );
+        // The working tree alone is now just a.txt.
+        let tree = review_patch(cwd, "uncommitted", None).unwrap().patch;
+        assert!(
+            tree.contains("+three") && !tree.contains("rename"),
+            "{tree}"
+        );
+
+        // No base, an unknown base, a folder that is no repository, a missing folder.
+        assert_eq!(
+            review_patch(cwd, "lastTurn", None).unwrap(),
+            ReviewPatch::default()
+        );
+        assert!(review_patch(cwd, "lastTurn", Some("deadbeef")).is_err());
+        let plain = hermes_testdir::tempdir().unwrap();
+        assert_eq!(
+            review_patch(plain.path(), "uncommitted", None).unwrap(),
+            ReviewPatch::default()
+        );
+        assert_eq!(
+            review_patch(&cwd.join("nope"), "uncommitted", None).unwrap(),
+            ReviewPatch::default()
+        );
+    }
+
+    #[test]
+    fn a_repository_with_no_commit_compares_with_the_empty_tree() {
+        let dir = hermes_testdir::tempdir().unwrap();
+        let cwd = dir.path();
+        git_ok(cwd, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(cwd.join("staged.txt"), "s\n").unwrap();
+        git_ok(cwd, &["add", "staged.txt"]).unwrap();
+        std::fs::write(cwd.join("loose.txt"), "l\n").unwrap();
+        let patch = review_patch(cwd, "uncommitted", None).unwrap().patch;
+        assert!(
+            patch.contains("+++ b/staged.txt") && patch.contains("+++ b/loose.txt"),
+            "{patch}"
+        );
+    }
+
+    #[test]
+    fn from_a_subfolder_every_path_is_named_from_the_repository_top() {
+        let dir = repo();
+        let cwd = dir.path();
+        std::fs::create_dir_all(cwd.join("sub")).unwrap();
+        std::fs::write(cwd.join("sub").join("loose.txt"), "l\n").unwrap();
+        std::fs::write(cwd.join("top-loose.txt"), "t\n").unwrap();
+        std::fs::write(cwd.join("a.txt"), "changed\n").unwrap();
+        let patch = review_patch(&cwd.join("sub"), "uncommitted", None)
+            .unwrap()
+            .patch;
+        // Untracked files as `git diff` names tracked ones: from the top, the whole repository.
+        assert!(patch.contains("+++ b/sub/loose.txt"), "{patch}");
+        assert!(patch.contains("+++ b/top-loose.txt"), "{patch}");
+        assert!(patch.contains("+++ b/a.txt"), "{patch}");
+        assert!(!patch.contains("+++ b/loose.txt"), "{patch}");
+    }
+
+    #[test]
+    fn untracked_files_past_the_caps_are_counted_not_written() {
+        let dir = repo();
+        let cwd = dir.path();
+        for n in 0..(PATCH_UNTRACKED_MAX + 3) {
+            std::fs::write(cwd.join(format!("f{n:03}.txt")), "x\n").unwrap();
+        }
+        std::fs::write(
+            cwd.join("huge.log"),
+            vec![b'a'; PATCH_UNTRACKED_BYTES as usize + 1],
+        )
+        .unwrap();
+        let out = review_patch(cwd, "uncommitted", None).unwrap();
+        assert_eq!(
+            out.untracked_skipped, 4,
+            "three past the count, one too big"
+        );
+        assert_eq!(out.patch.matches("diff --git").count(), PATCH_UNTRACKED_MAX);
     }
 
     #[test]

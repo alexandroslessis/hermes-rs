@@ -935,9 +935,14 @@ fn opening_a_thread_in_the_sidebar_shows_it_and_its_events_stream_in() {
     })
     .unwrap();
     settle(&mut cx);
+    // The fixture's working tree does not change that file: the Files tab's placeholder names it
+    // (CP6.2 builds the file view).
     let (open, file) = cx.update(|cx| {
         let w = window.read(cx).unwrap();
-        (w.state().right_panel.open, w.panel_file().cloned())
+        (
+            w.state().right_panel.open,
+            w.right_panel().read(cx).file().cloned(),
+        )
     });
     assert!(open);
     assert_eq!(file.unwrap().label(), "src/stream.rs:42");

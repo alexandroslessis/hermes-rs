@@ -539,6 +539,28 @@ temporary folders are scrubbed so it is deterministic) and that the cards the li
 the ones the stored transcript builds. The gallery's `thread-tools-*` stories replay slices of that
 recording through the model.
 
+**The right panel's diff (CP6.1).** `panel/tests.rs` drives the workspace over the fixture repository
+(`panel/fixture.rs`: a Rust file with two hunks, a new file, a deleted one, a rename, a binary file, very long
+lines, no newline at the end): the panel reads once when it is on screen and never while hidden, letters and
+counts of every kind of change, the layout at 640 / 1100 / 1920 (tab strip 40 px, toolbar, scope buttons, 26 px
+list rows with one letter column and one right-aligned counts column, `no_overflow` with paths and lines far too
+long, wrapped and not), the folder tree, each scope's file set through the scope buttons (this turn from the
+commit the turn began at, else narrowed to the files its footer names; this thread; the working tree), the
+revert flow (nothing happens until the confirmation, cancel, a failure toast, which scopes and kinds allow it),
+open-in-editor reaching the backend, `OpenDiffTab` / `OpenFileInPanel` opening the panel (a changed file in the
+diff, any other in the Files placeholder), a failed read with its retry, a stale answer dropped, and a
+6,000-line diff (what the UI thread pays to install it, the frames after; `--nocapture` prints the numbers).
+`panel/data.rs` has the pure parts (patch parsing with no newline at the end, CRLF, an empty file, a 5,000-line
+hunk, a patch cut at a size limit, a file the parser refuses; the editor command built without starting
+anything; which changed file a card's path names). **`panel/real_tests.rs` is the live check:** a real `Core`
+on a temporary data folder and temporary git repositories (`git init` with a local identity: nothing of the
+user's) read the three scopes (modified, renamed, deleted, binary, untracked, committed since the turn began),
+a revert restores or removes the file on disk (a thread in a subfolder included), and a wiremock agent patches
+a file, writes a new one and changes a third with a terminal command: the footer lists all three from git (and
+not the untracked file that was already there), the diff tab shows them, and a revert from the panel changes the
+disk only after its confirmation. `hermes_core::git` has the timeout tests (a hung child is killed; a fake
+`git` script whose helper keeps the pipes open still returns).
+
 **The gallery** (`hermes-native-gallery.exe`, `cargo run -p hermes-native --bin
 hermes-native-gallery`): every story in every state, with t3code's default / GPUI Kit / Zed One and
 light / dark switches, for a person to judge hover, press and focus by hand (the user's checklist).

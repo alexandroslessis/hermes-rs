@@ -18,6 +18,7 @@ pub mod notify;
 #[cfg(test)]
 mod notify_tests;
 pub mod palette;
+pub mod panel;
 pub mod sidebar;
 pub mod spike;
 #[cfg(any(test, feature = "dev"))]

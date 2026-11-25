@@ -987,7 +987,7 @@ fn in_the_frame_branching_opens_the_new_thread_and_the_diff_and_screen_actions_a
         cx.update(|cx| model.read(cx).selected().clone()),
         Selection::Thread("t1-branch".into())
     );
-    // The diff tab and a screen are Phase 6 and 7: the panel opens and a toast says so.
+    // The diff tab opens the right panel (CP6.1); a screen is Phase 7: a toast says so.
     cx.update_window(handle, |root, window, cx| {
         let workspace = root.downcast::<crate::workspace::Workspace>().unwrap();
         workspace.update(cx, |w, cx| w.focus(window, cx));
@@ -1018,6 +1018,7 @@ fn in_the_frame_branching_opens_the_new_thread_and_the_diff_and_screen_actions_a
         .filter(|e| e.path.last().is_some_and(|n| n.starts_with("toast")))
         .map(|e| e.path.last().unwrap().clone())
         .collect();
-    assert!(toasts.len() >= 2, "a toast for each action: {toasts:?}");
+    assert!(!toasts.is_empty(), "a toast for the screen: {toasts:?}");
     assert!(layout.get("right-panel").is_ok(), "the right panel opened");
+    assert!(layout.get("diff-panel").is_ok(), "on the diff tab");
 }

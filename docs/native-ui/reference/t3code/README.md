@@ -80,3 +80,9 @@ CP5.2 took no new screenshot either (the window cannot be driven from here, and 
 chip `ContextChip.tsx`; the sent thumbnails reuse `app-hover_reply_closeup-dark.png`. No README row to add: no file was added.
 
 CP5.3: no capture of the approval or question panel exists here (t3code has none of a pending approval: it shows it in the timeline row, and the question as the composer top drawer; I did not drive the user's t3code window). The panel is built from `ComposerBanner.tsx`, `ComposerPendingApprovalActions.tsx`, `TimelinePendingApprovalRow.tsx` and `ComposerPendingUserInputPanel.tsx` (source only), on the card of `app-thread-dark.png`.
+
+CP6.1 took no new screenshot (t3code's window cannot be driven from here, and nothing was changed in the user's t3code): the diff tab
+follows `DiffPanel.tsx`, `diffs/DiffFileTree.tsx` and `diffs/DiffFileStatus.tsx`, checked against `sidebar-diff.png` (the toolbar and the
+collapsed file rows: chevron, status mark, name, `+N -M`) and `sidebar-diff-content.png` (an opened file: line numbers, added lines on a
+green ground); the tab strip follows `RightPanelTabs.tsx` and `sidebar-right.png`. The light theme, the scope switch, the revert
+confirmation, a binary file and a huge diff are not in a screenshot: they follow the source and the two themes' tokens.
