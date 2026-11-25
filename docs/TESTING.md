@@ -539,6 +539,18 @@ temporary folders are scrubbed so it is deterministic) and that the cards the li
 the ones the stored transcript builds. The gallery's `thread-tools-*` stories replay slices of that
 recording through the model.
 
+**The Files tab (CP6.2).** `panel/files_tests.rs` drives the workspace over the fixture backend's *virtual* project
+(`panel/fixture_files.rs`: a Rust-ish project with an ignored `target/`, a credentials file, a link that leaves the
+project, a binary, a picture, an SVG, a non-UTF-8 file, a file claimed to be 34 MB) and, where `.gitignore` files or the
+disk matter, over a real temporary folder (`Source::Disk`): lazy listing, ignored rows, keys, the layout at 640 / 1100 /
+1920, every kind of file, jump to a line (selected and scrolled into view: `visible_row_range`), every refusal, open in
+editor, "Diff". `panel/finder_tests.rs` has the dialog (placement as the palette's, keys, Enter and Escape, a real folder of
+20,000 files indexed while typing); `finder.rs` the ranking and a 100,000-path timing; `fs.rs` the disk rules with real
+folders (nested `.gitignore` with negation, `.git/info/exclude`, a project inside a repository, links and junctions
+(skipped with a message when none can be made), the size limits, and a **100,000-file tree** made in 1,000 folders:
+`cargo test -p hermes-native --lib panel::fs -- --nocapture` prints the timings). The headless platform runs
+background tasks on the test's own thread: a test cannot tell a background decode from a foreground one by thread id.
+
 **The right panel's diff (CP6.1).** `panel/tests.rs` drives the workspace over the fixture repository
 (`panel/fixture.rs`: a Rust file with two hunks, a new file, a deleted one, a rename, a binary file, very long
 lines, no newline at the end): the panel reads once when it is on screen and never while hidden, letters and

@@ -197,6 +197,61 @@ pub fn message(view: TextView, cx: &App) -> TextView {
         .selectable(true)
 }
 
+/// `view` set up as a rendered markdown *file* of the Files tab (`folder`: the file's own folder,
+/// relative to the project, `""` at the top): the same style, extensions and link rules as a
+/// message, except that a relative link names a file next to this one ([`preview_link`]).
+pub fn preview(view: TextView, cx: &App, folder: String) -> TextView {
+    let extensions = EXTENSIONS.with(Clone::clone);
+    view.style(style(cx))
+        .markdown_extensions(extensions)
+        .code_block_actions(code_header)
+        .on_link_click(move |url, _, window, cx| match preview_link(url, &folder) {
+            LinkAction::OpenFile(action) => window.dispatch_action(Box::new(action), cx),
+            LinkAction::OpenUrl(url) => cx.open_url(&url),
+            LinkAction::Ignore => {}
+        })
+        .selectable(true)
+}
+
+/// What a click on `url` in a markdown file of `folder` does: [`link_action`], with a relative
+/// file link read from `folder` (`../README.md` in `docs/guide` is `docs/README.md`). A link that
+/// climbs out of the project keeps its `..`, which the backend refuses.
+pub fn preview_link(url: &str, folder: &str) -> LinkAction {
+    match link_action(url) {
+        LinkAction::OpenFile(mut file) => {
+            let path = file.path.replace('\\', "/");
+            let absolute = path.starts_with('/')
+                || path.starts_with('~')
+                || path.chars().nth(1) == Some(':')
+                || folder.is_empty();
+            if !absolute {
+                file.path = join_folder(folder, &path);
+            }
+            LinkAction::OpenFile(file)
+        }
+        other => other,
+    }
+}
+
+/// `folder/path` with `.` and `..` folded; `..` past the top stays.
+fn join_folder(folder: &str, path: &str) -> String {
+    let mut parts: Vec<&str> = folder.split('/').filter(|p| !p.is_empty()).collect();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.last().is_some_and(|last| *last != "..") {
+                    parts.pop();
+                } else {
+                    parts.push("..");
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
 /// A code block's header: the language and the copy button.
 fn code_header(block: &CodeBlock, _: &mut Window, cx: &mut App) -> AnyElement {
     let palette = cx.design_theme().palette;
@@ -349,6 +404,44 @@ mod tests {
                 LinkAction::Ignore,
                 "{unsafe_link}"
             );
+        }
+    }
+
+    #[test]
+    fn links_in_a_markdown_file_are_read_from_its_own_folder_by_the_same_safe_rules() {
+        let open = |path: &str, line: Option<u32>| {
+            LinkAction::OpenFile(OpenFileInPanel {
+                path: path.into(),
+                line,
+            })
+        };
+        assert_eq!(
+            preview_link("../../README.md", "docs/guide"),
+            open("README.md", None)
+        );
+        assert_eq!(preview_link("intro.md#L4", "docs/guide"), open("docs/guide/intro.md", Some(4)));
+        assert_eq!(preview_link("./a/../b.md", "docs"), open("docs/b.md", None));
+        // Up and out of the project: kept, so the backend says it is outside.
+        assert_eq!(preview_link("../../x.md", "docs"), open("../x.md", None));
+        // At the top of the project nothing is prefixed.
+        assert_eq!(preview_link("docs/a.md", ""), open("docs/a.md", None));
+        // Absolute paths are not joined.
+        assert_eq!(preview_link("C:/proj/a.md", "docs"), open("C:/proj/a.md", None));
+        // The thread's rules for everything else.
+        assert_eq!(
+            preview_link("https://example.com/x", "docs"),
+            LinkAction::OpenUrl("https://example.com/x".into())
+        );
+        assert_eq!(preview_link("www.example.com", "docs"), LinkAction::OpenUrl("https://www.example.com".into()));
+        assert_eq!(preview_link("mailto:a@b.c", "docs"), LinkAction::OpenUrl("mailto:a@b.c".into()));
+        for unsafe_link in [
+            "javascript:alert(1)",
+            "file:C:/Windows/System32/calc.exe",
+            "ms-settings:privacy",
+            "#section",
+            "",
+        ] {
+            assert_eq!(preview_link(unsafe_link, "docs"), LinkAction::Ignore, "{unsafe_link}");
         }
     }
 

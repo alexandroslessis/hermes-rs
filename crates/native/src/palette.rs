@@ -408,7 +408,7 @@ impl Palette {
 }
 
 /// The title as styled text: matched characters bold.
-fn highlighted(title: &str, positions: &[usize]) -> AnyElement {
+pub(crate) fn highlighted(title: &str, positions: &[usize]) -> AnyElement {
     let mut row = div().flex();
     let mut run = String::new();
     let mut bold = false;
@@ -671,5 +671,35 @@ mod tests {
         assert_eq!(items.len(), keymap::COMMANDS.len());
         let sidebar = items.iter().find(|i| i.id == "sidebar.toggle").unwrap();
         assert_eq!(sidebar.shortcut.as_deref(), Some("Ctrl+B"));
+    }
+
+    /// Every action, in the palette's order (a new command once pushed "Toggle right panel" out of
+    /// the first five rows, which the gallery story shows, and so out of its "tog" search).
+    #[core::prelude::v1::test]
+    fn the_actions_are_listed_in_their_order_and_tog_finds_both_panel_toggles() {
+        let items = action_items();
+        let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Open command palette",
+                "Show all actions",
+                "New thread",
+                "Toggle sidebar",
+                "Toggle right panel",
+                "Toggle terminal drawer",
+                "Go to file",
+                "Cycle theme",
+                "Focus next region",
+                "Focus previous region",
+                "Open settings",
+            ]
+        );
+        let first_five: Vec<Item> = items.into_iter().take(5).collect();
+        let found: Vec<&str> = search(&first_five, "tog")
+            .iter()
+            .map(|h| first_five[h.index].title.as_str())
+            .collect();
+        assert_eq!(found, ["Toggle sidebar", "Toggle right panel"]);
     }
 }

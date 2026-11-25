@@ -119,6 +119,8 @@ pub fn run(options: Options) {
             crate::dev::install(cx);
             keymap::bind(cx);
             palette::bind(cx);
+            crate::panel::files::bind(cx);
+            crate::panel::finder::bind(cx);
             sidebar::keys::bind(cx);
             crate::thread::header::bind(cx);
             crate::thread::composer::view::bind(cx);

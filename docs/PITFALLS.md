@@ -173,6 +173,24 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 
 ## Native UI (`crates/native`, GPUI Kit; [docs/native-ui/](native-ui/README.md))
 
+- **A linked file is shown, never run (CP6.2).** The Files tab reads a file; it never opens it with the shell. Every
+  path (a link in a message, a tree row, the finder, a link in rendered markdown) goes through `panel::fs::locate`:
+  refused unless *lexically* below the thread's folder before the disk is touched (a `\\host\share` link must never be
+  opened: Windows would send the user's sign-in to that host; the same goes for following a symbolic link: links are
+  read with `read_link`, not followed, until they are known to stay inside), then made canonical and checked again
+  (a `..` that comes back is fine; a link or junction that leaves is "escapes"); stream names (`a:b`), device names
+  (`CON`, `nul.txt`) and trailing dots refused; credentials refused by `hermes_core::files::is_private` (the preview's
+  `is_sensitive` + the runtime's secret files + `.ssh`/`.aws`/... + `.git`), and the app's data folder kept out
+  (`fs::keep_out`). The file is opened once and the handle checked (`GetFinalPathNameByHandleW`, a disk file); the read
+  is bounded. An SVG is rasterised by GPUI (usvg, no HTTP, no script) after `viewer::svg_without_references` empties
+  every `href` that is not `#...` or `data:` (usvg would read `C:\...` or `\\host\...` images). Markdown images are never
+  fetched: the app installs no HTTP client (GPUI's `NullHttpClient`). "Open in editor" uses the same check, then the
+  CP6.1 launcher (no shell, relative `PATH` entries skipped, the system fallback reveals executables in Explorer).
+- **`.gitignore` rules are per folder you enter (CP6.2).** `fs::Ignores::for_dir` loads the `.gitignore` files from the
+  repository top (nearest `.git`, else the project) down to the folder; the index walk `enter`s each folder it descends into,
+  so `index_files` takes the root's own rules off once (`leave_own`). The user's global excludes file is not read.
+- **`cargo` from a subfolder with a relative `CARGO_TARGET_DIR` builds a second target there** (`crates/native/target`):
+  run cargo from the worktree root.
 - **GPUI Kit ships a diff view (CP6.1): use it.** `gpui_kit::component::diff` (`DiffFile::parse_with`, `DiffState`,
   `Diff`) parses git's unified diffs (renames, deletions, binary notes, `\ No newline at end of file`, CRLF, a patch
   cut at a size limit with `truncated_hunks`) and draws one virtual list of every file with hunk separators, word-level

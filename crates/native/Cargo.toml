@@ -40,6 +40,8 @@ hermes_runtime.workspace = true
 hermes_store.workspace = true
 # The runtime's `ApprovalMode`, which the composer's mode picker sets (the backend module only).
 hermes_tools.workspace = true
+# The `.gitignore` matcher (already used by the runtime and tools): the Files tab and the finder (panel/fs.rs).
+ignore.workspace = true
 # Pinned exactly (AGENTS.md ground rule 3, the GPUI Kit exception); vendor/SOURCES.md records it.
 # `syntect` highlights fenced code: GPUI Kit's `tree-sitter` features pull tree-sitter 0.26,
 # which Cargo refuses next to crates/highlight's 0.27 (both declare `links = "tree-sitter"`).

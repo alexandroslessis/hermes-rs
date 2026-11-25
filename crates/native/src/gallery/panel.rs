@@ -1,9 +1,9 @@
 //! The right panel's diff story (CP6.1): the panel as the app draws it (a 380 x 620 pane: the tab
 //! strip, the toolbar, the changed files, the diff) over a fake repository
-//! ([`crate::panel::fixture`]) in six states. `working`: the working tree as a flat list with the
+//! ([`crate::panel::fixture`]) in five states. `working`: the working tree as a flat list with the
 //! first files open; `tree`: the same as a folder tree; `split`: side by side; `confirm`: a file's
 //! revert waiting for its confirmation; `empty`: a turn that changed nothing, with the note;
-//! `files`: the Files tab's placeholder after a file link to a file that is not changed.
+//! (CP6.2 moved the Files tab to its own story, `panel-files`.)
 //! References: `sidebar-diff.png`, `sidebar-diff-content.png`, `sidebar-right.png`.
 //!
 //! The panel is given its data directly ([`crate::panel::diff::DiffPanel::show_data`]): a story is
@@ -31,7 +31,6 @@ use crate::{
         data::{DiffData, Revert, Scope},
         fixture::FixtureDiffs,
     },
-    thread::OpenFileInPanel,
 };
 
 const fn at_rest(name: &'static str) -> State {
@@ -41,13 +40,12 @@ const fn at_rest(name: &'static str) -> State {
     }
 }
 
-const STATES: [State; 6] = [
+const STATES: [State; 5] = [
     at_rest("working"),
     at_rest("tree"),
     at_rest("split"),
     at_rest("confirm"),
     at_rest("empty"),
-    at_rest("files"),
 ];
 
 /// The width of the pane in the app at its default size, and a height that shows a diff.
@@ -103,15 +101,6 @@ fn make(name: &str, window: &mut Window, cx: &mut App) -> Entity<RightPanel> {
                 }
             }
         });
-        if name == "files" {
-            panel.open_file(
-                &OpenFileInPanel {
-                    path: "crates/native/src/workspace.rs".to_string(),
-                    line: Some(89),
-                },
-                cx,
-            );
-        }
         panel
     })
 }

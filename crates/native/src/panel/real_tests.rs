@@ -747,3 +747,67 @@ fn an_agents_edits_show_in_the_turn_footer_and_in_the_diff_tab_from_git() {
     drop(server);
     drop(runtime);
 }
+
+// --- the Files tab over the real core ---------------------------------------------------------------
+
+#[core::prelude::v1::test]
+fn the_files_tab_lists_reads_and_refuses_through_the_real_core_for_a_threads_folder() {
+    let repo = hermes_testdir::tempdir().unwrap();
+    make_repo(repo.path());
+    std::fs::write(repo.path().join(".gitignore"), "ignored/\n").unwrap();
+    std::fs::create_dir_all(repo.path().join("ignored")).unwrap();
+    std::fs::write(repo.path().join("ignored").join("o.txt"), "x").unwrap();
+    std::fs::write(repo.path().join(".env"), "SECRET=1\n").unwrap();
+    // The thread works in `sub`: its folder is the tree's root, the repository's rules apply.
+    let sub = repo.path().join("sub");
+    std::fs::write(sub.join("noise.log"), "n").unwrap();
+    std::fs::write(repo.path().join(".gitignore"), "ignored/\n*.log\n").unwrap();
+    let w = core_world(&sub, "http://127.0.0.1:9/v1");
+    let b = &w.backend;
+    let listing = b.project_list(&w.session, "", false).unwrap();
+    let names: Vec<(&str, bool)> = listing
+        .entries
+        .iter()
+        .map(|e| (e.name.as_str(), e.ignored))
+        .collect();
+    assert_eq!(names, [("noise.log", true), ("x.txt", false)]);
+    let read = b.project_read(&w.session, "x.txt").unwrap();
+    assert_eq!((read.rel.as_str(), read.size), ("x.txt", 2));
+    // An absolute path inside the folder is the same file.
+    let abs = sub.join("x.txt").to_string_lossy().into_owned();
+    assert_eq!(b.project_read(&w.session, &abs).unwrap().rel, "x.txt");
+    // Outside the folder (the repository's other files), credentials, missing.
+    assert!(matches!(
+        b.project_read(&w.session, "../a.txt"),
+        Err(super::fs::Refused::Outside(_))
+    ));
+    // A credentials file outside is refused for being outside (nothing outside is looked at);
+    // one inside for what it is.
+    let env = repo.path().join(".env").to_string_lossy().into_owned();
+    assert!(matches!(
+        b.project_read(&w.session, &env),
+        Err(super::fs::Refused::Outside(_))
+    ));
+    std::fs::write(sub.join("id_ed25519"), "-----BEGIN").unwrap();
+    assert_eq!(
+        b.project_read(&w.session, "id_ed25519"),
+        Err(super::fs::Refused::Sensitive)
+    );
+    std::fs::remove_file(sub.join("id_ed25519")).unwrap();
+    assert!(matches!(
+        b.project_read(&w.session, "nope.txt"),
+        Err(super::fs::Refused::NotFound(_))
+    ));
+    let mut found = Vec::new();
+    let summary = b
+        .project_index(&w.session, &mut |batch| {
+            found.extend(batch);
+            true
+        })
+        .unwrap();
+    assert_eq!((found, summary.files), (vec!["x.txt".to_string()], 1));
+    // A session that does not exist, and an editor request for a refused path, start nothing.
+    assert!(b.project_list("nope", "", false).is_err());
+    assert!(b.project_open(&w.session, &env, None).is_err());
+    assert!(b.project_open(&w.session, "../a.txt", None).is_err());
+}

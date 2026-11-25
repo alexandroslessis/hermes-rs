@@ -26,6 +26,7 @@ use hermes_core::Core;
 use hermes_core::git::{self, GIT_TIMEOUT};
 use hermes_core::git_review;
 
+use super::fs::{self, Refused};
 use super::data::{
     DiffData, DiffRequest, Revert, Scope, absolute, editor_command, find_on_path,
     patch_from_changes,
@@ -238,9 +239,14 @@ pub fn open_in_editor(
     if !file.is_file() {
         return Err(format!("{} does not exist.", file.display()));
     }
+    launch_editor(&file, line)
+}
+
+/// Starts the editor on `file` (see [`open_in_editor`]); the name of what opened it.
+fn launch_editor(file: &Path, line: Option<u32>) -> Result<String, String> {
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     let find = |name: &str| find_on_path(&path_var, name);
-    if let Some(command) = editor_command(&find, &file, line) {
+    if let Some(command) = editor_command(&find, file, line) {
         use std::os::windows::process::CommandExt as _;
         Command::new(&command.program)
             .args(&command.args)
@@ -255,4 +261,56 @@ pub fn open_in_editor(
     let plan = hermes_core::open_file::plan(&file.to_string_lossy())?;
     hermes_core::open_file::run(&plan)?;
     Ok("the default app".to_string())
+}
+
+// --- the Files tab --------------------------------------------------------------------------------
+
+/// The thread's folder, which the Files tab's paths are inside of.
+fn project_root(core: &Core, session: &str) -> Result<PathBuf, Refused> {
+    // The app's own data folder is never shown, even in a project that holds it.
+    fs::keep_out(core.data_dir());
+    let cwd = session_cwd(core, session).map_err(Refused::Unreadable)?;
+    if cwd.is_dir() {
+        Ok(cwd)
+    } else {
+        Err(Refused::NoFolder)
+    }
+}
+
+/// A folder's entries (see [`fs::list_dir`]).
+pub fn project_list(
+    core: &Core,
+    session: &str,
+    dir: &str,
+    inherit_ignored: bool,
+) -> Result<fs::Listing, Refused> {
+    fs::list_dir(&project_root(core, session)?, dir, inherit_ignored)
+}
+
+/// One file read and classified (see [`fs::read_file`]).
+pub fn project_read(core: &Core, session: &str, path: &str) -> Result<fs::FileRead, Refused> {
+    fs::read_file(&project_root(core, session)?, path)
+}
+
+/// The finder's index (see [`fs::index_files`]).
+pub fn project_index(
+    core: &Core,
+    session: &str,
+    emit: &mut dyn FnMut(Vec<String>) -> bool,
+) -> Result<fs::IndexSummary, Refused> {
+    fs::index_files(&project_root(core, session)?, fs::INDEX_LIMIT, emit)
+}
+
+/// Opens a file of the thread's folder in the editor. The same rules as the view (inside the
+/// folder, no credentials, no link out), then [`launch_editor`]: the default-app fallback shows an
+/// executable in Explorer and never runs it.
+pub fn project_open(
+    core: &Core,
+    session: &str,
+    path: &str,
+    line: Option<u32>,
+) -> Result<String, String> {
+    let root = project_root(core, session).map_err(|r| r.message())?;
+    let at = fs::locate_file(&root, path).map_err(|r| r.message())?;
+    launch_editor(&fs::plain(&at.abs), line)
 }

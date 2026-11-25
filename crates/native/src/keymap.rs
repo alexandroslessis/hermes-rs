@@ -20,6 +20,7 @@ gpui_kit::actions!(
         ToggleDrawer,
         OpenCommandPalette,
         OpenActionPalette,
+        OpenFileFinder,
         NewThread,
         OpenSettings,
         CycleTheme,
@@ -100,6 +101,16 @@ pub const COMMANDS: &[CommandDef] = &[
         "View",
         Some("ctrl-j"),
         ToggleDrawer
+    ),
+    // After the panel toggles: the palette's first rows (and its gallery story, which shows the
+    // first five actions) stay the ones they were. `Ctrl+P` is bound globally; CP6.3's terminal
+    // must let it through to the shell while it has the focus (a context binding there).
+    command!(
+        "files.find",
+        "Go to file",
+        "Files",
+        Some("ctrl-p"),
+        OpenFileFinder
     ),
     command!(
         "appearance.cycle",

@@ -56,7 +56,7 @@ use crate::{
     notify::{self, Attention, Notifier, Policy},
     model::{AppModel, ModelEvent, Selection, fixture},
     palette::{self, Item, Kind, Mode, Palette, PaletteEvent},
-    panel::{RightPanel, RightPanelEvent},
+    panel::{RightPanel, RightPanelEvent, finder::{FileFinder, FinderEvent}},
     sidebar::{Sidebar, SidebarEvent, data::Snapshot, empty},
     theme::{self, DesignTheme as _, Themes},
     thread::{
@@ -230,6 +230,11 @@ pub struct Workspace {
     toast_timer: Option<Task<()>>,
     palette: Option<Entity<Palette>>,
     palette_subscription: Option<Subscription>,
+    /// What had the focus when the finder opened: closing gives it back.
+    finder_return: Option<FocusHandle>,
+    /// The file finder (`Ctrl+P`) while open.
+    finder: Option<Entity<FileFinder>>,
+    finder_subscription: Option<Subscription>,
     focus: FocusHandle,
     save_task: Option<Task<()>>,
     model: Entity<AppModel>,
@@ -292,7 +297,7 @@ impl Workspace {
         let open = state.right_panel.open;
         right_panel.update(cx, |panel, cx| panel.set_visible(open, cx));
         let subscriptions = vec![
-            cx.subscribe(&right_panel, Self::on_panel_event),
+            cx.subscribe_in(&right_panel, window, Self::on_panel_event),
             cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
             cx.subscribe_in(&model, window, Self::on_model_event),
             // The palette's list, the title and the open thread follow the model.
@@ -310,6 +315,9 @@ impl Workspace {
             toast_timer: None,
             palette: None,
             palette_subscription: None,
+            finder: None,
+            finder_subscription: None,
+            finder_return: None,
             focus,
             save_task: None,
             model,
@@ -349,11 +357,13 @@ impl Workspace {
     /// What the right panel says: toasts, and a revert changing the folder's git state.
     fn on_panel_event(
         &mut self,
-        _: Entity<RightPanel>,
+        _: &Entity<RightPanel>,
         event: &RightPanelEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
+            RightPanelEvent::OpenFinder => self.open_finder(window, cx),
             RightPanelEvent::Notice(spec) => {
                 self.push_toast(spec.clone(), cx);
             }
@@ -477,10 +487,74 @@ impl Workspace {
 
     /// A file link was clicked: the right panel opens on the file (in the diff when it is
     /// changed, else the Files tab's placeholder until CP6.2).
-    pub fn open_file_in_panel(&mut self, file: &OpenFileInPanel, cx: &mut Context<Self>) {
+    pub fn open_file_in_panel(
+        &mut self,
+        file: &OpenFileInPanel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.open_right_panel(cx);
         self.right_panel
-            .update(cx, |panel, cx| panel.open_file(file, cx));
+            .update(cx, |panel, cx| panel.open_file(file, window, cx));
+        cx.notify();
+    }
+
+    /// The file finder, while open.
+    pub fn finder(&self) -> Option<&Entity<FileFinder>> {
+        self.finder.as_ref()
+    }
+
+    /// Opens the finder over the open thread's folder (`Ctrl+P`), or closes it when open.
+    pub fn open_finder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.finder.is_some() {
+            self.close_finder(window, cx);
+            return;
+        }
+        let Some(session) = self
+            .model
+            .read(cx)
+            .thread()
+            .map(|t| t.read(cx).session().to_string())
+        else {
+            self.push_toast(
+                ToastSpec::new(toast::Kind::Info, "Open a thread to search its files."),
+                cx,
+            );
+            return;
+        };
+        // Closing gives the focus back where it was (the composer, the tree).
+        self.finder_return = window.focused(cx);
+        let app = self.model.clone();
+        let finder = cx.new(|cx| FileFinder::new(app, session, window, cx));
+        self.finder_subscription = Some(cx.subscribe_in(
+            &finder,
+            window,
+            |this, _, event: &FinderEvent, window, cx| match event {
+                FinderEvent::Dismiss => this.close_finder(window, cx),
+                FinderEvent::Open(path) => {
+                    let file = OpenFileInPanel {
+                        path: path.clone(),
+                        line: None,
+                    };
+                    // The file view takes it from here.
+                    this.finder_return = None;
+                    this.close_finder(window, cx);
+                    this.open_file_in_panel(&file, window, cx);
+                }
+            },
+        ));
+        finder.update(cx, |f, cx| f.focus_input(window, cx));
+        self.finder = Some(finder);
+        cx.notify();
+    }
+
+    pub fn close_finder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.finder = None;
+        self.finder_subscription = None;
+        match self.finder_return.take() {
+            Some(back) => window.focus(&back, cx),
+            None => window.focus(&self.focus, cx),
+        }
         cx.notify();
     }
 
@@ -989,6 +1063,7 @@ impl Workspace {
         match id {
             "commandPalette.toggle" => self.open_palette(Mode::All, window, cx),
             "commandPalette.actions" => self.open_palette(Mode::Actions, window, cx),
+            "files.find" => self.open_finder(window, cx),
             "sidebar.toggle" => self.toggle_sidebar(cx),
             "rightPanel.toggle" => self.toggle_right_panel(cx),
             "terminal.toggle" => self.toggle_drawer(cx),
@@ -1366,6 +1441,36 @@ impl Render for Workspace {
                 )
         });
 
+        let finder_layer = self.finder.clone().map(|f| {
+            div()
+                .id("finder-layer")
+                .probe()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .items_start()
+                .pt(px((h * 0.12).max(24.)))
+                .bg(palette
+                    .background
+                    .with_alpha(if cx.design_theme().appearance.is_dark() {
+                        163
+                    } else {
+                        153
+                    })
+                    .hsla())
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.close_finder(window, cx)),
+                )
+                .child(
+                    div()
+                        .id("finder-box")
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(f),
+                )
+        });
+
         let handle_edge = px(HANDLE / 2.);
         div()
             .id("workspace")
@@ -1385,6 +1490,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 this.open_palette(Mode::All, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &OpenFileFinder, window, cx| {
+                this.open_finder(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &OpenActionPalette, window, cx| {
                 this.open_palette(Mode::Actions, window, cx)
             }))
@@ -1396,8 +1504,8 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &CycleTheme, _, cx| this.cycle_theme(cx)))
             .on_action(
-                cx.listener(|this, file: &OpenFileInPanel, _, cx| {
-                    this.open_file_in_panel(file, cx)
+                cx.listener(|this, file: &OpenFileInPanel, window, cx| {
+                    this.open_file_in_panel(file, window, cx)
                 }),
             )
             .on_action(cx.listener(|this, diff: &OpenDiffTab, _, cx| this.open_diff_tab(diff, cx)))
@@ -1475,6 +1583,7 @@ impl Render for Workspace {
                 )
             })
             .when_some(toasts, |d, t| d.child(t))
+            .when_some(finder_layer, |d, p| d.child(p))
             .when_some(palette_layer, |d, p| d.child(p))
             .probe()
     }

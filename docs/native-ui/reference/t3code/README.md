@@ -81,6 +81,8 @@ chip `ContextChip.tsx`; the sent thumbnails reuse `app-hover_reply_closeup-dark.
 
 CP5.3: no capture of the approval or question panel exists here (t3code has none of a pending approval: it shows it in the timeline row, and the question as the composer top drawer; I did not drive the user's t3code window). The panel is built from `ComposerBanner.tsx`, `ComposerPendingApprovalActions.tsx`, `TimelinePendingApprovalRow.tsx` and `ComposerPendingUserInputPanel.tsx` (source only), on the card of `app-thread-dark.png`.
 
+CP6.2 took no new screenshot either (t3code's window cannot be driven from here): the tree follows `sidebar-filetree.png` (toolbar with refresh, "Search files" and a collapse-all icon; chevron + icon + name rows, ignored folders dimmed); the file view, the finder, markdown preview, picture view and the light theme follow `FilePreviewPanel.tsx`, `ProjectFilePicker.tsx` and the tokens.
+
 CP6.1 took no new screenshot (t3code's window cannot be driven from here, and nothing was changed in the user's t3code): the diff tab
 follows `DiffPanel.tsx`, `diffs/DiffFileTree.tsx` and `diffs/DiffFileStatus.tsx`, checked against `sidebar-diff.png` (the toolbar and the
 collapsed file rows: chevron, status mark, name, `+N -M`) and `sidebar-diff-content.png` (an opened file: line numbers, added lines on a

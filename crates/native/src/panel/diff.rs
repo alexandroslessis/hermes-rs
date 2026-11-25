@@ -314,6 +314,14 @@ impl DiffPanel {
         Some(shown.entries.iter().any(|e| names_file(path, &e.path)))
     }
 
+    /// Whether `path` is changed in the working tree, as far as the working tree's changes have
+    /// been read (`None`: they have not: another scope is shown, or nothing was read).
+    pub fn working_tree_has(&self, path: &str) -> Option<bool> {
+        let shown = self.shown.as_ref()?;
+        (shown.scope == Scope::WorkingTree)
+            .then(|| shown.entries.iter().any(|e| names_file(path, &e.path)))
+    }
+
     /// Scrolls to the file `path` names, opening it; when the changes are not read yet, once they
     /// are.
     pub fn show_file(&mut self, path: &str, cx: &mut Context<Self>) {

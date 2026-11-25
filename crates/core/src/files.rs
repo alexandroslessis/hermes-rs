@@ -131,6 +131,35 @@ pub fn is_sensitive(path: &Path) -> bool {
         })
 }
 
+/// Credential folders a project browser never enters, wherever they are (Hermes's
+/// `HOME_CREDENTIAL_DIRS`, as the runtime's `@file:` references refuse them under home).
+const CREDENTIAL_DIRS: [&str; 6] = [".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure"];
+
+/// What a front end that browses a project (the native app's Files tab and finder) never reads or
+/// opens: stricter than [`is_sensitive`] (Hermes's preview guard, which the page's routes keep
+/// as Hermes has it). Also the runtime's secret files (`hermes_tools::redact::is_secret_file`:
+/// private keys, `*.pem`, `*.key`, `.netrc`, `.npmrc`, shell profiles...), anything inside a
+/// credential folder (`.ssh`, `.aws`, `.gnupg`, `.kube`, `.docker`, `.azure`, `.config/gh`,
+/// `.config/gcloud`), and git's own folder (`.git/config` can hold a token in a remote URL).
+/// Names compare without case, as Windows does.
+pub fn is_private(path: &Path) -> bool {
+    if is_sensitive(path) || hermes_tools::redact::is_secret_file(path) {
+        return true;
+    }
+    let parts: Vec<String> = path
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    parts.iter().enumerate().any(|(n, part)| {
+        part == ".git"
+            || CREDENTIAL_DIRS.contains(&part.as_str())
+            || (part == ".config"
+                && parts
+                    .get(n + 1)
+                    .is_some_and(|next| next == "gh" || next == "gcloud"))
+    })
+}
+
 /// `_FS_PREVIEW_LANGUAGE_BY_EXT`.
 fn language(path: &Path) -> &'static str {
     let ext = path
@@ -381,6 +410,38 @@ mod tests {
         let env = dir.path().join(".env");
         std::fs::write(&env, "KEY=1").unwrap();
         assert!(matches!(read_text(&env), Err(FileError::Forbidden(_))));
+    }
+
+    #[test]
+    fn a_project_browser_also_keeps_out_keys_credential_folders_and_git_internals() {
+        for private in [
+            "C:/repo/.env",
+            "C:/repo/deploy/id_rsa",
+            "C:/repo/certs/server.PEM",
+            "C:/repo/tls/site.key",
+            "C:/Users/me/.netrc",
+            "C:/Users/me/.npmrc",
+            "C:/Users/me/.SSH/config",
+            "C:/Users/me/.aws/credentials",
+            "C:/Users/me/.docker/config.json",
+            "C:/Users/me/.config/gh/hosts.yml",
+            "C:/Users/me/.config/gcloud/application_default_credentials.json",
+            "C:/repo/.git/config",
+            "C:/repo/.GIT/hooks/pre-commit",
+            "C:/repo/mcp-tokens/server.json",
+        ] {
+            assert!(is_private(Path::new(private)), "{private}");
+        }
+        for public in [
+            "C:/repo/src/env.rs",
+            "C:/repo/.gitignore",
+            "C:/repo/.github/workflows/ci.yml",
+            "C:/repo/docs/ssh.md",
+            "C:/repo/.config/app.toml",
+            "C:/repo/keys.rs",
+        ] {
+            assert!(!is_private(Path::new(public)), "{public}");
+        }
     }
 
     #[test]

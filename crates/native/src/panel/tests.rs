@@ -391,12 +391,10 @@ fn the_panel_lays_out_at_three_window_sizes() {
         ] {
             assert!(l.get(name).is_ok(), "{window:?}: {name} is missing");
         }
-        // One tab, the Diff tab; the strip is the panel's header row.
+        // Two tabs, Diff and Files; the strip is the panel's header row.
         assert_eq!(l.bounds("panel-tabs").size.height.as_f32(), 40.);
-        assert!(
-            l.get("panel-tab-files").is_err(),
-            "only existing tabs are shown"
-        );
+        assert!(l.get("panel-tab-files").is_ok());
+        l.check().same_row("panel-tab-diff", "panel-tab-files").assert();
         check_rows(&mut rig, 7);
         let mut c = l.check();
         c.same_height(&["diff-refresh", "diff-collapse", "diff-split", "diff-tree"]);
@@ -807,93 +805,48 @@ fn open_diff_opens_the_panel_on_the_diff_tab_and_a_path_on_the_turn_when_it_is_k
 }
 
 #[core::prelude::v1::test]
-fn a_file_link_opens_the_diff_on_a_changed_file_else_the_files_placeholder() {
+fn a_file_link_opens_the_files_tab_on_that_file_and_the_diff_is_one_click_away() {
     let mut rig = rig(MEDIUM, &[]);
-    // A file the working tree changes: the diff tab, scrolled to it.
+    // A file the working tree changes: the Files tab shows it and offers its diff.
     rig.dispatch(OpenFileInPanel {
-        path: r"C:\work\structure\src\main.rs".into(),
+        path: "src/main.rs".into(),
         line: Some(3),
     });
     let right = rig.right();
     assert_eq!(
         rig.cx.update(|cx| right.read(cx).tabs().active()),
-        Tab::Diff
-    );
-    assert_eq!(rig.cx.update(|cx| right.read(cx).file().cloned()), None);
-    assert!(rig.layout().get("panel-tab-files").is_err());
-    // A file it does not: the Files tab appears with a placeholder that names it.
-    rig.dispatch(OpenFileInPanel {
-        path: "crates/native/src/workspace.rs".into(),
-        line: Some(89),
-    });
-    assert_eq!(
-        rig.cx.update(|cx| right.read(cx).tabs().active()),
         Tab::Files
     );
-    assert_eq!(
-        rig.cx.update(|cx| right.read(cx).tabs().open().to_vec()),
-        [Tab::Diff, Tab::Files]
-    );
     let l = rig.layout();
-    assert!(l.get("panel-tab-files").is_ok() && l.get("panel-file").is_ok());
-    assert!(l.get("diff-panel").is_err(), "the placeholder is the body");
+    assert!(l.get("file-view").is_ok() && l.get("diff-panel").is_err());
+    assert!(l.get("file-diff").is_ok(), "a changed file offers its diff");
     assert!(rig.toasts().is_empty());
-    // The Diff tab is one click away; the placeholder did not make it read again.
+    // "Diff" opens the Diff tab on the working tree, without reading again.
     let reads = rig.backend.diffs().reads.len();
-    rig.click("panel-tab-diff");
+    rig.click("file-diff");
     assert_eq!(
         rig.cx.update(|cx| right.read(cx).tabs().active()),
         Tab::Diff
     );
     assert!(rig.layout().get("diff-panel").is_ok());
+    assert_eq!(rig.scope(), Scope::WorkingTree);
     assert_eq!(rig.backend.diffs().reads.len(), reads);
-}
-
-#[core::prelude::v1::test]
-fn a_link_before_the_changes_are_read_waits_for_them() {
-    // The panel closed and no read yet: the link opens the panel, reads, and then decides.
-    let mut rig = rig(MEDIUM, &[]);
-    rig.toggle_panel();
-    rig.open("t2");
-    let panel = rig.panel();
-    assert!(
-        rig.cx
-            .update(|cx| panel.read(cx).has_file("src/main.rs"))
-            .is_none(),
-        "nothing read for t2 yet"
-    );
-    rig.dispatch(OpenFileInPanel {
-        path: "src/main.rs".into(),
-        line: None,
-    });
-    let right = rig.right();
-    assert_eq!(
-        rig.cx.update(|cx| right.read(cx).tabs().active()),
-        Tab::Diff
-    );
-    assert_eq!(rig.entries().len(), 7);
 }
 
 #[core::prelude::v1::test]
 fn the_tab_model_keeps_diff_first_and_only_the_open_tabs() {
     let mut tabs = super::Tabs::default();
-    assert_eq!((tabs.open(), tabs.active()), (&[Tab::Diff][..], Tab::Diff));
-    assert!(
-        !tabs.activate(Tab::Files),
-        "a tab that is not open cannot be activated"
-    );
-    tabs.show(Tab::Files);
     assert_eq!(
         (tabs.open(), tabs.active()),
-        (&[Tab::Diff, Tab::Files][..], Tab::Files)
+        (&[Tab::Diff, Tab::Files][..], Tab::Diff)
     );
+    assert!(tabs.activate(Tab::Files));
     tabs.show(Tab::Diff);
     tabs.show(Tab::Files);
     assert_eq!(tabs.open().len(), 2, "no duplicates");
     tabs.close(Tab::Diff);
-    assert_eq!(tabs.open().len(), 2, "Diff stays");
     tabs.close(Tab::Files);
-    assert_eq!((tabs.open(), tabs.active()), (&[Tab::Diff][..], Tab::Diff));
+    assert_eq!(tabs.open().len(), 2, "Diff and Files stay");
 }
 
 // --- big diffs ----------------------------------------------------------------------------------------------

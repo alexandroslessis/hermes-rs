@@ -935,18 +935,20 @@ fn opening_a_thread_in_the_sidebar_shows_it_and_its_events_stream_in() {
     })
     .unwrap();
     settle(&mut cx);
-    // The fixture's working tree does not change that file: the Files tab's placeholder names it
-    // (CP6.2 builds the file view).
-    let (open, file) = cx.update(|cx| {
+    // The Files tab opens on it (the fixture project has no such file: the view says so).
+    let (open, tab, asked) = cx.update(|cx| {
         let w = window.read(cx).unwrap();
+        let right = w.right_panel().read(cx);
         (
             w.state().right_panel.open,
-            w.right_panel().read(cx).file().cloned(),
+            right.tabs().active(),
+            right.files().read(cx).view().read(cx).asked().map(str::to_string),
         )
     });
     assert!(open);
-    assert_eq!(file.unwrap().label(), "src/stream.rs:42");
-    assert!(layout(&mut cx, handle).get("panel-file").is_ok());
+    assert_eq!(tab, crate::panel::Tab::Files);
+    assert_eq!(asked.as_deref(), Some("src/stream.rs"));
+    assert!(layout(&mut cx, handle).get("file-view").is_ok());
     // Closing the thread drops its model and view.
     cx.update(|cx| model.update(cx, |m, cx| m.clear_selection(cx)));
     settle(&mut cx);

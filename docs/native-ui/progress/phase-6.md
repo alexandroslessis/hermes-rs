@@ -269,3 +269,151 @@ Tests after the fixes (`CARGO_TARGET_DIR=target/claude`): `scripts/native/check.
 `dist-webapp` copied from the main checkout for the build and removed after); `hermes_tools --lib checkpoints` 4, `hermes_runtime
 --lib changes` 6; `scripts/perf/native-thread-check.ps1` ok; `cargo build --workspace --locked` passes;
 `scripts/clean-test-temp.ps1`: 8 folders removed, then 0; no process left under `target\claude`.
+
+## CP6.2 — Files
+Worktree: C:\Users\alexandros\repos\hermes-rs-n6   Branch: native/p6-panel   Model: Sonnet 5.5 (subagent)
+Cut from CP6.1 (40e2b96). Uncommitted. The run was interrupted by a rate limit and resumed; the worktree was re-checked against the brief.
+
+### Files
+- New in `crates/native/src/panel/`: `fs.rs` (disk rules, no views: `locate` with the refusals `Refused::{Outside, Escapes, Sensitive, NotFound, NotAFile, TooLarge, ...}`, `list_dir` with git-ignored marks, `read_file` + `classify`, `index_files`, `Ignores` over the `ignore` crate's matcher), `tree.rs` (the tree as data: lazy loads, open folders, flat rows, keys), `files.rs` (`FilesPanel`: toolbar, virtual tree, tree/file modes, keys), `viewer.rs` (`FileView`: read-only code editor, markdown preview, SVG, pictures, binary, refusals, jump to line), `finder.rs` (`Ctrl+P`: chunked index, background ranking, dialog), `fixture_files.rs` (virtual or on-disk fake project), tests `files_tests.rs`, `finder_tests.rs`, plus a real-core test in `real_tests.rs`; new story file `gallery/panel_files.rs` (`panel-files`, `file-finder`).
+- Edited: `panel/mod.rs` (Files is a tab that is always open; the placeholder, `file`, `waiting`, `show_changed` are gone; `open_file(file, window, cx)`, `view_diff`, `show_tab`, visibility per tab), `panel/diff.rs` (`working_tree_has`), `panel/backend.rs` (`project_list/read/index/open`; the editor launcher shared with CP6.1's), `model/backend.rs` (4 trait methods; Core and Fixture impls), `workspace.rs` (finder layer, `open_finder`, `open_file_in_panel` takes the window, panel events with window), `keymap.rs` (`files.find`, `Ctrl+P`), `app.rs` (binds), `palette.rs` (`highlighted` is `pub(crate)`), `thread/markdown.rs` (`preview`, `preview_link`), `design/icons.rs` (FileCode, FileImage), `testing.rs` (scrolling lists exempt from `no_overflow`), `gallery/panel.rs` (the `files` state moved out), `Cargo.toml`/`Cargo.lock` (`ignore`, already in the lock). Old tests adapted: `panel/tests.rs` (two tabs, the file-link test, the tab model; "link before the read waits" removed: the Files tab needs no diff read), `thread/tests.rs`.
+- **Core (`hermes_core`): unchanged.** Docs: AGENTS.md, ARCHITECTURE.md, TESTING.md, PITFALLS.md (3 bullets), PHASES.md status, native-ui/README.md row, reference/t3code/README.md (no screenshot). PORTING.md: no row (no Hermes port; `fs.rs` reuses the core's sensitive-path check).
+
+### What it does
+1. **Tree.** Root = the open thread's folder. Only the root is read when the tab is first on screen; a folder when opened (background task); ignored folders (`.gitignore` from the repository top down, nested files with negation, `.git/info/exclude`) are dimmed, listed on demand as ignored, never read until opened; a listing is cut at 10,000 entries with a "N more" row. Keys: Up/Down/Home/End, Left/Right, Enter/Space. Refresh (button, window forward, turn end) re-lists open folders and keeps rows; collapse all; thread switch starts over.
+2. **File view.** Replaces the tree with a back button (stacked, not side by side: deviation). Source = Kit's read-only code editor (syntax, line numbers, horizontal scroll, Ctrl+F); markdown rendered with a Source switch (links: web ones open, relative ones open that file resolved from the file's folder, the rest nothing); SVG as a picture with a Source switch; PNG/JPEG/GIF/WebP/BMP/TIFF/ICO decoded and shrunk (over 2048 px) in a background task and drawn from a renderer image (animated GIFs show frame 1); binary: "Binary file, N bytes" + Open in editor; non-UTF-8: replacement characters + a note; over 2 MB: plain text + note; over 20 MB: refused with the editor offered. `path:line` selects the line and scrolls it into view (4 rows of context).
+3. **Refusals** (message, no editor offer except too-large): outside the folder (also `..`, absolute, `~`), a link/junction that leaves, credentials (`is_sensitive` on the asked and the resolved path), a folder, missing. Open in editor checks the same rules, then CP6.1's launcher.
+4. **Finder** `Ctrl+P` (and the toolbar field): index built by a background walk in batches of 2,000 (ignored folders, `.git`, links, credential files left out; cap 200,000), ranked on the background executor (byte filter, cheap score for the best 400, the palette's matcher for the final order and bold positions, a whole-word bonus), 100 results, virtual list; Enter opens at no line, Esc closes, same overlay place as the palette.
+5. **Links.** `OpenFileInPanel` (timeline, edit cards, finder) opens the Files tab on the file; when the diff has read the working tree and the file is changed, the header shows "Diff" (Diff tab on it).
+
+### Tests (`CARGO_TARGET_DIR=target/claude`, run from the worktree root)
+- Results of the final runs are in the last block of this section ("Final runs").
+- New tests: `fs` 14 (listing, nested ignores + negation, exclude file, subfolder of a repo, cut listing, index limits, `..`/outside/absolute/`file:`, credentials, links/junctions (made with `mklink /J`, no rights needed), classification, 2 MB / 20 MB, the 100,000-file tree), `tree` 5, `finder` 6, `fixture_files` 1, `markdown` 1 (preview links), `files_tests` 17, `finder_tests` 4, `real_tests` 1 (real `Core`: list/read/index/refusals/open for a thread in a repository's subfolder).
+- **100,000-file tree** (1,000 folders, empty files, debug build): the `fs` test prints the timings (`cargo test -p hermes-native --lib panel::fs::tests::indexing -- --nocapture`); asserted bound 20 s. Ranking 100,000 synthetic paths (`finder` test): bound 3 s per query, timings printed. Over the UI, 20,000 real files: indexed while typing, a two-letter query ranked in the printed time, results capped at 100.
+- A 2.4 MB, 40,000-line file opens as plain text and jumps to line 30,000 (time printed by its test, bound 30 s).
+- Not asserted (headless limit): that the picture decode runs on another thread; the test platform runs background tasks on the test's own thread. The code path is `background_spawn`.
+
+### Snapshots
+New (4): `panel-files-t3-{light,dark}.png` (7 states: tree, code with line 5, markdown, image, svg, binary, refused), `file-finder-t3-{light,dark}.png` (results, none, indexing). **Pre-existing baselines that changed (6):** `app-frame-t3-{light,dark}` (right panel: two tabs), `palette-t3-{light,dark}` (a new "Go to file  Ctrl+P" row), `panel-diff-t3-{light,dark}` (the `files` placeholder state removed: 5 states). I looked at the dark `panel-files` and `file-finder` sheets: layout and colours are as intended. The light ones and the three changed pairs were not inspected here (for the Haiku check).
+
+### Deviations
+- Tree and file share the panel by turns (back button), not t3code's tree column beside the file; no resizable column; no git dots on folders, no context menu, no drag-to-mention; four generic file icons instead of per-type colour icons.
+- The finder re-indexes each time it opens (no cache). The user's global git excludes are not read.
+- Files is always in the tab strip (no "+" chooser exists).
+- No t3code screenshot was taken (cannot drive its window): the file view, finder, markdown, picture and light themes follow the source and tokens.
+- Core operations that do not exist (implemented in `panel/fs.rs` instead): a project listing with ignore marks, a bounded classified read, a finder index. `files::read_text` caps at 512 KB, `paths::list_dir` is not ignore-aware or root-bound, `looks_binary` is private (copied: 10 lines).
+
+### For the reviewer
+1. **Where `fs.rs` lives.** Native, not `hermes_core`; moving it to the core is mechanical if another front end needs it.
+2. **`locate` is the security core**: canonical both sides, `starts_with` on canonical paths, `Escapes` vs `Outside` decided lexically. Please look for TOCTOU (a file swapped for a link between the check and the read) and Windows oddities (8.3 names, verbatim prefix, case); `plain()` strips the verbatim prefix before the editor launch.
+3. **Kit's editor as a viewer**: `EditorState` read-only, `set_scroll_offset` (deferred to the next layout) for the jump, row height assumed 1.5 x the mono size (a test asserts the line is among the laid-out rows). 40,000-line plain file performance: see the test's printed time.
+4. **A jump to a line on a markdown file shows the source** (the line is only meaningful there).
+5. **`RightPanel::view_diff` sets the diff scope to the working tree** (as CP6.1's link did); the "Diff" button needs the working tree to have been read, no read is started for it.
+6. **Finder keys**: `Ctrl+P` inside the finder is "previous" (as in the palette); the global `Ctrl+P` toggles it only when focus is outside the dialog.
+7. A tree refresh keeps stale rows for a deleted folder until its listing fails (shown as an error row).
+8. `Tree::is_ignored` only reads the folder's own flag; children of an ignored folder are flagged by the inherit rule at listing time.
+9. A click on a link in rendered markdown dispatches the window action `OpenFileInPanel`; no test clicks it (the link rules are unit-tested).
+10. Pre-existing and untouched: clippy notes and unformatted Phase 4/5 files; mine are `rustfmt`ed.
+
+### User checklist (CP6.2, the files)
+Build as in CP6.1 (`target/claude`, `HERMES_RS_HOME=target\native-test`); use a throwaway folder, never `%APPDATA%`.
+A. `hermes-native.exe --fixture`: open "halo", Ctrl+Alt+B.
+ 1. Click the "Files" tab: a tree (assets, crates, ... README.md); `node_modules`, `target` and `debug.log` are dim; `outside` has a lock.
+ 2. Click a folder: it opens; click a file (`src/main.rs`): the file with line numbers and colours; the arrow goes back to the tree with the file selected.
+ 3. Up/Down/Left/Right/Home/End/Enter on the tree move and open (focus the tree by clicking a row).
+ 4. `README.md`: rendered, Preview/Source switch; click a relative link ("the guide"): that file opens.
+ 5. `assets/logo.png`, `logo.svg`, `data.bin`, `docs/old.txt`, `data/huge.sql`, `.env`: a picture, a vector picture with Source, "Binary file, 2,048 bytes", a note about replacement characters, a "34.0 MB, files over 20.0 MB are not opened" message with Open in editor, "holds credentials".
+ 6. Ctrl+P: type "main": `src/main.rs` first, bold letters; Enter opens it; Esc closes; the "Search files" field does the same.
+ 7. In "Fix the sidebar width" click `workspace.rs` in the reply: the Files tab opens on `crates/native/src/workspace.rs`.
+B. Real core, a throwaway folder with a `.gitignore`: the same on real files; the editor icon opens Zed or VS Code (or the default app) at the line; a changed file shows a "Diff" button (after the Diff tab has been read).
+Hand-only: scrolling and selection feel in the editor, a huge real repository (`node_modules` open, Ctrl+P on 100,000 files), the light theme, dragging the panel wider.
+
+### Final runs
+- `scripts/native/check.ps1`: "native check: all ok" (build, `cargo test -p hermes-native`, then with `--features snapshots`, baselines as listed above).
+- Timings (debug build, this machine): index of 100,000 real files first batch 17.5 ms, all 708 ms (50 batches); ranking 100,000 paths: "f" 66 ms, "fi" 73 ms, "src rs" 163 ms, no match 13 ms; UI over 20,000 real files indexed in 878 ms, a 2-letter query ranked in 206 ms; a 2.4 MB / 40,000-line file opened, jumped to line 30,000 and drawn in 592 ms.
+- `cargo test -p hermes-native --lib panel::real_tests`: 7 passed (incl. the new Files test). `hermes_core` is unchanged, so its tests and `hermes-desktop`s were not rerun. `cargo build --workspace` passes (the webapp dist copied from the main checkout for the build and removed after). `scripts/perf/native-thread-check.ps1`: ok. `scripts/clean-test-temp.ps1`: 13 folders removed, then 0.
+
+### Visual check (Haiku 5.5)
+References opened: `docs/native-ui/reference/t3code/sidebar-filetree.png` and `sidebar-right.png` (for the dark new sheets). Previous versions of the changed sheets: `HEAD` copies, compared by eye.
+- panel-files-t3-dark: differs vs sidebar-filetree | tree is a separate state, not a column beside the file (documented); selected row is a grey fill, not t3's blue outline; file icons are generic, no git dots (documented). Otherwise expected: chevrons and indent, dimmed ignored rows, lock on `outside`, gutter numbers, syntax colours, markdown, picture, SVG, binary and refused states legible, no clipping beyond the expected code scroll.
+- panel-files-t3-light: expected | legible and readable; dimmed `debug.log` and `node_modules` are low-contrast grey on white but still readable.
+- file-finder-t3-dark: expected | input, bold match in `main.rs`, selected row, "18 files" and the Enter/Esc hint, no-match and indexing states all visible. No t3 finder reference exists in the set.
+- file-finder-t3-light: expected | same layout, legible.
+- app-frame-t3-dark: changed-as-expected | right panel now shows Diff and Files tabs. Versus sidebar-right: differs, no "+" tab button and no "Open a surface" chooser (documented).
+- app-frame-t3-light: changed-as-expected | Diff and Files tabs; legible.
+- palette-t3-dark: unexpected change | "Go to file  Ctrl P" row added as intended, but the "Toggle right panel  Ctrl Alt B" action row is gone from the list and from the "tog" search (present in HEAD).
+- palette-t3-light: unexpected change | same as dark: "Toggle right panel" row missing.
+- panel-diff-t3-dark: changed-as-expected | the `files` placeholder state (`workspace.rs:89`, "The file view arrives with CP6.2") is removed; 5 states remain.
+- panel-diff-t3-light: changed-as-expected | same removal; legible.
+
+### Review (Opus 5.5)
+Verdict: a good checkpoint whose path rules needed hardening for Windows; fixed. `main` had not moved (no merge).
+
+**Findings and fixes**
+1. **Sensitive-path parity (fixed, core).** The Tauri preview's `files::is_sensitive` (Hermes's guard: `.env`, `auth.json`,
+   `mcp-tokens`...) is narrower than what the runtime refuses: `id_rsa`, `*.pem`, `*.key`, `.netrc`, `.npmrc`, shell profiles
+   (`redact::is_secret_file`), `.ssh`/`.aws`/`.gnupg`/`.kube`/`.docker`/`.azure`/`.config/gh|gcloud` (the `@file:` rule), and
+   `.git/config` (a token in a remote URL) was readable. New `hermes_core::files::is_private` = all of those + `.git`, used by
+   `fs.rs` (locate, the finder's walk) and the fixture; `is_sensitive` (and so the page's routes) is unchanged. The app's
+   data folder is kept out of any project that holds it (`fs::keep_out(core.data_dir())`, not when the project is inside it).
+   Tests: core `a_project_browser_also_keeps_out_...`; fs `keys_credential_folders_and_git_internals_...`,
+   `a_kept_out_folder_...`; the real-core test reads an `id_ed25519` inside the folder (refused).
+2. **Network paths were touched (fixed, serious on Windows).** `locate` canonicalised before checking containment, and
+   `list_dir` canonicalised every link: a `\\host\share` link in a message, a `file:////host/...`, or a symbolic link in a
+   cloned repository pointing at a share would make Windows connect and send the user's sign-in (NTLM). Now a path must be
+   lexically below the folder (names without case; as given or as the disk spells it, 8.3 included) before any disk call;
+   links on the way are `read_link`ed, recursively (16 deep), and only followed when they stay inside; `.gitignore` and
+   `.git` are looked at without following links. Then canonical + `starts_with` as before (Escapes). Tests:
+   `windows_path_forms_that_lead_elsewhere_...` (UNC, `\\?\UNC`, `\\.\pipe`, `\\.\C:`, `C:foo`, `..`, all Outside in < 2 s;
+   other case and the verbatim form of an inside file fine), `a_link_to_another_machine_...` (skipped here: no symlink rights).
+3. **Windows names (fixed).** `.env::$DATA` / `a:stream` (an alternate data stream: bypassed the name check), `CON`,
+   `nul.txt`, `COM1`, trailing dots/spaces are refused before the disk (`odd_name`); the canonical re-check covers 8.3
+   names. Test `names_windows_reads_as_...`.
+4. **TOCTOU and bounded read (fixed).** `read_file` stat-checked a path and then `fs::read` it again. Now it opens once,
+   checks the handle (`GetFileType` = disk, so no device or pipe; `GetFinalPathNameByHandleW` still inside and not private),
+   stats the handle, and reads `take(OPEN_MAX + 1)` (a growing log is refused at 20 MB, a sparse file by its length first).
+   What remains: "Open in editor" hands a checked path to another program, which opens it again (inherent).
+5. **Palette row (fixed).** Not a cap or a cfg: the gallery story shows the first five actions, and "Go to file" was the
+   third command, pushing "Toggle right panel" out. `files.find` moved after the panel toggles; the `palette-t3-*`
+   baselines are HEAD's again. Test `the_actions_are_listed_in_their_order_and_tog_finds_both_panel_toggles`.
+6. **A 5 MB minified file froze the UI ~11.5 s (debug)** laying out its one line on the UI thread. Lines over 10,000 bytes
+   are now cut (in `classify`, off the UI thread) with a note; 0.6 s. Markdown and SVG over 2 MB are shown as text (they
+   were rendered regardless of size). UTF-8 BOM dropped. Test `a_five_megabyte_single_line_...` (timing printed).
+7. **SVG (fixed).** Rasterised by GPUI (usvg/resvg, at most 8192 px a side, on GPUI's background executor; no webview, no
+   script, no HTTP), but usvg reads `<image href="C:\...">` or `\\host\...` from disk: every `href` that is not `#...` or
+   `data:` is emptied first (`viewer::svg_without_references`, tested incl. entity-hidden values). The picture is made once
+   per file, not copied and hashed on every frame.
+8. **Raster decode:** off the UI thread (code path `background_spawn`), 256 MB decoder allocation cap, shrunk to 2048 px;
+   now also asserted deterministically: right after `show_read` of a 4000x3000 PNG, inside the same UI update, nothing is
+   decoded; one decode follows on the task.
+9. **Markdown images** are never fetched: GPUI's default `NullHttpClient` is the app's (none is installed); local images do
+   not load either (documented in PITFALLS). Links follow the thread's rules (tested by the implementer).
+10. **Names drawn escaped:** control and bidi-override characters (`invoice\u{202E}gpj.exe`) are drawn as U+FFFD, one for
+    one, in the tree, the finder (highlight positions still fit) and the view's header (`fs::shown_name`, tested).
+11. **Finder focus:** closing (Escape, a click outside, `Ctrl+P` again) gives the focus back where it was (test
+    `closing_the_finder_gives_the_focus_back_where_it_was`); opening a file leaves it with the panel.
+12. Selected row: t3code's tree selection is a 12% `currentColor` fill (`pierre-tree-theme.ts`,
+    `--trees-selected-bg-override`), which ours matches; the outline in `sidebar-filetree.png` is Pierre's keyboard
+    focus ring. Left as is.
+
+Checked and fine: views never touch the disk or the core (only `Backend::project_*` on `background_spawn`); `fs.rs` is
+called from the backends only; tokens, no raw colours; `ignore` was already in `Cargo.lock`; no store change; tests use
+`hermes_testdir`; the finder's walk stops when the finder closes (the channel closes); ranking prefers basename matches.
+
+**Left, and why**
+- `Ctrl+P` is a global binding: CP6.3's terminal must take it in its own key context so the shell gets it (noted in
+  `keymap.rs`).
+- The finder re-indexes on each open (0.7 s for 100,000 files, off the UI thread): acceptable; no cache.
+- A listing reads a whole folder before cutting at 10,000 (memory ~ names only). Markdown parse and the editor's rope are
+  built on the UI thread for files up to 2 MB / 20 MB (measured: 0.6 s for 2.4 MB debug).
+- UTF-16 files are shown as binary. The user's global git excludes are not read (documented).
+- Junctions / links whose target is spelled a third way (not the session's spelling nor the canonical one) count as
+  leading out (shown with the lock).
+- Tree as a separate state, generic icons, no git dots, no "+" tab (documented deviations / CP6.3).
+
+Tests after the fixes (`CARGO_TARGET_DIR=target/claude`): `scripts/native/check.ps1` "native check: all ok" (lib tests
+and `--features snapshots`; the `palette-t3-*` baselines are HEAD's again and match, no other baseline changed by the
+review); `cargo test -p hermes_core` 149 passed; `cargo test -p hermes-desktop` 130 + 68 passed (RPC-table fixture
+unchanged; the webapp's `dist-webapp` copied from the main checkout for the build and removed after);
+`cargo build --workspace --locked` passes; `scripts/perf/native-thread-check.ps1` ok; `scripts/clean-test-temp.ps1`:
+5 folders removed, then 0; no process left under `target\claude`.

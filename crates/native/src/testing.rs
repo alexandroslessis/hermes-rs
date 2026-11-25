@@ -191,7 +191,15 @@ impl Checks<'_> {
                     .any(|s| {
                         matches!(
                             s.as_str(),
-                            "threads" | "timeline-list" | "ask-body" | "diff-list" | "diff-code"
+                            "threads"
+                                | "timeline-list"
+                                | "ask-body"
+                                | "diff-list"
+                                | "diff-code"
+                                | "files-list"
+                                | "file-code"
+                                | "file-markdown"
+                                | "finder-results"
                         )
                     })
             })

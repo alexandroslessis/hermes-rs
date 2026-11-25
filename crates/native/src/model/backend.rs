@@ -51,6 +51,7 @@ use crate::sidebar::data::{
 use crate::panel::{
     backend as panel_backend,
     data::{DiffData, DiffRequest},
+    fs::{FileRead, IndexSummary, Listing, Refused},
 };
 use crate::thread::composer::ask::{Answer, Choice};
 use crate::thread::composer::attach::{self, Prepared, Refusal};
@@ -219,6 +220,47 @@ pub trait Backend: Send + Sync + 'static {
     /// Opens a changed file (a path as the diff names it) in the user's editor at `line`; the
     /// name of what opened it ("Zed", "VS Code", "the default app").
     fn open_in_editor(
+        &self,
+        _session: &str,
+        _path: &str,
+        _line: Option<u32>,
+    ) -> Result<String, String> {
+        Err("Opening a file is not available here.".to_string())
+    }
+    /// The Files tab: the entries of folder `dir` of the thread's folder (empty for the folder
+    /// itself); `inherit_ignored`: `dir` is itself ignored by git (CP6.2). Reads the disk, so it
+    /// blocks.
+    fn project_list(
+        &self,
+        _session: &str,
+        _dir: &str,
+        _inherit_ignored: bool,
+    ) -> Result<Listing, Refused> {
+        Err(Refused::Unreadable(
+            "The file tree is not available here.".to_string(),
+        ))
+    }
+    /// The Files tab: reads the file `path` names (relative to the thread's folder, absolute or a
+    /// `file:` link), or says why it is not shown. Blocks.
+    fn project_read(&self, _session: &str, _path: &str) -> Result<FileRead, Refused> {
+        Err(Refused::Unreadable(
+            "The file view is not available here.".to_string(),
+        ))
+    }
+    /// The finder's index: every file of the thread's folder that git does not ignore, in
+    /// batches handed to `emit` (it returns `false` to stop). Blocks until the walk ends.
+    fn project_index(
+        &self,
+        _session: &str,
+        _emit: &mut dyn FnMut(Vec<String>) -> bool,
+    ) -> Result<IndexSummary, Refused> {
+        Err(Refused::Unreadable(
+            "The file finder is not available here.".to_string(),
+        ))
+    }
+    /// Opens a file of the thread's folder in the user's editor at `line` (as
+    /// [`Backend::open_in_editor`], with the Files tab's path rules); the name of what opened it.
+    fn project_open(
         &self,
         _session: &str,
         _path: &str,
@@ -1213,6 +1255,36 @@ impl Backend for CoreBackend {
         panel_backend::open_in_editor(&self.core, session, path, line)
     }
 
+    fn project_list(
+        &self,
+        session: &str,
+        dir: &str,
+        inherit_ignored: bool,
+    ) -> Result<Listing, Refused> {
+        panel_backend::project_list(&self.core, session, dir, inherit_ignored)
+    }
+
+    fn project_read(&self, session: &str, path: &str) -> Result<FileRead, Refused> {
+        panel_backend::project_read(&self.core, session, path)
+    }
+
+    fn project_index(
+        &self,
+        session: &str,
+        emit: &mut dyn FnMut(Vec<String>) -> bool,
+    ) -> Result<IndexSummary, Refused> {
+        panel_backend::project_index(&self.core, session, emit)
+    }
+
+    fn project_open(
+        &self,
+        session: &str,
+        path: &str,
+        line: Option<u32>,
+    ) -> Result<String, String> {
+        panel_backend::project_open(&self.core, session, path, line)
+    }
+
     fn answer(&self, prompt_id: &str, answer: &Answer) -> Result<bool, String> {
         use hermes_tools::approval::ApprovalChoice;
         Ok(match answer {
@@ -1268,6 +1340,8 @@ pub struct FixtureBackend {
     answered_asks: Mutex<std::collections::HashSet<String>>,
     /// The right panel's diff: what each scope answers, and what was asked of it.
     diffs: Mutex<crate::panel::fixture::FixtureDiffs>,
+    /// The Files tab's project: what it answers, and what was asked of it.
+    project: Mutex<crate::panel::fixture_files::FixtureFiles>,
 }
 
 /// A composer operation that reached a [`FixtureBackend`].
@@ -1345,12 +1419,18 @@ impl FixtureBackend {
             open_asks: Mutex::default(),
             answered_asks: Mutex::default(),
             diffs: Mutex::new(crate::panel::fixture::FixtureDiffs::sample()),
+            project: Mutex::new(crate::panel::fixture_files::FixtureFiles::sample()),
         })
     }
 
     /// The right panel's fake repository (what each scope answers, what was asked of it).
     pub fn diffs(&self) -> std::sync::MutexGuard<'_, crate::panel::fixture::FixtureDiffs> {
         self.diffs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The Files tab's fake project (what it answers, what was asked of it).
+    pub fn project(&self) -> std::sync::MutexGuard<'_, crate::panel::fixture_files::FixtureFiles> {
+        self.project.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The models a fixture offers: two providers, a handful of models.
@@ -2054,6 +2134,47 @@ impl Backend for FixtureBackend {
         let mut diffs = self.diffs.lock().unwrap_or_else(|e| e.into_inner());
         diffs.opened.push((session.to_string(), path.to_string(), line));
         Ok("the fixture editor".to_string())
+    }
+
+    fn project_list(
+        &self,
+        session: &str,
+        dir: &str,
+        inherit_ignored: bool,
+    ) -> Result<Listing, Refused> {
+        self.project().list(session, dir, inherit_ignored)
+    }
+
+    fn project_read(&self, session: &str, path: &str) -> Result<FileRead, Refused> {
+        self.project().read(session, path)
+    }
+
+    fn project_index(
+        &self,
+        _session: &str,
+        emit: &mut dyn FnMut(Vec<String>) -> bool,
+    ) -> Result<IndexSummary, Refused> {
+        // The lock is not held while the walk emits: a disk project can take a while.
+        let source = {
+            let mut project = self.project();
+            project.indexed += 1;
+            project.source.clone()
+        };
+        match source {
+            crate::panel::fixture_files::Source::Virtual(project) => Ok(project.index(emit)),
+            crate::panel::fixture_files::Source::Disk(root) => {
+                crate::panel::fs::index_files(&root, crate::panel::fs::INDEX_LIMIT, emit)
+            }
+        }
+    }
+
+    fn project_open(
+        &self,
+        session: &str,
+        path: &str,
+        line: Option<u32>,
+    ) -> Result<String, String> {
+        self.project().open(session, path, line)
     }
 
     fn answer(&self, prompt_id: &str, answer: &Answer) -> Result<bool, String> {
