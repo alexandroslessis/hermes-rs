@@ -179,6 +179,8 @@ pub enum Status {
     /// mark, in the warning colour). The sidebar shows it; it is not in [`Status::ALL`], which is
     /// the CP2.2 gallery's five (adding a state there would change its approved snapshot).
     Approval,
+    /// The agent asked a question and waits for the answer (t3code's "Input").
+    Input,
 }
 
 impl Status {
@@ -200,6 +202,7 @@ impl Status {
             Status::Unread => "New",
             Status::Done => "Done",
             Status::Approval => "Approval",
+            Status::Input => "Input",
         }
     }
 
@@ -212,6 +215,7 @@ impl Status {
             Status::Unread => palette.primary,
             Status::Done => palette.success_foreground,
             Status::Approval => palette.warning_foreground,
+            Status::Input => palette.info_foreground,
         }
     }
 
@@ -225,6 +229,7 @@ impl Status {
             Status::Unread => IconName::CircleDot,
             Status::Done => IconName::CircleCheck,
             Status::Approval => IconName::ShieldQuestionMark,
+            Status::Input => IconName::MessageCircleQuestionMark,
         }
     }
 }

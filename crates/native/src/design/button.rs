@@ -246,6 +246,8 @@ pub struct Button {
     icon_only: bool,
     tooltip: Option<SharedString>,
     on_click: Option<ClickHandler>,
+    /// The key that does the same, quietly after the label (the approval panel's `1`, `Esc`).
+    hint: Option<SharedString>,
 }
 
 impl Button {
@@ -262,7 +264,14 @@ impl Button {
             icon_only: false,
             tooltip: None,
             on_click: None,
+            hint: None,
         }
+    }
+
+    /// A key hint after the label (`1`, `Esc`, `↵`), drawn at 60%.
+    pub fn hint(mut self, key: impl Into<SharedString>) -> Self {
+        self.hint = Some(key.into());
+        self
     }
 
     /// A square button with only an icon (t3code's `icon*` sizes); give it an accessible name
@@ -361,6 +370,16 @@ impl RenderOnce for Button {
                         .text_size(size.text().size)
                         .child(label.clone())
                         .probe_text(label),
+                )
+            })
+            .when_some(self.hint.clone(), |row, hint| {
+                row.child(
+                    div()
+                        .id("hint")
+                        .opacity(0.6)
+                        .text_size(text::XXS2.size)
+                        .child(hint.clone())
+                        .probe_text(hint),
                 )
             });
 

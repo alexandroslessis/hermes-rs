@@ -78,3 +78,5 @@ theme, the grown input, the queue strip, the mode menu in isolation and the cont
 CP5.2 took no new screenshot either (the window cannot be driven from here, and nothing was changed in the user's t3code): the
 `@`/`/` drawer follows `ComposerCommandMenu.tsx` and `ComposerCommandMenuLayer.tsx`, the strip `ComposerAttachmentStrip.tsx`, the
 chip `ContextChip.tsx`; the sent thumbnails reuse `app-hover_reply_closeup-dark.png`. No README row to add: no file was added.
+
+CP5.3: no capture of the approval or question panel exists here (t3code has none of a pending approval: it shows it in the timeline row, and the question as the composer top drawer; I did not drive the user's t3code window). The panel is built from `ComposerBanner.tsx`, `ComposerPendingApprovalActions.tsx`, `TimelinePendingApprovalRow.tsx` and `ComposerPendingUserInputPanel.tsx` (source only), on the card of `app-thread-dark.png`.

@@ -58,6 +58,14 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# The taskbar flash and the toast of a waiting thread (src/notify.rs; Windows only). All three are
+# already in Cargo.lock: the workspace's `windows`, the window handle GPUI's windows implement, and
+# the Tauri app's toast crate.
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+tauri-winrt-notification = "0.8"
+windows.workspace = true
+
 [dev-dependencies]
 hermes_testdir.workspace = true
 gpui-kit = { version = "=0.10.0", features = ["syntect", "test-support"] }

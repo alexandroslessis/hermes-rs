@@ -136,6 +136,8 @@ register_stories![
     composer::COMPOSER_MENTIONS,
     composer::COMPOSER_COMMANDS,
     composer::COMPOSER_ATTACHMENTS,
+    composer::COMPOSER_ASKS,
+    sidebar::SIDEBAR_WAITING,
     thread::THREAD,
     thread::THREAD_LIVE,
     thread::TOOLS_COMMAND,

@@ -32,6 +32,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -52,6 +53,7 @@ use crate::{
     },
     dev::ProbeExt as _,
     keymap::{self, *},
+    notify::{self, Attention, Notifier, Policy},
     model::{AppModel, ModelEvent, Selection, fixture},
     palette::{self, Item, Kind, Mode, Palette, PaletteEvent},
     sidebar::{Sidebar, SidebarEvent, data::Snapshot, empty},
@@ -71,6 +73,8 @@ pub const MAIN_MIN_WIDTH: f32 = 320.;
 pub const MAIN_MIN_HEIGHT: f32 = 160.;
 /// How wide the invisible band that grabs a border is.
 pub const HANDLE: f32 = 6.;
+/// How often the frame looks for a click on a notification.
+const CLICK_POLL: Duration = Duration::from_millis(250);
 /// The title bar's right-hand toggles: two 28 px buttons, a 4 px gap and 8 px of padding.
 const TOGGLES_WIDTH: f32 = 68.;
 /// The title bar's left block while the sidebar is collapsed: padding, toggle, gap, "Hermes".
@@ -239,6 +243,15 @@ pub struct Workspace {
     /// The composer under the open thread, or in the new-thread screen.
     composer_view: Option<Entity<ComposerView>>,
     composer_subscription: Option<Subscription>,
+    /// What tells the user a thread waits (CP5.3, [`crate::notify`]); none in a fixture.
+    notifier: Option<Rc<dyn Notifier>>,
+    notify_policy: Policy,
+    /// Requests held back before they are announced, by thread.
+    holding: HashMap<String, Task<()>>,
+    /// Reads the clicks on a notification.
+    clicks: Option<Task<()>>,
+    /// Tests say whether the window is in front (the headless one has no answer).
+    active_override: Option<bool>,
     /// The file a link asked the right panel to open (its view is Phase 6).
     panel_file: Option<OpenFileInPanel>,
     _bounds: Subscription,
@@ -267,6 +280,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let notifications = state.notifications;
         let focus = cx.focus_handle();
         let bounds = cx.observe_window_bounds(window, |this, window, cx| {
             this.window_moved(window, cx);
@@ -274,7 +288,7 @@ impl Workspace {
         let sidebar = cx.new(|cx| Sidebar::new(model.clone(), state.sidebar_list.clone(), cx));
         let subscriptions = vec![
             cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
-            cx.subscribe(&model, Self::on_model_event),
+            cx.subscribe_in(&model, window, Self::on_model_event),
             // The palette's list, the title and the open thread follow the model.
             cx.observe_in(&model, window, |this, _, window, cx| {
                 this.sync_thread_view(window, cx);
@@ -300,6 +314,11 @@ impl Workspace {
             header_subscription: None,
             composer_view: None,
             composer_subscription: None,
+            notifier: None,
+            notify_policy: Policy::new(notifications),
+            holding: HashMap::new(),
+            clicks: None,
+            active_override: None,
             panel_file: None,
             _bounds: bounds,
             _subscriptions: subscriptions,
@@ -512,7 +531,13 @@ impl Workspace {
         }
     }
 
-    fn on_model_event(&mut self, _: Entity<AppModel>, event: &ModelEvent, cx: &mut Context<Self>) {
+    fn on_model_event(
+        &mut self,
+        _: &Entity<AppModel>,
+        event: &ModelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             ModelEvent::Toast { spec, open } => {
                 let id = self.push_toast(spec.clone(), cx);
@@ -520,7 +545,108 @@ impl Workspace {
                     self.toast_threads.insert(id, thread.clone());
                 }
             }
+            ModelEvent::Waiting { session } => self.hold_announcement(session, window, cx),
+            ModelEvent::Resumed { session } => {
+                // Answered or settled before the hold ran out: nothing is announced; and the
+                // thread's next wait is a new one.
+                self.holding.remove(session);
+                self.notify_policy.resumed(session);
+            }
         }
+    }
+
+    // --- a thread waits for the user (CP5.3) ----------------------------------------------------
+
+    /// Gives the frame what tells the user (the app's [`notify::OsNotifier`], or a test's), and
+    /// the channel the notification's clicks arrive on.
+    pub fn set_notifier(
+        &mut self,
+        notifier: Rc<dyn Notifier>,
+        clicked: Option<std::sync::mpsc::Receiver<String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.notifier = Some(notifier);
+        self.clicks = clicked.map(|clicked| {
+            cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    match clicked.try_recv() {
+                        Ok(session) => {
+                            let done = this.update_in(cx, |this, window, cx| {
+                                this.model.update(cx, |m, cx| m.open(&session, cx));
+                                window.activate_window();
+                            });
+                            if done.is_err() {
+                                break;
+                            }
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            cx.background_executor().timer(CLICK_POLL).await;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+            })
+        });
+    }
+
+    /// Makes the frame believe the window is in front (`Some(true)`) or behind (`Some(false)`):
+    /// for tests, since a headless window has no focus to ask.
+    pub fn force_window_active(&mut self, active: Option<bool>) {
+        self.active_override = active;
+    }
+
+    /// Turns announcing on or off (the `notifications` setting).
+    pub fn set_notifications(&mut self, on: bool) {
+        self.state.notifications = on;
+        self.notify_policy.set_enabled(on);
+    }
+
+    /// A thread began to wait: announce it after [`notify::HOLD`] unless it was answered by then.
+    fn hold_announcement(&mut self, session: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.notifier.is_none() || self.holding.contains_key(session) {
+            return;
+        }
+        let key = session.to_string();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(notify::HOLD).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.holding.remove(&key);
+                this.announce(&key, window, cx);
+            });
+        });
+        self.holding.insert(session.to_string(), task);
+    }
+
+    /// Flashes the taskbar and shows a notification for `session`, if it still waits and the user
+    /// is not looking at it ([`Policy`]).
+    fn announce(&mut self, session: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(notifier) = self.notifier.clone() else {
+            return;
+        };
+        let attention = {
+            let model = self.model.read(cx);
+            let title = model.thread_title(session);
+            Attention::of(model.asks(), session, &title)
+        };
+        let Some(attention) = attention else {
+            return;
+        };
+        let active = self
+            .active_override
+            .unwrap_or_else(|| window.is_window_active());
+        let open = self.model.read(cx).open_thread().map(str::to_string);
+        if !self
+            .notify_policy
+            .should_announce(session, open.as_deref(), active)
+        {
+            return;
+        }
+        // The taskbar button of a window that is in front does not need to flash.
+        if !active {
+            notifier.flash(window);
+        }
+        notifier.toast(&attention);
     }
 
     /// The remembered state (what the next save writes).

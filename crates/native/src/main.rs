@@ -13,6 +13,10 @@
 //! - `--dev-send <prompt>` (with `--dev`): open the first listed thread, send the prompt, print
 //!   the streamed and the stored reply on stderr, quit (the Phase 4 live check,
 //!   `scripts/perf/native-thread-check.ps1`; `--dump` is then written when the turn has ended).
+//! - `--dev-answer <once|session|always|deny>` (with `--dev-send`): answer what the turn asks,
+//!   from the composer's model (approvals with that choice, questions with their first choice),
+//!   and write the `--dump` files while each panel is shown (the Phase 5 live check,
+//!   `scripts/perf/native-approval-check.ps1`; no notification is made in this mode).
 //! - `--quit-after <seconds>`, `--dump <file>` (with `--features dev`): as below.
 //!
 //! Flags of `--spike` (for measuring, CP0.1 step 4):
@@ -81,6 +85,11 @@ fn main() {
             dev_send: args
                 .iter()
                 .position(|a| a == "--dev-send")
+                .and_then(|ix| args.get(ix + 1))
+                .cloned(),
+            dev_answer: args
+                .iter()
+                .position(|a| a == "--dev-answer")
                 .and_then(|ix| args.get(ix + 1))
                 .cloned(),
         });

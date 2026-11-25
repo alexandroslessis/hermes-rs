@@ -392,6 +392,33 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 - **`Handle::block_on` for core calls** (`delete_session`, `move_session`) is fine from GPUI's
   background threads and panics inside a tokio worker; `CoreBackend` is only called from the former.
 
+- **Approvals and questions (CP5.3).** The core asks an edit as the plain command `write_file <path>` / `patch <path>` (reason
+  `file edit` / `edit a file ...`), with no diff and no flag for a secret answer: the panel takes the diff from the running
+  call's card in the thread's timeline (`ThreadModel::pending_edit`) and masks nothing. `Core` publishes a question only if
+  a listener "shows" it: the app model's channel does, so a question is never auto-denied while the app runs. `Settled`
+  closes a request however it ended (answered, stopped, 300 s timeout), and a finished turn clears its session's requests.
+  The app model keeps every thread's requests (`AppModel::asks`); the composer made on open is seeded from them. The sidebar
+  mark is derived from that queue (two requests keep it until both are gone), not from the last `Settled`.
+- **The panel's keys are raw `on_key_down` on a focusable drawer**, not actions: it takes the focus when a request appears
+  unless the composer has text or a menu is open (nobody loses what they type); Enter in the *input* never approves (Escape
+  there denies). `Rig::press("1")` in tests goes through the same dispatch. Since the CP5.3 review it takes the focus only
+  from the composer's own empty input, its own previous panel or nothing (never from the sidebar's search or a dialog); a
+  held key (`KeyDownEvent::is_held`) never answers, and for `panel::KEY_GUARD` (500 ms, the executor's clock) after a request
+  appears its answer keys are swallowed: a test that presses a key must let the fake clock pass the guard
+  (`Rig::ask_approval` does; `ask_approval_now` does not). "Always allow" persists the runtime's reason (a whole kind of
+  command, every thread, permanently): it asks for a confirmation first (the Tauri page's dialog); `--dev-answer always`
+  answers through the model and skips it. The command, path and reason are drawn through `ask::visible` (control, bidi and
+  zero-width characters escaped) and a toast never carries them.
+- **`Start-Process -ArgumentList` does not quote**: an argument with spaces arrives split (`--dev-send 'hello from x'` sent
+  only `hello`). Put the quotes inside the string (`'"hello from x"'`); `dev-send: sending to <id>: "<prompt>"` prints what
+  arrived, and the live checks assert it.
+- **`Win32 FlashWindowEx` + `tauri-winrt-notification`** are in `Cargo.lock` already (Tauri's stack); a toast needs an
+  application id, ours is PowerShell's until the installer registers one (Phase 8). `OsNotifier` is built only in the real app
+  (not with `--fixture` or `--dev-answer`); tests use a recording `Notifier` and `Workspace::force_window_active`, because a
+  headless window has no focus to ask. Never construct an `OsNotifier` in a test or a check: it would flash the user's taskbar.
+- **`no_overflow` ignores what is under a probed `ask-body`** (it scrolls, like `threads` and `timeline-list`): check the parts of
+  a long question with `inside` on a short one.
+
 ## Protocol and page behaviour
 
 - **-32601 / 404 hide features.** If you answer a method with something half-right, the page shows

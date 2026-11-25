@@ -489,6 +489,21 @@ impl ThreadModel {
         self.live.is_some()
     }
 
+    /// The edit call (`write_file`, `patch`) of the live turn that is still running on `path`: an
+    /// approval of that edit shows its diff from this card. `path` is matched as the call gave it.
+    pub fn pending_edit(&self, tool: &str, path: &str) -> Option<&ToolCard> {
+        self.rows.iter().rev().find_map(|row| match &row.kind {
+            RowKind::Work(group) => group.entries.iter().rev().find_map(|entry| {
+                let card = &entry.card;
+                (card.status == Status::Running
+                    && card.name == tool
+                    && card.args.get("path").and_then(|p| p.as_str()) == Some(path))
+                .then_some(card)
+            }),
+            _ => None,
+        })
+    }
+
     fn key(&mut self) -> u64 {
         self.next_key += 1;
         self.next_key

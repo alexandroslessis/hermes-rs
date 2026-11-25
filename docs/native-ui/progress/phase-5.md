@@ -369,3 +369,178 @@ removed after). Core, runtime and desktop untouched by the review, so `hermes-de
 
 User checklist addition: in a narrow window (about 640 px with the right panel open) the model chip shows only its
 icon (hover names the model), "Accept edits" stays whole, the send button stays inside the card.
+
+## CP5.3 — Approvals and questions
+Worktree: C:\Users\alexandros\repos\hermes-rs-n5   Branch: native/p5-composer   Model: Sonnet 5.5 (subagent)
+Cut from CP5.2 (94f65d9). Uncommitted.
+
+### Files
+- New: `thread/composer/ask.rs` (no GPUI: `Choice`, `Approval` + `subject()` command/edit, `Question`, `Request`, `Asks` queue built from the core's events, `Nav` = what each key does,
+  `Answer`), `thread/composer/panel.rs` (the drawer: approval and question views, keys, focus), `notify.rs` (`Policy`, `Attention`, `Notifier`, `OsNotifier`: `FlashWindowEx` +
+  `tauri-winrt-notification`), tests `thread/composer/tests/asking.rs`, `notify_tests.rs`, `wiring_tests.rs::asking`, `real_tests.rs` (+3), `scripts/perf/native-approval-check.ps1`.
+- Edited: `model/backend.rs` (`Backend::answer`; fixture `ask` / `ComposerOp::Answer`), `model/mod.rs` (`AppModel::asks`, `ModelEvent::Waiting` / `Resumed`, composer seeded on open,
+  sidebar `asking` mark), `thread/composer/{model,view,mod}.rs`, `thread/model.rs` (`pending_edit`), `thread/cards.rs` (`diff_lines` public), `workspace.rs` (hold + announce, `set_notifier`),
+  `ui_state.rs` (`notifications`), `app.rs`/`main.rs`/`dev_send.rs` (`--dev-answer`), sidebar (`ThreadItem::asking`, `RowStatus::Input`, `Status::Input`),
+  `design/{button,icons,list_row}.rs` (`Button::hint`, two icons, Input status), `gallery/{composer,sidebar,mod}.rs` (stories `composer-asks`, `sidebar-waiting`), `testing.rs` (`ask-body` scrolls),
+  `Cargo.toml` (Windows-only `windows`, `raw-window-handle`, `tauri-winrt-notification`: all already in `Cargo.lock`, no new crate), `scripts/perf/mock_llm.py` ("please ask"), docs.
+
+### What it does
+1. **Approval panel** (t3code's composer banner shape: a drawer 12 px narrower than the card, tucked 16 px under its rounded top, warning-tinted): "Command approval" / "File change approval",
+   the command in a mono block (max 160 px, scrolls) or, for `write_file` / `patch`, the path and the diff of the *running call* from the timeline (`ThreadModel::pending_edit`, drawn by the tool cards'
+   `diff_lines`, 8 lines), "Flagged: <the runtime's reason>", and the choices the core offered: Deny (Esc, 4), Allow for this session (2), Always allow (3), Allow once (Enter, 1); Manual and Plan offer
+   once and deny only. Several requests queue, oldest first, "1 of N". Buttons disable while an answer is on its way.
+2. **Question panel**: the question, the choices as rows (radio, or checkbox for multi-select) with their digit, a free-text field always (the core adds "Other"; with no choices it is the only way,
+   and the cursor starts there), Skip (Esc: empty answer = skipped) and Send. Enter in the field sends text, else the picks.
+3. **Keys.** The panel takes the focus when a request appears unless the composer holds text or a menu is open. Panel focused: Enter = allow once (Tauri), Escape = deny / skip, digits, Up/Down/Tab move,
+   Space toggles. In the composer's own input: Escape (empty) denies; Enter never approves (deviation from Tauri: an Enter meant for a message must not allow a command). A key is one press; the model ignores
+   a second answer while one is in flight, and the next request is a new id.
+4. **While a request waits the input stays usable**: a typed message is queued behind the waiting turn as always (t3code: "decline and redirect"; the core has no such operation, recorded). The placeholder says so.
+5. **Requests for other threads are kept**: `AppModel` holds every thread's queue; a composer made on open is seeded from it. `Settled`, `TurnEnded` and `Idle` remove; the 300 s runtime timeout arrives as `Settled`.
+   Answers go through `ComposerModel::answer` (one in flight per request; `Ok(false)` "no longer open" closes the panel quietly; an error keeps it with a toast).
+6. **Sidebar**: the existing status (Phase 3) is now driven from the queue: "Approval" (warning shield), or **"Input"** (new, t3code's) when only questions wait; the folder dot follows; it clears when the queue empties.
+7. **Notifications** (`notify.rs`, wired in `workspace.rs`): when a request arrives the frame holds it 400 ms; then, if the thread still waits and (the window is not in front or the thread is not the open one) and
+   the thread was not announced for this wait: flash the taskbar (only if the window is behind; `FLASHW_ALL | FLASHW_TIMERNOFG`) and show a Windows toast "<title> / Approve a command: ... (and N more)". Clicking the toast
+   opens the thread and activates the window. `notifications` (default on) in `native-ui.json`. No notifier in `--fixture` or with `--dev-answer`.
+
+### Tests (CARGO_TARGET_DIR=target/claude): results in "Final checks"
+Unit: `ask.rs` 10, `notify.rs` 4. Behaviour + layout: `tests/asking.rs` 24, `wiring_tests::asking` 5, `notify_tests` 8, `real_tests` +3 (real core, scripted wiremock provider: a question and a flagged `chmod 777` in the test's temp folder,
+answered through the composer model, allow and deny; stop closes a waiting panel), sidebar tests adjusted (`ModelEvent` has three variants now).
+Live: `scripts/perf/native-approval-check.ps1`, documented in TESTING.md section 6 and `scripts/perf/README.md`.
+
+### Snapshots
+New (4): `composer-asks-t3-{light,dark}.png` (approval of a command, of an edit with its diff, question with choices, with free text and an answer typed, a second request queued, a narrow 352 px card),
+`sidebar-waiting-t3-{light,dark}.png` (Approval, Input, a closed folder's dot). No pre-existing baseline changed. I looked at the dark composer-asks sheet (crops of the question-text and approval-edit states); the light ones and the sidebar sheets are for the Haiku check.
+
+### Deviations
+- **No t3code capture** of an approval or question exists and I did not drive the user's t3code window: built from source (`ComposerBanner.tsx`, `ComposerPendingApprovalActions.tsx`, `TimelinePendingApprovalRow.tsx`, `ComposerPendingUserInputPanel.tsx`) and the Tauri page's card.
+  t3code shows an approval as a timeline row with inline buttons and the question as the composer's top drawer; we show both as the drawer (the brief).
+- Four buttons visible, not t3code's two plus a "More" menu; "Always allow" has no confirm dialog (Tauri asks, it persists to config): the tooltip says it adds to the allowlist. Reviewer: decide whether it needs the dialog.
+- Question text is plain (t3code renders markdown); no per-question header or collapse; one question at a time as the core sends them; no secret masking (the core has no such flag).
+- The clarify free-text field is the panel's own, not the composer's input (t3code reuses the composer editor); the composer input keeps the draft.
+- The toast is headed "Windows PowerShell" until the installer registers an application id (Phase 8).
+- Multi-select answers are joined with ", " (the core splits on commas: a choice containing a comma would split).
+
+### Missing core operations
+None blocking. Facts: no diff in `ApprovalRequested` (taken from the timeline's running card, so absent if the call's event was not seen, e.g. a thread opened mid-turn); no "secret" flag on clarify; no "decline and redirect";
+`Core::open_questions` exists but is not used (the app model sees every event since it subscribes).
+
+### For the reviewer
+1. `ComposerView::sync_ask` decides the focus on each model notify; check it cannot steal focus wrongly and that the `typing` guard (text or a menu open) is enough (an open `@` drawer is not checked).
+2. `Nav` multi-select: Enter with nothing picked toggles the highlighted row; Enter with picks sends. Is that the expected feel?
+3. `AppModel` and the composer each run `Asks::on_event`; they could diverge only if events were lost. Seeding on open is the only link.
+4. Panel `mb(-16)` + `pb(16)` emulates t3code's `-mb-[calc(1rem+1px)]`; the buttons got an extra `pb(8)` so they do not touch the card. Look at the snapshots.
+5. `Policy` keys on the thread, not the request: a second request arriving after the first was announced while the thread still waits is not announced again (by design: "never spam").
+6. `OsNotifier` cannot be tested headless; `FlashWindowEx` takes the HWND through `raw-window-handle` from the GPUI `Window`; never exercised in a real window by me (hand-only).
+7. `Button::hint` is new in the design layer (no story of its own; it shows in `composer-asks`).
+8. `testing::no_overflow` now skips everything under a probed `ask-body`.
+
+### User checklist (CP5.3), and the whole Phase 5
+Build (PowerShell, in `C:\Users\alexandros\repos\hermes-rs-n5`): `$env:CARGO_TARGET_DIR="target/claude"; cargo build -p hermes-native --bins`, `$env:HERMES_RS_HOME="$PWD\target\native-test"` (synthetic, never `%APPDATA%`).
+A. Fixture (`.\target\claude\debug\hermes-native.exe --fixture --dev`): the CP5.1 and CP5.2 lists above still hold; the fixture never asks, so see the panels in the gallery:
+   `.\target\claude\debug\hermes-native-gallery.exe` (stories "Composer: approvals and questions" and "Sidebar: threads that wait").
+B. With the mock provider (as Phase 4's item 11: a seeded folder, `python scripts\perf\mock_llm.py --port 47900`, the app started with `--dev --dev-provider http://127.0.0.1:47900/v1`, a thread open):
+   1. Type `please ask`, Enter. A "Question" drawer appears over the card with "blue" and "green"; the panel has the keys. Press `2`: it closes at once.
+   2. A warning-tinted "Command approval" drawer: `chmod 777 live-check-note.txt`, "Flagged: chmod 777", Deny, Allow for this session, Always allow, Allow once. Press Esc: it closes; the reply says `command=denied`.
+   3. Repeat and click "Allow once" (or press Enter): `command=ran`.
+   4. While it waits, type a message and Enter: it queues above the card and the drawer stays. Escape in the empty input denies.
+   5. Open another thread while a request waits in the first: its row shows the shield ("Approval") or "Input"; open it: the drawer is there.
+   6. Click Stop while a request waits: the drawer closes.
+   7. (Review) Repeat and click "Always allow" (or press `3`): the buttons give way to a sentence "Always allow commands flagged “chmod 777”? ... permanent allowlist ..."
+      with Cancel (Esc) and a red Always allow (Enter). Press Esc: back to the four buttons, nothing denied. Then Deny, so nothing is persisted in your test data.
+   8. (Review) Press Enter at the very instant the drawer appears (within half a second): nothing happens; a moment later Enter allows. With the sidebar's search focused
+      when a request appears, the drawer does not take the keyboard.
+C. Automated: `powershell -NoProfile -File scripts\perf\native-approval-check.ps1` (prints `native-approval-check: ok`) and `scripts\perf\native-thread-check.ps1` (now checks the prompt arrived whole).
+D. **Hand-only, nobody has done these in a real window:** the Windows toast and the taskbar flash (minimise the window, send `please ask` from another thread, then click the toast: the thread opens and the window comes to the front;
+   the toast is headed "Windows PowerShell" by Windows, its title reads "Hermes: <thread title>" and its text "A command needs your approval. Open Hermes to answer." with no command in it);
+   Enter held on an approval must not approve the next one (tested headless with a synthetic repeat, not with a real keyboard); IME and the emoji panel in the composer and in the answer field; a real clipboard image paste, a drag from Explorer, the Windows file dialog (CP5.2);
+   the narrow footer at about 640 px with the right panel open (CP5.1 and CP5.2).
+
+### Phase 5 Done list, and what covers it
+*Layout tests and snapshots for each composer state:* `thread/composer/tests.rs`, `tests/input.rs`, `tests/asking.rs`, `wiring_tests.rs`; snapshots `composer`, `composer-menus`, `composer-new`, `composer-mentions`, `composer-commands`, `composer-attachments`, `composer-asks`, `sidebar-waiting`.
+*A mock-provider turn that asks for an approval and a question, answered from the composer in our instance:* `scripts/perf/native-approval-check.ps1` (live, our built app) and `real_tests` (real core).
+
+### Final checks (CP5.3)
+`scripts/native/check.ps1`: "native check: all ok" (build with dev, `cargo test -p hermes-native` 469 passed + 2 ignored, snapshots 471; 4 new baselines written by me with `UPDATE_SNAPSHOTS=1`, none of the others changed).
+`cargo test -p hermes_core`: 140 passed. `cargo build --workspace`: ok (webapp dist copied from the main checkout, then removed). `scripts/perf/native-thread-check.ps1`: ok.
+`scripts/perf/native-approval-check.ps1`: "native-approval-check: ok" (both runs: question answered `blue`, command `ran` / `denied`, panels in the dumps, streamed = stored).
+Found on the way: `native-thread-check.ps1` passes `--dev-send 'hello from the live check'` through `Start-Process -ArgumentList` unquoted, so the app sent only "hello" (the check still passed: the mock ignores the text). The new script quotes the prompt; the old one is left as it was.
+`scripts/clean-test-temp.ps1` result is in the final report.
+
+### Visual check (Sonnet 5.5)
+Opened: t3code source (`ComposerPendingApprovalActions.tsx`, `ComposerPendingUserInputPanel.tsx`, `TimelinePendingApprovalRow.tsx`, `ComposerBanner.tsx`), references `app-sidebar_closeup-dark.png` (status look). No t3code capture of the approval panel exists. Dark and light viewed in per-panel crops.
+- composer-asks-t3-dark (command approval): matches (warning-tinted drawer tucked under card, mono block, Deny muted + outline + primary, "Flagged:" reason); expected: Deny/Esc, "Allow for this session 2", "Always allow 3", "Allow once ⏎" aligned on one baseline, primary filled.
+- composer-asks-t3-dark (file change): differs — t3code shows buttons inline in a timeline row, we show a drawer (documented); expected: red/green diff with line numbers readable, "Flagged: file edit", two buttons.
+- composer-asks-t3-dark (question, choices): expected — radio rows with digit chips right-aligned, free-text field, Skip Esc, Send (dimmed while empty, reads as disabled); (free text): expected.
+- composer-asks-t3-dark ("1 of 2"): expected — top right, low contrast but legible.
+- composer-asks-t3-dark (narrow 352 px): unexpected — buttons wrap to two ragged right-aligned rows (Always allow starts left of Allow for this session; Deny sits beside row one only); model label collapses to icon (as in composer-new narrow, expected). Legible, no clipping.
+- composer-asks-t3-light: expected in all six states — orange tint with dark orange text/shield, diff tints legible, white mono block, primary contrast fine; disabled Send is pale but readable; same narrow wrap as dark (unexpected, see above).
+- sidebar-waiting-t3-dark: differs (minor) — t3code's "Done" is a green check-circle; ours "Input" is blue help-circle and "Approval" amber shield (new, no capture); expected: icon + text right-aligned to the same edge as "Working" and the time marks, folder dot "3" amber.
+- sidebar-waiting-t3-light: expected — Input blue, Approval dark orange, contrast good, aligned.
+- composer-t3, composer-menus-t3, composer-new-t3, composer-mentions-t3, composer-commands-t3, composer-attachments-t3 (dark and light): expected, nothing unexpected seen (checked at contact-sheet scale).
+
+### Review (Opus 5.5)
+2026-11-25. `main` had not moved (nothing to merge). Verdict: **good shape, safety gaps fixed; Phase 5 done.**
+
+**Approval safety (fixed).**
+1. *Keys not meant as answers.* The panel took the keyboard whenever the composer's input was empty, from anywhere (the sidebar's search, a
+   dialog), and answered any key at once; a held Enter's auto-repeat answered the next request appearing under it (Tauri's `approval-keys.ts`
+   ignores repeats). Now: a held key (`KeyDownEvent::is_held`) never answers (arrows may repeat); for `panel::KEY_GUARD` = 500 ms after a request
+   appears its answer keys (Enter, Escape, Space, digits) are swallowed, by the executor's clock so tests drive it; the panel takes the focus only
+   from the composer's own empty input, its previous panel/field, or nothing. Clicks are not guarded (t3code and Tauri do not either).
+   Tests: `a_key_in_the_first_moments_of_a_request_answers_nothing`, `a_held_enter_does_not_approve_the_next_request`,
+   `the_panel_does_not_take_the_keyboard_from_outside_the_composer`. Enter in the composer's input never approves (existing test, kept).
+2. *What is shown is what runs.* The command, the edit's path and the reason were drawn raw: an ANSI escape, `\r`, a right-to-left override or a
+   zero-width character could hide or reorder the tail. `ask::visible` escapes control, bidi, zero-width/format characters (`\x1b`, `\u{202e}`),
+   keeps newlines (multi-line commands show as lines; the block was already scrollable, max 160 px, so no truncation); a warning line says when
+   something was escaped or when the text holds non-ASCII characters (lookalikes). Unit test + `hidden_and_control_characters_in_a_command_are_shown_escaped`
+   + snapshot state `hidden-chars`.
+3. *Edit diff.* The request carries no tool-call id, so `ThreadModel::pending_edit` matches the *running* card by tool and path (as the core asks it):
+   the best available; a finished or other-path card never matches. When none matches the panel showed nothing; it now says
+   "The diff of this change is not available here; only the path is known." (state `edit-no-diff`, test extended).
+4. *"Always allow".* Checked the runtime (`SessionTools::check_command`): "always" persists the **reason** (`description` before the taint
+   suffix, e.g. `chmod 777`, `recursive delete`) to the permanent allowlist file, for every thread from then on; "session" remembers the same key
+   in that session's tools only (= this thread); Manual/Plan (`once_only`) offer neither and honour neither. That is broad, and the Tauri page puts
+   it behind a confirm dialog ("Always allow this command?", "adds the pattern to your permanent allowlist ... won't ask again ... in this session or
+   any future one"). Added the same step in the drawer: the button or `3` (or Enter on it) replaces the buttons with that sentence (our store's
+   wording: `panel::always_words`) and Cancel (Esc: back, not a denial) / a destructive "Always allow" (Enter or click). `Nav::confirm_always`;
+   tests updated (four buttons, digits) and `always_allow_says_what_it_persists_and_cancel_goes_back`; state `always-confirm`.
+   `--dev-answer always` answers through the model and skips it (dev only).
+5. Answer routing was right: answers go by `prompt_id`; one in flight per id; `Ok(false)` closes quietly; `Settled`/`TurnEnded`/`Idle` close; out-of-order
+   answers and answers after `Settled` reach nobody (existing tests). Deny/Escape = `deny`, Skip = empty answer.
+
+**Notifications (fixed).** The toast is built by `tauri-winrt-notification` through the XML DOM (`SetInnerText`), so `<`, `&` and quotes cannot
+inject markup (checked its source, 0.8.1). But its text held the first 100 characters of the command (a command line may carry a token; toasts show
+on the lock screen and stay in the notification centre) and its title was the bare thread title under the "Windows PowerShell" app name. Now the
+title is "Hermes: <thread title>" and the text says only what waits ("A command needs your approval. Open Hermes to answer."; never the command,
+path or question). `Toast::show` (COM/WinRT) moved off the UI thread to a short-lived thread; `FlashWindowEx` is a plain call. Policy (400 ms hold,
+once per wait, focus/open-thread rules, settled-before-hold makes none, `notifications` default on, malformed falls back) reviewed: fine. The
+"Windows PowerShell" app id stays until Phase 8 (installer), recorded.
+
+**Visual check items.** (a) Narrow wrap: the four buttons are now two pairs that never split, Deny + "Allow for this session" and "Always allow" +
+"Allow once", so a narrow card shows two right-aligned rows with the primary bottom-right (test `on_a_narrow_card_the_buttons_wrap_as_two_right_aligned_pairs`;
+one row on the wider cards, as before). (b) t3code's `ComposerPendingApprovalActions` is used only by `TimelinePendingApprovalRow` and
+`ChildThreadApprovals` (grep): t3code's composer shows no approval panel, so the drawer stays a documented deviation; its words (Decline / Approve /
+"Always allow this session" in a More menu) are Codex's decisions, ours are Hermes's four (the Tauri page's labels), kept. (c) Sidebar: t3code's
+pills are "Pending Approval" amber and "Awaiting Input" indigo, dot + text (`Sidebar.logic.ts::resolveThreadStatusPill`). Ours keep Phase 3's
+icon + short label; Approval is amber (`warning_foreground`), aligned; Input is `info_foreground` blue (the same hue as Working, a different
+icon): there is no indigo token and adding one changes the token sheet's snapshot and every theme mapping, left for the theme work (Phase 7).
+(d) "1 of N" now foreground at 80%, medium weight (was muted on the warning tint).
+
+**Live checks.** `native-thread-check.ps1` did send only "hello" (`Start-Process -ArgumentList` joins without quoting): the prompt now carries its
+quotes, `dev_send` prints `sending to <id>: "<prompt>"`, and the script fails unless the whole prompt arrived (PITFALLS bullet).
+
+**Other checks.** Views never call the core (grep of `panel.rs`, `view.rs`, `ask.rs`, `notify.rs`); no raw colours in the new code; no Zed code; no
+new crate (`windows`, `raw-window-handle`, `tauri-winrt-notification` were in `Cargo.lock`; `--locked` build ok); no store schema change; the core
+and runtime were not changed (so no `hermes-desktop` run needed). The runtime never asks a secret through clarify (no such request type), so an
+unmasked answer field is acceptable. Pending questions live in memory only: after a restart there is no ghost panel (the runtime's turn is gone
+too). `AppModel::asks` is bounded by the runtime's open requests (each ends in `Settled`, a turn end or idle).
+
+**Left as is (and why).** Question text is plain (not markdown) and not escaped (the agent's own words, not something that runs). Clicks are not
+time-guarded. The diff is matched by tool+path (no call id in the core's event: a core change, not this checkpoint). Input's colour (above).
+`OsNotifier` and the real keyboard repeat remain hand-only (checklist D).
+
+**Final checks (review).** `cargo test -p hermes-native`: 477 passed + 2 ignored. `scripts/native/check.ps1`: "native check: all ok" (snapshots:
+only `composer-asks-t3-{dark,light}` changed, by this review: the pairs, "1 of N", three new states; looked at in crops, both themes, then
+accepted). `cargo test -p hermes_core`: 140 passed. `cargo build --workspace --locked`: ok (webapp dist copied from the main checkout, then
+removed). `native-approval-check.ps1`: ok (question `blue`, command `ran` / `denied`, the whole prompt arrived). `native-thread-check.ps1`: ok,
+now with `sending to ...: "hello from the live check"`. `scripts/clean-test-temp.ps1`: 11 folders, 2.8 MB, removed.

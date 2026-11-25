@@ -53,6 +53,11 @@ pub struct Options {
     /// `--dev-send <prompt>` (with `--dev`): open the first thread, send the prompt, print the
     /// streamed and the stored reply, quit ([`crate::dev_send`]: the Phase 4 live check).
     pub dev_send: Option<String>,
+    /// `--dev-answer <once|session|always|deny>` (with `--dev-send`): answer the turn's approvals
+    /// with this choice and its questions with their first choice, from the composer's model, and
+    /// write the `--dump` (`<file>.approval`, `<file>.question`) while each panel is on screen
+    /// ([`crate::dev_send`]: the Phase 5 live check). No notification is made in this mode.
+    pub dev_answer: Option<String>,
 }
 
 fn appearance_of(window: WindowAppearance) -> Appearance {
@@ -145,6 +150,7 @@ pub fn run(options: Options) {
             let wanted_theme = options.theme.clone().or_else(|| state.theme.clone());
             let (dev_send, send_dump) = (options.dev_send.clone(), options.dump.clone());
             let driven = options.dev && options.dev_send.is_some();
+            let answer_with = options.dev_answer.clone();
             let opened = gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(bounds),
@@ -194,12 +200,23 @@ pub fn run(options: Options) {
                             window.window_handle(),
                             prompt,
                             send_dump.clone(),
+                            answer_with.clone(),
                             cx,
                         );
                     }
                     let workspace =
                         cx.new(|cx| Workspace::with_model(state, data_dir, model, window, cx));
                     workspace.update(cx, |w, cx| w.focus(window, cx));
+                    // A waiting thread flashes the taskbar and shows a notification (not in a
+                    // fixture, and not in the live check that answers by itself).
+                    #[cfg(windows)]
+                    if !options.fixture && options.dev_answer.is_none() {
+                        let (clicked, clicks) = std::sync::mpsc::channel();
+                        let notifier = std::rc::Rc::new(crate::notify::OsNotifier::new(clicked));
+                        workspace.update(cx, |w, cx| {
+                            w.set_notifier(notifier, Some(clicks), window, cx)
+                        });
+                    }
                     // Follow the system's light and dark while no theme was picked.
                     let follow = workspace.clone();
                     window

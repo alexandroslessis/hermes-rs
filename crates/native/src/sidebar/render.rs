@@ -129,6 +129,7 @@ pub fn monogram_with_id(
 fn status_of_row(status: RowStatus) -> Status {
     match status {
         RowStatus::Approval => Status::Approval,
+        RowStatus::Input => Status::Input,
         RowStatus::Working => Status::Working,
         RowStatus::Failed => Status::Failed,
         // t3code shows a finished thread nobody looked at as "Done".

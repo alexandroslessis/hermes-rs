@@ -57,6 +57,7 @@ use gpui_kit::{
     px, relative,
 };
 
+use super::ask::Nav;
 use super::data::{
     EFFORTS, MODELS_SHOWN, Mode, context_label, effort_label, sendable, visible_queue,
 };
@@ -146,7 +147,7 @@ pub struct ComposerView {
     pub(super) input: Entity<TextareaState>,
     search: Entity<InputState>,
     focus: FocusHandle,
-    menu: Option<Menu>,
+    pub(super) menu: Option<Menu>,
     /// The menu that closed itself on a mouse-down outside it, and where that press went down:
     /// the click that the same press makes on the menu's chip must not open it again.
     closed_by_outside: Option<(Menu, Point<Pixels>)>,
@@ -165,6 +166,19 @@ pub struct ComposerView {
     /// (a paste that changes nothing leaves this set until the next edit, which then makes chips
     /// of the references in the text: harmless).
     pasting: bool,
+    /// Where the keyboard is in the request the thread waits on (CP5.3, [`super::panel`]).
+    pub(super) nav: Nav,
+    /// The request `nav` belongs to.
+    pub(super) ask_for: Option<String>,
+    /// When it appeared (the executor's clock): its keys answer nothing for
+    /// [`super::panel::KEY_GUARD`].
+    pub(super) ask_shown_at: Option<std::time::Instant>,
+    /// The panel's focus: its keys work while it has it.
+    pub(super) ask_focus: FocusHandle,
+    /// A question's free-text answer.
+    pub(super) answer_input: Entity<TextareaState>,
+    /// What the input says while it is empty (it changes while the agent waits).
+    pub(super) input_hint: &'static str,
     file_picker: FilePicker,
     _subscriptions: Vec<Subscription>,
 }
@@ -199,8 +213,20 @@ impl ComposerView {
             });
         }
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models..."));
+        let answer_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 4)
+                .submit_on_enter(true)
+                .placeholder(super::panel::FIELD_HINT)
+        });
         let subscriptions = vec![
-            cx.observe(&model, |_, _, cx| cx.notify()),
+            // A request arriving or closing moves the keyboard (the panel takes it, or gives it back).
+            cx.observe_in(&model, window, |this, _, window, cx| {
+                this.sync_ask(window, cx);
+                cx.notify();
+            }),
+            cx.subscribe_in(&answer_input, window, Self::on_answer_event),
+            cx.observe(&answer_input, |_, _, cx| cx.notify()),
             cx.subscribe_in(&model, window, Self::on_model_event),
             cx.subscribe_in(&input, window, Self::on_input_event),
             // The caret moving is no change of the text, but it moves the trigger.
@@ -222,6 +248,12 @@ impl ComposerView {
             highlight: 0,
             list_scroll: ScrollHandle::new(),
             pasting: false,
+            nav: Nav::default(),
+            ask_for: None,
+            ask_shown_at: None,
+            ask_focus: cx.focus_handle(),
+            answer_input,
+            input_hint: PLACEHOLDER,
             file_picker: real_file_picker(),
             _subscriptions: subscriptions,
         };
@@ -237,6 +269,11 @@ impl ComposerView {
     /// The input's state.
     pub fn input(&self) -> &Entity<TextareaState> {
         &self.input
+    }
+
+    /// What the input says while it is empty.
+    pub fn input_hint(&self) -> &str {
+        self.input_hint
     }
 
     /// The model picker's search field.
@@ -433,6 +470,34 @@ impl ComposerView {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn on_answer_event(
+        &mut self,
+        input: &Entity<TextareaState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InputEvent::Change => cx.notify(),
+            InputEvent::PressEnter { secondary, shift } => {
+                if *shift && !*secondary {
+                    return;
+                }
+                let composing = input.update(cx, |input, cx| {
+                    input.marked_text_range(window, cx).is_some()
+                });
+                if composing {
+                    return;
+                }
+                let current = self.model.read(cx).current_ask().map(|r| r.prompt_id.clone());
+                if let Some(id) = current {
+                    self.send_field(&id, window, cx);
+                }
+            }
+            InputEvent::Focus | InputEvent::Blur => {}
         }
     }
 
@@ -687,6 +752,7 @@ impl Render for ComposerView {
         let has_text = (sendable(&self.input.read(cx).value()) || has_attachments) && !preparing;
         let strip = self.attachment_strip(&palette, cx);
         let drawer = self.suggest_drawer(&palette, window, cx);
+        let ask_panel = self.ask_panel(&palette, dark, cx);
 
         // The surface and its 1 px outline (`--chat-composer-outline`: white at 5% in the dark,
         // black at 8% in the light; the theme's foreground at those strengths, so another theme's
@@ -774,7 +840,7 @@ impl Render for ComposerView {
                                 }
                             }))
                             .capture_action(cx.listener(|this, _: &Escape, window, cx| {
-                                if this.suggest_key(Key::Escape, window, cx) {
+                                if this.suggest_key(Key::Escape, window, cx) || this.escape_ask(window, cx) {
                                     cx.stop_propagation();
                                 }
                             }))
@@ -819,6 +885,7 @@ impl Render for ComposerView {
                             cx,
                         ))
                     })
+                    .children(ask_panel)
                     .child(card),
             )
             .probe()

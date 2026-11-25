@@ -41,6 +41,7 @@ fn thread(id: &str, title: &str, project: &ProjectItem, ago_ms: i64) -> ThreadIt
         updated_ms: NOW_MS - ago_ms,
         working: false,
         waiting: false,
+        asking: false,
         branch: None,
     }
 }

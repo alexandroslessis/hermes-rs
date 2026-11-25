@@ -25,12 +25,13 @@
 //! Hermes: none (`hermes_core::turns` is the queue; the page's `prompt.submit` and the queue panel
 //! are its counterparts).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui_kit::{AppContext as _, Context, Entity, EventEmitter, ImageFormat};
 use hermes_core::CoreEvent;
 
+use super::ask::{Answer, Asks, Request};
 use super::attach::{self, Attachment, MAX_ATTACHMENTS};
 use super::data::{
     Controls, ModelChoices, Pick, Picks, QueueOp, QueuedItem, SendRequest, Sent, sendable,
@@ -149,6 +150,10 @@ pub struct ComposerModel {
     mentions: Option<Mentions>,
     /// Bumped by every `@` request: an answer for an older word is dropped.
     mention_seq: u64,
+    /// The approvals and questions this thread's turn waits on, oldest first (CP5.3).
+    asks: Asks,
+    /// Requests whose answer is on its way to the core: a second answer is nothing.
+    responding: HashSet<String>,
 }
 
 impl EventEmitter<ComposerEvent> for ComposerModel {}
@@ -185,6 +190,8 @@ impl ComposerModel {
             catalog: Catalog::Idle,
             mentions: None,
             mention_seq: 0,
+            asks: Asks::default(),
+            responding: HashSet::new(),
         };
         model.refresh(cx);
         model
@@ -326,6 +333,93 @@ impl ComposerModel {
         }
     }
 
+    // --- approvals and questions --------------------------------------------------------------
+
+    /// The requests the thread waits on, oldest first.
+    pub fn asks(&self) -> Vec<&Request> {
+        self.asks.all().iter().collect()
+    }
+
+    /// The request the panel shows: the oldest.
+    pub fn current_ask(&self) -> Option<&Request> {
+        self.asks.all().first()
+    }
+
+    /// How many requests wait (the panel says "1 of 2").
+    pub fn ask_count(&self) -> usize {
+        self.asks.all().len()
+    }
+
+    /// The running edit call an approval of `tool` on `path` is about: its diff, from the open
+    /// thread's timeline (the core's request carries only `write_file <path>`).
+    pub fn pending_edit(
+        &self,
+        tool: &str,
+        path: &str,
+        cx: &gpui_kit::App,
+    ) -> Option<crate::thread::tools::ToolCard> {
+        self.thread
+            .as_ref()?
+            .read(cx)
+            .pending_edit(tool, path)
+            .cloned()
+    }
+
+    /// Whether the answer to `prompt_id` is on its way to the core.
+    pub fn is_responding(&self, prompt_id: &str) -> bool {
+        self.responding.contains(prompt_id)
+    }
+
+    /// Gives the composer the requests that arrived while its thread was not open (the app model
+    /// kept them): they queue in the order they came.
+    pub fn seed_asks(&mut self, requests: Vec<Request>, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for request in requests {
+            if self.session() == Some(request.session.as_str()) {
+                changed |= self.asks.push(request);
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// The user's answer to a request. The panel closes when the core has taken it (the core's
+    /// `Settled` closes it too, whoever answered); a second answer to the same request, while the
+    /// first is on its way or after it was taken, is nothing. A refusal keeps the request, with a
+    /// toast.
+    pub fn answer(&mut self, prompt_id: &str, answer: Answer, cx: &mut Context<Self>) {
+        if !self.asks.all().iter().any(|r| r.prompt_id == prompt_id)
+            || !self.responding.insert(prompt_id.to_string())
+        {
+            return;
+        }
+        cx.notify();
+        let (backend, id) = (self.backend.clone(), prompt_id.to_string());
+        cx.spawn(async move |this, cx| {
+            let sent = {
+                let id = id.clone();
+                cx.background_spawn(async move { backend.answer(&id, &answer) })
+                    .await
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.responding.remove(&id);
+                match sent {
+                    // Taken, or no longer open (answered elsewhere): either way it is closed.
+                    Ok(_) => {
+                        this.asks.remove(&id);
+                    }
+                    Err(why) => cx.emit(ComposerEvent::Problem {
+                        title: "Could not send the answer".into(),
+                        why,
+                    }),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     // --- the core's events --------------------------------------------------------------------
 
     /// Takes in one of the core's events (the ones for another thread are ignored).
@@ -335,6 +429,11 @@ impl ComposerModel {
         };
         if event.session_id() != session {
             return;
+        }
+        if self.asks.on_event(event) {
+            let open: HashSet<&str> = self.asks.all().iter().map(|r| r.prompt_id.as_str()).collect();
+            self.responding.retain(|id| open.contains(id.as_str()));
+            cx.notify();
         }
         match event {
             CoreEvent::TurnStarted { admission_id, .. } => {

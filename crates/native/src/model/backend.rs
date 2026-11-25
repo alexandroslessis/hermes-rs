@@ -48,6 +48,7 @@ use tokio::sync::mpsc;
 use crate::sidebar::data::{
     NO_PROJECT, NO_PROJECT_LABEL, Op, ProjectItem, ProjectKind, Snapshot, ThreadItem,
 };
+use crate::thread::composer::ask::{Answer, Choice};
 use crate::thread::composer::attach::{self, Prepared, Refusal};
 use crate::thread::composer::data::{
     Controls, Mode, ModelChoices, ModelEntry, Pick, Picks, QueueOp, QueuedItem, SendRequest, Sent,
@@ -183,6 +184,12 @@ pub trait Backend: Send + Sync + 'static {
     /// Makes `provider`'s `model` the default for new threads (a pick on the new-thread screen).
     fn set_default_model(&self, _provider: &str, _model: &str) -> Result<(), String> {
         Err("Changing the default model is not available here.".to_string())
+    }
+    /// The user's answer to an approval or a clarify question (`Core::answer_approval` /
+    /// `Core::answer_clarify`). `Ok(false)`: the question is no longer open (answered elsewhere,
+    /// settled), which is not an error: asking twice is harmless. `Settled` follows on the events.
+    fn answer(&self, _prompt_id: &str, _answer: &Answer) -> Result<bool, String> {
+        Err("Answering is not available here.".to_string())
     }
 }
 
@@ -413,6 +420,7 @@ pub fn build_snapshot(
                 updated_ms: s.record.updated_at,
                 working: s.live || s.running,
                 waiting: s.waiting,
+                asking: false,
                 branch: s.git_branch.clone(),
             });
         }
@@ -1143,6 +1151,22 @@ impl Backend for CoreBackend {
         hermes_core::providers::save_default(self.core.data_dir(), provider, model)
             .map_err(|e| format!("{e:#}"))
     }
+
+    fn answer(&self, prompt_id: &str, answer: &Answer) -> Result<bool, String> {
+        use hermes_tools::approval::ApprovalChoice;
+        Ok(match answer {
+            Answer::Approval(choice) => self.core.answer_approval(
+                prompt_id,
+                match choice {
+                    Choice::Once => ApprovalChoice::Once,
+                    Choice::Session => ApprovalChoice::Session,
+                    Choice::Always => ApprovalChoice::Always,
+                    Choice::Deny => ApprovalChoice::Deny,
+                },
+            ),
+            Answer::Text(text) => self.core.answer_clarify(prompt_id, text.clone()),
+        })
+    }
 }
 
 /// Fake data in memory. Edits change the list as the core's would and are recorded; a failure can
@@ -1176,6 +1200,11 @@ pub struct FixtureBackend {
     catalog: Mutex<Vec<CommandSpec>>,
     /// Answers of commands set by a test; a command without one answers with a line of output.
     answers: Mutex<HashMap<String, CommandAnswer>>,
+    /// The questions [`FixtureBackend::ask`] opened and no answer closed yet, with the session
+    /// and kind their `Settled` carries.
+    open_asks: Mutex<HashMap<String, (String, hermes_core::QuestionKind)>>,
+    /// The questions an answer reached (a second answer is "no longer open").
+    answered_asks: Mutex<std::collections::HashSet<String>>,
 }
 
 /// A composer operation that reached a [`FixtureBackend`].
@@ -1218,6 +1247,8 @@ pub enum ComposerOp {
     },
     /// An attachment was read for the strip.
     Prepare(AttachmentSource),
+    /// An approval or a clarify question was answered.
+    Answer { prompt_id: String, answer: Answer },
 }
 
 /// A turn footer's action that reached a [`FixtureBackend`].
@@ -1248,6 +1279,8 @@ impl FixtureBackend {
             paths: Mutex::new(Self::default_paths()),
             catalog: Mutex::new(Self::default_catalog()),
             answers: Mutex::default(),
+            open_asks: Mutex::default(),
+            answered_asks: Mutex::default(),
         })
     }
 
@@ -1463,6 +1496,27 @@ impl FixtureBackend {
     /// Makes the next edits fail with `message` (`None`: work again).
     pub fn fail_with(&self, message: Option<&str>) {
         *self.failure.lock().unwrap_or_else(|e| e.into_inner()) = message.map(str::to_string);
+    }
+
+    /// Opens a question as the core would: sends its `ApprovalRequested` / `ClarifyRequested`
+    /// event and remembers it, so [`Backend::answer`] closes it with a `Settled` and a second
+    /// answer finds it closed.
+    pub fn ask(&self, event: CoreEvent) {
+        let kind = match &event {
+            CoreEvent::ApprovalRequested { .. } => hermes_core::QuestionKind::Approval,
+            CoreEvent::ClarifyRequested { .. } => hermes_core::QuestionKind::Clarify,
+            _ => return,
+        };
+        let prompt_id = match &event {
+            CoreEvent::ApprovalRequested { prompt_id, .. }
+            | CoreEvent::ClarifyRequested { prompt_id, .. } => prompt_id.clone(),
+            _ => return,
+        };
+        self.open_asks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(prompt_id, (event.session_id().to_string(), kind));
+        self.emit(event);
     }
 
     /// Sends a core event to whoever subscribed ([`Backend::events`]).
@@ -1697,6 +1751,7 @@ impl Backend for FixtureBackend {
             updated_ms: crate::model::fixture::NOW_MS,
             working: false,
             waiting: false,
+            asking: false,
             branch: None,
         });
         Ok(id)
@@ -1892,5 +1947,37 @@ impl Backend for FixtureBackend {
             c.model = model.to_string();
         });
         Ok(())
+    }
+
+    fn answer(&self, prompt_id: &str, answer: &Answer) -> Result<bool, String> {
+        self.log_composer(ComposerOp::Answer {
+            prompt_id: prompt_id.to_string(),
+            answer: answer.clone(),
+        });
+        if let Some(message) = self.scripted_failure() {
+            return Err(message);
+        }
+        // A second answer, or one for a question the core settled meanwhile, finds it closed.
+        if !self
+            .answered_asks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(prompt_id.to_string())
+        {
+            return Ok(false);
+        }
+        let open = self
+            .open_asks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(prompt_id);
+        if let Some((session_id, kind)) = open {
+            self.emit(CoreEvent::Settled {
+                session_id,
+                prompt_id: prompt_id.to_string(),
+                kind,
+            });
+        }
+        Ok(true)
     }
 }

@@ -8,10 +8,12 @@
 //! parts left out are named in [`view`]'s header. Later checkpoints add `@` mentions, the `/`
 //! menu and attachments (CP5.2) and the approval and question panels (CP5.3).
 
+pub mod ask;
 pub mod attach;
 pub mod data;
 pub mod mention;
 pub mod model;
+pub mod panel;
 #[cfg(test)]
 mod real_tests;
 pub mod strip;

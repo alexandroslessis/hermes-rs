@@ -6,6 +6,7 @@ rate, so measurements don't depend on a real model or the GPU.
 
 import argparse
 import json
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -65,6 +66,11 @@ class Handler(BaseHTTPRequestHandler):
         global REQUESTS
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}")
+        if os.environ.get("MOCK_LLM_DUMP"):
+            with open(os.environ["MOCK_LLM_DUMP"], "a") as dump:
+                dump.write(json.dumps([
+                    {"role": m.get("role"), "content": str(m.get("content"))[:300]}
+                    for m in body.get("messages", []) if m.get("role") != "system"]) + "\n")
         with LOCK:
             REQUESTS += 1
         created = int(time.time())
@@ -120,6 +126,53 @@ class Handler(BaseHTTPRequestHandler):
                           {"command": command, "timeout": 900})}}]}}]})
             send({"id": "mock", "object": "chat.completion.chunk", "created": created, "model": "mock",
                   "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
+            send("[DONE]")
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            return
+        # "please ask": a turn that stops for the user twice (the CP5.3 live check): a clarify
+        # question with two choices, then a terminal call that is flagged for approval (`chmod 777`
+        # is on the dangerous list; on Windows the shell says it does not know it, so allowing it
+        # changes nothing), then a reply that quotes both tool results.
+        def text_of(m):
+            content = m.get("content")
+            return content if isinstance(content, str) else " ".join(
+                p.get("text", "") for p in (content or []) if isinstance(p, dict))
+
+        # The prompt may be followed by context the runtime adds as a user message.
+        user_ix = max((i for i, m in enumerate(messages)
+                       if m.get("role") == "user" and "please ask" in text_of(m)), default=-1)
+        turn_text = text_of(messages[user_ix]) if user_ix >= 0 else ""
+        if "please ask" in turn_text:
+            results = [m.get("content") for m in messages[user_ix + 1:] if m.get("role") == "tool"]
+            results = [r if isinstance(r, str) else json.dumps(r) for r in results]
+
+            def tool_call(name, arguments):
+                send({"id": "mock", "object": "chat.completion.chunk", "created": created, "model": "mock",
+                      "choices": [{"index": 0, "finish_reason": None, "delta": {"tool_calls": [{
+                          "index": 0, "id": f"call_{REQUESTS}", "type": "function",
+                          "function": {"name": name, "arguments": json.dumps(arguments)}}]}}]})
+                send({"id": "mock", "object": "chat.completion.chunk", "created": created, "model": "mock",
+                      "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                      "usage": {"prompt_tokens": 3000, "completion_tokens": 20, "total_tokens": 3020}})
+
+            if len(results) == 0:
+                tool_call("clarify", {"questions": [
+                    {"question": "Which colour should the report be?", "choices": ["blue", "green"]}]})
+            elif len(results) == 1:
+                tool_call("terminal", {"command": "chmod 777 live-check-note.txt"})
+            else:
+                try:
+                    colour = json.loads(results[0])["responses"][0]["user_response"]
+                except Exception:
+                    colour = "?"
+                verdict = "denied" if "BLOCKED" in results[1] else "ran"
+                body = f"ANSWERS colour={colour} command={verdict}"
+                send({"id": "mock", "object": "chat.completion.chunk", "created": created, "model": "mock",
+                      "choices": [{"index": 0, "delta": {"content": body}, "finish_reason": None}]})
+                send({"id": "mock", "object": "chat.completion.chunk", "created": created, "model": "mock",
+                      "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                      "usage": {"prompt_tokens": 3000, "completion_tokens": 40, "total_tokens": 3040}})
             send("[DONE]")
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()

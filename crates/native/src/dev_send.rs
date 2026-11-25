@@ -8,6 +8,12 @@
 //! does not finish prints `dev-send: failed: <why>` and quits. No pointer or keyboard is used: the
 //! user's input is never touched.
 //!
+//! `--dev-answer <choice>` (CP5.3, the approval check `scripts/perf/native-approval-check.ps1`):
+//! while the turn runs, whatever it asks is answered through the open thread's composer model
+//! (the same call the panel's buttons and keys make): an approval with `<choice>`, a question
+//! with its first choice. When `--dump <file>` is given, the element dump of each panel is written
+//! first, to `<file>.approval` or `<file>.question`, so the check can see the panel on screen.
+//!
 //! Hermes: none (a test driver of our own).
 
 use std::time::{Duration, Instant};
@@ -15,6 +21,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::{AnyWindowHandle, App, Entity};
 
 use crate::model::{AppModel, Phase, Selection};
+use crate::thread::composer::ask::{Answer, Ask, Choice};
 use crate::thread::ThreadModel;
 use crate::thread::model::{RowKind, ThreadPhase};
 
@@ -47,6 +54,7 @@ pub fn start(
     window: AnyWindowHandle,
     prompt: String,
     dump: Option<std::path::PathBuf>,
+    answer: Option<String>,
     cx: &mut App,
 ) {
     #[cfg(not(feature = "dev"))]
@@ -100,16 +108,64 @@ pub fn start(
                 None => tick().await,
             }
         };
-        eprintln!("dev-send: sending to {session}");
+        // The prompt is printed whole, so a check sees it arrived in one piece (a shell that split
+        // it at its spaces once sent only the first word).
+        eprintln!("dev-send: sending to {session}: {prompt:?}");
         cx.update(|cx| thread.update(cx, |t, cx| t.submit(&prompt, cx)));
 
-        // 3. The turn streams, then ends.
+        // 3. The turn streams, then ends. With `--dev-answer`, what it asks is answered from the
+        // composer's model while the panel is on screen (the dump of each panel is written first).
         let mut seen_live = false;
+        let mut asked = std::collections::HashSet::new();
         loop {
             if cx.update(|cx| thread.read(cx).is_live()) {
                 seen_live = true;
             } else if seen_live {
                 break;
+            }
+            if let Some(choice) = answer.as_deref() {
+                let waiting = cx.update(|cx| {
+                    let composer = model.read(cx).composer().cloned()?;
+                    let request = composer.read(cx).current_ask().cloned()?;
+                    Some((composer, request))
+                });
+                if let Some((composer, request)) = waiting
+                    && asked.insert(request.prompt_id.clone())
+                {
+                    let (kind, what, reply) = match &request.ask {
+                        Ask::Approval(a) => {
+                            let reply = Choice::parse(choice).unwrap_or(Choice::Deny);
+                            ("approval", a.command.clone(), Answer::Approval(reply))
+                        }
+                        Ask::Clarify(q) => (
+                            "question",
+                            q.text.clone(),
+                            Answer::Text(
+                                q.choices
+                                    .first()
+                                    .cloned()
+                                    .unwrap_or_else(|| "dev answer".to_string()),
+                            ),
+                        ),
+                    };
+                    eprintln!("dev-send: asked {kind}: {}", head(&what));
+                    #[cfg(feature = "dev")]
+                    if let Some(path) = dump.clone() {
+                        let path = std::path::PathBuf::from(format!("{}.{kind}", path.display()));
+                        // Let the panel draw, then write what is on screen.
+                        cx.background_executor()
+                            .timer(Duration::from_millis(600))
+                            .await;
+                        cx.update(|cx| crate::dev::dump_after(window, Duration::ZERO, path, cx));
+                        cx.background_executor()
+                            .timer(Duration::from_millis(400))
+                            .await;
+                    }
+                    eprintln!("dev-send: answering {kind} with {reply:?}");
+                    cx.update(|cx| {
+                        composer.update(cx, |c, cx| c.answer(&request.prompt_id, reply, cx))
+                    });
+                }
             }
             if expired() {
                 fail(if seen_live {

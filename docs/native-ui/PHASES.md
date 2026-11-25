@@ -40,7 +40,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 2 | Design system and app frame: themes, tokens, design layer, window, palette, keymap — ✅ 2026-11-19 | M–L | 0 |
 | 3 | Sidebar: projects and threads — ✅ 2026-11-19 | M | 1 (CP1.1), 2 |
 | 4 | Thread view: timeline, markdown, tool calls, streaming — ✅ 2026-11-24 | L | 3 |
-| 5 | Composer: input, mentions, commands, attachments, model, approvals, questions | L | 4 |
+| 5 | Composer: input, mentions, commands, attachments, model, approvals, questions — ✅ 2026-11-25 | L | 4 |
 | 6 | Right panel: diff, files, terminal | L | 1, 4 |
 | 7 | Hermes screens: settings, memory, skills, staging, usage, import | L | 1, 2 |
 | 8 | First run, polish, accessibility, installer | M | 3–7 |
@@ -441,7 +441,7 @@ provider in `scripts/perf/` streams correctly in our instance.
 
 ### CP5.2 — Mentions, commands, attachments (M)
 
-**Status (CP5.2, 2026-11-24):** built, not reviewed, uncommitted in `hermes-rs-n5`; `thread/composer/{mention,suggest,attach,strip}.rs`, details and the reviewer's list in `progress/phase-5.md`.
+**Status (CP5.2, 2026-11-24):** built and reviewed (Opus), committed on `native/p5-composer`, not merged; `thread/composer/{mention,suggest,attach,strip}.rs`, details and the reviewer's list in `progress/phase-5.md`.
 
 1. `@` path completion (the core's completion), inserted as an inline chip.
 2. `/` command menu from our catalog, with arguments; commands that answer locally (`/usage`,
@@ -450,6 +450,8 @@ provider in `scripts/perf/` streams correctly in our instance.
    core.
 
 ### CP5.3 — Approvals and questions (M)
+
+**Status (CP5.3, 2026-11-25):** built and reviewed (Opus), committed on `native/p5-composer`, not merged; `thread/composer/{ask,panel}.rs`, `notify.rs`, details, the review and the Phase 5 user checklist in `progress/phase-5.md`. **Phase 5 done.**
 
 1. A pending approval replaces the composer's top with t3code's approval panel: the command (or
    edit), why it was flagged, the four choices (once, session, always, deny) with shortcuts.

@@ -493,7 +493,9 @@ fn a_failed_edit_shows_a_toast_and_the_list_goes_back() {
     rig.with(|s, _, cx| s.archive("t1", cx));
     {
         let toasts = toasts.borrow();
-        let ModelEvent::Toast { spec, .. } = &toasts[0];
+        let ModelEvent::Toast { spec, .. } = &toasts[0] else {
+            panic!("a toast");
+        };
         assert!(spec.title.contains("archive"));
         assert_eq!(spec.description.as_deref(), Some("disk full"));
     }
@@ -625,7 +627,10 @@ fn core_events_set_the_marks_and_a_few_become_toasts() {
     let toasts = toasts.borrow();
     let titles: Vec<String> = toasts
         .iter()
-        .map(|ModelEvent::Toast { spec, .. }| spec.title.clone())
+        .filter_map(|event| match event {
+            ModelEvent::Toast { spec, .. } => Some(spec.title.clone()),
+            _ => None,
+        })
         .collect();
     assert_eq!(
         titles,
@@ -636,7 +641,12 @@ fn core_events_set_the_marks_and_a_few_become_toasts() {
             "Review finished"
         ]
     );
-    let ModelEvent::Toast { open, .. } = &toasts[0];
+    let Some(ModelEvent::Toast { open, .. }) = toasts
+        .iter()
+        .find(|e| matches!(e, ModelEvent::Toast { .. }))
+    else {
+        panic!("a toast");
+    };
     assert_eq!(open.as_deref(), Some("t2"), "its action opens the thread");
 }
 

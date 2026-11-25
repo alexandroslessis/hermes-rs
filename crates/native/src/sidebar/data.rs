@@ -60,6 +60,9 @@ pub struct ThreadItem {
     pub working: bool,
     /// A question (an approval, a clarify) waits for the user.
     pub waiting: bool,
+    /// What waits is a question of the agent, not an approval (`waiting` is also set): the row says
+    /// "Input" (t3code) instead of "Approval".
+    pub asking: bool,
     pub branch: Option<String>,
 }
 
@@ -244,8 +247,10 @@ impl Marks<'_> {
 /// A thread's state in the right slot of its row (t3code's `topStatus`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowStatus {
-    /// A question waits for the user.
+    /// A flagged command or edit waits for the user's approval.
     Approval,
+    /// The agent asked a question and waits for the answer.
+    Input,
     /// The agent is working.
     Working,
     /// The last turn failed.
@@ -258,7 +263,11 @@ pub enum RowStatus {
 /// unread completion; `None` for a thread at rest.
 pub fn status_of(thread: &ThreadItem, marks: &Marks<'_>) -> Option<RowStatus> {
     if thread.waiting {
-        Some(RowStatus::Approval)
+        Some(if thread.asking {
+            RowStatus::Input
+        } else {
+            RowStatus::Approval
+        })
     } else if thread.working {
         Some(RowStatus::Working)
     } else if Marks::has(marks.failed, &thread.id) {
@@ -283,7 +292,7 @@ pub enum FolderDot {
 fn folder_dot(threads: &[&ThreadItem], marks: &Marks<'_>) -> Option<FolderDot> {
     let statuses: Vec<RowStatus> = threads.iter().filter_map(|t| status_of(t, marks)).collect();
     let has = |s| statuses.contains(&s);
-    if has(RowStatus::Approval) {
+    if has(RowStatus::Approval) || has(RowStatus::Input) {
         Some(FolderDot::Attention)
     } else if has(RowStatus::Failed) {
         Some(FolderDot::Failed)
@@ -521,6 +530,7 @@ mod tests {
             updated_ms: updated,
             working: false,
             waiting: false,
+            asking: false,
             branch: None,
         }
     }

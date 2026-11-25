@@ -14,6 +14,9 @@ pub mod fake;
 pub mod gallery;
 pub mod keymap;
 pub mod model;
+pub mod notify;
+#[cfg(test)]
+mod notify_tests;
 pub mod palette;
 pub mod sidebar;
 pub mod spike;

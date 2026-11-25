@@ -161,3 +161,41 @@ pub static EMPTY_STATES: Story = Story {
         }
     },
 };
+
+const WAITING: [State; 2] = [at_rest("approval-and-input"), at_rest("closed-folder")];
+
+/// The sidebar while threads wait for the user (CP5.3): one for an approval ("Approval", the
+/// warning shield), one for a question ("Input"), and a closed folder with the attention dot.
+pub static SIDEBAR_WAITING: Story = Story {
+    name: "sidebar-waiting",
+    title: "Sidebar: threads that wait",
+    size: (580., 640.),
+    themes: Themes::T3,
+    states: &WAITING,
+    render: |state, _, cx| {
+        let mut snapshot = fixture::snapshot();
+        let mut prefs = Prefs::default();
+        if state.name == "approval-and-input" {
+            snapshot.threads[0].working = true; // t1 works
+            snapshot.threads[1].waiting = true; // t2 waits for an approval
+            snapshot.threads[2].waiting = true; // t3 waits for an answer
+            snapshot.threads[2].asking = true;
+        } else {
+            snapshot.threads[3].waiting = true; // t4, in hermes-rs
+            snapshot.threads[3].asking = true;
+            prefs.collapsed.insert("prj_hermes".into());
+            prefs.collapsed.insert("prj_engine".into());
+        }
+        let backend = FixtureBackend::new(snapshot.clone());
+        let model =
+            cx.new(|cx| AppModel::with_snapshot(backend, snapshot, cx).with_clock(|| NOW_MS));
+        let sidebar = cx.new(|cx| Sidebar::new(model, prefs, cx));
+        div()
+            .id("sidebar-frame")
+            .w(px(256.))
+            .h(px(600.))
+            .child(sidebar)
+            .probe()
+            .into_any_element()
+    },
+};

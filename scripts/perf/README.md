@@ -158,6 +158,8 @@ and the `open_file.rs` unit tests.
 imported chat) against a home built by `make-hermes-db.py` with Hermes's own SessionDB; start the
 instance with `HERMES_HOME` set to it.
 
+`native-approval-check.ps1` is Phase 5's: our `hermes-native --dev --dev-send --dev-answer` against `mock_llm.py` on :47902 ("please ask": a clarify question, then a flagged `chmod 777`), run twice (allowed, denied); both panels must show in the element dump and the reply must carry the outcome (docs/TESTING.md section 6). It builds `hermes-native --features dev` itself.
+
 `native-thread-check.ps1` is the native UI's live turn (Phase 4): our `hermes-native --dev --dev-send` on a
 seeded synthetic folder (`target
 ative-live`) against `mock_llm.py` on :47901; the streamed reply and the same reply

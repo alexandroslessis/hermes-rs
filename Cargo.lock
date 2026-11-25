@@ -4739,13 +4739,16 @@ dependencies = [
  "hermes_testdir",
  "hermes_tools",
  "image",
+ "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",
  "similar 3.2.1",
+ "tauri-winrt-notification",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows 0.62.2",
  "wiremock",
 ]
 

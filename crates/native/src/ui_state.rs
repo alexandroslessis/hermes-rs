@@ -125,6 +125,9 @@ pub struct UiState {
     pub sidebar_list: crate::sidebar::data::Prefs,
     /// The composer's unsent text per thread (Phase 5): bounded, see [`Drafts`].
     pub drafts: Drafts,
+    /// Flash the taskbar and show a Windows notification when a thread waits for an answer while
+    /// the window is not where the user looks (CP5.3; the settings screen is Phase 7).
+    pub notifications: bool,
 }
 
 impl Default for UiState {
@@ -146,6 +149,7 @@ impl Default for UiState {
             theme: None,
             sidebar_list: Default::default(),
             drafts: Drafts::default(),
+            notifications: true,
         }
     }
 }
@@ -258,6 +262,9 @@ impl UiState {
             drafts: part("drafts")
                 .map(|v| Drafts::from_json(&v))
                 .unwrap_or_default(),
+            notifications: part("notifications")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(defaults.notifications),
         }
         .sanitized()
     }

@@ -41,6 +41,7 @@ use hermes_runtime::TurnStatus;
 
 use crate::design::toast::{Kind, ToastSpec};
 use crate::sidebar::data::{Marks, Op, Snapshot};
+use crate::thread::composer::ask::{Asks, Request};
 use crate::thread::composer::data::{Picks, SendRequest};
 use crate::thread::composer::{ComposerEvent, ComposerModel, Target};
 use crate::thread::{ThreadEvent, ThreadModel};
@@ -81,6 +82,11 @@ pub enum ModelEvent {
         spec: ToastSpec,
         open: Option<String>,
     },
+    /// A thread began to wait for the user (an approval or a question): the frame decides whether
+    /// to flash the taskbar and show a notification (`crate::notify`). Said once per request.
+    Waiting { session: String },
+    /// A thread waits no more (its last request was answered or settled).
+    Resumed { session: String },
 }
 
 /// The projects and threads, the selection and the marks.
@@ -94,6 +100,9 @@ pub struct AppModel {
     /// before the core caught up, until their end event.
     working: HashSet<String>,
     waiting: HashSet<String>,
+    /// The approvals and questions of every thread, open or not (CP5.3): what the sidebar marks
+    /// and what a thread shows when it is opened.
+    asks: Asks,
     phase: Phase,
     clock: fn() -> i64,
     reading: bool,
@@ -144,6 +153,7 @@ impl AppModel {
             failed: HashSet::new(),
             working: HashSet::new(),
             waiting: HashSet::new(),
+            asks: Asks::default(),
             phase: Phase::Starting,
             clock: system_now_ms,
             reading: false,
@@ -310,6 +320,16 @@ impl AppModel {
         }
     }
 
+    /// The approvals and questions of every thread.
+    pub fn asks(&self) -> &Asks {
+        &self.asks
+    }
+
+    /// The title of a listed thread (a notification's heading).
+    pub fn thread_title(&self, session: &str) -> String {
+        self.title_of(session)
+    }
+
     /// The open thread's model (once [`Self::open`] made it).
     pub fn thread(&self) -> Option<&Entity<ThreadModel>> {
         self.thread.as_ref()
@@ -350,7 +370,16 @@ impl AppModel {
                     .thread
                     .clone()
                     .filter(|_| matches!(target, Target::Thread(_)));
-                Some(cx.new(|cx| ComposerModel::new(target, backend, thread, cx)))
+                // What the thread waits on arrived while it was not open: it is shown now.
+                let waiting: Vec<Request> = match &target {
+                    Target::Thread(id) => self.asks.of(id).cloned().collect(),
+                    Target::Draft(_) => Vec::new(),
+                };
+                let composer = cx.new(|cx| ComposerModel::new(target, backend, thread, cx));
+                if !waiting.is_empty() {
+                    composer.update(cx, |c, cx| c.seed_asks(waiting, cx));
+                }
+                Some(composer)
             }
             _ => None,
         };
@@ -515,6 +544,7 @@ impl AppModel {
         for thread in &mut snapshot.threads {
             thread.working |= self.working.contains(&thread.id);
             thread.waiting |= self.waiting.contains(&thread.id);
+            thread.asking = self.asks.only_questions(&thread.id);
         }
         if snapshot != self.snapshot {
             self.snapshot = snapshot;
@@ -604,6 +634,14 @@ impl AppModel {
             .map_or_else(|| "A thread".to_string(), |t| t.display_title().to_string())
     }
 
+    /// A thread that waits on questions only shows "Input"; one that waits on an approval
+    /// "Approval".
+    fn mark_asking(&mut self) {
+        for thread in &mut self.snapshot.threads {
+            thread.asking = self.asks.only_questions(&thread.id);
+        }
+    }
+
     fn set_flags(&mut self, session: &str, working: Option<bool>, waiting: Option<bool>) {
         let mark = |set: &mut HashSet<String>, on: bool| {
             if on {
@@ -639,6 +677,29 @@ impl AppModel {
         // The composer follows the same turn (its queue, whether it runs).
         if let Some(composer) = &self.composer {
             composer.update(cx, |composer, cx| composer.on_event(&event, cx));
+        }
+        // The approvals and questions of every thread are kept here, open or not: a request for a
+        // thread that is not open waits until it is, and the sidebar marks the thread meanwhile.
+        let session = event.session_id().to_string();
+        let was_waiting = self.asks.waiting(&session);
+        if self.asks.on_event(&event) && !session.is_empty() {
+            let waiting = self.asks.waiting(&session);
+            self.set_flags(&session, None, Some(waiting));
+            self.mark_asking();
+            let is_request = matches!(
+                event,
+                CoreEvent::ApprovalRequested { .. } | CoreEvent::ClarifyRequested { .. }
+            );
+            if is_request {
+                cx.emit(ModelEvent::Waiting {
+                    session: session.clone(),
+                });
+            } else if was_waiting && !waiting {
+                cx.emit(ModelEvent::Resumed {
+                    session: session.clone(),
+                });
+            }
+            cx.notify();
         }
         match event {
             CoreEvent::TurnStarted { session_id, .. } => {
@@ -684,15 +745,6 @@ impl AppModel {
             CoreEvent::Idle { session_id } => {
                 self.set_flags(&session_id, Some(false), None);
                 self.refresh(cx);
-                cx.notify();
-            }
-            CoreEvent::ApprovalRequested { session_id, .. }
-            | CoreEvent::ClarifyRequested { session_id, .. } => {
-                self.set_flags(&session_id, None, Some(true));
-                cx.notify();
-            }
-            CoreEvent::Settled { session_id, .. } => {
-                self.set_flags(&session_id, None, Some(false));
                 cx.notify();
             }
             CoreEvent::TitleChanged { session_id, title } => {

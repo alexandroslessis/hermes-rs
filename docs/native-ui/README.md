@@ -140,7 +140,7 @@ copies a layout cites its source in its header, like the Hermes port map
 | Sidebar | `components/Sidebar.tsx`, `components/sidebar/*` (`SidebarThreadRow`, `SidebarProjectFolderHeader`), `ThreadStatusIndicators.tsx` | `sidebar/` |
 | Thread header, branch bar | `components/chat/ChatHeader.tsx`, `BranchToolbar.tsx`, `GitActionsControl.tsx` | `thread/header.rs`, `header_data.rs` (CP4.3: the title bar's middle; git state and the model as chips, no separate branch bar) |
 | Timeline | `components/ChatView.tsx`, `components/chat/ChatCanvas.tsx`, `ChatMarkdown.tsx`, `CommandBlock.tsx`, `chat/ChangedFilesTree.tsx` | `thread/` (CP4.1: `view.rs`, `model.rs`, `markdown.rs`; CP4.2: `tools.rs`, `work.rs`, `cards.rs`, `ansi.rs`, `diff.rs`) |
-| Composer | `components/chat/ChatComposer.tsx`, `Composer*` (model and effort, command menu, pending approval, user input panel, attachments) | `thread/composer/` (CP5.2: `mention.rs`, `suggest.rs`, `attach.rs`, `strip.rs`; CP5.1: `model.rs`, `view.rs`, `data.rs`; the new-thread screen is `view::hero`) |
+| Composer | `components/chat/ChatComposer.tsx`, `Composer*` (model and effort, command menu, pending approval, user input panel, attachments) | `thread/composer/` (CP5.3: `ask.rs`, `panel.rs`, `notify.rs`; CP5.2: `mention.rs`, `suggest.rs`, `attach.rs`, `strip.rs`; CP5.1: `model.rs`, `view.rs`, `data.rs`; the new-thread screen is `view::hero`) |
 | Right panel | `components/RightPanelTabs.tsx`, `rightPanelStore.ts`, `DiffPanel.tsx`, `components/diffs/*`, `components/files/*` | `panel/` |
 | Terminal drawer | `components/ThreadTerminalDrawer.tsx` | `terminal/` |
 | Command palette | `components/CommandPalette*.tsx` | `palette.rs` |

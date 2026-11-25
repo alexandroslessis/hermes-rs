@@ -530,3 +530,215 @@ fn an_app_command_typed_in_the_composer_reaches_the_frame() {
     });
     assert!(titles.iter().any(|t| t == "Settings"), "{titles:?}");
 }
+
+// --- CP5.3: approvals and questions in the app -------------------------------------------------
+
+mod asking {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use hermes_core::QuestionKind;
+
+    use super::*;
+    use crate::model::ModelEvent;
+    use crate::sidebar::data::{RowStatus, status_of};
+    use crate::thread::composer::ask::{Answer, Choice};
+
+    fn approval(id: &str, session: &str, command: &str) -> CoreEvent {
+        CoreEvent::ApprovalRequested {
+            session_id: session.into(),
+            prompt_id: id.into(),
+            command: command.into(),
+            description: "recursive delete".into(),
+            choices: vec!["once", "session", "always", "deny"],
+        }
+    }
+
+    fn question(id: &str, session: &str) -> CoreEvent {
+        CoreEvent::ClarifyRequested {
+            session_id: session.into(),
+            prompt_id: id.into(),
+            question: "Which one?".into(),
+            choices: vec!["a".into(), "b".into()],
+            multi_select: false,
+        }
+    }
+
+    fn settled(id: &str, session: &str, kind: QuestionKind) -> CoreEvent {
+        CoreEvent::Settled {
+            session_id: session.into(),
+            prompt_id: id.into(),
+            kind,
+        }
+    }
+
+    fn record(app: &mut App) -> Rc<RefCell<Vec<ModelEvent>>> {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let (sink, model) = (events.clone(), app.model.clone());
+        app.cx.update(|cx| {
+            cx.subscribe(&model, move |_, event: &ModelEvent, _| {
+                sink.borrow_mut().push(event.clone());
+            })
+            .detach();
+        });
+        events
+    }
+
+    fn waiting(app: &mut App, id: &str) -> (bool, bool) {
+        let model = app.model.clone();
+        app.cx.update(|cx| {
+            let t = model.read(cx).snapshot().thread(id).unwrap().clone();
+            (t.waiting, t.asking)
+        })
+    }
+
+    fn open(app: &mut App, id: &str) {
+        let model = app.model.clone();
+        app.cx.update(|cx| model.update(cx, |m, cx| m.open(id, cx)));
+        app.settle();
+    }
+
+    fn pending(app: &mut App) -> Vec<String> {
+        let composer = app.composer();
+        app.cx.update(|cx| {
+            composer
+                .read(cx)
+                .asks()
+                .iter()
+                .map(|r| r.prompt_id.clone())
+                .collect()
+        })
+    }
+
+    #[core::prelude::v1::test]
+    fn a_request_for_a_thread_that_is_not_open_is_kept_and_shown_when_it_is_opened() {
+        let mut app = app();
+        open(&mut app, "t1");
+        app.backend.ask(approval("p1", "t2", "rm -rf build"));
+        app.settle();
+        // Nothing on screen for t1; t2 is marked in the list.
+        assert!(pending(&mut app).is_empty());
+        assert_eq!(waiting(&mut app, "t2"), (true, false), "an approval");
+        assert_eq!(waiting(&mut app, "t1"), (false, false));
+        // Opening t2 shows it in the composer.
+        open(&mut app, "t2");
+        assert_eq!(pending(&mut app), ["p1"]);
+        // Going away and coming back still has it: the app model keeps what the core has.
+        open(&mut app, "t1");
+        open(&mut app, "t2");
+        assert_eq!(pending(&mut app), ["p1"]);
+    }
+
+    #[core::prelude::v1::test]
+    fn settled_clears_the_mark_and_the_panel_two_requests_keep_the_mark_until_both_are_gone() {
+        let mut app = app();
+        open(&mut app, "t2");
+        app.backend.ask(approval("p1", "t2", "first"));
+        app.backend.ask(question("q2", "t2"));
+        app.settle();
+        assert_eq!(pending(&mut app), ["p1", "q2"], "in the order they came");
+        assert_eq!(waiting(&mut app, "t2"), (true, false), "an approval waits among them");
+        // The first is settled: one still waits, and it is a question.
+        app.backend.emit(settled("p1", "t2", QuestionKind::Approval));
+        app.settle();
+        assert_eq!(pending(&mut app), ["q2"]);
+        assert_eq!(waiting(&mut app, "t2"), (true, true), "only a question waits: Input");
+        app.backend.emit(settled("q2", "t2", QuestionKind::Clarify));
+        app.settle();
+        assert!(pending(&mut app).is_empty());
+        assert_eq!(waiting(&mut app, "t2"), (false, false));
+    }
+
+    #[core::prelude::v1::test]
+    fn the_sidebar_status_is_approval_or_input_and_a_finished_turn_clears_it() {
+        let mut app = app();
+        let marks_of = |app: &mut App, id: &str| {
+            let model = app.model.clone();
+            app.cx.update(|cx| {
+                let m = model.read(cx);
+                let t = m.snapshot().thread(id).unwrap().clone();
+                status_of(&t, &m.marks())
+            })
+        };
+        app.backend.ask(question("q1", "t2"));
+        app.settle();
+        assert_eq!(marks_of(&mut app, "t2"), Some(RowStatus::Input));
+        app.backend.ask(approval("p1", "t2", "x"));
+        app.settle();
+        assert_eq!(
+            marks_of(&mut app, "t2"),
+            Some(RowStatus::Approval),
+            "an approval is the more urgent"
+        );
+        // The turn ended (stopped): nothing waits any more, whatever Settled said.
+        app.backend.emit(CoreEvent::Idle {
+            session_id: "t2".into(),
+        });
+        app.settle();
+        assert_eq!(waiting(&mut app, "t2"), (false, false));
+        assert_eq!(marks_of(&mut app, "t2"), None);
+    }
+
+    #[core::prelude::v1::test]
+    fn the_model_says_when_a_thread_starts_and_stops_waiting() {
+        let mut app = app();
+        let events = record(&mut app);
+        app.backend.ask(approval("p1", "t2", "x"));
+        app.backend.ask(approval("p2", "t2", "y"));
+        app.settle();
+        // Said for each request; the frame announces a thread once.
+        let waits = |events: &Rc<RefCell<Vec<ModelEvent>>>| {
+            events
+                .borrow()
+                .iter()
+                .filter(|e| matches!(e, ModelEvent::Waiting { session } if session == "t2"))
+                .count()
+        };
+        assert_eq!(waits(&events), 2);
+        app.backend.emit(settled("p1", "t2", QuestionKind::Approval));
+        app.settle();
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, ModelEvent::Resumed { .. })),
+            "one still waits"
+        );
+        app.backend.emit(settled("p2", "t2", QuestionKind::Approval));
+        app.settle();
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, ModelEvent::Resumed { session } if session == "t2"))
+        );
+        // A repeated event is not a new wait.
+        let before = waits(&events);
+        app.backend.emit(approval("p3", "t2", "z"));
+        app.backend.emit(approval("p3", "t2", "z"));
+        app.settle();
+        assert_eq!(waits(&events), before + 1);
+    }
+
+    #[core::prelude::v1::test]
+    fn answering_from_the_open_composer_reaches_the_backend_and_settles_everywhere() {
+        let mut app = app();
+        open(&mut app, "t2");
+        app.backend.ask(approval("p1", "t2", "rm -rf build"));
+        app.settle();
+        let composer = app.composer();
+        app.cx.update(|cx| {
+            composer.update(cx, |c, cx| {
+                c.answer("p1", Answer::Approval(Choice::Session), cx)
+            })
+        });
+        app.settle();
+        assert!(app.backend.composer_ops().iter().any(|op| matches!(
+            op,
+            ComposerOp::Answer { prompt_id, answer: Answer::Approval(Choice::Session) } if prompt_id == "p1"
+        )));
+        // The fixture settled it like the core does: the mark and the panel are gone.
+        assert!(pending(&mut app).is_empty());
+        assert_eq!(waiting(&mut app, "t2"), (false, false));
+    }
+}

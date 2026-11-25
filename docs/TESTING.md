@@ -483,6 +483,28 @@ attached file (what the provider got, the stored row and its image, the copy in 
 `composer-mentions`, `composer-commands`, `composer-attachments` (strip pictures are synthetic: `ComposerModel::seed_attachments`).
 Hand-only: a real clipboard image, a drag from Explorer, the Windows file dialog.
 
+**Approvals and questions (CP5.3).** `thread/composer/ask.rs` has the pure parts (the request queue built from the core's
+events, `Nav`: what each key does on an approval or a question) with unit tests; `thread/composer/tests/asking.rs` (same rig,
+a child of `tests.rs`) drives the panel over a `FixtureBackend` (`ask` opens a question the way the core does, a second
+answer finds it closed): each of the four buttons reaches `Backend::answer`, Enter/Escape/digits/arrows, Escape in the
+empty input denies but Enter there allows nothing, a composer with text keeps the keyboard, Settled and a finished turn
+close the panel at once, two requests queue ("1 of 2"), a second answer is nothing, a refused answer keeps the request,
+an edit shows its path and the diff of the running call, free text, a multi-select, and the layout of both panels at 640,
+1100 and 1920 px with a very long command, path and reason, twelve choices, hints inside their buttons, the card under
+the panel. `wiring_tests.rs::asking`: a request for a thread that is not open is kept and shown on open, the sidebar mark
+(Approval / Input) clears on Settled and on a finished turn. `notify_tests.rs`: the frame's notices with a recording
+`Notifier` and a forced window state (focus rules, one notice per wait, hold and settled-before, the setting off, a click
+opens the thread). `real_tests.rs`: a real `Core` + a scripted wiremock provider asks a question and then a flagged
+`chmod 777` (a file that does not exist in the test's own temp folder); the composer's model answers both, for allow and
+for deny, and the turn's reply shows the outcome; stopping a waiting turn closes the panel. Snapshots `composer-asks`
+(approval of a command and of an edit, question with choices and with free text, a second request queued, a narrow card; since the review also "Always allow" asking for its confirmation, an edit whose diff is not in the timeline, a command with hidden characters shown escaped; review tests: an early key, a held Enter on the next request, focus not taken from outside the composer, escaped characters, the narrow two-pair wrap)
+and `sidebar-waiting`. **Live check** `scripts/perf/native-approval-check.ps1` (the Phase 5 Done criterion): seeds
+`target\native-live`, starts `mock_llm.py` on :47902 and our build (`--features dev`) with `--dev --dev-send "please ask ..."
+--dev-answer once|deny --dump <file>`; the app answers through the open thread's composer model, writes the element dump of
+each panel while it is on screen (`<file>.question`, `<file>.approval`) and the script checks the panels' names in the dumps,
+the mock's `ANSWERS colour=blue command=ran|denied` in the streamed and the stored reply. No notification is made in that
+mode. Hand-only: the Windows toast and the taskbar flash (`OsNotifier`), clicking the toast, the feel of the keys.
+
 **Phase 4 Done list, and what covers it.** *A recorded fixture session of every event kind replays in the
 gallery:* `thread::recording` (the recorder test and the replay round trip) and the stories `thread`, `thread-live`
 and `thread-tools-*`. *Timeline layout tests:* `thread/tests.rs`, `thread/tests/tools.rs`. *Snapshots of every
