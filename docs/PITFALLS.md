@@ -173,6 +173,31 @@ ACP mode (`--acp`, [docs/acp/](acp/README.md)):
 
 ## Native UI (`crates/native`, GPUI Kit; [docs/native-ui/](native-ui/README.md))
 
+- **The terminal must answer ConPTY's first question (CP6.3).** A pseudo-console prints `ESC[6n` (where is the
+  cursor?) when it starts and the shell shows nothing until it gets the answer. The emulator answers (its `PtyWrite`
+  events, written back by the pump); a front end that only displays output sees an empty terminal forever.
+- **A global key binding and a `Terminal`-context one tie (CP6.3).** GPUI ranks a binding with no context as deep as
+  the focused element's own context, and breaks ties by order: `terminal::bind` must run **after** `keymap::bind`,
+  or `Ctrl+P` / `Ctrl+K` open the finder / palette instead of reaching the shell. GPUI Kit's root binds `Tab`,
+  `Shift+Tab` (focus cycling) and `Ctrl+C` (copy) in `Root`; the terminal takes them back (`NoAction`, its own
+  `CopyOrInterrupt`). The reserved set is `terminal::RESERVED_IN_TERMINAL` (tested against `keymap::COMMANDS`).
+- **Closing a shell's pseudo-console is not enough to end what it started (CP6.3).** It ends processes attached to the
+  console, not one started in a console of its own (`Start-Process -WindowStyle Hidden`). `hermes_core::terminal`
+  kills the descendants (`kill_descendants`), the shell, the descendants again, then closes the console. Not
+  `taskkill /T`: Windows keeps a dead parent's id in its children, so a walk by parent id alone can reach an unrelated
+  process whose parent id was recycled; `kill_descendants` walks from the shell's held handle (its id cannot be
+  reused) and only through children created after their parent, and kills through handles it opened. No job object
+  (a GUI program started from the terminal would die with it); a crash of the app is not covered: see the CP6.3 review.
+- **What a program prints must never become input (CP6.3).** The emulator's replies are fixed formats with numbers
+  (DSR, DA, sizes, colours, modes); `alacritty_terminal` has no title report (`CSI 21 t`); OSC 52 is `Disabled` (no
+  clipboard read or write); OSC 8 hyperlinks are not followed (target may differ from the text); a bracketed paste
+  loses every ESC (removing only `ESC[201~` lets `ESC[20ESC[201~1~` close up into a new one). Keep it so.
+- **Alacritty selections are half-cell (CP6.3).** A click in the right half of a cell starts the selection *after* it
+  (`Side::Right`); a click leaves an empty selection that Shift+click extends (`Emulator::has_anchor`, not
+  `has_selection`). Tests click in a cell's left quarter.
+- **A terminal's emulator lock is fair for the view, unfair for the pump (CP6.3).** `FairMutex::lock` from the UI,
+  `lock_unfair` from the pump, which parses 64 KiB per hold: a frame waits for one slice at most (measured 5 ms).
+
 - **A linked file is shown, never run (CP6.2).** The Files tab reads a file; it never opens it with the shell. Every
   path (a link in a message, a tree row, the finder, a link in rendered markdown) goes through `panel::fs::locate`:
   refused unless *lexically* below the thread's folder before the disk is touched (a `\\host\share` link must never be

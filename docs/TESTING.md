@@ -539,6 +539,26 @@ temporary folders are scrubbed so it is deterministic) and that the cards the li
 the ones the stored transcript builds. The gallery's `thread-tools-*` stories replay slices of that
 recording through the model.
 
+**The terminal (CP6.3).** `terminal/tests.rs` is the scripted session with no window: byte streams through the
+emulator (`alacritty_terminal`) checked on the screen the view draws: SGR 16 / 256 / true colour and every attribute,
+cursor movement and erasing, wide and emoji characters, the alternate screen, scrolling regions, a full-screen program's
+screen (`fixture::tui_demo`: box drawing, inverse status bar, mouse reporting), resize with reflow, the program's
+questions answered (ConPTY's `ESC[6n` at start, colours), titles, the bell, OSC 52 refused, printed text never
+coming back as input (`printed_text_cannot_type_into_the_shell`), selection text (wrapped lines,
+wide characters, trailing blanks), damage-only row rebuilds, and the volume tests (1,000,000 lines through the emulator
+with the scrollback bound; the pump fed 200,000 lines while a "frame" takes the lock every 16 ms; a flood past the
+channel replays the history). The numbers print with `--nocapture`. `terminal/view_tests.rs` drives the workspace
+over the fixture's scripted shell (`terminal/fixture.rs`): the drawer and the right panel's Terminal tab at three sizes
+(cell-grid alignment, toolbar, list, `no_overflow`), keys (what reaches the shell, what the app keeps), Ctrl+C, paste,
+mouse selection, mouse reports, the wheel and the "lines below" indicator, debounced resize, Ctrl+click on a path,
+several terminals and thread switches, the "+" chooser, the bell, the IME. **`terminal/real_tests.rs` is the live
+check:** a real `Core` on a `hermes_testdir` folder starts a real shell through `Backend::terminal_spawn`, runs a
+command, sees a resize (`$Host.UI.RawUI.WindowSize`), runs Git for Windows' `less` when installed (its first and
+second pages on the alternate screen, the shell's screen back after `q`), waits on computed markers, never on time
+(`Term::sync`: a marker command resent until its output shows, since a program that just quit may eat input), and checks with
+`tasklist` that the shell and a hidden `ping` it started are gone after close and after `terminals_close_all` (the
+app's quit). `hermes_core::terminal`'s own test does the same at the core level.
+
 **The Files tab (CP6.2).** `panel/files_tests.rs` drives the workspace over the fixture backend's *virtual* project
 (`panel/fixture_files.rs`: a Rust-ish project with an ignored `target/`, a credentials file, a link that leaves the
 project, a binary, a picture, an SVG, a non-UTF-8 file, a file claimed to be 34 MB) and, where `.gitignore` files or the

@@ -16,6 +16,7 @@ mod header;
 mod panel;
 mod panel_files;
 mod sidebar;
+mod terminal;
 #[cfg(all(test, feature = "snapshots"))]
 mod snapshots;
 mod thread;
@@ -152,6 +153,8 @@ register_stories![
     panel::PANEL_DIFF,
     panel_files::PANEL_FILES,
     panel_files::FILE_FINDER,
+    terminal::TERMINAL,
+    terminal::PANEL_TERMINAL,
 ];
 
 /// One story in one state, on the theme's background: the root view of a snapshot window, and

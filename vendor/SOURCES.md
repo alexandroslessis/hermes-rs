@@ -44,6 +44,19 @@ snapshot tests use on Windows (`gpui-pre-platform` wires it on Linux only; docs/
 *Native UI*). Its `wgpu-hal` needs `gpu-allocator` built against `windows` 0.62; that entry in
 `Cargo.lock` was set by hand (CP0.2).
 
+## alacritty_terminal (CP6.3)
+
+`alacritty_terminal` **0.26.0** from crates.io (https://github.com/alacritty/alacritty,
+Apache-2.0), a dependency of `crates/native` pinned `=0.26.0`, `default-features = false` (no
+serde): the terminal view's grid, VT parser (`vte` 0.15.0), scrollback and selection. An ordinary
+crates.io crate (no Zed or Alacritty code is copied); our renderer, input encoding, links and the
+pump are written here (`crates/native/src/terminal/`). It added seven packages to `Cargo.lock`
+(`alacritty_terminal`, `vte`, `cursor-icon`, `home`, `miow`, `rustix-openpty`, `signal-hook`; the
+last two are Unix-only and not built on Windows). The lock was edited so that only those entries
+and `hermes-native`'s dependency line were added: a plain re-resolution also re-pointed existing
+crates at other `windows-sys` versions (CP6.3 progress note); `cargo build --workspace --locked`
+accepts it. Upgrade on purpose.
+
 ## Themes and fonts bundled in `crates/native/assets/` (CP2.1)
 
 - `assets/themes/one/one.json` and `assets/themes/ayu/ayu.json`: Zed's One (its port of Atom's

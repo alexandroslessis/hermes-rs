@@ -19,7 +19,10 @@
 //! project yet, no open thread) or the open thread ([`crate::thread::ThreadView`], Phase 4); the
 //! right panel is [`crate::panel::RightPanel`] (Phase 6: its tab strip and the diff tab; "Open
 //! diff" and a file link, [`crate::thread::OpenDiffTab`] and [`crate::thread::OpenFileInPanel`],
-//! open it); the drawer is a placeholder for CP6.3.
+//! open it); the drawer holds the open thread's terminals ([`crate::terminal::group`], CP6.3: a
+//! hub of groups, one per thread, kept while other threads are shown and while the drawer is
+//! closed). Opening the drawer gives the focus to its terminal; closing it while the terminal has
+//! the focus gives the focus back to the frame.
 //!
 //! t3code: `apps/web/src/components/AppSidebarLayout.tsx` (the frame, the sidebar width limits:
 //! `threadSidebarWidth.ts`), `components/ui/sidebar.tsx` (`Sidebar`, `SidebarRail`: the drag
@@ -57,6 +60,7 @@ use crate::{
     model::{AppModel, ModelEvent, Selection, fixture},
     palette::{self, Item, Kind, Mode, Palette, PaletteEvent},
     panel::{RightPanel, RightPanelEvent, finder::{FileFinder, FinderEvent}},
+    terminal::group::{GroupEvent, Surface, TerminalHub},
     sidebar::{Sidebar, SidebarEvent, data::Snapshot, empty},
     theme::{self, DesignTheme as _, Themes},
     thread::{
@@ -260,6 +264,10 @@ pub struct Workspace {
     active_override: Option<bool>,
     /// The right panel: the tab strip and the diff (Phase 6).
     right_panel: Entity<RightPanel>,
+    /// The drawer's terminals, per thread (CP6.3).
+    drawer_terminals: Entity<TerminalHub>,
+    /// The drawer was opened or closed since the last frame: the focus follows at the next one.
+    drawer_toggled: bool,
     _bounds: Subscription,
     _subscriptions: Vec<Subscription>,
 }
@@ -293,11 +301,17 @@ impl Workspace {
         });
         let sidebar = cx.new(|cx| Sidebar::new(model.clone(), state.sidebar_list.clone(), cx));
         let right_panel = cx.new(|cx| RightPanel::new(model.clone(), window, cx));
+        let drawer_terminals = cx.new(|_| TerminalHub::new(model.clone(), Surface::Drawer));
         // The panel reads only while it is open: it is open from the start when it was left open.
         let open = state.right_panel.open;
         right_panel.update(cx, |panel, cx| panel.set_visible(open, cx));
         let subscriptions = vec![
             cx.subscribe_in(&right_panel, window, Self::on_panel_event),
+            cx.subscribe(&drawer_terminals, |this, _, event: &GroupEvent, cx| {
+                if let GroupEvent::Notice(spec) = event {
+                    this.push_toast(spec.clone(), cx);
+                }
+            }),
             cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
             cx.subscribe_in(&model, window, Self::on_model_event),
             // The palette's list, the title and the open thread follow the model.
@@ -334,6 +348,8 @@ impl Workspace {
             clicks: None,
             active_override: None,
             right_panel,
+            drawer_terminals,
+            drawer_toggled: false,
             _bounds: bounds,
             _subscriptions: subscriptions,
         }
@@ -837,10 +853,76 @@ impl Workspace {
         self.changed(cx);
     }
 
-    /// Opens or closes the bottom drawer.
+    /// Opens or closes the bottom drawer (the focus goes to its terminal, or back to the frame,
+    /// at the next frame).
     pub fn toggle_drawer(&mut self, cx: &mut Context<Self>) {
         self.state.drawer.open = !self.state.drawer.open;
+        self.drawer_toggled = true;
         self.changed(cx);
+    }
+
+    /// The drawer's terminal hub.
+    pub fn drawer_terminals(&self) -> &Entity<TerminalHub> {
+        &self.drawer_terminals
+    }
+
+    /// The open thread's id, when a thread (not a draft) is open.
+    fn open_thread_id(&self, cx: &App) -> Option<String> {
+        match self.model.read(cx).selected() {
+            Selection::Thread(id) => Some(id.clone()),
+            _ => None,
+        }
+    }
+
+    /// The drawer's content: the open thread's terminals (the first starts now), or a note.
+    fn drawer_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let toggled = std::mem::take(&mut self.drawer_toggled);
+        let Some(session) = self.open_thread_id(cx) else {
+            let palette = cx.design_theme().palette;
+            return div()
+                .id("drawer-body")
+                .flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .text_size(text::SM.size)
+                .text_color(palette.muted_foreground.hsla())
+                .child("Open a thread to use its terminal.")
+                .probe()
+                .into_any_element();
+        };
+        let group = self
+            .drawer_terminals
+            .update(cx, |hub, cx| hub.group(&session, cx));
+        group.update(cx, |g, cx| {
+            g.ensure_started(window, cx);
+            if toggled {
+                g.focus_active(window, cx);
+            }
+        });
+        div()
+            .id("drawer-body")
+            .size_full()
+            .child(group)
+            .probe()
+            .into_any_element()
+    }
+
+    /// The drawer was just closed: if one of its terminals had the focus, the frame takes it.
+    fn drawer_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.drawer_toggled) {
+            return;
+        }
+        let focused_terminal = self.drawer_terminals.read(cx).groups().any(|(_, group)| {
+            group
+                .read(cx)
+                .terminals()
+                .iter()
+                .any(|t| t.read(cx).focus_handle(cx).is_focused(window))
+        });
+        if focused_terminal {
+            window.focus(&self.focus, cx);
+        }
     }
 
     /// Moves a border to the pointer at `pointer` (window coordinates) in a window of `window`
@@ -1348,26 +1430,20 @@ impl Render for Workspace {
                         .child(self.right_panel.clone()),
                 )
         });
-        let drawer = (frame.drawer > 0.).then(|| {
-            div()
-                .id("drawer-slot")
-                .flex_shrink_0()
-                .h(px(frame.drawer))
-                .w_full()
-                .child(
-                    Panel::pane("drawer", Edge::Top)
-                        .title("Terminal")
-                        .size_full()
-                        .child(
-                            div()
-                                .id("drawer-body")
-                                .p(px(12.))
-                                .text_size(text::SM.size)
-                                .text_color(palette.muted_foreground.hsla())
-                                .child("The terminal arrives in Phase 6."),
-                        ),
-                )
-        });
+        let drawer = if frame.drawer > 0. {
+            let body = self.drawer_body(window, cx);
+            Some(
+                div()
+                    .id("drawer-slot")
+                    .flex_shrink_0()
+                    .h(px(frame.drawer))
+                    .w_full()
+                    .child(Panel::pane("drawer", Edge::Top).size_full().child(body)),
+            )
+        } else {
+            self.drawer_closed(window, cx);
+            None
+        };
 
         let toasts = (!self.toasts.is_empty()).then(|| {
             let this = cx.entity();

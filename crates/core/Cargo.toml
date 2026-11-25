@@ -34,6 +34,10 @@ tokio.workspace = true
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
+# Ending a terminal's process tree (`terminal.rs`, `kill_descendants`): the workspace's `windows`.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_Diagnostics_ToolHelp"] }
+
 [dev-dependencies]
 hermes_testdir.workspace = true
 wiremock = "0.6"

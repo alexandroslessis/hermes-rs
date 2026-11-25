@@ -7,6 +7,22 @@
 //! The output is a per-shell stream (`broadcast`) rather than `CoreEvent`s: it is high-volume,
 //! only the attached view wants it, and a view that falls behind skips what it missed.
 //!
+//! Ending a shell ([`Terminals::remove`], [`Terminals::close_all`], the idle reaper) kills what it
+//! started ([`kill_descendants`]), then the shell itself, then the descendants again (one started
+//! meanwhile), then closes the pseudo-console (which ends what is still attached to it and lets
+//! the reader thread go): a program started from the terminal does not outlive it. The tree is
+//! walked from the shell's process handle (held by its killer, so its id cannot be reused) and
+//! only through children created after their parent, so a process whose parent id is a recycled
+//! number of an older, unrelated process is never killed (`taskkill /T` does not check this).
+//! No job object: a GUI program started from the terminal whose launcher has exited (`code .`,
+//! `start notepad`) keeps running after the terminal closes, as in Windows Terminal; the cost is
+//! that a crash of the app leaves a program started in a console of its own running (CP6.3 review).
+//!
+//! The environment: the app's own, minus `NO_COLOR` / `FORCE_COLOR` / `COLORFGBG`, plus `TERM`,
+//! `COLORTERM`, `TERM_PROGRAM(_VERSION)` and `HERMES_DESKTOP_TERMINAL`. Nothing is added that the
+//! user's own environment did not hold (the app never puts a provider key in its environment: keys
+//! live in Settings and the keyring), so a terminal sees what a terminal opened beside the app sees.
+//!
 //! Hermes: `hermes_cli/web_host_terminal*.py` (`shell_spec`, `_MAX_SHELLS`, `RETENTION_SECONDS`),
 //! `pty_session.py`. The page's socket protocol is `crates/desktop/src/terminal.rs`.
 
@@ -50,7 +66,10 @@ pub struct Shell {
     id: String,
     name: String,
     cwd: String,
-    master: Mutex<Box<dyn MasterPty + Send>>,
+    /// The shell's process id (`None` when the platform did not say).
+    pid: Option<u32>,
+    /// The pseudo-console; `None` once the shell was ended (dropping it closes the console).
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     /// Keystrokes go to a writer thread (a blocked pipe must not stall the caller).
     input: std::sync::mpsc::Sender<Vec<u8>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
@@ -92,6 +111,11 @@ impl Shell {
     /// The folder it started in.
     pub fn cwd(&self) -> &str {
         &self.cwd
+    }
+
+    /// The shell's process id.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
     }
 
     /// Whether the shell's process has ended.
@@ -138,7 +162,9 @@ impl Shell {
 
     /// Resizes the pseudo-console.
     pub fn resize(&self, cols: u16, rows: u16) {
-        if let Ok(master) = self.master.lock() {
+        if let Ok(master) = self.master.lock()
+            && let Some(master) = master.as_ref()
+        {
             let _ = master.resize(PtySize {
                 rows,
                 cols,
@@ -148,12 +174,121 @@ impl Shell {
         }
     }
 
+    /// Ends the shell and everything it started: its descendants, the shell, its descendants again
+    /// (started in between), then the pseudo-console. The killer's handle keeps the shell's
+    /// process id from being reused, even after it exited.
     fn kill(&self) {
+        if let Some(pid) = self.pid {
+            kill_descendants(pid);
+        }
         if let Ok(mut killer) = self.killer.lock() {
             let _ = killer.kill();
         }
+        if let Some(pid) = self.pid {
+            kill_descendants(pid);
+        }
+        let master = self.master.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(master);
     }
 }
+
+/// Kills every process descended from `root` (not `root` itself), which must be a process the
+/// caller holds a handle to (so `root` names it and no other). A child counts only when it was
+/// created after its parent: Windows keeps a dead parent's id in its children, and a process whose
+/// parent id belonged to an older process that has since gone (the number now `root`'s, or a
+/// descendant's) is not ours. Each process is opened before it is judged and killed through that
+/// handle, so none can be swapped in between.
+#[cfg(windows)]
+pub(crate) fn kill_descendants(root: u32) {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        TerminateProcess,
+    };
+
+    struct Owned(HANDLE);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from a successful open and is closed once, here.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+    let open = |pid: u32| -> Option<Owned> {
+        // SAFETY: a plain Win32 call; the handle is owned by the returned value.
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, false, pid) }
+            .ok()
+            .map(Owned)
+    };
+    let created = |process: &Owned| -> Option<u64> {
+        let mut times = [FILETIME::default(); 4];
+        let [c, e, k, u] = &mut times;
+        // SAFETY: `process` is open; the four out-pointers are live locals.
+        unsafe { GetProcessTimes(process.0, c, e, k, u) }.ok()?;
+        Some((u64::from(times[0].dwHighDateTime) << 32) | u64::from(times[0].dwLowDateTime))
+    };
+    // (pid, parent pid) of every process now.
+    let mut table = Vec::new();
+    // SAFETY: a snapshot handle, owned and closed by `Owned`; the entry's size is set as required.
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return;
+        };
+        let snapshot = Owned(snapshot);
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if Process32FirstW(snapshot.0, &mut entry).is_ok() {
+            loop {
+                table.push((entry.th32ProcessID, entry.th32ParentProcessID));
+                if Process32NextW(snapshot.0, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let Some(root_process) = open(root) else {
+        return;
+    };
+    let Some(root_created) = created(&root_process) else {
+        return;
+    };
+    let mut seen = std::collections::HashSet::from([root, 0]);
+    let mut queue = vec![(root, root_created)];
+    let mut found = Vec::new();
+    while let Some((parent, parent_created)) = queue.pop() {
+        for &(pid, ppid) in &table {
+            if ppid != parent || seen.contains(&pid) {
+                continue;
+            }
+            let Some(process) = open(pid) else { continue };
+            let Some(child_created) = created(&process) else {
+                continue;
+            };
+            if child_created < parent_created {
+                continue; // Its parent id is a recycled number: not a child of ours.
+            }
+            seen.insert(pid);
+            queue.push((pid, child_created));
+            found.push(process);
+        }
+    }
+    for process in &found {
+        // SAFETY: `process` is open with PROCESS_TERMINATE.
+        unsafe {
+            let _ = TerminateProcess(process.0, 1);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn kill_descendants(_root: u32) {}
 
 /// Why a shell didn't start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +358,13 @@ fn safe_cwd(requested: Option<&str>) -> PathBuf {
         candidate.parent().map_or(home, Path::to_path_buf)
     } else {
         home
+    }
+}
+
+/// The last owner going away ends every shell still running (no shell outlives its `Terminals`).
+impl Drop for Terminals {
+    fn drop(&mut self) {
+        self.close_all();
     }
 }
 
@@ -298,7 +440,8 @@ impl Terminals {
             id: uuid::Uuid::new_v4().simple().to_string(),
             name,
             cwd: cwd.display().to_string(),
-            master: Mutex::new(pty.master),
+            pid: child.process_id(),
+            master: Mutex::new(Some(pty.master)),
             input,
             killer: Mutex::new(child.clone_killer()),
             history: Mutex::new(History::default()),
@@ -354,24 +497,27 @@ impl Terminals {
 
     /// Ends a shell and forgets it.
     pub fn remove(&self, id: &str) {
-        if let Some(shell) = self
+        let shell = self
             .shells
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(id)
-        {
+            .remove(id);
+        // (Killed outside the lock: walking the process table takes a moment.)
+        if let Some(shell) = shell {
             shell.kill();
         }
     }
 
-    /// Ends every shell (the app is closing).
+    /// Ends every shell and what each started (the app is closing).
     pub fn close_all(&self) {
-        for (_, shell) in self
+        let shells: Vec<_> = self
             .shells
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .drain()
-        {
+            .map(|(_, shell)| shell)
+            .collect();
+        for shell in shells {
             shell.kill();
         }
     }
@@ -444,5 +590,60 @@ mod tests {
         assert!(shell.has_exited(), "exit ends the shell");
         terminals.close_all();
         assert!(terminals.get(shell.id()).is_none());
+    }
+
+    /// Whether process `pid` is running (`tasklist`, from System32).
+    pub(crate) fn process_alive(pid: u32) -> bool {
+        use std::os::windows::process::CommandExt as _;
+        let system = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let out = std::process::Command::new(Path::new(&system).join(r"System32\tasklist.exe"))
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .creation_flags(crate::git::CREATE_NO_WINDOW)
+            .output()
+            .expect("tasklist runs");
+        String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+    }
+
+    /// Ending a shell ends what it started: a `ping` that would run for a minute is gone with it,
+    /// and so is the shell (closing a terminal, and the app's quit, both go through `kill`). The
+    /// `ping` runs in a console of its own (hidden), so closing the pseudo-console alone would not
+    /// end it: only the tree kill does.
+    #[test]
+    fn ending_a_shell_ends_the_programs_it_started() {
+        let terminals = Terminals::new("test");
+        let shell = terminals.spawn(80, 24, None).expect("a shell starts");
+        if shell.name().starts_with("cmd") {
+            terminals.close_all();
+            return; // The command below is PowerShell's.
+        }
+        wait_until(|| output(&shell).contains("\x1b[6n"));
+        shell.write(b"\x1b[1;1R");
+        let ping = r#"$p = Start-Process -PassThru -WindowStyle Hidden -FilePath "$env:SystemRoot\System32\PING.EXE" -ArgumentList '-n','60','127.0.0.1'; "CHILD=$($p.Id)=""#;
+        shell.write(format!("{ping}\r").as_bytes());
+        wait_until(|| child_pid(&output(&shell)).is_some());
+        let child = child_pid(&output(&shell)).expect("the child's pid is printed");
+        let parent = shell.pid().expect("the shell's pid");
+        assert!(process_alive(child) && process_alive(parent));
+        terminals.remove(shell.id());
+        wait_until(|| !process_alive(child) && !process_alive(parent));
+        assert!(
+            !process_alive(child),
+            "the child {child} outlived its terminal"
+        );
+        assert!(
+            !process_alive(parent),
+            "the shell {parent} outlived its terminal"
+        );
+        // A second end is harmless.
+        terminals.close_all();
+    }
+
+    fn child_pid(text: &str) -> Option<u32> {
+        let at = text.rfind("CHILD=")? + "CHILD=".len();
+        let rest = &text[at..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        (rest[digits.len()..].starts_with('=') && !digits.is_empty())
+            .then(|| digits.parse().ok())
+            .flatten()
     }
 }

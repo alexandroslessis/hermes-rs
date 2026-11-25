@@ -27,6 +27,9 @@ dev = ["gpui-kit/test-support"]
 snapshots = ["dev", "dep:gpui-pre-wgpu"]
 
 [dependencies]
+# The terminal emulator under the terminal view (CP6.3, `src/terminal/`): Alacritty's grid, parser
+# and selection, Apache-2.0, pinned exactly and recorded in vendor/SOURCES.md. No serde.
+alacritty_terminal = { version = "=0.26.0", default-features = false }
 anyhow.workspace = true
 # Attached images are stored base64 in the messages; the thread view decodes them for thumbnails.
 base64.workspace = true

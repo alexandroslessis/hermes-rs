@@ -417,3 +417,340 @@ review); `cargo test -p hermes_core` 149 passed; `cargo test -p hermes-desktop` 
 unchanged; the webapp's `dist-webapp` copied from the main checkout for the build and removed after);
 `cargo build --workspace --locked` passes; `scripts/perf/native-thread-check.ps1` ok; `scripts/clean-test-temp.ps1`:
 5 folders removed, then 0; no process left under `target\claude`.
+
+## CP6.3 — Terminal
+Worktree: C:\Users\alexandros\repos\hermes-rs-n6   Branch: native/p6-panel   Model: Opus 5.5 (subagent)
+Cut from CP6.2 (b5abf69). Uncommitted. The run was interrupted by a rate limit while writing the view tests and resumed;
+the worktree was re-checked against the brief.
+
+### Files
+- New `crates/native/src/terminal/` (~6,200 lines with tests): `mod.rs` (actions, `bind`, `RESERVED_IN_TERMINAL`,
+  `passed_through`), `emulator.rs` (`Emulator` over `alacritty_terminal::Term` + `vte` `Processor`: feed, replies,
+  title, bell, OSC 52, resize, scroll, selection, `Screen` = resolved cells rebuilt from the grid's damage),
+  `colors.rs` (`TermColors`: theme tokens + t3code's 16 per light/dark, a Zed theme's `terminal.ansi.*`, xterm cube and
+  greys, OSC overrides), `input.rs` (keys, paste, mouse reports as bytes), `links.rs` (http(s) and `path:line`),
+  `boxdraw.rs` (box-drawing and block characters as rectangles), `session.rs` (the `Pty` seam, `CorePty` /
+  `spawn_core`, `Shared`, the pump), `view.rs` (`TerminalView`: painting, keys, mouse, IME, clipboard, resize, bell,
+  blink, the "lines below" indicator, `script` for stories), `group.rs` (`TerminalGroup` = a thread's terminals in one
+  surface, `TerminalHub`), `fixture.rs` (`FixturePty` scripted shell, `colours_demo`, `tui_demo`, `numbered_lines`);
+  tests `tests.rs` (scripted session, 17), `view_tests.rs` (GPUI, 17), `real_tests.rs` (real core, 2), plus unit tests in
+  `colors`, `input`, `links`, `boxdraw`, `fixture`; new story file `gallery/terminal.rs` (`terminal`, `panel-terminal`).
+- Edited: `panel/mod.rs` (`Tab::Terminal`, `Tab::CHOOSER`, the strip's "+" button and "Open a surface" chooser with
+  T/F/D, a closable Terminal tab labelled by its terminal, the panel's own `TerminalHub`), `workspace.rs` (the drawer
+  holds the open thread's terminal group; focus follows open/close; `drawer_terminals()`), `model/backend.rs`
+  (`Backend::terminal_spawn`, `terminals_close_all`; `CoreBackend` holds an `Arc<Terminals>` (`with_terminals`);
+  `FixtureBackend` makes `FixturePty`s: `ptys()`, `fail_terminals`, `quiet_terminals`), `app.rs` (`terminal::bind` after
+  the global bindings; one `Terminals` shared with the core backend, `close_all` on `on_app_quit` and again after the
+  event loop), `lib.rs`, `gallery/mod.rs`, `Cargo.toml` (`alacritty_terminal = "=0.26.0"`, no default features),
+  `Cargo.lock` (7 packages added, nothing else changed: see Deviations).
+- **Core (`hermes_core`):** `terminal.rs`: `Shell::pid`; ending a shell (`remove`, `close_all`, the idle reaper) kills
+  its process tree (review: `kill_descendants`, replacing the implementer's `taskkill /T /F`; see Review), then
+  the shell, then drops the pseudo-console (`master` is now an `Option`: closing it ends console-attached processes and
+  lets the reader thread finish); kills happen outside the shells lock; `Drop for Terminals` closes what is left. Test
+  `ending_a_shell_ends_the_programs_it_started` (a hidden `ping` in a console of its own: it **fails without the tree
+  kill**, checked once by taking it out). `crates/desktop` is untouched (its socket uses the same `remove` / `close_all`).
+- Docs: AGENTS.md, ARCHITECTURE.md, TESTING.md §6 (the terminal paragraph), PITFALLS.md (5 bullets), PHASES.md status,
+  native-ui/README.md rows, PORTING.md (`terminal.rs` row: the tree kill is ours), vendor/SOURCES.md (alacritty_terminal).
+
+### What it does
+1. **Emulator off the UI thread.** The pump (`session::pump`, a GPUI background task) attaches to the shell (the core's
+   per-shell broadcast), takes what is waiting up to 1 MiB per batch, parses it 64 KiB per hold of a `FairMutex`
+   (`lock_unfair`), writes the emulator's replies back (ConPTY's `ESC[6n` at start, DA, OSC colour queries, size
+   queries), sets a dirty flag and wakes the view once (`Notify`: one permit however many batches). The view takes the
+   lock fairly when it draws and rebuilds only the rows the grid's damage names (all after a scroll, a resize or a theme
+   change). Drop to latest: frames draw the newest state; the emulator parses every byte.
+2. **Backpressure policy.** The core's channel holds 1,024 chunks of at most 16 KiB; if the pump falls further behind
+   (`Lagged`), the skipped bytes cannot be parsed: the pump resets the emulator and replays the shell's 1 MiB history
+   (`Shared::resyncs`). Memory is bounded by the scrollback (10,000 lines, ~29 MB of cells at 120 columns) plus the
+   channel and the history.
+3. **Renderer** (`view.rs`): canvas `terminal_background`; background runs; selection (`terminal_selection`; double-width
+   characters selected whole); cursor (block with its character drawn in the cell's background, beam, underline; an
+   outline when unfocused; blinks only when the program asks, DECSCUSR); text per row: runs of single-width cells
+   shaped as one line with `force_width` = the cell width (every glyph on the grid), bold / italic fonts, underline
+   (single, double and curly drawn as underline / wavy), strike; dim, inverse and hidden resolved into colours; 256 and
+   true colour; double-width (CJK, emoji) characters centred on two cells; box drawing and blocks as rectangles; OSC 8
+   links; Ctrl-hovered links underlined; the IME's composition drawn at the cursor; the bell's flash (150 ms;
+   `BellStyle::None` exists, no setting yet). Font: the theme's monospace (Consolas, else Cascadia Mono) at t3code's
+   12 px; cell = advance of `m` x max(ascent + descent, 1.2 lines), whole pixels; fallbacks Cascadia Mono, Segoe UI
+   Emoji / Symbol, MS Gothic, Malgun Gothic.
+4. **Size.** cols / rows from the element's bounds minus 6 / 4 px padding; the emulator resizes at once (Alacritty
+   reflows wrapped lines), the shell is told at once the first time and then after 100 ms of a stable size.
+5. **Keys** (decision below). Text goes through the input handler (IME). Typing scrolls to the bottom and drops the
+   selection. Application cursor keys when the program asks.
+6. **Mouse.** Programs that ask get reports (X10 / SGR, press / release / drag / motion / wheel, modifiers); Shift
+   overrides. Otherwise: drag selects, double click a word (Alacritty's semantic characters), triple a line,
+   Shift+click extends. The wheel scrolls the scrollback, or sends arrows on the alternate screen (alternate scroll).
+   Shift+PageUp/PageDown a page, Ctrl+Shift+Home/End the top / bottom; a "N lines below" pill (click: bottom).
+7. **Links.** Ctrl+click: `http(s)://` opens in the browser (`cx.open_url`; nothing else is opened), a file path
+   (`a/b.rs:12:5`, `a\b.rs:40`, `a.txt(7,3)`, `README.md`) dispatches `OpenFileInPanel` (the Files tab and its rules:
+   inside the thread's folder, no credentials). OSC 8 links are not followed (review). Nothing is ever run.
+8. **Surfaces.** The drawer (`Ctrl+J`) shows the open thread's group; the right panel's "+" opens t3code's "Open a
+   surface" (Terminal T, Files F, Diff D; Esc closes) and the Terminal tab has its own group (t3code keeps drawer and
+   panel terminals apart). One terminal: t3code's floating toolbar (new, close) top right. Several: t3code's 144 px
+   list (22 px header with new / close, 24 px rows after the review, a close per row), labels = OSC title or "Terminal N". Empty: "No terminal
+   sessions for this thread yet." + New terminal. At most 8 per thread per surface (the core's 16 shells overall).
+9. **Lifetime.** Terminals belong to (thread, surface); switching threads, hiding the drawer or closing the Terminal tab
+   keep the shells running (output still parsed). `exit` removes the terminal; the trash button, Ctrl+Shift+W and a
+   row's x kill the process tree; a `TerminalView` dropped without closing closes its shell on a thread; at quit the
+   app calls `Terminals::close_all` (`on_app_quit`, and after the event loop), and `Drop for Terminals` covers the rest.
+10. **Shell and environment.** The core decides: PowerShell 7, Windows PowerShell, `COMSPEC`, cmd (`shell_spec`), in
+    the thread's folder (refused if the folder is gone: the core would fall back to home). Environment: the app's own
+    minus `NO_COLOR` / `FORCE_COLOR` / `COLORFGBG`, plus `TERM=xterm-256color`, `COLORTERM`, `TERM_PROGRAM(_VERSION)`,
+    `HERMES_DESKTOP_TERMINAL`. Checked: neither the core nor the native app sets an environment variable (provider keys
+    live in Settings and the keyring; `set_var` appears only in tests), so nothing secret is injected. Kept as is: the
+    user's own variables are theirs, as in any terminal beside the app (scrubbing as the agent's shell does would also
+    change the Tauri app's terminal).
+
+### Reserved keys (decision)
+While a terminal has the focus the app keeps **`Ctrl+J`** (the drawer: t3code's `terminal.toggle` has no
+`!terminalFocus`), **`Ctrl+Alt+B`** (right panel, idem), **`F6` / `Shift+F6`** (leave the terminal by keyboard) and
+**`Ctrl+Shift+P`** (all actions; Windows Terminal's palette key). Every other global binding reaches the shell: `Ctrl+K`,
+`Ctrl+P`, `Ctrl+B`, `Ctrl+N`, `Ctrl+,`, `Ctrl+Alt+Shift+A`, and GPUI Kit's `Tab` / `Shift+Tab` / `Ctrl+Shift+I`
+(`NoAction` in the `Terminal` context; `terminal::bind` must run after `keymap::bind`). **Deviation from t3code:** t3code
+keeps `mod+b` (sidebar) in the terminal; `Ctrl+B` goes to the shell here (readline, tmux's prefix), as the brief asks.
+The terminal's own keys follow Windows Terminal: `Ctrl+Shift+C/V`, `Ctrl+C` copies only with a selection (and drops it),
+`Ctrl+V` pastes, `Shift+PageUp/Down`, `Ctrl+Shift+Home/End`, `Ctrl+Shift+T` new, `Ctrl+Shift+W` close (t3code's
+in-terminal `mod+n` / `mod+w` are shell keys on Windows). With `Ctrl+J` reserved the keyboard cannot send a bare LF
+(Enter sends CR; as in t3code).
+
+### Tests (`CARGO_TARGET_DIR=target/claude`, from the worktree root)
+- `terminal::tests` (scripted session, no window): SGR 16 / 256 / true colour (fg and bg), bold / italic / underline /
+  double / curly / inverse / dim / strike / hidden, CUP / CUB / CUD / CUF / EL 0 and 1 / ED 2 / DECSC-DECRC / ICH / DCH,
+  wide and emoji characters (spacers, a wide character wrapping whole), the alternate screen (primary kept), a scrolling
+  region (DECSTBM, reverse index), a full-screen program's screen (`tui_demo`: box drawing, inverse status bar, SGR mouse
+  modes, cursor addressing), resize with reflow and scrollback, replies (DSR `ESC[6n` -> `ESC[1;3R`, DA, OSC 10 query),
+  titles OSC 0 / 2, bell, OSC 52 (refused both ways after the review), selection text (wrapped line joined, trailing blanks dropped, wide
+  characters whole, word, line), damage-only rebuilds, theme change, cursor shapes, the colours demo, and three volume
+  tests. Plus unit tests in `colors` (2), `input` (4: keys, Ctrl/Alt, paste incl. a pasted `ESC[201~` removed, mouse X10 /
+  SGR), `links` (2), `boxdraw` (1), `fixture` (1).
+- **Numbers** (debug build, this machine, `cargo test -p hermes-native --lib terminal::tests -- --nocapture`):
+  1,000,000 lines (12.9 MB) parsed in **1.00 s (12.9 MB/s)**; scrollback held at **10,000 lines, grid 28.9 MB** (the
+  bound); pump test: 200,000 lines (2.5 MB) through the fixture channel in **0.22 s** while a "frame" took the lock every
+  16 ms: longest wait for the lock **5.4 ms**, 5 wake-ups for 12 frames (coalesced); a 3,000-chunk flood before the pump
+  read anything: **1 resync**, the screen ends with the last chunk.
+- `terminal::view_tests` (17, workspace over the fixture): drawer at 640 / 1100 / 1920 (one shell started, prompt drawn,
+  toolbar 8 px from the top right, grid origin = terminal origin + padding, cols / rows = floor of the padded size over
+  the cell, whole-pixel rows, emulator and shell at that size at once, `no_overflow`); a drawer drag resizes the grid at
+  once and the shell only after 100 ms, a TUI then draws at the new size; keys (typed text, Ctrl+P / Ctrl+K / Ctrl+B /
+  Ctrl+N / Tab / Shift+Tab / arrows / Alt+B / Ctrl+Left / Esc / Backspace reach the shell as their bytes and no app action
+  runs; DECCKM; Ctrl+J toggles the drawer and sends nothing; the shell keeps running); the reserved / passed-through sets
+  cover `keymap::COMMANDS`; Ctrl+C (^C without a selection, copies and drops it with one; Ctrl+Shift+C keeps it; double
+  click word, triple click line, Shift+click extends; typing drops the selection); paste plain and bracketed; IME
+  composition drawn and not sent, committed text sent, candidate window at the cursor; mouse reports in a full-screen
+  program (click press / release in SGR, wheel 64, Shift selects instead, `q` leaves); wheel / Shift+PageUp /
+  Ctrl+Shift+Home / output while scrolled up / typing jumps to the bottom / the indicator's click; Ctrl+click on
+  `src/main.rs:5:1` opens the right panel's Files tab on it, Ctrl-hover marks the link's cells; several terminals (the
+  144 px list, 24 px rows (review), titles, row click, another thread's own terminal, the same entities back, output while the
+  drawer is hidden, row close ends the shell, `exit` removes it, the empty state and its button); Ctrl+Shift+T / W; the
+  bell's flash; a failed start says why; the "+" chooser at three sizes (32 px rows, T / F keys, a Terminal tab with
+  its own shell, its label from OSC 2, closing the tab keeps the shell); a dropped view ends its shell.
+- `terminal::real_tests` (2, real `Core`, `hermes_testdir` folders): PowerShell through `Backend::terminal_spawn` in the
+  thread's folder: `Write-Output ('hermes-' + (6*7))` -> `hermes-42`, `(Get-Location)` is the folder, a resize to 72
+  columns -> `$Host.UI.RawUI.WindowSize.Width` = 72, **`less` from Git for Windows** (`C:\Program Files\Git\usr\bin`)
+  enters the alternate screen, pages, `q` leaves; a hidden `ping` started from the shell and the shell are gone after
+  close (`tasklist`); two shells and their children are gone after `terminals_close_all` (the app's quit). 4.3 s alone.
+  Under the full suite's load an earlier version failed: the command typed right after `less` quit was lost (typed
+  while `less` was still reading its tty); the test now waits for the prompt after `less`, waits up to 90 s, and a
+  `Term` closes its shell on drop (a failed run left its folder held until the sweep).
+- `hermes_core` `terminal::tests::ending_a_shell_ends_the_programs_it_started` (see Files).
+- Runs: `cargo test -p hermes-native` **626 passed, 1 failed (the real test above, timeout under load; fixed), 2 ignored**
+  in a first run; after the fixes `scripts/native/check.ps1` ran **627 passed, 2 ignored** (lib tests) and **630 passed, 2
+  ignored** with `--features snapshots` (the snapshot test 411 s); `cargo test -p hermes_core` **150 passed**; `cargo test -p hermes-desktop` **130 + 68 passed** (the
+  webapp's `dist-webapp` copied from the main checkout for the build, removed after); `cargo build --workspace --locked`
+  passes; `scripts/perf/native-thread-check.ps1` "native-thread-check: ok"; `scripts/native/check.ps1` **"native check: all ok"** (last run).
+  `scripts/clean-test-temp.ps1`: dry run 27 folders (5.7 MB), `-Delete` removed 27, then 0. No shell left: after the runs no `pwsh` / `powershell -NoLogo` / `PING.EXE` / `less.exe` process of ours
+  (checked with `Get-CimInstance Win32_Process`), nothing under `target\claude` running.
+
+### Snapshots
+New (4), `crates/native/snapshots/`: `terminal-t3-{light,dark}.png` (720 x 300 drawer, 5 states: `prompt`, `colours`,
+`tui`, `list`, `scrolled`) and `panel-terminal-t3-{light,dark}.png` (380 x 620 panel: `chooser`, `tab`). Copied from the
+harness's `.actual.png` (no `UPDATE_SNAPSHOTS=1`, so no other baseline was rewritten). **Pre-existing baselines that
+changed (6):** `app-frame-t3-{light,dark}` (the drawer's "Terminal" header and "arrives in Phase 6" text became "Open a
+thread to use its terminal."; the strip's "+"), `panel-diff-t3-{light,dark}` and `panel-files-t3-{light,dark}` (the
+strip's "+" only). I looked at both new dark sheets, the light `terminal` sheet and the `app-frame` dark diff.
+Compared with `app-terminal-open.png` (prompt top left on black, toolbar pill top right, a filled cursor) and
+`sidebar-right.png` ("Open a surface": centred title, icon / label / letter rows): same structure; ours has two toolbar
+buttons, not four (no split). A Haiku / Sonnet visual check should look at the four new and six changed images.
+
+### Deviations
+- **No split panes** (t3code's split horizontally / vertically and groups): one terminal shown per surface, a list for
+  several. **No rename** (the brief: titles from OSC only). No "add terminal context to chat".
+- **Drawer and panel terminals are separate** (as t3code); a thread's drawer terminals are not shown in the panel.
+- **Ctrl+B reaches the shell** (t3code keeps it for the sidebar); new / close terminal are Ctrl+Shift+T / W (Windows
+  Terminal), not t3code's in-terminal `mod+n` / `mod+w`.
+- **Right-click does nothing** (no context menu; Windows Terminal's right-click paste was left out: a stray click
+  could run a pasted line in a shell without bracketed paste). Middle and right buttons are reported to programs.
+- **No cursor blink by default** (only when a program asks with DECSCUSR); bell is flash, with no setting yet (Phase 7).
+- **Cargo.lock edited by hand:** adding the crate made Cargo re-point 18 existing dependency edges at other
+  `windows-sys` / `windows-link` / `libloading` versions; the lock keeps the old edges and adds only the 7 packages
+  (`cargo metadata --locked` and `cargo build --workspace --locked` accept it).
+- **No t3code screenshot was taken** (t3code's window cannot be driven from here): several terminals, light theme,
+  selection and the scrolled indicator follow `ThreadTerminalDrawer.tsx` / `RightPanelTabs.tsx` and the tokens.
+- File links are resolved against the thread's folder, not the shell's current folder (after a `cd` a relative path
+  may name another file or be refused by the Files tab).
+
+### For the reviewer
+1. **Process cleanup without a job object.** Close and quit kill the tree (`taskkill /T`) while the shell is alive;
+   a crash of the app leaves a process started in its own console (e.g. `Start-Process -WindowStyle Hidden`) running.
+   A Windows job object with KILL_ON_JOB_CLOSE (needs the `Win32_System_JobObjects` feature of `windows`) would cover
+   crashes; not done (feature change for the whole workspace).
+2. **`Terminals::remove` now kills the tree for the Tauri page's terminal too** (same core type); its socket tests
+   pass. `Drop for Terminals` calls `close_all` (taskkill per remaining shell on the dropping thread).
+3. **The pump's lag policy resets the emulator** and replays the 1 MiB history: the scrollback before that is lost and
+   a program on the alternate screen is redrawn from whatever the history holds.
+4. **Synchronized updates** (`CSI ? 2026`): a pending one is ended only when the view draws or more output comes (no
+   timer in the pump).
+5. **The view updates its own entity in the canvas's prepaint** (`set_layout`, the gpui-component pattern); a size
+   change costs one extra frame.
+6. **`EntityInputHandler`**: only the marked (composition) text is exposed; `selected_text_range` is its end.
+   Real IME behaviour (Japanese / emoji panel) is hand-only.
+7. **Fonts**: CJK and emoji rely on DirectWrite fallback through the listed families; box drawing is ours (rounded
+   corners drawn square, dashed lines left to the font).
+8. **OSC 52 copy is allowed** (a program can set the clipboard, as in Windows Terminal); reading it is refused.
+   (Review: both are refused now.)
+9. The **environment is unchanged** (point 10 above): the user's own variables reach their terminal.
+10. `TerminalGroup` keeps every thread's terminals until closed or quit; a deleted thread's terminals are not closed
+    when the thread goes (they end at quit).
+11. Pre-existing and untouched: clippy notes and unformatted Phase 4/5 files. New files and `app.rs` / core `terminal.rs`
+    are `rustfmt`ed; `panel/mod.rs`, `workspace.rs`, `model/backend.rs` were not formatted before and were left so
+    (rustfmt on `panel/mod.rs` would reformat its child modules too).
+12. **Visual check pending:** 4 new and 6 changed baselines (Snapshots above); the cursor in stories is drawn filled
+    because `new_terminal` focuses the terminal (unfocused would be an outline).
+
+### Phase 6 Done
+- "Snapshots of each panel with fixture repos": `panel-diff-t3-*` (CP6.1, fake repository `panel/fixture.rs`),
+  `panel-files-t3-*` and `file-finder-t3-*` (CP6.2, fake project `panel/fixture_files.rs`), `terminal-t3-*` and
+  `panel-terminal-t3-*` (CP6.3, the scripted shell). Live: `panel::real_tests` (git), `terminal::real_tests` (shell).
+- "The terminal passes a scripted session (colours, a full-screen program like `less` or `vim` if present, resize)":
+  `terminal::tests` (colours, attributes, cursor, erase, wide, alt screen, scroll region, the TUI screen, resize and
+  reflow), `terminal::view_tests` (keys, mouse, resize through the frame), `terminal::real_tests` (real PowerShell, real
+  `less`, a resize the shell reports).
+
+### User checklist (Phase 6: diff, files, terminal)
+Build (PowerShell, in `C:\Users\alexandros\repos\hermes-rs-n6`): `$env:CARGO_TARGET_DIR="target/claude"; cargo build -p
+hermes-native --bins`, then `$env:HERMES_RS_HOME="$PWD\target\native-test"` (synthetic, never `%APPDATA%`). Use a
+throwaway git repository for anything that reverts or runs commands.
+A. Fixture, synthetic data: `.\target\claude\debug\hermes-native.exe --fixture`, open "halo".
+ 1. Diff (CP6.1 checklist items 1-7 above) and Files (CP6.2 items 1-7 above) still work; the strip now ends in "+".
+ 2. Ctrl+J: the drawer opens with "Hermes fixture shell..." and a prompt, the cursor in it. Type `colors` Enter: the
+    16 colours, a 256 strip, a true-colour ramp, bold / dim / italic / underline / inverse / strike / curly, `漢字かな`,
+    emoji, a box table and blocks. Type `tui` Enter: a framed full-screen screen; click in it (nothing selects: the
+    program has the mouse); Shift+drag selects; `q` leaves.
+ 3. Type `lines 500` Enter, scroll up with the wheel: "N lines below" appears bottom right; Shift+PageUp; type a letter:
+    back to the bottom. `title build` Enter: nothing visible with one terminal; click + (top right): a second terminal and
+    the list at the right, the first row now "build". `bell`: a short flash.
+ 4. Drag over text, Ctrl+C: copied (paste it in Notepad), and Ctrl+C again sends ^C (a new prompt). Double click a
+    word, triple click a line, Shift+click extends. Ctrl+V pastes (multi-line pastes as several lines).
+ 5. Press Ctrl+P, Ctrl+K, Ctrl+B in the terminal: they are typed into the fixture shell (nothing opens); Ctrl+J closes
+    the drawer; F6 moves the focus out.
+ 6. Switch to "ayo": its own terminal; back to "halo": the two terminals with their output. Close one with its x;
+    type `exit` in the other: the empty state and "New terminal".
+ 7. Right panel (Ctrl+Alt+B), "+": "Open a surface"; press T: a Terminal tab with its own terminal; its x closes the
+    tab; "+" then T brings the same terminal back; F and D open Files and Diff.
+B. Real core on a throwaway folder (hand-only: the real shell): add the folder as a project, open a thread in it.
+ 8. Ctrl+J: PowerShell in the thread's folder (`pwd`). Run `git status`, `dir`, a long-running command and Ctrl+C.
+ 9. If Git for Windows is installed: `& 'C:\Program Files\Git\usr\bin\less.exe' somefile` (wheel and keys page it, `q`
+    quits); `vim` from the same folder if you use it.
+10. Drag the drawer's top edge: the prompt reflows; `$Host.UI.RawUI.WindowSize` shows the new size.
+11. Print a URL and a `path:line` (`Write-Output https://example.com README.md:3`): Ctrl+hover underlines, Ctrl+click
+    opens the browser / the Files tab.
+12. Start `ping -t 127.0.0.1` and close the terminal (trash): ping is gone in Task Manager; open two terminals, quit the
+    app: no `pwsh` / `ping` left.
+13. (Review) Copy some text in Notepad, then in the terminal run `$e=[char]27; $b=[char]7` and
+    `Write-Output "$e]52;c;aGVsbG8=$b"`: Ctrl+V in Notepad still pastes your text (a program cannot set the
+    clipboard). Run `Write-Output "$e]8;;https://example.com$e\click me$e]8;;$e\"`: Ctrl+click on "click me" opens
+    nothing (only addresses visible in the text open).
+14. (Review) Switch to a light theme, run `colors` in the fixture shell (A.2): every colour of the 16 is readable on
+    the light canvas (bright green, bright yellow and bright white are darker than t3code's).
+Hand-only (no test can judge them): real shell feel and typing latency, IME (Win+. emoji panel, a Japanese or Greek
+IME), mouse selection feel, vim / less in daily use, Ctrl+click links in the real browser, copy / paste with the real
+clipboard, wide and emoji glyph rendering and font fallback, resize by dragging, the light theme, cursor look.
+
+### Visual check (Sonnet 5.5)
+Opened: `app-terminal-open.png` (dark), `sidebar-right.png`; t3code's `ThreadTerminalDrawer.tsx` was not opened (the screenshots only). Crops of every state, old vs new for the six changed.
+- terminal-t3-dark: matches app-terminal-open (prompt top left on black, toolbar pill top right, filled light-blue cursor). Colours legible on black (0 invisible by nature), bold/dim/inverse/strike/curly, wide and emoji on the grid, box drawing continuous, blocks ok, selection visible, "12 lines below" pill ok. Differs: the toolbar has 2 buttons, not 4 (documented); no scrollbar is drawn in the scrolled state; in `tui` the toolbar overlaps the program's top-right border (floating, as t3code).
+- terminal-t3-light: expected; marginal contrast for bright colours on the near-white (15 about #a5a5a5, 11 olive-yellow, 9 bright green); all readable, no clipping or overlap.
+- panel-terminal-t3-dark: matches sidebar-right (centred title, icon/label/letter rows; fewer rows: documented); tab strip with a closable "Terminal 1" and "+": expected.
+- panel-terminal-t3-light: expected.
+- app-frame, panel-diff, panel-files (light, dark): changed-as-expected (drawer placeholder text; the strip's "+" only; pixel diff confined to the strip row).
+- Phase 6 spot-check (panel-diff, panel-files, file-finder, light and dark): nothing unexpected.
+
+### Review (Opus 5.5)
+`main` had not moved (nothing to merge). Read the diff, `alacritty_terminal` 0.26.0's reply sites and
+`portable-pty` 0.9's Windows child, and t3code's `ThreadTerminalDrawer.tsx` / `keybindings.ts`.
+
+**Security (fixed):**
+1. **Bracketed paste could be closed early.** `encode_paste` removed `ESC[201~` once, so `ESC[20ESC[201~1~` closed up
+   into a fresh end marker and the rest ran as typed commands. Now every ESC (and the 8-bit CSI U+009B) is removed
+   from bracketed text; test with the nested form.
+2. **OSC 52 write was allowed.** Printed output (a `cat`ed file) could replace the clipboard with a command the user
+   then pastes elsewhere. Now `Osc52::Disabled` (read was already refused); the clipboard plumbing is gone.
+3. **OSC 8 targets were opened.** A hyperlink's target can differ from its text (`https://good.example` leading
+   elsewhere). OSC 8 is no longer followed; only addresses visible in the text open (http(s) only, as before).
+4. **The tree kill could hit an unrelated process.** `taskkill /T` walks by parent id only; Windows keeps a dead
+   parent's id in its children, so a process whose parent id is a recycled number now held by the shell would be
+   killed. New `hermes_core::terminal::kill_descendants`: a ToolHelp snapshot, walked from the shell's pid (safe:
+   the killer holds the shell's handle, so the id is never reused, even after exit), a child counted only when created
+   after its parent, each opened before it is judged and killed through that handle. `kill` = descendants, shell,
+   descendants again (started in between); also runs after the shell exited (orphans are found through the held id).
+   Faster than spawning `taskkill` (quit runs on the UI thread). `git.rs` keeps its `taskkill` (back to private).
+   Dependency: `windows` (workspace, 0.62) for `hermes_core` with `Win32_System_Diagnostics_ToolHelp`; one line in
+   `Cargo.lock`.
+
+**Checked, no change:** replies are fixed numeric formats (DSR, DA, DECRQM, CSI 14/18 t, OSC 4/10/11 colours, kitty
+mode); `alacritty_terminal` has no title report (`CSI 21 t`) - test `printed_text_cannot_type_into_the_shell` feeds a
+hostile title plus every query. File links go to the Files tab, whose `fs::locate` refuses `\\host\share` and
+`\\?\UNC` lexically before touching the disk (CP6.2). `cx.open_url` only for `http(s)://`. Environment: neither the
+core nor the native app calls `set_var` outside tests; provider keys live in the keyring, so the shell gets exactly the
+user's own environment (as a terminal beside the app would); scrubbing it would change the Tauri terminal too - left.
+`taskkill` (git) is called by its System32 path with an argument vector.
+
+**Not done, on purpose:** **no job object.** KILL_ON_JOB_CLOSE would also end, when the terminal closes, a GUI program
+whose launcher has exited (`code .`, `start notepad`): Windows Terminal leaves those running, and so does the walk
+above. The cost stays: an app crash leaves a program started in a console of its own (`Start-Process
+-WindowStyle Hidden`); console-attached programs end with the pseudo-console. **`Ctrl+J` stays reserved:** t3code's
+default `{ key: "mod+j", command: "terminal.toggle" }` has no `when`, so it also works in a focused terminal; a bare LF
+cannot be typed (documented in the decision above).
+
+**Visual check items:** (a) light palette fixed: t3code's bright green `#14ce14`, bright yellow `#b5ba00`, bright white
+`#a5a5a5` (about 2:1) are now `#0e9a0e`, `#8f8a00`, `#8c8c8c`; test `the_light_palette_is_readable_on_the_light_canvas`
+(all 16 at least 3:1 on the light canvas). (b) No scrollbar in the scrolled state: left; the "N lines below" pill and
+Shift+PageUp cover it (Phase 8 polish). (c) Toolbar over a program's top-right border: as t3code, accepted. (d) Chooser
+with 3 rows: accepted (documented). (e) Compared with `ThreadTerminalDrawer.tsx`: font 12 px (`DEFAULT_TERMINAL_FONT_SIZE`)
+and the toolbar pill (`right-2 top-2`) match; the list's rows were 22 px / 11 px text / small radius, t3code's are
+`h-6 rounded-md text-xs pr-2 pl-1.5`: now 24 px, 12 px, `radius::MD`, 6 / 8 px padding (header stays `h-[22px]`).
+Remaining deviation, documented in `group.rs`: a close button at the row's end (t3code swaps the icon on hover).
+Baselines `terminal-t3-{light,dark}` re-accepted after looking: light = the palette and the list; dark = the list rows
+only (pixel diff confined to the list).
+
+**Emulator / renderer, assessed:** the lag policy (reset + replay of the 1 MiB history) can start mid-sequence and lose
+the alternate-screen switch if it is older than the history: the user may see a garbled screen until the program
+redraws (or Ctrl+L); it needs more than 1,024 x 16 KiB of unread output, i.e. the UI frozen for long; accepted and
+noted in "For the reviewer" 3. Resize: emulator first, the shell after 100 ms, sizes clamped to at least 2 x 1. Copy
+trims trailing blanks per line and joins wrapped lines (Alacritty's). `Ctrl+C` with a selection copies even while a
+program runs (as Windows Terminal). Blink only on DECSCUSR, its task dropped on blur. A hidden terminal parses but does
+not draw. Memory: 10,000 lines x 120 columns is ~29 MB a terminal; with the 16-shell cap about 460 MB at worst, left.
+AltGr: `Ctrl+Alt+<key>` with a character is text in the terminal; the global `Ctrl+Alt+B` vs AltGr+B is the Phase 2
+item, unchanged. Views do not call the core: `terminal/session.rs` holds the `hermes_core::terminal` adapter behind
+the `Pty` seam, spawned from `model/backend.rs`; spawn and close run in `background_spawn`.
+
+**Tests made deterministic:** `real_tests` slept 300 ms after `less` quit. Now `Term::sync` resends a marker command
+until its computed output shows (a program that just quit may read the first ones). The `less` part now asserts the
+pages: the first page holds `row 1` and not `row 25` or the shell's lines, the next one `row 30` without `row 1`, the
+shell's screen comes back after `q`. The whole `terminal` module ran 5 times in a row (49 passed each time; the real
+test runs beside the others).
+
+**Licences / lock:** `alacritty_terminal`'s Windows tree is MIT / Apache-2.0 / Unlicense / Zlib (none copyleft).
+`cargo update --workspace --dry-run` locks 0 packages: the hand-edited lock is what Cargo would keep; its diff is
+additions only.
+
+**Final runs (review, `CARGO_TARGET_DIR=target/claude`):** `cargo test -p hermes-native --features snapshots`: 630
+passed, 2 failed: the two `terminal-t3` baselines (re-accepted, above) and
+`thread::composer::real_tests::a_model_and_a_mode_picked_during_a_turn_apply_from_the_next_turn_on_a_real_core`
+("the footer showed the old model"), which passes alone (10 / 10) and in `check.ps1`: a Phase 5 test that is timing
+sensitive under the full suite's load, not touched here (left for Phase 5's owner). `scripts/native/check.ps1`: "native
+check: all ok". `cargo test -p hermes_core`: 150 passed. `cargo test -p hermes-desktop` (with `dist-webapp` copied in
+from the main checkout and removed after): 130 + 68 passed; `crates/desktop` is untouched, so its RPC table and
+terminal socket are as before (the socket now ends shells through `kill_descendants`). `cargo build --workspace
+--locked`: ok. `scripts/perf/native-thread-check.ps1`: ok. `scripts/clean-test-temp.ps1`: 20 folders (4.8 MB) removed,
+then none. No process under `target\claude`, no child of one, no `PING.EXE` / `less.exe`, no orphaned `-NoLogo` shell.

@@ -41,7 +41,7 @@ Sizes: S ≈ a day, M ≈ 2–4 days, L ≈ a week or more (agent-days, rough).
 | 3 | Sidebar: projects and threads — ✅ 2026-11-19 | M | 1 (CP1.1), 2 |
 | 4 | Thread view: timeline, markdown, tool calls, streaming — ✅ 2026-11-24 | L | 3 |
 | 5 | Composer: input, mentions, commands, attachments, model, approvals, questions — ✅ 2026-11-25 | L | 4 |
-| 6 | Right panel: diff, files, terminal | L | 1, 4 |
+| 6 | Right panel: diff, files, terminal — ✅ 2026-11-25 | L | 1, 4 |
 | 7 | Hermes screens: settings, memory, skills, staging, usage, import | L | 1, 2 |
 | 8 | First run, polish, accessibility, installer | M | 3–7 |
 | 9 | Switch over and retire `crates/app` and `vendor/zed` | S–M | 8 + user's decision |
@@ -485,6 +485,8 @@ highlighting and line numbers, images, markdown preview; "Open in editor" (the u
 editor: Zed, VS Code, or the system default).
 
 ### CP6.3 — Terminal (L)
+
+**Status (CP6.3, 2026-11-25):** built, reviewed (escape-sequence input hardened: OSC 52 and OSC 8 refused, bracketed paste strips every ESC; process-tree kill safe from recycled ids; light ANSI palette made readable) and committed on `native/p6-panel` (Phase 6 done, not merged into `main`); `terminal/`, details, numbers, the reserved-keys decision and the Phase 6 user checklist in `progress/phase-6.md`. `hermes_core::terminal` kills a shell's descendants on close and at quit.
 
 The core's PTY sessions rendered by our terminal view over `alacritty_terminal`: colours from the
 theme, selection and copy, paste, scrollback, resize, links. Shown as a right panel tab and as

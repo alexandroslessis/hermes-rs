@@ -111,6 +111,12 @@ pub fn run(options: Options) {
         .build()
         .expect("a tokio runtime");
     let handle = runtime.handle().clone();
+    // The terminals' shells: the core backend starts them; whatever is still running when the
+    // window closes is ended below, with everything it started (no orphans).
+    let terminals = Arc::new(hermes_core::terminal::Terminals::new(env!(
+        "CARGO_PKG_VERSION"
+    )));
+    let shells = terminals.clone();
     gpui_kit::application()
         .with_assets(AppAssets)
         .run(move |cx| {
@@ -124,6 +130,8 @@ pub fn run(options: Options) {
             sidebar::keys::bind(cx);
             crate::thread::header::bind(cx);
             crate::thread::composer::view::bind(cx);
+            // After the global bindings: the terminal takes some of them back for the shell.
+            crate::terminal::bind(cx);
 
             let state = data_dir.as_deref().map(UiState::load).unwrap_or_default();
 
@@ -153,6 +161,7 @@ pub fn run(options: Options) {
             let (dev_send, send_dump) = (options.dev_send.clone(), options.dump.clone());
             let driven = options.dev && options.dev_send.is_some();
             let answer_with = options.dev_answer.clone();
+            let quitting = shells.clone();
             let opened = gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(bounds),
@@ -191,6 +200,7 @@ pub fn run(options: Options) {
                             model.clone(),
                             handle.clone(),
                             options.dev_provider.clone(),
+                            shells.clone(),
                             cx,
                         );
                         model
@@ -256,6 +266,11 @@ pub fn run(options: Options) {
                     return;
                 }
             }
+            cx.on_app_quit(move |_| {
+                quitting.close_all();
+                async {}
+            })
+            .detach();
             if let Some(after) = options.quit_after {
                 cx.spawn(async move |cx| {
                     cx.background_executor().timer(after).await;
@@ -268,6 +283,7 @@ pub fn run(options: Options) {
     // for its blocking tasks (a curator or review call in flight), which would leave a windowless
     // process holding the app lock. Give them a moment, then go; the lock is released after.
     runtime.shutdown_timeout(Duration::from_secs(2));
+    terminals.close_all();
 }
 
 /// Builds the core off the main thread and gives it to the model.
@@ -275,6 +291,7 @@ fn start_core(
     model: gpui_kit::Entity<AppModel>,
     handle: tokio::runtime::Handle,
     dev_provider: Option<String>,
+    terminals: Arc<hermes_core::terminal::Terminals>,
     cx: &mut App,
 ) {
     cx.spawn(async move |cx| {
@@ -288,7 +305,11 @@ fn start_core(
             .await;
         let _ = model.update(cx, |model, cx| match built {
             Ok(core) => model.connect(
-                Arc::new(CoreBackend::new(core).with_dev_provider(dev_provider)),
+                Arc::new(
+                    CoreBackend::new(core)
+                        .with_dev_provider(dev_provider)
+                        .with_terminals(terminals),
+                ),
                 cx,
             ),
             Err(error) => model.fail(format!("{error:#}"), cx),

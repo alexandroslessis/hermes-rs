@@ -23,6 +23,7 @@ pub mod sidebar;
 pub mod spike;
 #[cfg(any(test, feature = "dev"))]
 pub mod testing;
+pub mod terminal;
 pub mod theme;
 pub mod thread;
 pub mod titlebar;

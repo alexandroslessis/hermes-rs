@@ -60,6 +60,7 @@ use crate::thread::composer::data::{
 };
 use crate::thread::composer::mention::{CommandOrigin, CommandSpec, Suggestion};
 use crate::thread::data::{Attachment, HistoryItem, HistoryPage, items_from_entries, page};
+use crate::terminal::{fixture::FixturePty, session::Pty};
 use crate::thread::header_data::{Exported, GitState, GitSummary, HeaderInfo};
 use crate::thread::recording::Recording;
 
@@ -268,6 +269,19 @@ pub trait Backend: Send + Sync + 'static {
     ) -> Result<String, String> {
         Err("Opening a file is not available here.".to_string())
     }
+    /// Starts a shell of `cols` × `rows` in thread `session`'s folder (the terminal, CP6.3). The
+    /// core picks the program (PowerShell 7, Windows PowerShell, else `COMSPEC`) and its
+    /// environment (`hermes_core::terminal`).
+    fn terminal_spawn(
+        &self,
+        _session: &str,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<Arc<dyn Pty>, String> {
+        Err("There is no terminal here.".to_string())
+    }
+    /// Ends every shell and what each started (the app is quitting).
+    fn terminals_close_all(&self) {}
 }
 
 /// Where the `@` menu looks for files.
@@ -513,6 +527,9 @@ pub struct CoreBackend {
     dev_provider: Option<ProviderConfig>,
     /// Models picked while a turn ran, until applied between turns (shared with the hooks).
     picked: PickedRoutes,
+    /// The terminals' shells (a standalone type: `Core` does not hold them). The app shares it so
+    /// it can end every shell after its event loop returns.
+    terminals: Arc<hermes_core::terminal::Terminals>,
 }
 
 impl CoreBackend {
@@ -521,7 +538,16 @@ impl CoreBackend {
             core,
             dev_provider: None,
             picked: PickedRoutes::default(),
+            terminals: Arc::new(hermes_core::terminal::Terminals::new(env!(
+                "CARGO_PKG_VERSION"
+            ))),
         }
+    }
+
+    /// Uses `terminals` for the shells (the app keeps a handle to end them at quit).
+    pub fn with_terminals(mut self, terminals: Arc<hermes_core::terminal::Terminals>) -> Self {
+        self.terminals = terminals;
+        self
     }
 
     /// The provider a prompt of `session` goes to: `--dev-provider`'s, else the session's own.
@@ -1285,6 +1311,26 @@ impl Backend for CoreBackend {
         panel_backend::project_open(&self.core, session, path, line)
     }
 
+    fn terminal_spawn(
+        &self,
+        session: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Arc<dyn Pty>, String> {
+        let record = self
+            .core
+            .runtime()
+            .store()
+            .session(session)
+            .map_err(|e| format!("{e:#}"))?
+            .ok_or_else(|| "This thread is not in the store.".to_string())?;
+        crate::terminal::session::spawn_core(&self.terminals, &record.cwd, cols, rows)
+    }
+
+    fn terminals_close_all(&self) {
+        self.terminals.close_all();
+    }
+
     fn answer(&self, prompt_id: &str, answer: &Answer) -> Result<bool, String> {
         use hermes_tools::approval::ApprovalChoice;
         Ok(match answer {
@@ -1342,6 +1388,12 @@ pub struct FixtureBackend {
     diffs: Mutex<crate::panel::fixture::FixtureDiffs>,
     /// The Files tab's project: what it answers, and what was asked of it.
     project: Mutex<crate::panel::fixture_files::FixtureFiles>,
+    /// The terminals' scripted shells, in the order they were started.
+    ptys: Mutex<Vec<Arc<FixturePty>>>,
+    /// A terminal start that fails with this message.
+    terminal_failure: Mutex<Option<String>>,
+    /// Terminals start as scripted, silent shells.
+    quiet_terminals: std::sync::atomic::AtomicBool,
 }
 
 /// A composer operation that reached a [`FixtureBackend`].
@@ -1420,6 +1472,9 @@ impl FixtureBackend {
             answered_asks: Mutex::default(),
             diffs: Mutex::new(crate::panel::fixture::FixtureDiffs::sample()),
             project: Mutex::new(crate::panel::fixture_files::FixtureFiles::sample()),
+            ptys: Mutex::default(),
+            terminal_failure: Mutex::default(),
+            quiet_terminals: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1431,6 +1486,25 @@ impl FixtureBackend {
     /// The Files tab's fake project (what it answers, what was asked of it).
     pub fn project(&self) -> std::sync::MutexGuard<'_, crate::panel::fixture_files::FixtureFiles> {
         self.project.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The terminals' scripted shells started so far.
+    pub fn ptys(&self) -> Vec<Arc<FixturePty>> {
+        self.ptys.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Terminals start silent (no greeting, no echo: stories put their own content in).
+    pub fn quiet_terminals(&self) {
+        self.quiet_terminals
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Makes the next terminal starts fail with `message` (`None`: they work).
+    pub fn fail_terminals(&self, message: Option<&str>) {
+        *self
+            .terminal_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = message.map(str::to_string);
     }
 
     /// The models a fixture offers: two providers, a handful of models.
@@ -2175,6 +2249,38 @@ impl Backend for FixtureBackend {
         line: Option<u32>,
     ) -> Result<String, String> {
         self.project().open(session, path, line)
+    }
+
+    fn terminal_spawn(
+        &self,
+        _session: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Arc<dyn Pty>, String> {
+        if let Some(why) = self
+            .terminal_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return Err(why);
+        }
+        let pty = if self.quiet_terminals.load(std::sync::atomic::Ordering::Relaxed) {
+            FixturePty::scripted(cols, rows)
+        } else {
+            FixturePty::interactive(cols, rows)
+        };
+        self.ptys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(pty.clone());
+        Ok(pty)
+    }
+
+    fn terminals_close_all(&self) {
+        for pty in self.ptys() {
+            pty.close();
+        }
     }
 
     fn answer(&self, prompt_id: &str, answer: &Answer) -> Result<bool, String> {
